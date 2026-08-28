@@ -29,7 +29,7 @@
  * next frame is its reply will read a batch as an answer and hang.
  */
 
-import { CRYPTO_SUITE, type SealedChunk } from "./crypto.ts";
+import { CRYPTO_SUITE, chunkName, type SealedChunk } from "./crypto.ts";
 
 /** The protocol version this client speaks. A mismatch is refused, not negotiated. */
 export const PROTO = 1;
@@ -179,6 +179,14 @@ export class Transport {
     private bodyWaiter: Waiter<Uint8Array> | undefined;
     /** Bodies that arrived before anything asked for them. Obsidian's dataQueue. */
     private readonly bodyQueue: Uint8Array[] = [];
+
+    /**
+     * How many chunk bodies are still owed by a fetch in flight.
+     *
+     * Bodies arrive as bare binary frames with nothing tying them to a request,
+     * so this is the only thing that says whether one was asked for.
+     */
+    private expecting = 0;
     private closed = false;
     private closeReason: Error | undefined;
     /**
@@ -288,9 +296,23 @@ export class Transport {
         if (waiter) {
             this.bodyWaiter = undefined;
             waiter.resolve(bytes);
-        } else {
-            this.bodyQueue.push(bytes);
+            return;
         }
+        if (this.bodyQueue.length >= this.expecting) {
+            // A body nobody asked for. The queue is bounded by what is
+            // outstanding rather than left to grow, because a peer that keeps
+            // sending them would otherwise be a way to exhaust this device's
+            // memory, and because a body arriving outside a fetch means the two
+            // ends no longer agree about what is being answered.
+            this.die(
+                new ProtocolError(
+                    "protostate",
+                    `server sent a ${bytes.length} byte body with nothing outstanding to receive it`
+                )
+            );
+            return;
+        }
+        this.bodyQueue.push(bytes);
     }
 
     private onTextFrame(frame: Reply): void {
@@ -655,12 +677,20 @@ export class Transport {
      * Downloads chunk bodies, in the order asked for.
      *
      * The server refuses the whole fetch if it lacks any of them, so a partial
-     * answer is not a case to handle. Each body is still checked against the name
-     * it was requested under by the caller, which is what the names being hashes
-     * is for.
+     * answer is not a case to handle.
+     *
+     * Every body is checked against the name it was asked for, here rather than
+     * in the caller. That check used to be described as the caller's and no
+     * caller did it, which mattered more than it sounds: bodies arrive as bare
+     * binary frames with nothing tying them to a request, so a body left over
+     * from an abandoned fetch is consumed by the next one. It would decrypt
+     * perfectly, being a real chunk of a real file, and be assembled into the
+     * wrong note. The name is a hash of exactly these bytes, so the check is
+     * exact and costs one digest.
      */
     async fetch(names: readonly string[]): Promise<Uint8Array[]> {
         if (names.length === 0) return [];
+        this.expecting += names.length;
         const reply = this.request({ op: "fetch", chunks: [...names] });
 
         // The bodies come as binary frames with no reply frame in front of them,
@@ -668,15 +698,32 @@ export class Transport {
         // will only settle if the server refuses, which is why it is raced rather
         // than awaited.
         const bodies: Uint8Array[] = [];
-        for (let i = 0; i < names.length; i++) {
-            const next = await Promise.race([
-                this.body(),
-                reply.then((r) => {
-                    throw new ProtocolError("protostate", `expected a chunk body, got ${JSON.stringify(r)}`);
-                }),
-            ]);
-            bodies.push(next);
+        try {
+            for (let i = 0; i < names.length; i++) {
+                const next = await Promise.race([
+                    this.body(),
+                    reply.then((r) => {
+                        throw new ProtocolError("protostate", `expected a chunk body, got ${JSON.stringify(r)}`);
+                    }),
+                ]);
+                const got = await chunkName(next);
+                if (got !== names[i]) {
+                    // The stream is no longer saying what it is answering, so
+                    // there is nothing to recover to. Carrying on would mean
+                    // guessing which body belonged to which name.
+                    throw new ProtocolError(
+                        "badchunk",
+                        `asked for ${names[i]} and received ${next.length} bytes that hash to ${got}`
+                    );
+                }
+                bodies.push(next);
+            }
+        } catch (err) {
+            this.expecting = 0;
+            if (err instanceof ProtocolError && err.code === "badchunk") this.die(err);
+            throw err;
         }
+        this.expecting = Math.max(0, this.expecting - names.length);
         // Nothing is coming for the request slot, so release it: the fetch is
         // answered entirely in binary frames.
         this.replyWaiter = undefined;

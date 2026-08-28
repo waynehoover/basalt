@@ -213,7 +213,7 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	// which auth key the vault belongs to from then on. After that the
 	// bootstrap opens nothing, and the only credential is one derived from the
 	// root secret that also produces the content and path keys.
-	srv := server.New(st, server.DerivedAuth(st, token, func() int64 {
+	srv := server.New(st, server.DerivedAuth(st, *vault, token, func() int64 {
 		return time.Now().UnixMilli()
 	}), log)
 

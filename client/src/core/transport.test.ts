@@ -15,6 +15,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import { chunkName } from "./crypto.ts";
 import { Backoff, ConnectionError, ProtocolError, Transport, urlForHost, type Batch, type SocketLike } from "./transport.ts";
 
 /** A socket under the test's control, which can say anything at all. */
@@ -84,6 +85,11 @@ async function helloed(cursor = 0, opts: Parameters<typeof connected>[0] = {}) {
     rig.socket.reply({ res: "ready", proto: 1, cursor: 10, perFileMax: 1, chunkMax: 1, maxChunks: 1 });
     await hello;
     return rig;
+}
+
+/** A body and the name it travels under, which is a hash of exactly its bytes. */
+async function named(body: Uint8Array): Promise<{ body: Uint8Array; name: string }> {
+    return { body, name: await chunkName(body) };
 }
 
 /** Lets queued notification work run before asserting on it. */
@@ -382,20 +388,70 @@ describe("bodies", () => {
         // they can land before the loop that reads them. Dropping one loses a
         // chunk and the file it belongs to.
         const { t, socket } = await helloed(0);
-        const fetching = t.fetch(["a".repeat(64), "b".repeat(64)]);
-        socket.body(new Uint8Array([7]));
-        socket.body(new Uint8Array([8]));
+        const one = await named(new Uint8Array([7]));
+        const two = await named(new Uint8Array([8]));
+        const fetching = t.fetch([one.name, two.name]);
+        socket.body(one.body);
+        socket.body(two.body);
         const bodies = await fetching;
         expect(bodies.map((b) => b[0])).toEqual([7, 8]);
     });
 
     it("returns as many bodies as it asked for", async () => {
         const { t, socket } = await helloed(0);
-        const fetching = t.fetch(["a".repeat(64), "b".repeat(64), "c".repeat(64)]);
-        socket.body(new Uint8Array([1]));
-        socket.body(new Uint8Array([2]));
-        socket.body(new Uint8Array([3]));
+        const parts = await Promise.all([1, 2, 3].map((n) => named(new Uint8Array([n]))));
+        const fetching = t.fetch(parts.map((p) => p.name));
+        for (const p of parts) socket.body(p.body);
         expect(await fetching).toHaveLength(3);
+    });
+
+    /**
+     * Bodies arrive as bare binary frames with nothing tying them to a request,
+     * so the only thing connecting one to a name is the order it came in. A body
+     * left over from an abandoned fetch would be taken by the next one, decrypt
+     * perfectly, being a real chunk of a real file, and be assembled into the
+     * wrong note. The name is a hash of exactly those bytes, so this is exact.
+     */
+    it("refuses a body that is not the one it asked for", async () => {
+        const { t, socket } = await helloed(0);
+        const wanted = await named(new Uint8Array([1, 2, 3]));
+        const other = await named(new Uint8Array([9, 9, 9]));
+        const fetching = t.fetch([wanted.name]);
+        socket.body(other.body);
+        await expect(fetching).rejects.toMatchObject({ code: "badchunk" });
+        // The stream no longer says what it is answering, so there is nothing to
+        // carry on to.
+        expect(t.isClosed).toBe(true);
+    });
+
+    it("refuses a body nobody asked for", async () => {
+        // Unbounded queueing would make this a way to exhaust the device's
+        // memory, and a body outside a fetch means the two ends no longer agree
+        // about what is being answered.
+        const { t, socket } = await helloed(0);
+        socket.body(new Uint8Array([1, 2, 3]));
+        await settle();
+        expect(t.isClosed).toBe(true);
+    });
+
+    it("does not let one fetch inherit the bodies of another", async () => {
+        const { t, socket } = await helloed(0);
+        const wanted = await named(new Uint8Array([4, 5, 6]));
+        const stale = await named(new Uint8Array([7, 8, 9]));
+
+        // A fetch is abandoned with a body still to come.
+        const abandoned = t.fetch([stale.name, wanted.name]);
+        socket.body(stale.body);
+        socket.reply({ res: "err", code: "nochunk", msg: "gone" });
+        await expect(abandoned).rejects.toMatchObject({ code: "nochunk" });
+
+        // Whatever happens next, it is not that the leftover is served as the
+        // answer to a different question.
+        const next = t.fetch([wanted.name]).catch((e: Error) => e);
+        socket.body(wanted.body);
+        const result = await next;
+        if (result instanceof Error) return; // refused outright, which is fine
+        expect(result[0], "a fetch was answered with another fetch's body").toEqual(wanted.body);
     });
 
     it("raises a refusal that arrives instead of the bodies", async () => {

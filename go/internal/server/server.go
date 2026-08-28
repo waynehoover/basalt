@@ -232,8 +232,29 @@ func (s *Server) ready(cursor int64) wire.Ready {
 // sends the auth key it wants the vault bound to, and from then on the
 // bootstrap opens nothing. Trust on first connection would be simpler and would
 // mean whoever reached the port first owned the vault.
-func DerivedAuth(st *store.Store, bootstrap string, now func() int64) Authenticator {
+// MinClaimLength is the shortest auth key a vault may be bound to.
+//
+// A derived key is 43 characters of base64url. Anything much shorter came from
+// a client that is not deriving it, and binding a vault to a guessable
+// credential is worse than refusing to bind it at all: the refusal is visible
+// and the weak key is not.
+const MinClaimLength = 32
+
+func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int64) Authenticator {
 	return func(c Credentials) error {
+		// Exactly one vault is authorised. A typo in the vault name fails here
+		// instead of quietly creating a second, empty vault that reports itself
+		// as fully synced, which is what claiming does if it is allowed to
+		// invent the vault it claims.
+		if c.VaultID != allowedVault {
+			return fmt.Errorf("this server serves %q, not %q", allowedVault, c.VaultID)
+		}
+		if bootstrap == "" {
+			// Otherwise an empty token would match an empty bootstrap and the
+			// first caller would claim the vault with nothing at all.
+			return errors.New("this server has no bootstrap token, so no vault can be claimed")
+		}
+
 		hash, err := st.AuthHash(c.VaultID)
 		if err != nil {
 			return fmt.Errorf("reading the vault's auth hash: %w", err)
@@ -258,8 +279,10 @@ func DerivedAuth(st *store.Store, bootstrap string, now func() int64) Authentica
 		if subtle.ConstantTimeCompare([]byte(c.Token), []byte(bootstrap)) != 1 {
 			return errors.New("bootstrap token mismatch")
 		}
-		if c.Claim == "" {
-			return errors.New("this vault has not been claimed, and no auth key was offered to claim it with")
+		if len(c.Claim) < MinClaimLength {
+			return fmt.Errorf(
+				"this vault has not been claimed, and the key offered to claim it with is %d characters, which is too few",
+				len(c.Claim))
 		}
 		claimed := sha256.Sum256([]byte(c.Claim))
 		ok, err := st.ClaimVault(c.VaultID, hex.EncodeToString(claimed[:]), now())
