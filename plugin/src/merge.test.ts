@@ -472,3 +472,124 @@ describe("offsets, in the presence of more than one change", () => {
         expect(mergeText(base, mine, theirs).kind).toBe("conflict");
     });
 });
+
+describe("a hunk placed in the wrong place, which reports success", () => {
+    /**
+     * The fourth failure mode, and the one that made the merge run twice.
+     *
+     * `patch_apply` finds each hunk's home by fuzzy search. In repetitive
+     * content it will find somewhere that looks right and is not, and report
+     * success: every flag true, the inserted text present, the regions not
+     * overlapping. Every other check in this module passes and the note is wrong.
+     */
+    const block = (i: number) => `## Section\n\nSome shared boilerplate text here.\n\nItem ${i}\n`;
+    const base = Array.from({ length: 12 }, (_, i) => block(i)).join("\n");
+    const mine = base.replace("Item 3", "Item 3 EDITED LOCALLY");
+    // Sections 0 to 2 removed, so everything shifts up and the matcher's target
+    // offset lands on text that looks identical.
+    const theirs = Array.from({ length: 12 }, (_, i) => block(i))
+        .slice(3)
+        .join("\n");
+
+    it("is exactly what the library does, unaided", () => {
+        const spliced = obsidianMerge(base, mine, theirs);
+        // The edit is present, so nothing looking for a lost edit would notice.
+        expect(spliced).toContain("EDITED LOCALLY");
+        // And it is attached to the wrong item.
+        expect(spliced).not.toContain("Item 3 EDITED LOCALLY");
+        expect(spliced).toContain("Item 6 EDITED LOCALLY");
+    });
+
+    it("is refused", () => {
+        const r = mergeText(base, mine, theirs);
+        expect(r.kind).toBe("conflict");
+        expect(r.kind === "conflict" && r.why).toMatch(/either order/);
+    });
+
+    it("does not turn ordinary merges into conflicts", () => {
+        // The check earns its place only if it is quiet on everything else. The
+        // legitimate merges above all still merge, and these are the shapes most
+        // likely to trip an order comparison.
+        const cases: [string, string, string][] = [
+            ["a\nb\nc\nd\n", "a\nMINE\nb\nc\nd\n", "a\nb\nc\nTHEIRS\nd\n"],
+            ["x y z\n", "X y z\n", "x y Z\n"],
+            ["one\ntwo\n", "one\ntwo\nthree mine\n", "one\ntwo\nthree theirs\n"],
+            ["p\n".repeat(30), "p\n".repeat(15) + "MINE\n" + "p\n".repeat(15), "p\n".repeat(30) + "THEIRS\n"],
+        ];
+        for (const [b, m, t] of cases) {
+            expect(mergeText(b, m, t).kind, `${JSON.stringify(b.slice(0, 20))} became a conflict`).toBe("merged");
+        }
+    });
+
+    it("returns the same content whichever order it merged in", () => {
+        // When the two orders differ only in the order of two additions, the
+        // result returned is the forward one. Whatever it is, it must contain
+        // both additions.
+        const b = "# day\n\n- first\n";
+        const r = mergeText(b, b + "- mine\n", b + "- theirs\n");
+        expect(r.kind).toBe("merged");
+        if (r.kind !== "merged") return;
+        expect(r.text).toContain("- mine");
+        expect(r.text).toContain("- theirs");
+    });
+});
+
+describe("which check catches what", () => {
+    /**
+     * Recorded because it was measured, by disabling each check in turn, and
+     * because it is the answer to "why are there four of these".
+     *
+     * These are not tests of the checks; they are the cases that distinguish
+     * them, kept together so that removing one and finding the suite still green
+     * is not mistaken for the check being useless.
+     */
+    it("only the overlap check catches a symmetric splice", () => {
+        // Both sides rewrote the same sentence. diff-match-patch splices them,
+        // and it does so the same way in both directions, so merging both ways
+        // round agrees on the same mangled answer.
+        const base = "# Note\n\nThe original sentence.\n";
+        const mine = "# Note\n\nMy completely different sentence.\n";
+        const theirs = "# Note\n\nTheir entirely other sentence.\n";
+        expect(mergeText(base, mine, theirs).kind).toBe("conflict");
+    });
+
+    it("only the two-directions check catches a misplaced hunk", () => {
+        const block = (i: number) => `## Section\n\nSome shared boilerplate text here.\n\nItem ${i}\n`;
+        const base = Array.from({ length: 12 }, (_, i) => block(i)).join("\n");
+        const mine = base.replace("Item 3", "Item 3 EDITED LOCALLY");
+        const theirs = Array.from({ length: 12 }, (_, i) => block(i))
+            .slice(3)
+            .join("\n");
+        const r = mergeText(base, mine, theirs);
+        expect(r.kind).toBe("conflict");
+        expect(r.kind === "conflict" && r.why).toMatch(/either order/);
+    });
+
+    it("only the two-directions check separates a run-on from two added lines", () => {
+        // Structurally identical: two additions at one offset. One reads as two
+        // list items, the other as a sentence neither person wrote, and the
+        // difference is only visible in the result.
+        const day = "# 2026-08-27\n\n- first thing\n";
+        expect(mergeText(day, day + "- mine\n", day + "- theirs\n").kind).toBe("merged");
+
+        const line = "the contested line";
+        expect(mergeText(line, `${line} as I wrote it`, `${line} as they wrote it`).kind).toBe("conflict");
+    });
+
+    it("returns the same side's result every time, so a merge is reproducible", () => {
+        // When the two orders differ only in the order of two additions, either
+        // is defensible and the choice has to be fixed. An unstable choice makes
+        // a merge non-reproducible, and two devices merging the same three
+        // versions would then disagree and conflict for ever.
+        const day = "# day\n\n- first\n";
+        const once = mergeText(day, day + "- mine\n", day + "- theirs\n");
+        for (let i = 0; i < 5; i++) {
+            const again = mergeText(day, day + "- mine\n", day + "- theirs\n");
+            expect(again).toEqual(once);
+        }
+        // Which order comes out is arbitrary. Pinned so that a change to it is
+        // a deliberate act: two devices merging the same three versions must
+        // reach the same answer, or they conflict with each other for ever.
+        expect(once.kind === "merged" && once.text).toBe("# day\n\n- first\n- mine\n- theirs\n");
+    });
+});

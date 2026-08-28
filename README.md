@@ -35,6 +35,7 @@ Early. See `docs/` for the design this is being built to:
 - `docs/philosophy.md` — what it refuses to do, and why
 - `docs/protocol.md` — the wire protocol, and the seven defects it exists to avoid
 - `docs/backup.md`, on the two kinds of backup and which one saves you from what
+- `docs/vs-obsidian-sync.md`, a side by side comparison, including where theirs wins
 
 ## Not LiveSync
 

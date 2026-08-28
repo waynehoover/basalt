@@ -46,19 +46,47 @@
  * present and the meaning destroyed. `conflictingSpans` is the check diff3 and
  * git make and this library does not, and it runs before anything is applied.
  *
- * ## The three checks, and which one actually fires
+ * ## The fourth failure, and why the merge runs twice
  *
- * In order: overlapping regions, then the applied flags, then insertion
- * survival. Stated plainly because the ordering has a consequence worth
- * knowing: the overlap check turned out to subsume the other two in every case
- * that could be constructed for it, including a lost deletion that leaves the
- * output looking correct. Disabling either of the later two leaves the whole
- * suite passing.
+ * Three checks were not enough, and the fourth one is the interesting one.
  *
- * They stay anyway. Each is a comparison over data already computed, the flags
- * are the precise defect this module exists to invert, and "nothing currently
- * reaches it" is a description of today's test cases rather than of the space of
- * inputs a vault will produce. What is not done is pretending they are tested.
+ * `patch_apply` matches each hunk into the target by fuzzy search. In repetitive
+ * content it can find somewhere that looks like the right place and is not.
+ * Observed, with the real library, on a note of twelve similar sections: a local
+ * edit to section 3 landed on section 6. Every flag true. The inserted text
+ * present. The regions did not overlap. Every check above passes and the note is
+ * wrong.
+ *
+ * So the merge is computed both ways round, and the two results must hold the
+ * same lines. Applying the remote change to the local file has no reason to make
+ * the same mistake as applying the local change to the remote file, so a
+ * misplacement shows up as a disagreement about *which* lines exist.
+ *
+ * Same lines rather than the same string, because the two orders legitimately
+ * differ in one common case: two devices each appending to a daily note. Nothing
+ * is lost either way and only the order is arbitrary, so demanding identical
+ * output would produce a conflict copy a day. A misplaced hunk changes which
+ * lines exist, not their order, so the weaker comparison still catches it.
+ *
+ * ## Which check catches what, measured
+ *
+ * Each of these was disabled in turn to find out, rather than reasoned about:
+ *
+ *   - **Overlapping regions** catches exactly one thing the rest do not: two
+ *     sides rewriting the same sentence differently. diff-match-patch splices
+ *     those, and it does so symmetrically, so merging both ways round gives the
+ *     same mangled answer and the two-directions check sees nothing wrong.
+ *   - **Two directions** catches a misplaced hunk, and catches two additions at
+ *     one point that do not concatenate cleanly. Disabling it leaves four tests
+ *     failing.
+ *   - **The applied flags** catch nothing any constructed input reaches: with
+ *     non-overlapping regions, `patch_apply` placed every hunk in every case
+ *     tried, including with all four lines of context either side destroyed.
+ *   - **Insertion survival** likewise. It is a check on the library's own report.
+ *
+ * The last two stay for the cost of a comparison over data already at hand, and
+ * because the flags are the precise defect this module exists to invert. What is
+ * not done is pretending they are tested.
  *
  * ## Where this sits between the two predecessors
  *
@@ -94,16 +122,6 @@ interface Span {
  * they produce a wide span and a point at the same place. Both are kept: they
  * describe the same edit and neither is wrong.
  */
-/**
- * Whether an offset sits where a line begins, which is where two additions can
- * be concatenated without running into each other.
- */
-function atLineBoundary(base: string, at: number): boolean {
-    if (at === 0) return true;
-    if (at >= base.length) return base.endsWith("\n");
-    return base[at - 1] === "\n";
-}
-
 function changedSpans(diff: Diff[]): Span[] {
     const spans: Span[] = [];
     let at = 0;
@@ -112,6 +130,11 @@ function changedSpans(diff: Diff[]): Span[] {
             at += text.length;
         } else if (op === DELETE) {
             spans.push({ start: at, end: at + text.length });
+            // Deleted text still occupied space in the base, so the cursor has
+            // to move past it or every later span is recorded too early. No test
+            // reaches this on its own any more: the two-directions check catches
+            // whatever a wrong offset lets through, and the tests for ordinary
+            // merges catch a wrong offset that invents a collision.
             at += text.length;
         } else {
             spans.push({ start: at, end: at });
@@ -142,38 +165,25 @@ function changedSpans(diff: Diff[]): Span[] {
  * "no edit was lost" is necessary and not sufficient, and this is the check that
  * covers the rest.
  *
- * Two insertion points at the same offset are treated by where they land.
- *
- * At a line boundary they are allowed: both texts survive as separate lines,
- * only their order is arbitrary, and two devices adding to one daily note is
- * the common case. Refusing it would produce a conflict copy a day for no gain.
- *
- * Mid-line they are refused, because concatenating them produces a run-on
- * sentence neither person wrote:
- *
- * ```
- * base   the contested line
- * mine   the contested line as I wrote it
- * theirs the contested line as they wrote it
- * merged the contested line as I wrote it as they wrote it
- * ```
- *
- * Structurally those two cases are identical, which is why an earlier version
- * allowed both. The distinction that matters is whether the result reads as two
- * additions or as one mangled sentence, and a line boundary is exactly that
- * line.
+ * Two additions at the same offset are not a collision here. Nothing was
+ * destroyed, so this check has nothing to say about them, and the two-directions
+ * check below decides whether concatenating them reads as two additions or as
+ * one mangled sentence. An earlier version tried to make that call here by
+ * asking whether the offset was at a line boundary; it gave the same answers and
+ * needed a concept of its own to do it.
  */
-function conflictingSpans(base: string, mine: Span[], theirs: Span[]): Span | undefined {
+function conflictingSpans(mine: Span[], theirs: Span[]): Span | undefined {
     for (const l of mine) {
         for (const r of theirs) {
             const lPoint = l.start === l.end;
             const rPoint = r.start === r.end;
-            if (lPoint && rPoint) {
-                // Coincident additions. Whole lines concatenate readably;
-                // fragments do not.
-                if (l.start === r.start && !atLineBoundary(base, l.start)) return l;
-                continue;
-            }
+            // Two additions at one point are never a collision here, whether
+            // they land on a line boundary or inside a sentence. Nothing was
+            // destroyed, so this check has nothing to say about them; whether
+            // concatenating them reads as two additions or as one mangled
+            // sentence is decided by the two-directions check below, which
+            // catches the mangled case and lets the daily-note case through.
+            if (lPoint && rPoint) continue;
             if (lPoint) {
                 // An insertion into text the other side removed.
                 if (r.start < l.start && l.start < r.end) return l;
@@ -238,7 +248,7 @@ export function mergeText(base: string, mine: string, theirs: string): MergeOutc
         dmp.diff_cleanupSemantic(theirDiff);
         dmp.diff_cleanupEfficiency(theirDiff);
     }
-    const collision = conflictingSpans(base, changedSpans(diff), changedSpans(theirDiff));
+    const collision = conflictingSpans(changedSpans(diff), changedSpans(theirDiff));
     if (collision !== undefined) {
         return {
             kind: "conflict",
@@ -251,20 +261,43 @@ export function mergeText(base: string, mine: string, theirs: string): MergeOutc
     // No guard on an empty patch list. A non-empty diff always produces at
     // least one patch, and if it ever did not, the result would simply be
     // `theirs` and the insertion check below is exactly what notices that.
-    const patches = dmp.patch_make(base, diff);
-    const [text, applied] = dmp.patch_apply(patches, theirs);
+    // Merge in both directions and require the same answer.
+    //
+    // This is what catches a misplaced hunk, and a misplaced hunk is a real
+    // thing patch_apply does: its matcher is fuzzy, so in repetitive content it
+    // will find somewhere that *looks* like the right place and report success.
+    // Observed, with the real library, on a note of twelve similar sections:
+    // a local edit to section 3 landed on section 6, every flag true, the
+    // inserted text present, and the note wrong.
+    //
+    // Neither the overlap check nor the insertion check sees that, because
+    // nothing was lost and nothing collided. What does see it is asking the
+    // question the other way round: applying the *remote* change to the *local*
+    // file has no reason to make the same mistake, so the two results diverge.
+    // A merge worth having is one that does not depend on which side you start
+    // from.
+    const forward = applyOneWay(dmp, base, diff, theirs);
+    const reverse = applyOneWay(dmp, base, theirDiff, mine);
 
-    const failed = applied.filter((ok) => !ok).length;
-    if (failed > 0) {
+    if (forward.failed > 0 || reverse.failed > 0) {
+        const failed = Math.max(forward.failed, reverse.failed);
+        const total = Math.max(forward.total, reverse.total);
         return {
             kind: "conflict",
-            why: `${failed} of ${applied.length} changes could not be placed in the incoming version`,
+            why: `${failed} of ${total} changes could not be placed in the other version`,
         };
     }
 
-    // The flags say every hunk was placed. That is the library's account of its
-    // own work, so check the thing that actually matters.
-    const missing = missingInsertions(diff, text);
+    if (!sameLines(forward.text, reverse.text)) {
+        return {
+            kind: "conflict",
+            why: "merging the two versions in either order gives different content, so at least one change was placed wrongly",
+        };
+    }
+
+    // Both directions agree and every hunk was placed. That is the library's
+    // account of its own work, twice over, so check the thing that matters.
+    const missing = missingInsertions(diff, forward.text);
     if (missing !== undefined) {
         return {
             kind: "conflict",
@@ -272,7 +305,41 @@ export function mergeText(base: string, mine: string, theirs: string): MergeOutc
         };
     }
 
-    return { kind: "merged", text };
+    return { kind: "merged", text: forward.text };
+}
+
+/**
+ * Whether two merge results hold the same lines, in any order.
+ *
+ * Comparing the strings outright is too strict, and the case that shows it is
+ * the common one: two devices each appending a line to a daily note. Both orders
+ * lose nothing, and only the order differs, so demanding identical strings would
+ * produce a conflict copy a day. Comparing line multisets accepts that and still
+ * catches a misplaced hunk, because a hunk that lands in the wrong place changes
+ * *which* lines exist rather than their order.
+ *
+ * When the two orders differ, the forward result is the one returned: local
+ * changes applied to the incoming version. Arbitrary, and fixed, which is what
+ * matters.
+ */
+function sameLines(a: string, b: string): boolean {
+    if (a === b) return true;
+    const x = a.split("\n").sort();
+    const y = b.split("\n").sort();
+    if (x.length !== y.length) return false;
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+    return true;
+}
+
+/** Applies one side's changes to the other, reporting how many hunks landed. */
+function applyOneWay(
+    dmp: InstanceType<typeof diff_match_patch>,
+    base: string,
+    diff: Diff[],
+    onto: string
+): { text: string; failed: number; total: number } {
+    const [text, applied] = dmp.patch_apply(dmp.patch_make(base, diff), onto);
+    return { text, failed: applied.filter((ok: boolean) => !ok).length, total: applied.length };
 }
 
 /**
