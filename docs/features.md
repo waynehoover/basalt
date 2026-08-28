@@ -176,6 +176,7 @@ match on the way in.
 |---|---|
 | Shared core between the plugin and a headless client | **Built** |
 | Local index with one remembered fingerprint per file | **Built** |
+| An index that shrinks again when notes are deleted | **Built** |
 | Content cache, so an unchanged vault costs one stat per file | **Built** |
 | Filesystem adapter | **Built** |
 | Obsidian Vault API adapter | **Built**, against a fake of Obsidian's own interface |

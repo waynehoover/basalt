@@ -287,7 +287,7 @@ async function cmdDeleted(args: Args, io: Console): Promise<number> {
         const gone = await client.deleted(args.limit > 20 ? args.limit : undefined);
         if (args.json) {
             io.out(JSON.stringify({ ok: true, deleted: gone.notes, more: gone.more }));
-            return gone.more ? 0 : 0;
+            return 0;
         }
         if (gone.notes.length === 0) {
             io.out("Nothing has been deleted from this vault.");

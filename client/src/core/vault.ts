@@ -147,7 +147,21 @@ export class MemoryVault implements Vault {
         this.notify(path);
     }
 
+    /**
+     * Makes the next removal of this path fail, once.
+     *
+     * A test seam, and a narrow one. Applying an incoming deletion can fail for
+     * ordinary reasons on a real device, a locked file being the obvious one,
+     * and what the engine does next is a durability question rather than a
+     * cosmetic one. There is no other way to produce it.
+     */
+    failRemoveOnce: string | undefined;
+
     async remove(path: string): Promise<void> {
+        if (this.failRemoveOnce === path) {
+            this.failRemoveOnce = undefined;
+            throw new Error(`refusing to remove ${path}, as a locked file would`);
+        }
         this.files.delete(path);
         this.folders.delete(path);
         this.notify(path);

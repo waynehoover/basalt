@@ -696,6 +696,125 @@ describe("the guards the happy path hides", () => {
     }, 120_000);
 });
 
+describe("what the index forgets", () => {
+    /**
+     * `entries` was pruned and `remote` was not, so a vault kept the server's
+     * word about every path it had ever deleted, for ever, in a file rewritten
+     * on every sync. Measured before the fix: six hundred deleted notes left a
+     * 59 KB index that only ever grew.
+     */
+    it("does not keep a record of every note ever deleted", async () => {
+        await fresh();
+        const a = await device("a");
+
+        for (let i = 0; i < 40; i++) await a.vault.edit(`note-${i}.md`, `body ${i}\n`);
+        await a.settle();
+        expect(await remoteCount(a)).toBe(40);
+
+        for (let i = 0; i < 40; i++) await a.vault.remove(`note-${i}.md`);
+        await a.settle();
+        expect(await remoteCount(a), "the index kept a tombstone per deleted note").toBe(0);
+        expect(await entryCount(a)).toBe(0);
+    }, 300_000);
+
+    /**
+     * The whole risk of forgetting. A deletion this device has applied must
+     * stay applied: if dropping the record let the file come back, the prune
+     * would be undoing somebody's deletion on every pass.
+     */
+    it("does not let a deletion undo itself once forgotten", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        await a.vault.edit("gone.md", "here for now\n");
+        await convergeBoth(a, b);
+        expect(b.vault.text("gone.md")).toBe("here for now\n");
+
+        await a.vault.remove("gone.md");
+        await convergeBoth(a, b, 6);
+        expect(await remoteCount(a)).toBe(0);
+
+        // Several more passes, long after the record was dropped.
+        await convergeBoth(a, b, 6);
+        expect(a.vault.paths()).not.toContain("gone.md");
+        expect(b.vault.paths()).not.toContain("gone.md");
+    }, 300_000);
+
+    /**
+     * A device that was away when the deletion happened still learns about it,
+     * because that comes from the server's batches rather than from anybody's
+     * local index.
+     */
+    it("still tells a device that was not there", async () => {
+        await fresh();
+        const a = await device("a");
+        await a.vault.edit("gone.md", "here for now\n");
+        await a.settle();
+        await a.vault.remove("gone.md");
+        await a.settle();
+        expect(await remoteCount(a)).toBe(0);
+
+        const late = await device("late");
+        await late.settle(6);
+        expect(late.vault.paths()).not.toContain("gone.md");
+    }, 300_000);
+
+    /**
+     * Work still outstanding is not something to forget.
+     *
+     * Applying an incoming deletion can fail on a real device: a locked file is
+     * the ordinary case. The path stays on the inbound work list, and the
+     * server's word about it is what the retry will act on. Dropping that
+     * record would leave a work item nothing could ever resolve, and a file
+     * that stays on this device after being deleted everywhere else.
+     */
+    it("keeps what it needs while a deletion has not been applied yet", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        await a.vault.edit("locked.md", "cannot be removed just now\n");
+        await convergeBoth(a, b);
+        expect(b.vault.text("locked.md")).toBeDefined();
+
+        // B is told to delete it and cannot, this once.
+        b.vault.failRemoveOnce = "locked.md";
+        await a.vault.remove("locked.md");
+        await a.settle();
+        await new Promise((r) => setTimeout(r, 80));
+        // One pass, not a settle: a settle would retry within the same call and
+        // the window being tested would close before it could be looked at.
+        await b.engine.sync();
+
+        // The file is still there, so the work is not done, and the record of
+        // what to do must have survived.
+        expect(b.vault.paths(), "the removal was meant to fail").toContain("locked.md");
+        expect(await remoteCount(b), "B forgot what it still had to do").toBeGreaterThan(0);
+
+        // And the retry finishes the job.
+        await convergeBoth(a, b, 8);
+        expect(b.vault.paths()).not.toContain("locked.md");
+    }, 300_000);
+
+    /** A path used again after being deleted is a new file, and syncs like one. */
+    it("handles a path used again after it was forgotten", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        await a.vault.edit("reused.md", "the first note\n");
+        await convergeBoth(a, b);
+        await a.vault.remove("reused.md");
+        await convergeBoth(a, b, 6);
+        expect(await remoteCount(a)).toBe(0);
+
+        await a.vault.edit("reused.md", "a completely different note\n");
+        await convergeBoth(a, b, 6);
+        expect(b.vault.text("reused.md")).toBe("a completely different note\n");
+    }, 300_000);
+});
+
 describe("a file that could not sync, and then could", () => {
     /**
      * A permanent refusal stops the retries, which is right: a file the server
@@ -745,3 +864,14 @@ describe("a file that could not sync, and then could", () => {
         expect(said.filter((m) => m === "skipped for good").length).toBe(2);
     }, 300_000);
 });
+
+/** How many paths the persisted index still has the server's word about. */
+async function remoteCount(d: Device): Promise<number> {
+    const state = await d.store.load();
+    return state ? Object.keys(state.remote).length : 0;
+}
+
+async function entryCount(d: Device): Promise<number> {
+    const state = await d.store.load();
+    return state ? Object.keys(state.entries).length : 0;
+}

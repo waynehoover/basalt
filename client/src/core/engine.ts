@@ -749,12 +749,52 @@ export class Engine {
     }
 
     /** Forgets index entries for paths that exist nowhere any more. */
+    /**
+     * Forgets what nothing can act on any more.
+     *
+     * Two halves, and for a long time there was only the first. `entries` was
+     * pruned and `remote` was not, so a vault kept the server's word about every
+     * path it had ever deleted, for ever, in a file rewritten on every sync. Six
+     * hundred deleted notes cost around 60 KB and six hundred no-op decisions a
+     * pass, growing for as long as the vault exists.
+     *
+     * The second half is not a cap and not a setting. A number would be
+     * arbitrary and would evict on the wrong axis, and nobody can reasonably be
+     * asked how many tombstones their index should keep. What is dropped here is
+     * dropped because it is provably dead: the file is not on disk, the server's
+     * newest word is a deletion, no index entry refers to it, and no inbound
+     * work is outstanding. A record in that state can only produce a decision to
+     * do nothing.
+     *
+     * Nothing is lost by forgetting it. A batch naming the path again repopulates
+     * it, and a file reappearing at that path is a new file, which is what it is.
+     * The server keeps the history either way, and `basalt deleted` reads it from
+     * there rather than from here.
+     */
     private prune(onDisk: Map<string, unknown>): void {
         for (const [path, entry] of this.entries) {
             if (onDisk.has(path)) continue;
             const remote = this.remote.get(path);
             if (remote && !remote.deleted) continue;
             if (entry.synchash === "" && entry.hash === "") this.entries.delete(path);
+        }
+
+        // After the loop above, so a path whose entry was just dropped is
+        // considered in the same pass rather than the next one.
+        //
+        // The four clauses are one predicate: the server's last word was a
+        // deletion, this device has applied it, and nothing local still refers
+        // to it. Four tests fail if the whole predicate goes, and none fails if
+        // any single clause does, because in the states actually reachable the
+        // clauses overlap. That is a fact about the state space rather than
+        // about the clauses, and shaving it down to whatever a current test can
+        // tell apart would be optimising the predicate against the tests.
+        for (const [path, remote] of this.remote) {
+            if (!remote.deleted) continue;
+            if (onDisk.has(path)) continue;
+            if (this.entries.has(path)) continue;
+            if (this.pending.has(path)) continue;
+            this.remote.delete(path);
         }
     }
 
