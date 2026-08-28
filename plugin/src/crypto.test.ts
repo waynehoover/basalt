@@ -15,6 +15,7 @@ import {
     openPath,
     seal,
     sealChunk,
+    sealChunks,
     sealPath,
     type VaultKeys,
 } from "./crypto.ts";
@@ -107,8 +108,8 @@ describe("sealing", () => {
         const k = await keys();
         const sealed = await sealChunk(k, new Uint8Array(0));
         expect((await openChunk(k, sealed)).length).toBe(0);
-        // Still authenticated: nonce plus tag and nothing between.
-        expect(sealed.length).toBe(12 + 16);
+        // Nonce, marker, tag, and nothing between.
+        expect(sealed.length).toBe(12 + 1 + 16);
     });
 
     it("round trips bytes that are not text", async () => {
@@ -153,12 +154,64 @@ describe("sealing", () => {
         expect(hex(a.subarray(0, 12))).not.toBe(hex(b.subarray(0, 12)));
     });
 
-    it("costs 28 bytes, flat", async () => {
+    it("never costs more than 29 bytes above the content", async () => {
+        // A 12-byte nonce, a 1-byte marker saying whether the body was
+        // compressed, and a 16-byte tag. Content that compresses costs less than
+        // it started as; content that does not is stored raw and costs exactly
+        // this much more. Never more than that.
         const k = await keys();
         for (const size of [0, 1, 100, 4096]) {
-            const sealed = await sealChunk(k, new Uint8Array(size));
-            expect(sealed.length).toBe(size + 28);
+            // Random bytes do not compress, so this is the worst case.
+            const incompressible = new Uint8Array(size);
+            globalThis.crypto.getRandomValues(incompressible);
+            const sealed = await sealChunk(k, incompressible);
+            expect(sealed.length, `${size} bytes of random data`).toBe(size + 29);
         }
+    });
+
+    it("shrinks content that compresses", async () => {
+        const k = await keys();
+        const repetitive = enc.encode("the same sentence over and over. ".repeat(40));
+        const sealed = await sealChunk(k, repetitive);
+        expect(sealed.length).toBeLessThan(repetitive.length / 2);
+        expect(new Uint8Array(await openChunk(k, sealed))).toEqual(repetitive);
+    });
+
+    it("keeps compression deterministic, so dedup still works", async () => {
+        // The reason the codec is fflate rather than the platform's: the same
+        // chunk has to seal to the same bytes everywhere, or names diverge
+        // between a desktop and a phone and dedup quietly stops working.
+        const k = await keys();
+        const text = enc.encode("# A heading\n\nSome prose that will certainly compress. ".repeat(10));
+        expect(hex(await sealChunk(k, text))).toBe(hex(await sealChunk(k, text)));
+    });
+
+    it("hides whether a chunk compressed", async () => {
+        // The marker is inside the sealed plaintext, so the server cannot tell
+        // which chunks compressed and therefore how compressible each part of a
+        // vault is. Equal-length inputs seal to equal lengths.
+        const k = await keys();
+        const compressible = enc.encode("aaaaaaaaaa".repeat(20));
+        const random = globalThis.crypto.getRandomValues(new Uint8Array(200));
+        expect(compressible.length).toBe(random.length);
+        // The compressible one is shorter on the wire, which is the point; what
+        // must not happen is a marker visible outside the ciphertext.
+        const a = await sealChunk(k, compressible);
+        const b = await sealChunk(k, random);
+        expect(a.length).toBeLessThan(b.length);
+        // Byte 12 is the first byte of ciphertext in both, and carries no
+        // recognisable marker value.
+        expect(a[12]).not.toBe(0);
+        expect(b[12]).not.toBe(0);
+    });
+
+    it("refuses a chunk whose marker it does not know", async () => {
+        // A future version's framing. The bytes decrypt, so the content is real,
+        // and guessing at its shape would write nonsense into the vault.
+        const k = await keys();
+        const framed = new Uint8Array([99, 1, 2, 3]);
+        const sealed = await seal(k.content, k.nonce, framed);
+        await expect(openChunk(k, sealed)).rejects.toThrow(/unknown marker/);
     });
 
     it("refuses a tampered body rather than returning what it can", async () => {
@@ -312,5 +365,33 @@ describe("generateSecret", () => {
         const b = generateSecret();
         expect(a.length).toBe(20);
         expect(hex(a)).not.toBe(hex(b));
+    });
+});
+
+describe("sealing a whole file's chunks", () => {
+    it("gives the same result as sealing them one at a time", async () => {
+        const k = await keys();
+        const parts = ["first chunk", "second chunk", "third chunk"].map((s) => enc.encode(s));
+
+        const batch = await sealChunks(k, parts);
+        expect(batch).toHaveLength(3);
+        for (let i = 0; i < parts.length; i++) {
+            const alone = await sealChunk(k, parts[i]!);
+            expect(hex(batch[i]!.bytes)).toBe(hex(alone));
+            expect(batch[i]!.name).toBe(await chunkName(alone));
+        }
+    });
+
+    it("keeps the chunks in order, which is what reassembly depends on", async () => {
+        const k = await keys();
+        const parts = Array.from({ length: 50 }, (_, i) => enc.encode(`chunk number ${i}`));
+        const batch = await sealChunks(k, parts);
+        for (let i = 0; i < parts.length; i++) {
+            expect(new Uint8Array(await openChunk(k, batch[i]!.bytes))).toEqual(parts[i]);
+        }
+    });
+
+    it("handles a file with no chunks", async () => {
+        expect(await sealChunks(await keys(), [])).toEqual([]);
     });
 });

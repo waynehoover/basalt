@@ -231,6 +231,28 @@ nonce(p)  = HMAC-SHA-256(K_nonce, p)[:12]
 seal(K,p) = nonce(p) || AES-GCM-256(K, nonce(p), p)
 ```
 
+A chunk body is compressed before it is sealed, and the sealed plaintext is one
+marker byte followed by the payload: `0` for stored as-is, `1` for raw deflate. A
+chunk that does not shrink is stored as-is, so a sealed chunk is never more than
+29 bytes larger than its content.
+
+The ordering is forced in both directions. Compression goes *after* chunking,
+because compressing a file first would move every byte of the compressed stream
+on any edit and the content-defined boundaries would all shift. It goes *before*
+sealing, because ciphertext does not compress. Measured on a real vault, this
+takes a full upload of its text from 108% of the plaintext to 67%.
+
+The marker is inside the sealed plaintext rather than beside it. It costs the
+same byte and it means the server cannot tell which chunks compressed, so it
+learns nothing about how compressible each part of a vault is, and the marker is
+covered by the authentication tag.
+
+The codec is raw deflate at level 6, and a client must use an implementation
+whose output does not vary by platform. Determinism is load-bearing: the same
+chunk has to seal to the same bytes on a desktop and a phone, or the names
+diverge and dedup silently stops working. "Whatever zlib this runtime shipped"
+is not that guarantee.
+
 Determinism is not a stylistic choice, it is load-bearing twice over. Equal paths
 must produce equal ciphertext or the server cannot tell two versions of a file
 apart. Equal chunks must produce equal ciphertext or dedup does nothing: chunk

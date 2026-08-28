@@ -1,5 +1,16 @@
 # Design philosophy
 
+**Minimal, opinionated, fast, self-hosted.** In that order when they conflict,
+except that nothing outranks not losing a note.
+
+Minimal and opinionated are the same decision seen from two sides: every
+question with a right answer is answered once, in the source, with the reasoning
+beside it, so that it never becomes a row in a settings screen. Fast follows from
+minimal more often than it competes with it, because the fastest thing a sync
+client can do with a byte is not send it. Self-hosted is the constraint that
+makes the other three achievable: one backend, one transport, one person's
+devices.
+
 ## First principle: do not lose a note
 
 Everything else in this document exists to serve that, including the simplicity.
@@ -80,8 +91,79 @@ diverges: if any hunk fails to apply, the merge is abandoned and both versions
 are kept, one renamed as a conflict copy. A visible duplicate is a small
 annoyance. A silently mangled note is the thing this project exists to prevent.
 
+Checking the flags turned out not to be enough, and the reason is worth recording
+because it is the same failure one level deeper. diff-match-patch has **no notion
+of a conflicting region**: it fuzzy-matches each hunk and reports whether it
+found somewhere to put it. So two devices rewriting one sentence differently both
+"apply", and the result is a sentence neither person wrote:
+
+```
+base    The original sentence.
+mine    My completely different sentence.
+theirs  Their entirely other sentence.
+merged  My completely different entirely other sentence.
+```
+
+Every hunk applied. Every insertion is present, so a check for a lost edit passes.
+The meaning is gone. So Basalt also does what diff3 and git do and this library
+does not: it compares which regions of the ancestor each side changed, and refuses
+before applying anything if they collide. Two additions at one point are allowed
+when they land on a line boundary, because whole lines concatenate readably and
+two devices adding to one daily note is the common case; mid-line they are
+refused, because that is how the sentence above happens.
+
+And Basalt puts the *incoming* version in the conflict copy, where Obsidian puts
+the local one and overwrites the original with the server's. A sync you did not
+ask for should never rewrite the file you have open.
+
 This is not a criticism of either project. It is the one place where being
 scoped to a single use case lets us take the more conservative option.
+
+## Fast, and where the speed comes from
+
+Speed here is not an optimisation pass. It is a consequence of sending less, and
+the numbers are worth stating because "fast" is otherwise just a word.
+
+The comparison is Obsidian Sync, which keeps one hash per file and pushes the
+whole body on any change. Basalt chunks on a rolling hash and sends only the
+chunks that moved. Measured, one line inserted into a note:
+
+| Note | Basalt sends | Whole-file sends | |
+|---|---|---|---|
+| 4 KiB | 284 B | 4 KiB | 15x less |
+| 128 KiB | 349 B | 128 KiB | 376x less |
+| 2 MiB | 494 B | 2 MiB | 4245x less |
+
+The advantage grows with the file, which is the property that matters: a vault
+accumulates long notes, and the cost of editing one should not.
+
+Chunks are compressed before they are encrypted, which takes a full upload of a
+vault's text from 108% of its plaintext to 67%. That ordering is forced: after
+chunking, because compressing the file first would move every boundary on any
+edit; before encrypting, because ciphertext does not compress.
+
+A whole 78.8 MiB vault chunks, compresses, encrypts and names in 2.5 seconds,
+once, and moves 66.8 MiB.
+
+### Rules for making it fast
+
+1. **Send less before doing less work.** Bandwidth is the resource a phone on a
+   train actually lacks.
+2. **Measure on a real vault, then decide.** Every size and threshold in the
+   chunker was chosen from a measurement against 78.8 MiB of real notes, and two
+   plausible-sounding improvements were dropped because the measurement said they
+   were worth 3.7% and 1.7x-once-against-2.2KB-forever.
+3. **Report numbers, do not assert them.** Wall-clock assertions in a test suite
+   get loosened until they mean nothing; the same chunker measures 575 MiB/s
+   under one runner and 32 under another. Bytes on the wire is deterministic, so
+   that is what the tests assert, and throughput is a benchmark somebody reads.
+4. **Warm up, and alternate the order.** The first version of the benchmark here
+   measured one variant cold and its rival warm, and reported a 2.7x gain where
+   the truth was 1.3x.
+5. **A cache keyed on what the filesystem already tells you.** Obsidian's engine
+   keeps a content hash per file and invalidates it only when mtime or size
+   moves, so an unchanged vault costs one stat per file. Copy that, and extend it
+   to the chunk list.
 
 ## The simplicity principle
 
