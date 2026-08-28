@@ -719,19 +719,20 @@ describe("cutting to the ceiling the server advertised", () => {
         const syncing = engine.sync();
         // Sealing a megabyte takes real time, so this waits for the put rather
         // than for one turn of the event loop.
-        for (let i = 0; i < 200 && !socket.sentText.some((m) => m["op"] === "put"); i++) {
+        for (let i = 0; i < 200 && !socket.sentText.some((m) => m["op"] === "putmany"); i++) {
             await new Promise((r) => setTimeout(r, 10));
         }
 
         // The put names its chunks; the server asks for all of them.
-        const put = socket.sentText.find((m) => m["op"] === "put");
+        const put = socket.sentText.find((m) => m["op"] === "putmany");
         expect(put, `nothing was put: ${JSON.stringify(socket.sentText.map((m) => m["op"]))}`).toBeDefined();
-        const names = put!["chunks"] as string[];
+        const entries = put!["entries"] as { chunks: string[] }[];
+        const names = entries.flatMap((e) => e.chunks);
         expect(names.length, "a 1 MiB file was not cut to a 64 KiB ceiling").toBeGreaterThan(8);
 
         socket.reply({ res: "want", chunks: names });
         await settle();
-        socket.reply({ res: "ack", uid: 1 });
+        socket.reply({ res: "acks", results: entries.map((_, i) => ({ uid: i + 1 })) });
         await syncing.catch(() => undefined);
 
         const worst = Math.max(...socket.sentBinary.map((b) => b.length));

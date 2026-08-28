@@ -57,7 +57,7 @@ import {
     type LocalState,
     type RemoteState,
 } from "./index-state.ts";
-import type { ServerLimits, Transport, WireEntry } from "./transport.ts";
+import { MAX_BATCH_ENTRIES, type BatchEntry, type ServerLimits, type Transport, type WireEntry } from "./transport.ts";
 import { parents, type IndexStore, type Vault } from "./vault.ts";
 
 /**
@@ -236,6 +236,14 @@ export class Engine {
      * the file. Kept only so that the same complaint is not logged every pass.
      */
     private blocked = new Set<string>();
+
+    /** Writes waiting to go up together, and what they will cost to hold. */
+    private outbox: Queued[] = [];
+    private outboxBytes = 0;
+
+    /** Versions waiting to come down together, and what they will cost to hold. */
+    private inbox: Incoming[] = [];
+    private inboxBytes = 0;
 
     /**
      * What the server said it would accept, kept so a download can be held to
@@ -498,6 +506,11 @@ export class Engine {
             }
         }
 
+        // Whatever is still queued moves now. Until these return, no write in
+        // this pass has been acknowledged and no queued file is on disk.
+        await this.fill(report);
+        await this.flush(report);
+
         this.opts.onProgress?.(undefined);
 
         // Replaced rather than added to, so a path stops being blocked the
@@ -529,11 +542,12 @@ export class Engine {
         const remote = this.remote.get(path);
 
         let local: LocalState | undefined;
+        let sealed: SealedChunk[] | undefined;
         if (stat) {
             if (!stat.folder && needsRehash(entry, Math.ceil(stat.mtime), stat.size)) {
                 // The only place a file is read for its content, and only when
                 // the stat says it moved.
-                await this.rehash(entry, path);
+                sealed = await this.rehash(entry, path);
             }
             local = { folder: stat.folder, mtime: entry.mtime, size: entry.size, hash: entry.hash };
         }
@@ -557,12 +571,23 @@ export class Engine {
             return;
         }
 
-        await this.act(path, action, entry, local, remote, report);
+        await this.act(path, action, entry, local, remote, report, sealed);
         this.pending.delete(path);
     }
 
-    /** Chunks and seals a file, filling in the index's content cache. */
-    private async rehash(entry: IndexEntry, path: string): Promise<SealedChunk[]> {
+    /**
+     * Chunks and seals a file, filling in the index's content cache.
+     *
+     * The sealed bodies come back so that an upload deciding to send this file
+     * does not read, chunk and seal it all over again. On a first sync that
+     * second pass was half of everything the client did: seventeen megabytes
+     * took thirty seconds against four seconds of wire, and the four round
+     * trips it now costs made the duplication the whole cost.
+     *
+     * Only for files small enough to hold. Above that the bodies are dropped
+     * for the reason `planUpload` explains, and it does its own work.
+     */
+    private async rehash(entry: IndexEntry, path: string): Promise<SealedChunk[] | undefined> {
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
         const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map((c) => c.bytes);
@@ -570,7 +595,7 @@ export class Engine {
         entry.chunks = sealed.map((c) => c.name);
         entry.hash = contentId(entry.chunks);
         entry.size = bytes.length;
-        return sealed;
+        return bytes.length <= KEEP_SEALED_BELOW ? sealed : undefined;
     }
 
     private async act(
@@ -579,7 +604,9 @@ export class Engine {
         entry: IndexEntry,
         local: LocalState | undefined,
         remote: RemoteState | undefined,
-        report: SyncReport
+        report: SyncReport,
+        /** The sealed chunks the rehash produced, if this file was just read. */
+        sealed?: SealedChunk[]
     ): Promise<void> {
         switch (action.kind) {
             case "nothing":
@@ -592,17 +619,13 @@ export class Engine {
                 return;
 
             case "upload":
-                await this.upload(path, entry, report);
-                report.uploaded++;
+                await this.upload(path, entry, report, true, sealed);
                 return;
 
             case "download":
             case "restoreLocal": {
                 if (!remote) return;
-                await this.download(path, entry, remote);
-                if (action.kind === "download") report.downloaded++;
-                else report.restored++;
-                this.log(action.kind, path, action.why);
+                await this.receive(path, entry, remote, action.kind, action.why, report);
                 return;
             }
 
@@ -640,25 +663,39 @@ export class Engine {
                 this.log("deleted locally", path, action.why);
                 return;
 
-            case "deleteRemote": {
-                const uid = await this.putDeletion(path);
-                // Recorded before the entry is forgotten. This device's own
-                // writes come back with no payload, so nothing else will ever
-                // tell it the deletion happened, and a stale entry here reads on
-                // the next pass as a file to download back.
-                this.remote.set(path, {
-                    uid,
-                    folder: false,
-                    deleted: true,
-                    mtime: this.now(),
-                    size: 0,
-                    hash: "",
-                });
-                this.entries.delete(path);
-                report.deletedRemotely++;
-                this.log("deleted on the server", path, action.why);
+            case "deleteRemote":
+                await this.queue(
+                    {
+                        path,
+                        size: 0,
+                        entry: {
+                            path: await this.sealedPath(path),
+                            meta: { size: 0, ctime: 0, mtime: this.now(), deleted: true },
+                            names: [],
+                        },
+                        bodyOf: noBodies,
+                        commit: (uid) => {
+                            // Recorded before the entry is forgotten. This
+                            // device's own writes come back with no payload, so
+                            // nothing else will ever tell it the deletion
+                            // happened, and a stale entry here reads on the next
+                            // pass as a file to download back.
+                            this.remote.set(path, {
+                                uid,
+                                folder: false,
+                                deleted: true,
+                                mtime: this.now(),
+                                size: 0,
+                                hash: "",
+                            });
+                            this.entries.delete(path);
+                            report.deletedRemotely++;
+                            this.log("deleted on the server", path, action.why);
+                        },
+                    },
+                    report
+                );
                 return;
-            }
 
             case "merge":
                 await this.merge(path, entry, remote, report);
@@ -670,46 +707,165 @@ export class Engine {
         }
     }
 
-    private async upload(path: string, entry: IndexEntry, report: SyncReport): Promise<void> {
+    /**
+     * Queues a file to go up with the next batch.
+     *
+     * `count` is whether committing it adds to `report.uploaded`. A merge and a
+     * conflict copy both upload, and both are already counted as what they are.
+     */
+    private async upload(
+        path: string,
+        entry: IndexEntry,
+        report: SyncReport,
+        count = false,
+        /**
+         * Bodies already sealed for this exact content. Passed only where the
+         * file has not been touched since: a merge rewrites it, so a merge
+         * seals again.
+         */
+        sealed?: SealedChunk[]
+    ): Promise<void> {
         if (entry.folder) {
-            const uid = await this.putFolder(path);
-            synced(entry, "", [], uid, this.now());
-            this.remote.set(path, {
-                uid,
-                folder: true,
-                deleted: false,
-                mtime: 0,
-                size: 0,
-                hash: "",
-            });
+            await this.queue(
+                {
+                    path,
+                    size: 0,
+                    entry: {
+                        path: await this.sealedPath(path),
+                        meta: { size: 0, ctime: 0, mtime: 0, folder: true },
+                        names: [],
+                    },
+                    bodyOf: noBodies,
+                    commit: (uid) => {
+                        synced(entry, "", [], uid, this.now());
+                        this.remote.set(path, {
+                            uid,
+                            folder: true,
+                            deleted: false,
+                            mtime: 0,
+                            size: 0,
+                            hash: "",
+                        });
+                        if (count) report.uploaded++;
+                    },
+                },
+                report
+            );
             return;
         }
-        const plan = await this.planUpload(entry, path);
-        const result = await this.opts.transport.put(
-            await this.sealedPath(path),
+
+        const plan = await this.planUpload(entry, path, sealed);
+        // Read now, applied later. `entry` is mutable and the commit runs after
+        // the flush, so what gets recorded has to be what actually went up.
+        const hash = entry.hash;
+        const chunks = [...entry.chunks];
+        const size = entry.size;
+        const mtime = entry.mtime;
+
+        await this.queue(
             {
-                size: entry.size,
-                ctime: entry.ctime,
-                mtime: entry.mtime,
-                ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
+                path,
+                size,
+                entry: {
+                    path: await this.sealedPath(path),
+                    meta: {
+                        size,
+                        ctime: entry.ctime,
+                        mtime,
+                        ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
+                    },
+                    names: plan.names,
+                },
+                bodyOf: plan.bodyOf,
+                commit: (uid) => {
+                    synced(entry, hash, chunks, uid, this.now());
+                    // Record what the server now holds, so the next pass sees
+                    // agreement rather than deciding to upload again.
+                    this.remote.set(path, {
+                        uid,
+                        folder: false,
+                        deleted: false,
+                        mtime,
+                        size,
+                        hash,
+                    });
+                    if (count) report.uploaded++;
+                    this.log("uploaded", path);
+                },
             },
-            plan.names,
-            plan.bodyOf
+            report
         );
-        report.chunksSent += result.uploaded;
-        report.bytesSent += result.bytes;
-        synced(entry, entry.hash, entry.chunks, result.uid, this.now());
-        // Record what the server now holds, so the next pass sees agreement
-        // rather than deciding to upload again.
-        this.remote.set(path, {
-            uid: result.uid,
-            folder: false,
-            deleted: false,
-            mtime: entry.mtime,
-            size: entry.size,
-            hash: entry.hash,
-        });
-        this.log("uploaded", path, { chunks: result.uploaded, bytes: result.bytes });
+    }
+
+    /**
+     * Adds a write to the outbox, flushing when the batch is full.
+     *
+     * Two bounds, because they guard different things. The count is the
+     * server's, and it is what makes a vault of notes one exchange instead of
+     * hundreds. The byte bound is this device's: a queued file pins roughly its
+     * own size in memory until the batch goes, either as sealed bodies or as the
+     * plaintext its offsets point into, so batching two hundred and fifty-six
+     * attachments would hold all of them at once. Notes batch to the count;
+     * attachments flush almost every file, which is what this did before.
+     */
+    private async queue(q: Queued, report: SyncReport): Promise<void> {
+        this.outbox.push(q);
+        this.outboxBytes += q.size;
+        if (this.outbox.length >= MAX_BATCH_ENTRIES || this.outboxBytes >= BATCH_BYTES) {
+            await this.flush(report);
+        }
+    }
+
+    /**
+     * Sends the outbox as one exchange and applies what committed.
+     *
+     * Nothing here is recorded until the server has said so. An entry it refuses
+     * goes through the same failure path a single put's refusal did, and the
+     * rest of the batch is unaffected.
+     */
+    private async flush(report: SyncReport): Promise<void> {
+        if (this.outbox.length === 0) return;
+        const batch = this.outbox;
+        this.outbox = [];
+        this.outboxBytes = 0;
+
+        // One producer per chunk name. Two notes sharing a chunk means the
+        // server asks once, and it must not matter which of them is asked.
+        const producers = new Map<string, (name: string) => Promise<Uint8Array>>();
+        for (const q of batch) {
+            for (const name of q.entry.names) {
+                if (!producers.has(name)) producers.set(name, q.bodyOf);
+            }
+        }
+
+        let out;
+        try {
+            out = await this.opts.transport.putMany(
+                batch.map((q) => q.entry),
+                async (name) => {
+                    const produce = producers.get(name);
+                    if (!produce) throw new Error(`server asked for ${name}, which no queued file contains`);
+                    return produce(name);
+                }
+            );
+        } catch (err) {
+            // The exchange itself failed, so nothing in it committed. Every path
+            // in the batch is retried, exactly as it would have been alone.
+            for (const q of batch) this.recordFailure(q.path, err, report);
+            return;
+        }
+
+        report.chunksSent += out.uploaded;
+        report.bytesSent += out.bytes;
+        for (let i = 0; i < batch.length; i++) {
+            const q = batch[i]!;
+            const result = out.results[i]!;
+            if (result.error) {
+                this.recordFailure(q.path, result.error, report);
+                continue;
+            }
+            q.commit(result.uid);
+        }
     }
 
     /** The sealed chunks for a file, re-sealing only if the cache cannot serve. */
@@ -734,7 +890,21 @@ export class Engine {
      * Below the threshold nothing is dropped, because almost every file is a
      * note and re-sealing a note to save a few kilobytes is a worse trade.
      */
-    private async planUpload(entry: IndexEntry, path: string): Promise<UploadPlan> {
+    private async planUpload(entry: IndexEntry, path: string, fresh?: SealedChunk[]): Promise<UploadPlan> {
+        if (fresh) {
+            // Already done by the rehash that decided this file had changed.
+            // The names are in the index and the bodies are in hand.
+            const byName = new Map(fresh.map((c) => [c.name, c.bytes]));
+            return {
+                names: entry.chunks,
+                bodyOf: async (name) => {
+                    const body = byName.get(name);
+                    if (!body) throw new Error(`no sealed body for ${name} of ${path}`);
+                    return body;
+                },
+            };
+        }
+
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
         const pieces = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)];
@@ -779,25 +949,6 @@ export class Engine {
         };
     }
 
-    private async putFolder(path: string): Promise<number> {
-        const result = await this.opts.transport.put(
-            await this.sealedPath(path),
-            { size: 0, ctime: 0, mtime: 0, folder: true },
-            [],
-            noBodies
-        );
-        return result.uid;
-    }
-
-    private async putDeletion(path: string): Promise<number> {
-        const result = await this.opts.transport.put(
-            await this.sealedPath(path),
-            { size: 0, ctime: 0, mtime: this.now(), deleted: true },
-            [],
-            noBodies
-        );
-        return result.uid;
-    }
 
     /**
      * Downloads one version, in one round trip.
@@ -811,18 +962,99 @@ export class Engine {
      * On a fast link that was invisible. At four hundred milliseconds it was
      * two thirds of the time a download took.
      */
-    private async download(path: string, entry: IndexEntry, remote: RemoteState): Promise<void> {
+    /**
+     * Queues a version to come down with the next fetch.
+     *
+     * A download was one round trip, which for two hundred notes was two
+     * hundred of them, and on a slow link that was most of the sync. The chunk
+     * names are already known, because the batch that announced the version
+     * carried them, so many files' names can go up in one ask and their bodies
+     * come back in one stream.
+     */
+    private async receive(
+        path: string,
+        entry: IndexEntry,
+        remote: RemoteState,
+        kind: "download" | "restoreLocal",
+        why: string,
+        report: SyncReport
+    ): Promise<void> {
         const chunks = chunkNamesOf(remote.hash);
-        const content = await this.contentOf(remote.uid, chunks);
-        await this.opts.vault.write(path, content, { mtime: remote.mtime, ctime: remote.mtime });
-        const stat = { folder: false, mtime: remote.mtime, ctime: remote.mtime, size: content.length };
-        observe(entry, stat);
+        this.checkChunkCount(remote.uid, chunks.length);
+
+        this.inbox.push({ path, entry, remote, chunks, kind, why });
+        this.inboxBytes += remote.size;
+        if (this.inbox.length >= MAX_BATCH_ENTRIES || this.inboxBytes >= BATCH_BYTES) {
+            await this.fill(report);
+        }
+    }
+
+    /**
+     * Fetches every queued version's chunks in one ask and writes the files.
+     *
+     * The names are deduplicated across the batch, so two notes that share a
+     * chunk cost one body, and a file whose chunks the server cannot serve
+     * fails alone rather than taking the batch with it.
+     */
+    private async fill(report: SyncReport): Promise<void> {
+        if (this.inbox.length === 0) return;
+        const batch = this.inbox;
+        this.inbox = [];
+        this.inboxBytes = 0;
+
+        const wanted: string[] = [];
+        const seen = new Set<string>();
+        for (const d of batch) {
+            for (const name of d.chunks) {
+                if (!seen.has(name)) {
+                    seen.add(name);
+                    wanted.push(name);
+                }
+            }
+        }
+
+        const held = new Map<string, Uint8Array>();
+        if (wanted.length > 0) {
+            try {
+                const bodies = await this.opts.transport.fetch(wanted);
+                for (let i = 0; i < wanted.length; i++) held.set(wanted[i]!, bodies[i]!);
+            } catch (err) {
+                // The fetch failed, so no file in it arrived. Each is retried,
+                // exactly as it would have been on its own.
+                for (const d of batch) this.recordFailure(d.path, err, report);
+                return;
+            }
+        }
+
+        for (const d of batch) {
+            try {
+                await this.land(d, held);
+                if (d.kind === "download") report.downloaded++;
+                else report.restored++;
+                this.log(d.kind, d.path, d.why);
+            } catch (err) {
+                this.recordFailure(d.path, err, report);
+            }
+        }
+    }
+
+    /** Writes one queued version from bodies already in hand. */
+    private async land(d: Incoming, held: Map<string, Uint8Array>): Promise<void> {
+        const bodies = d.chunks.map((name) => {
+            const body = held.get(name);
+            if (!body) throw new Error(`the server did not send ${name}, which ${d.path} is made of`);
+            return body;
+        });
+        const content = await this.assemble(d.remote.uid, bodies);
+
+        await this.opts.vault.write(d.path, content, { mtime: d.remote.mtime, ctime: d.remote.mtime });
+        observe(d.entry, { folder: false, mtime: d.remote.mtime, ctime: d.remote.mtime, size: content.length });
         // The chunk list is the server's, so the cache is filled without
         // re-chunking what was just reassembled, and without asking again.
-        entry.chunks = chunks;
-        entry.hash = contentId(chunks);
-        entry.size = content.length;
-        synced(entry, entry.hash, entry.chunks, remote.uid, this.now());
+        d.entry.chunks = [...d.chunks];
+        d.entry.hash = contentId(d.chunks);
+        d.entry.size = content.length;
+        synced(d.entry, d.entry.hash, d.entry.chunks, d.remote.uid, this.now());
     }
 
     /**
@@ -839,18 +1071,27 @@ export class Engine {
         // works from a uid alone and has to ask.
         const meta = known !== undefined ? { chunks: known } : await this.opts.transport.get(uid);
         if (meta.chunks.length === 0) return new Uint8Array(0);
+        this.checkChunkCount(uid, meta.chunks.length);
+        return this.assemble(uid, await this.opts.transport.fetch(meta.chunks));
+    }
 
-        // Held to what the server itself advertised. Both of these are the
-        // server's own numbers, so refusing past them is not a policy of this
-        // client's, it is declining to be told two different things.
+    /**
+     * Held to what the server itself advertised. Both of these are the server's
+     * own numbers, so refusing past them is not a policy of this client's, it is
+     * declining to be told two different things.
+     */
+    private checkChunkCount(uid: number, count: number): void {
         const maxChunks = this.limits?.maxChunks ?? 0;
-        if (maxChunks > 0 && meta.chunks.length > maxChunks) {
+        if (maxChunks > 0 && count > maxChunks) {
             throw new Error(
-                `version ${uid} names ${meta.chunks.length} chunks, and this server said it stores at most ${maxChunks}`
+                `version ${uid} names ${count} chunks, and this server said it stores at most ${maxChunks}`
             );
         }
+    }
 
-        const bodies = await this.opts.transport.fetch(meta.chunks);
+    /** Opens sealed bodies in order and joins the plaintext. */
+    private async assemble(uid: number, bodies: readonly Uint8Array[]): Promise<Uint8Array> {
+        if (bodies.length === 0) return new Uint8Array(0);
         const opened: Uint8Array[] = [];
         let total = 0;
         const perFileMax = this.limits?.perFileMax ?? 0;
@@ -1077,6 +1318,35 @@ function fingerprintOf(entry: IndexEntry | undefined): string {
  * memory is the thing that matters.
  */
 const KEEP_SEALED_BELOW = 8 * 1024 * 1024;
+
+/**
+ * How many bytes of queued file this device will hold before sending a batch.
+ * See `queue`: the count bound is the server's, this one is memory.
+ */
+const BATCH_BYTES = 8 * 1024 * 1024;
+
+/** One version waiting for company in the inbox. */
+interface Incoming {
+    readonly path: string;
+    readonly entry: IndexEntry;
+    readonly remote: RemoteState;
+    /** The server's own chunk list for this version, from the batch. */
+    readonly chunks: readonly string[];
+    readonly kind: "download" | "restoreLocal";
+    readonly why: string;
+}
+
+/** One write waiting for company in the outbox. */
+interface Queued {
+    /** The plaintext path, for logging and for recording a failure against. */
+    readonly path: string;
+    /** Roughly what holding this until the flush costs in memory. */
+    readonly size: number;
+    readonly entry: BatchEntry;
+    readonly bodyOf: (name: string) => Promise<Uint8Array>;
+    /** Run only once the server has committed it, with the uid it was given. */
+    readonly commit: (uid: number) => void;
+}
 
 /** What an upload needs: every chunk's name, and a way to get one's bytes. */
 interface UploadPlan {

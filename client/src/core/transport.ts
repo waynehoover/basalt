@@ -84,6 +84,39 @@ export interface PutMeta {
     readonly prev?: string;
 }
 
+/** One version in a batched write. */
+export interface BatchEntry {
+    readonly path: string;
+    readonly meta: PutMeta;
+    readonly names: readonly string[];
+}
+
+/** What became of one entry in a batch. */
+export interface BatchResult {
+    /** The uid the server gave it, or zero if this entry alone was refused. */
+    readonly uid: number;
+    /** Why it was refused. The other entries in the batch still committed. */
+    readonly error?: ProtocolError;
+}
+
+/**
+ * The most entries one batch may hold. The server refuses more; this matches
+ * wire.MaxBatchEntries so a client splits rather than being told to.
+ */
+export const MAX_BATCH_ENTRIES = 256;
+
+/** The meta a put sends. Written once, because two copies drift. */
+function wireMeta(meta: PutMeta): Record<string, unknown> {
+    return {
+        size: meta.size,
+        ctime: meta.ctime,
+        mtime: meta.mtime,
+        folder: meta.folder ?? false,
+        deleted: meta.deleted ?? false,
+        ...(meta.prev ? { prev: meta.prev } : {}),
+    };
+}
+
 /**
  * A refusal from the server, carrying the code it sent.
  *
@@ -589,14 +622,7 @@ export class Transport {
         const reply = await this.request({
             op: "put",
             path,
-            meta: {
-                size: meta.size,
-                ctime: meta.ctime,
-                mtime: meta.mtime,
-                folder: meta.folder ?? false,
-                deleted: meta.deleted ?? false,
-                ...(meta.prev ? { prev: meta.prev } : {}),
-            },
+            meta: wireMeta(meta),
             chunks: [...names],
         });
 
@@ -628,6 +654,94 @@ export class Transport {
     }
 
     /**
+     * Writes many versions in one exchange, and returns one result per entry in
+     * the order they were given.
+     *
+     * A put is one round trip in the good case and two when bodies have to go,
+     * which on a loopback socket is nothing and on a link with four hundred
+     * milliseconds in it is the whole cost of a sync. Two hundred notes were two
+     * hundred conversations. This is one: every entry's chunk names go up
+     * together, the server answers with the union of what it lacks, and the
+     * bodies follow in that order.
+     *
+     * An entry the server refuses does not refuse the batch. Its result carries
+     * the error and the others carry their uids, because a batch that fails as a
+     * unit leaves a client bisecting it to find out which note it was.
+     */
+    async putMany(
+        entries: readonly BatchEntry[],
+        bodyOf: (name: string) => Promise<Uint8Array>
+    ): Promise<{ results: BatchResult[]; uploaded: number; bytes: number }> {
+        if (entries.length === 0) return { results: [], uploaded: 0, bytes: 0 };
+        if (entries.length > MAX_BATCH_ENTRIES) {
+            throw new ProtocolError(
+                "toolarge",
+                `${entries.length} entries in one batch, the limit is ${MAX_BATCH_ENTRIES}`
+            );
+        }
+
+        const reply = await this.request({
+            op: "putmany",
+            entries: entries.map((e) => ({ path: e.path, meta: wireMeta(e.meta), chunks: [...e.names] })),
+        });
+
+        let acks = reply;
+        let uploaded = 0;
+        let bytes = 0;
+
+        if (reply["res"] === "want") {
+            const wanted = stringsOf(reply["chunks"]);
+            const offered = new Set<string>();
+            for (const e of entries) for (const name of e.names) offered.add(name);
+
+            for (const name of wanted) {
+                if (!offered.has(name)) {
+                    throw new ProtocolError("badchunk", `server asked for ${name}, which this batch does not contain`);
+                }
+                const body = await bodyOf(name);
+                this.sendBody(body);
+                bytes += body.length;
+            }
+            uploaded = wanted.length;
+            acks = await this.awaitReply();
+        }
+
+        if (acks["res"] !== "acks") {
+            throw new ProtocolError("protostate", `expected acks, got ${JSON.stringify(acks)}`);
+        }
+
+        // Results are matched to entries by position and nothing else, so a
+        // count that does not line up is not something to paper over: the uid
+        // that would be recorded against a note would be another note's.
+        const raw = acks["results"];
+        if (!Array.isArray(raw) || raw.length !== entries.length) {
+            throw new ProtocolError(
+                "protostate",
+                `${entries.length} entries went up and ${Array.isArray(raw) ? raw.length : "no"} results came back`
+            );
+        }
+
+        const results = raw.map((r): BatchResult => {
+            const row = (r ?? {}) as Record<string, unknown>;
+            if (row["code"] !== undefined) {
+                return {
+                    uid: 0,
+                    error: new ProtocolError(String(row["code"]), String(row["msg"] ?? "no message")),
+                };
+            }
+            return { uid: numberOf(row["uid"]) };
+        });
+
+        // A per-entry refusal is survivable; a fatal one is not, and the session
+        // has to end for the same reason it would on a single put.
+        for (const r of results) {
+            if (r.error?.fatal) this.die(r.error);
+        }
+
+        return { results, uploaded, bytes };
+    }
+
+    /**
      * Waits for the ack that follows a body upload.
      *
      * A separate wait rather than another request, because the bodies were sent
@@ -635,6 +749,15 @@ export class Transport {
      * after every body and the entry are durable.
      */
     private async awaitAck(): Promise<number> {
+        const reply = await this.awaitReply();
+        if (reply["res"] !== "ack") {
+            throw new ProtocolError("protostate", `expected ack, got ${JSON.stringify(reply)}`);
+        }
+        return numberOf(reply["uid"]);
+    }
+
+    /** The next unsolicited reply, with a fatal error raised rather than returned. */
+    private async awaitReply(): Promise<Reply> {
         const reply = await new Promise<Reply>((resolve, reject) => {
             if (this.closed) {
                 reject(this.closeReason ?? new ConnectionError("not connected"));
@@ -660,10 +783,7 @@ export class Transport {
             if (err.fatal) this.die(err);
             throw err;
         }
-        if (reply["res"] !== "ack") {
-            throw new ProtocolError("protostate", `expected ack, got ${JSON.stringify(reply)}`);
-        }
-        return numberOf(reply["uid"]);
+        return reply;
     }
 
     /** Asks where a version's content lives. */

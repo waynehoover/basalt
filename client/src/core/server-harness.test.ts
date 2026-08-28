@@ -22,7 +22,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { chunkBytes, looksLikeText, sizesFor } from "./chunk.ts";
 import { authToken, deriveKeys, openChunk, sealChunks, sealPath, openPath, type VaultKeys } from "./crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
-import { ProtocolError, Transport, type Batch } from "./transport.ts";
+import { ProtocolError, Transport, type Batch, type BatchEntry } from "./transport.ts";
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -107,6 +107,26 @@ class Client {
             await sealPath(this.keys, path),
             { size: data.length, ctime: 1, mtime }, sealed.map((c) => c.name), async (n) => sealed.find((c) => c.name === n)!.bytes);
         return { ...result, chunks: sealed.map((c) => c.name), plaintext: data };
+    }
+
+    /** Chunks, seals and puts several files in one batched exchange. */
+    async writeMany(files: { path: string; content: string; mtime?: number }[]) {
+        const bodies = new Map<string, Uint8Array>();
+        const entries: BatchEntry[] = [];
+        for (const f of files) {
+            const data = enc.encode(f.content);
+            const isText = looksLikeText(f.path);
+            const parts = [...chunkBytes(data, sizesFor(data.length, isText), isText)].map((c) => c.bytes);
+            const sealed = await sealChunks(this.keys, parts);
+            for (const c of sealed) bodies.set(c.name, c.bytes);
+            entries.push({
+                path: await sealPath(this.keys, f.path),
+                meta: { size: data.length, ctime: 1, mtime: f.mtime ?? 1000 },
+                names: sealed.map((c) => c.name),
+            });
+        }
+        const out = await this.transport.putMany(entries, async (n) => bodies.get(n)!);
+        return { ...out, entries };
     }
 
     /** Downloads a version and reassembles the plaintext, as the engine will. */
@@ -308,6 +328,99 @@ describe("a file, all the way there and back", () => {
             const sealedPath = await sealPath(c.keys, path);
             expect(await openPath(c.keys, sealedPath)).toBe(path);
             expect(dec.decode(await c.read(put.uid))).toBe("content");
+            c.close();
+        } finally {
+            await fresh.cleanup();
+        }
+    }, 60_000);
+});
+
+describe("a batched write, which is one exchange for many notes", () => {
+    // Every round trip costs a whole latency, so a vault of two hundred notes
+    // used to cost two hundred of them. What follows is against the real server,
+    // because the round trip count is the thing being tested and a fake socket
+    // has none.
+    it("commits every note and hands back a uid for each, in order", async () => {
+        const fresh = new Server();
+        await fresh.start();
+        try {
+            const c = new Client(await deriveKeys(SECRET), "a");
+            await c.connect(fresh);
+
+            const files = Array.from({ length: 40 }, (_, i) => ({
+                path: `notes/${i}.md`,
+                content: `# Note ${i}\n\nEach one different, so none of them deduplicate.\n`,
+            }));
+            const before = c.transport.requestsSent;
+            const { results, uploaded } = await c.writeMany(files);
+
+            expect(results).toHaveLength(files.length);
+            expect(results.map((r) => r.uid)).toEqual(files.map((_, i) => i + 1));
+            expect(uploaded).toBe(files.length);
+            // One request for forty notes. Not forty, and not forty-one.
+            expect(c.transport.requestsSent - before).toBe(1);
+
+            for (let i = 0; i < files.length; i++) {
+                expect(dec.decode(await c.read(results[i]!.uid))).toBe(files[i]!.content);
+            }
+            expect(await fresh.cli("verify", "-deep")).toMatch(/0 faults/);
+            c.close();
+        } finally {
+            await fresh.cleanup();
+        }
+    }, 60_000);
+
+    it("uploads a chunk two notes share exactly once", async () => {
+        const fresh = new Server();
+        await fresh.start();
+        try {
+            const c = new Client(await deriveKeys(SECRET), "a");
+            await c.connect(fresh);
+            const same = "# Identical\n\nThe same bytes in two places.\n";
+            const { results, uploaded } = await c.writeMany([
+                { path: "a.md", content: same },
+                { path: "b.md", content: same },
+            ]);
+            expect(results.every((r) => r.uid > 0)).toBe(true);
+            expect(uploaded).toBe(1);
+            expect(dec.decode(await c.read(results[1]!.uid))).toBe(same);
+            c.close();
+        } finally {
+            await fresh.cleanup();
+        }
+    }, 60_000);
+
+    // The reason results carry errors rather than the call throwing: one note
+    // the server will not take must not cost the other thirty-nine, and the
+    // client has to be told which one it was without bisecting the batch.
+    it("refuses one bad entry and commits the rest", async () => {
+        const fresh = new Server();
+        await fresh.start();
+        try {
+            const c = new Client(await deriveKeys(SECRET), "a");
+            await c.connect(fresh);
+
+            const good = await sealPath(c.keys, "good.md");
+            const alsoGood = await sealPath(c.keys, "also-good.md");
+            const body = await sealChunks(c.keys, [enc.encode("fine")]);
+            const bodies = new Map(body.map((b) => [b.name, b.bytes]));
+
+            const { results } = await c.transport.putMany(
+                [
+                    { path: good, meta: { size: 4, ctime: 1, mtime: 1 }, names: [body[0]!.name] },
+                    // A size that no chunk list can honestly account for.
+                    { path: alsoGood, meta: { size: -1, ctime: 1, mtime: 1 }, names: [] },
+                    { path: alsoGood, meta: { size: 4, ctime: 1, mtime: 2 }, names: [body[0]!.name] },
+                ],
+                async (n) => bodies.get(n)!
+            );
+
+            expect(results[0]!.uid).toBeGreaterThan(0);
+            expect(results[1]!.uid).toBe(0);
+            expect(results[1]!.error?.code).toBe("badentry");
+            expect(results[2]!.uid).toBeGreaterThan(0);
+            // And the session survived it.
+            await c.transport.ping();
             c.close();
         } finally {
             await fresh.cleanup();

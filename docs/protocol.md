@@ -178,6 +178,39 @@ one chunk instead of shifting every chunk after it.
   Obsidian's protocol has no clean way to refuse a push, which is why a bad one
   has to close the connection.
 
+## Writing many files at once
+
+A `put` is one round trip, or two when bodies have to go. Two hundred notes were
+two hundred conversations, and at 400 ms that was most of a first sync. `putmany`
+is the same exchange for up to 256 entries.
+
+```
+-> {op:"putmany", entries:[{path, meta, chunks:[h1,h2]}, {path, meta, chunks:[h2,h3]}, ...]}
+<- {res:"want", chunks:[h1,h2,h3]}    the union of what the server lacks
+-> binary frames, in that order
+<- {res:"acks", results:[{uid:152}, {uid:153}, ...]}
+```
+
+- The `want` list is the **union** across the batch, deduplicated. Two notes
+  containing the same chunk cost one body.
+- `results` has exactly one entry per entry sent, **in the order they were
+  sent**. A client matches them by position and nothing else, so a count that
+  does not line up is a protocol fault rather than something to work around.
+- A refused entry appears as `{code, msg}` in its slot and **does not refuse the
+  batch**. The rest commit and are acked. A batch that failed as a unit would
+  leave a client bisecting two hundred notes to find out which one the server
+  would not take, and the offending note is usually the least important one in
+  the vault.
+- Every other rule of `put` applies unchanged: bodies are matched by hashing
+  them, the size budget is enforced per entry both as bodies arrive and at
+  commit, and an ack is withheld until every chunk and every entry that it
+  covers is durable.
+- An empty batch is `badentry`; more than 256 entries is `toolarge`. Neither
+  ends the session.
+- `put` is unchanged and still there. `putmany` of one entry is the same thing
+  with a different reply shape, and a client with one file to write may use
+  either.
+
 ## Reading a file
 
 ```
@@ -189,6 +222,12 @@ one chunk instead of shifting every chunk after it.
 
 A device that already holds `h1` and `h3` from another version of the file never
 downloads them again.
+
+One `fetch` may name the chunks of many files. The chunk list of every version
+in a catch-up batch is already known from the batch itself, so a client with two
+hundred files to download asks for all of their chunks at once, deduplicated,
+and reads the bodies back in the order it asked. That is what takes a first
+download from one round trip per file to a handful.
 
 A `fetch` naming any chunk the server lacks sends **no** bodies at all and
 returns `nochunk`. Failing halfway through leaves a client unable to tell which

@@ -116,7 +116,46 @@ type In struct {
 	// it. Zero starts at the newest. Limit is advisory and the server bounds it.
 	Before int64 `json:"before"`
 	Limit  int   `json:"limit"`
+
+	// putmany
+	Entries []PutEntry `json:"entries"`
 }
+
+// PutEntry is one file inside a batched put.
+//
+// The same three fields a single put carries. A batch exists because latency
+// multiplies round trips: two hundred paths were two hundred requests, and on a
+// link with four hundred milliseconds in it that is eighty seconds of waiting
+// for permission to send things the server was always going to want.
+type PutEntry struct {
+	Path   string   `json:"path"`
+	Meta   PutMeta  `json:"meta"`
+	Chunks []string `json:"chunks"`
+}
+
+// Entry converts one batched put into the store's record.
+func (p PutEntry) Entry(device string) store.Entry {
+	return store.Entry{
+		Path:    p.Path,
+		Size:    p.Meta.Size,
+		CTime:   p.Meta.CTime,
+		MTime:   p.Meta.MTime,
+		Folder:  p.Meta.Folder,
+		Deleted: p.Meta.Deleted,
+		Device:  device,
+		Prev:    p.Meta.Prev,
+		Chunks:  p.Chunks,
+	}
+}
+
+// MaxBatchEntries bounds one batched put.
+//
+// A cap rather than a stream, because the server holds every entry of a batch
+// in memory while it waits for the bodies, and because a want list has to be
+// computed from all of them before any of it can be answered. Two hundred and
+// fifty six is enough that a first sync is a handful of round trips and small
+// enough that a batch is never a reason to run out of anything.
+const MaxBatchEntries = 256
 
 // PutMeta is the metadata of one version. It is nested rather than flat so that
 // the fields a client assembles from the filesystem travel together and are
@@ -285,6 +324,25 @@ type Deleted struct {
 // Pong answers a ping. A client behind NAT needs something to send.
 type Pong struct {
 	Res string `json:"res"` // "pong"
+}
+
+// Acks answers a batched put, one result per entry, in the order they were sent.
+//
+// Per entry rather than one verdict for the batch. A single unacceptable file
+// among two hundred good ones must not refuse the other hundred and
+// ninety-nine, and a client needs to know which one it was: the alternative is
+// a batch that fails as a unit and a client that has to bisect it to find out
+// why.
+type Acks struct {
+	Res     string      `json:"res"` // "acks"
+	Results []AckResult `json:"results"`
+}
+
+// AckResult is a uid, or the reason there is not one.
+type AckResult struct {
+	UID  int64  `json:"uid,omitempty"`
+	Code string `json:"code,omitempty"`
+	Msg  string `json:"msg,omitempty"`
 }
 
 // Err is every rejection.

@@ -31,28 +31,47 @@ beside theirs.
 
 ## Results
 
-Apple M4 Pro, 14 cores, Bun 1.4. 200 files, 65.8 MiB as the devices see it.
+Apple M4 Pro, 14 cores, Bun 1.4. `BENCH_SCALE=0.1`: 200 files, 17.8 MiB as the
+devices see it.
 
-| Round trip | First sync up | First sync down | 20 notes edited | Nothing changed |
-|---|---|---|---|---|
-| loopback | 32.7 s | 1.2 s | 0.46 s | 0.01 s |
-| 100 ms | 83.2 s | 22.1 s | 4.6 s | 0.01 s |
+| Round trip | First sync up | First sync down | 20 notes up | 20 notes down | Nothing changed |
+|---|---|---|---|---|---|
+| loopback | 12.1 s | 0.63 s | 0.25 s | 0.12 s | 0.01 s |
+| 20 ms | 12.5 s | 0.67 s | 0.30 s | 0.14 s | 0.01 s |
+| 100 ms | 12.7 s | 0.85 s | 0.45 s | 0.23 s | 0.01 s |
+| 400 ms, 2.6 MiB/s | 14.7 s | 5.60 s | 1.07 s | 0.63 s | 0.01 s |
 
 Correct on every one of them: 200 sent, 200 arrived, **0 wrong, 0 missing, 0
 refused**.
 
-Two numbers do not move with the wire, and they are the ones that describe the
-design.
+Three numbers describe the design better than the timings do.
 
-**Bytes.** 17.8 MiB of vault crosses as **10.8 MiB**, and that is compression
+**Bytes.** 17.8 MiB of vault crosses as **10.7 MiB**, and that is compression
 alone: chunks are deflated before they are sealed. Deduplication contributes
 nothing here, because the notes are distinct, and on a real vault they are.
-Twenty edited notes cost **21 chunks**, a few KiB, rather than twenty files, and
+Twenty edited notes cost **20 chunks**, a few KiB, rather than twenty files, and
 that is what chunking is actually for.
 
-**Round trips.** 314 to upload 200 paths, 221 to download them, at every
-latency. That is the number latency multiplies, and it is where this design is
-weak.
+**Round trips.** **4 to upload 200 paths and 4 to download them**, at every
+latency. It was 314 and 221, one per file, and that was the number latency
+multiplied: at 400 ms it was two minutes of asking permission. A batched write
+sends every entry's chunk names together and gets back one list of what the
+server lacks; a batched read asks for every file's chunks in one fetch. The
+batch is bounded at 256 entries and at 8 MiB of queued file, the second because
+a queued file is pinned in memory until its batch goes.
+
+**What is left is not the wire.** At 400 ms the upload spends 14.7 s to move
+10.7 MiB, which the link itself would carry in 4. Almost all of the rest is the
+server's `fsync`: a chunk costs one file flush and its share of a directory
+flush, and an ack must not be sent before both. Doing them one at a time was
+**29 of the first sync's 30 seconds** with the wire and most of the disk idle.
+They now run sixteen at a time and each directory is flushed once per batch
+rather than once per chunk, which is the same guarantee with less waiting.
+
+That last figure is a laptop's. On Linux, where this actually runs, the same
+3000 chunks go at 4527/s against 307/s here, because Go issues `F_FULLFSYNC` for
+`File.Sync` on darwin and it flushes the whole drive cache. `go test
+./internal/chunks -bench WriterWidth` prints both.
 
 ## Read beside Sync Engine, carefully
 
@@ -66,32 +85,22 @@ same latency:
 | | upload | download |
 |---|---|---|
 | Sync Engine, their machine, WebDAV | 0.28 s/file | 0.18 s/file |
-| Basalt, this machine, 400 ms | 1.02 s/file | 0.42 s/file |
+| Basalt, this machine, 400 ms | 0.073 s/file | 0.028 s/file |
 
-**They are still faster per file on upload, and the reason is round trips.**
-This client sends one request at a time: the transport allows exactly one in
-flight, because a reply carries no request id and a second question would
-resolve into the first one's slot. Their engine overlaps its requests.
+Read that as an order of magnitude and not as a race. Their number includes a
+Nextcloud, a slower CPU, and ten times the files; ours includes a Go server on
+the same laptop. What can be compared is the shape: their engine overlaps many
+requests to hide latency, and this one now sends four requests in total, so
+latency has almost nothing left to multiply.
 
-Download used to be three round trips a file and is now one. Two of the three
-were spent asking the server for a chunk list it had already sent in the batch
-that announced the version. Removing them took the download at 100 ms from 64.6
-seconds to 22.1.
+The one-in-flight rule still holds and did not have to be given up to get here.
+A reply carries no request id, so a second question in flight would resolve into
+the first one's slot; batching sidesteps that entirely by making one question
+cover two hundred files. Request ids remain unwritten and now buy very little.
 
-So the honest summary is that these two designs are good at different things.
-Basalt sends a quarter of the bytes and asks four times as often. On a fast link
-the bytes win; on a slow one the round trips do, and theirs is the better
-behaviour there today.
-
-Upload is one request per path, which is already the minimum without changing
-the protocol. Going below it means either request ids, so several questions can
-be in flight at once, or a put that carries many entries. The second is the
-larger win and does not touch the one-in-flight invariant: two hundred paths
-would be four requests rather than three hundred. Neither is written.
-
-What can be said without any of this: an edit to a large note costs one chunk
-here and costs the whole file on any backend that stores files. That follows
-from the design rather than from a race, and no wire changes it.
+What can be said without any race at all: an edit to a large note costs one
+chunk here and costs the whole file on any backend that stores files. That
+follows from the design, and no wire changes it.
 
 ## Why there is no table with their plugin measured on this machine
 
@@ -114,6 +123,11 @@ And it reported success. The settle loop stops when a pass produces no work, and
 a pass in which everything failed produces none, so a sync that lost its
 connection half way through said it had finished. A run that ends with files
 still failing now exits non-zero.
+
+And once the round trips were gone, the benchmark stopped measuring the wire and
+started measuring the server's disk, which is how the serial `fsync` above was
+found. It had been there from the first commit, hidden behind three hundred
+round trips that cost more.
 
 ## The other benchmark
 

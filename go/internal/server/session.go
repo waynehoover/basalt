@@ -249,6 +249,8 @@ func (s *Session) dispatch(m wire.In) error {
 		return s.writeJSON(wire.Pong{Res: "pong"})
 	case "put":
 		return s.handlePut(m)
+	case "putmany":
+		return s.handlePutMany(m)
 	case "get":
 		return s.handleGet(m)
 	case "fetch":
@@ -469,6 +471,131 @@ func (s *Session) flushPending(cursor int64) int64 {
  * put
  * ---------------------------------------------------------------- */
 
+// checkEntry runs every refusal a single put makes, without writing one.
+//
+// Split out of handlePut so a batch can decide per entry and carry on. The
+// order matters and is the order handlePut used: the two named refusals first,
+// because docs/protocol.md gives badname and toolarge their own codes and a
+// client acts on them differently, then Validate, which is the enforcer.
+func (s *Session) checkEntry(e store.Entry) *wire.Err {
+	if e.Path == "" || len(e.Path) > store.MaxPathLen {
+		err := wire.Error(wire.CodeBadName,
+			fmt.Sprintf("path is %d bytes, must be 1 to %d", len(e.Path), store.MaxPathLen))
+		return &err
+	}
+	if e.Size > store.PerFileMax {
+		err := wire.Error(wire.CodeToolarge,
+			fmt.Sprintf("file is %d bytes, limit is %d", e.Size, store.PerFileMax))
+		return &err
+	}
+	if len(e.Chunks) > store.MaxChunksPerEntry {
+		err := wire.Error(wire.CodeToolarge,
+			fmt.Sprintf("%d chunks, limit is %d", len(e.Chunks), store.MaxChunksPerEntry))
+		return &err
+	}
+	if err := e.Validate(); err != nil {
+		refusal := wire.Error(wire.CodeBadEntry, err.Error())
+		return &refusal
+	}
+	return nil
+}
+
+// handlePutMany is handlePut for several entries and one round trip.
+//
+// The shape is the same: work out what is missing, ask for it once, read the
+// bodies, commit. What changes is that the want list is the union across every
+// entry and the answer is one result per entry, so a batch of two hundred
+// paths costs one exchange rather than two hundred.
+//
+// Nothing is committed until every body has arrived, and each entry is then
+// committed on its own, so an ack still means what it has always meant: this
+// entry and its bodies are durable.
+func (s *Session) handlePutMany(m wire.In) error {
+	if len(m.Entries) == 0 {
+		return s.reject(wire.CodeBadEntry, errors.New("a batched put with no entries in it"))
+	}
+	if len(m.Entries) > wire.MaxBatchEntries {
+		return s.reject(wire.CodeToolarge,
+			fmt.Errorf("%d entries in one put, limit is %d", len(m.Entries), wire.MaxBatchEntries))
+	}
+
+	type prepared struct {
+		entry   store.Entry
+		refusal *wire.Err
+		spend   int64
+	}
+	items := make([]prepared, len(m.Entries))
+
+	// The union, in the order the entries name them, without repeats: two files
+	// sharing a chunk ask for it once, which is the whole of what dedup buys on
+	// a first sync.
+	var want []string
+	asked := map[string]struct{}{}
+	var allowance int64
+
+	for i, in := range m.Entries {
+		e := in.Entry(s.device)
+		if refusal := s.checkEntry(e); refusal != nil {
+			items[i] = prepared{entry: e, refusal: refusal}
+			continue
+		}
+
+		missing, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
+		if err != nil {
+			refusal := wire.Error(wire.CodeBadChunk, err.Error())
+			items[i] = prepared{entry: e, refusal: &refusal}
+			continue
+		}
+		budget := store.CiphertextBudget(e.Size, len(e.Chunks))
+		held, err := s.heldBytes(e.Chunks, missing)
+		if err != nil {
+			return s.reject(wire.CodeInternal, err)
+		}
+		if held > budget {
+			refusal := wire.Error(wire.CodeToolarge, fmt.Sprintf(
+				"the chunks named already hold %d bytes for a declared size of %d, budget %d",
+				held, e.Size, budget))
+			items[i] = prepared{entry: e, refusal: &refusal}
+			continue
+		}
+
+		items[i] = prepared{entry: e, spend: budget - held}
+		for _, name := range missing {
+			if _, seen := asked[name]; seen {
+				continue
+			}
+			asked[name] = struct{}{}
+			want = append(want, name)
+		}
+		allowance += budget - held
+	}
+
+	if len(want) > 0 {
+		if err := s.writeJSON(wire.Want{Res: "want", Chunks: want}); err != nil {
+			return err
+		}
+		if err := s.readBodies(want, allowance); err != nil {
+			return err
+		}
+	}
+
+	results := make([]wire.AckResult, len(items))
+	for i, item := range items {
+		if item.refusal != nil {
+			results[i] = wire.AckResult{Code: item.refusal.Code, Msg: item.refusal.Msg}
+			continue
+		}
+		uid, err := s.commit(item.entry)
+		if err != nil {
+			// commit already closed the session for anything it refuses, so
+			// there is nothing left to answer with.
+			return err
+		}
+		results[i] = wire.AckResult{UID: uid}
+	}
+	return s.writeJSON(wire.Acks{Res: "acks", Results: results})
+}
+
 func (s *Session) handlePut(m wire.In) error {
 	e := m.Entry()
 	if e.Device == "" {
@@ -584,6 +711,22 @@ func (s *Session) readBodies(want []string, allowance int64) error {
 		outstanding[n] = struct{}{}
 	}
 
+	// The bodies go to disk through one batch writer rather than one at a time.
+	// An fsync is almost all waiting, and doing them in series left the wire and
+	// most of the disk idle for the length of a first sync. Nothing is treated
+	// as stored until Close returns, which is before the entry is committed and
+	// so before anything is acknowledged.
+	w := s.srv.st.Chunks().NewWriter(s.vaultID)
+	closed := false
+	defer func() {
+		if !closed {
+			// The caller is abandoning this exchange. The chunks that did land
+			// are harmless: a chunk no entry references is what the sweep
+			// collects, and one that is referenced later is one fewer to send.
+			_ = w.Close()
+		}
+	}()
+
 	var uploaded int64
 	for len(outstanding) > 0 {
 		typ, body, err := s.readMsg()
@@ -615,10 +758,15 @@ func (s *Session) readBodies(want []string, allowance int64) error {
 					"declared size allows %d",
 				uploaded, len(outstanding), allowance))
 		}
-		if err := s.srv.st.Chunks().Put(s.vaultID, name, body); err != nil {
+		if err := w.Add(name, body); err != nil {
 			return s.fatal(putErrorCode(err), err)
 		}
 		delete(outstanding, name)
+	}
+
+	closed = true
+	if err := w.Close(); err != nil {
+		return s.fatal(putErrorCode(err), err)
 	}
 	return nil
 }
