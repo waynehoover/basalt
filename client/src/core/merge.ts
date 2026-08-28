@@ -322,6 +322,22 @@ export function mergeText(base: string, mine: string, theirs: string): MergeOutc
  * changes applied to the incoming version. Arbitrary, and fixed, which is what
  * matters.
  */
+/**
+ * Whether two merges produced the same content, allowing for ordering.
+ *
+ * The sort is the whole point and it is not a shortcut. Two devices appending
+ * to the same daily note is the commonest concurrent edit there is, and it is
+ * order-ambiguous: merging their change into mine puts theirs last, merging
+ * mine into theirs puts mine last, and both are right. Comparing the strings
+ * exactly turns that into a conflict, which was measured rather than guessed:
+ * five tests fail, the daily note among them.
+ *
+ * What it gives up is narrow and worth naming. Two merges that produce the same
+ * lines in a different order look identical here, so a line moved to different
+ * places by the two directions would pass. A hunk placed wrongly does not, and
+ * that is the failure this exists for: a misplaced edit changes the text of a
+ * line, so the two multisets differ and the check fires.
+ */
 function sameLines(a: string, b: string): boolean {
     if (a === b) return true;
     const x = a.split("\n").sort();

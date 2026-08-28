@@ -434,3 +434,49 @@ describe("the server's ceiling", () => {
         }
     });
 });
+
+/**
+ * Whether a file is treated as text is decided by its extension, not by its
+ * contents, so bytes that are not valid UTF-8 reach the UTF-8 path routinely:
+ * anything at all named `.md`.
+ *
+ * That path backs a boundary off the end of an incomplete character, and
+ * backing off to the start of the chunk would rewind the loop to where it
+ * already was. `trimIncompleteCharacter` returns the untrimmed end rather than
+ * the start for exactly that reason, and the reasoning is subtle enough that
+ * the consequence of getting it wrong, a client that hangs on a note, deserves
+ * to be checked rather than argued.
+ */
+describe("bytes that are not valid UTF-8, on the UTF-8 path", () => {
+    const sizes = { min: 8, avg: 16, max: 64 };
+
+    const shouldTerminate = (name: string, data: Uint8Array) => {
+        it(`terminates on ${name}`, () => {
+            const chunks = [...chunkBytes(data, sizes, true)];
+            // Every byte accounted for exactly once, in order.
+            const total = chunks.reduce((n, c) => n + c.bytes.length, 0);
+            expect(total).toBe(data.length);
+            let at = 0;
+            for (const c of chunks) {
+                expect(c.offset).toBe(at);
+                expect(c.bytes.length).toBeGreaterThan(0);
+                at += c.bytes.length;
+            }
+        });
+    };
+
+    // A long run of continuation bytes with no lead byte in sight.
+    shouldTerminate("a run of continuation bytes", new Uint8Array(4096).fill(0x80));
+    // Lead bytes promising more than follows, back to back.
+    shouldTerminate(
+        "truncated sequences end to end",
+        new Uint8Array(Array.from({ length: 2048 }, (_, i) => (i % 2 === 0 ? 0xf0 : 0x80)))
+    );
+    // Every byte value, which includes every malformed shape.
+    shouldTerminate(
+        "every byte value repeated",
+        new Uint8Array(Array.from({ length: 4096 }, (_, i) => i & 0xff))
+    );
+    shouldTerminate("a single continuation byte", new Uint8Array([0x80]));
+    shouldTerminate("one lead byte and nothing after it", new Uint8Array([0xf0]));
+});
