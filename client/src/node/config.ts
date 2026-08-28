@@ -10,16 +10,13 @@
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { SECRET_LENGTH, base64urlDecode, base64urlEncode } from "../core/crypto.ts";
-import type { Pairing } from "../core/pairing.ts";
+import { decodeConfig, encodeConfig, type DeviceConfig } from "../core/pairing.ts";
 
 /** The folder inside a vault that holds this client's state. */
 export const STATE_DIR = ".basalt";
 
-export interface Config extends Pairing {
-    /** What this device calls itself, which is what appears in conflict copies. */
-    readonly device: string;
-}
+/** What a paired device stores. Defined in core, so both shells agree. */
+export type Config = DeviceConfig;
 
 export const configPath = (vault: string) => join(vault, STATE_DIR, "config.json");
 export const indexPath = (vault: string) => join(vault, STATE_DIR, "index.json");
@@ -49,25 +46,10 @@ export async function loadConfig(vault: string): Promise<Config | undefined> {
         throw new Error(`${file} is not valid JSON, so it cannot be trusted: ${(err as Error).message}`);
     }
 
-    const str = (key: string): string => {
-        const value = raw[key];
-        if (typeof value !== "string" || value === "") throw new Error(`${file} has no ${key}`);
-        return value;
-    };
-    const secret = base64urlDecode(str("secret"));
-    if (secret.length !== SECRET_LENGTH) {
-        // A secret of the wrong length still derives keys. They would be the
-        // wrong keys, and the vault would sync happily and decrypt nothing.
-        throw new Error(`${file} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH}`);
-    }
-
-    return {
-        url: str("url"),
-        token: str("token"),
-        vaultId: str("vaultId"),
-        device: str("device"),
-        secret,
-    };
+    // Decoded by core, so the plugin and this agree about what a config is and
+    // refuse the same things. A secret of the wrong length still derives keys;
+    // they are the wrong keys, and the vault would sync and decrypt nothing.
+    return decodeConfig(raw, file);
 }
 
 /**
@@ -82,14 +64,7 @@ export async function saveConfig(vault: string, config: Config): Promise<void> {
     await mkdir(dir, { recursive: true });
     const file = configPath(vault);
     const tmp = `${file}.tmp`;
-    const body = {
-        url: config.url,
-        token: config.token,
-        vaultId: config.vaultId,
-        device: config.device,
-        secret: base64urlEncode(config.secret),
-    };
-    await writeFile(tmp, JSON.stringify(body, null, 2) + "\n", { mode: 0o600 });
+    await writeFile(tmp, JSON.stringify(encodeConfig(config), null, 2) + "\n", { mode: 0o600 });
     await chmod(tmp, 0o600);
     await rename(tmp, file);
 }

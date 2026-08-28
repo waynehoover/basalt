@@ -71,7 +71,7 @@ a vault's text from 108% of its plaintext to 67%.
 
 ### 5. One engine, a plugin and a command line
 
-**Partly built.** The sync engine, the crypto, the chunker and the merge are
+**Built, and half of it unverified.** The sync engine, the crypto, the chunker and the merge are
 platform-free; Obsidian's Vault API and the filesystem are two adapters behind
 one small interface. The headless client is not a second client, it is the same
 one with a different adapter, so a bug fixed in one is fixed in both.
@@ -91,6 +91,11 @@ basalt status
 Pairing is one string carrying the address, the token and the root secret, with
 a checksum on it, so a paste that lost its last line is refused rather than
 becoming a subtly wrong key.
+
+That the core really is platform-free is checked rather than asserted: the
+plugin bundle is built and read, and a test fails if a single `node:` import has
+reached it. That regression compiles, passes every unit test, and only shows up
+when somebody opens Obsidian on a phone.
 
 ### 6. A backup that is a directory, and a server that checks itself
 
@@ -150,11 +155,11 @@ match on the way in.
 | Content cache, so an unchanged vault costs one stat per file | **Built** |
 | Filesystem adapter | **Built** |
 | Obsidian Vault API adapter | **Partial**, written and untested |
-| Obsidian plugin shell | **Designed** |
+| Obsidian plugin shell | **Written**, and never loaded in Obsidian |
 | Reconnect with backoff and jitter | **Built** |
 | Headless CLI | **Built** |
 | Pairing | **Built**, one string carrying the address, the token and the secret |
-| Status and actions in Obsidian's settings pane | **Designed** |
+| Status bar, and one modal that is not a settings tab | **Written**, untested |
 
 ## Security and privacy
 
@@ -205,8 +210,9 @@ Stated plainly, because a features list that only lists features is marketing.
 - **No mobile.** Never run on iOS or Android. The crypto was built from WebCrypto
   primitives specifically so it could be, and that is not the same as having
   tried.
-- **No plugin.** The headless client runs; the Obsidian plugin has an adapter
-  and no shell around it, so there is nothing to install in Obsidian yet.
+- **The plugin has never been loaded in Obsidian.** It builds, it bundles to a
+  file that requires nothing but `obsidian`, and its default export is a class
+  extending `Plugin`. None of that is the same as running.
 - **No recovery interface.** The server keeps every version and every deletion
   and exposes none of it: there is no `history` or `restore` operation on the
   wire, so a deleted note is safe and not yet reachable.

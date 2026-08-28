@@ -94,3 +94,27 @@ in a shell is in the wrong file.
 reach the server. `2` the command line was wrong. A sync that skipped a file for
 good exits non-zero on purpose: a broken vault that exits zero is a broken vault
 nobody hears about.
+
+## The plugin
+
+`src/obsidian/main.ts` is the other shell, and it does the same job: assemble a
+vault, an index store, a transport and a client, then draw a status bar. There is
+no settings tab, on purpose (`docs/philosophy.md`); there is one modal, it exists
+to pair a vault and to say what is happening, and it has no options in it.
+
+`bun run build` writes `dist/plugin/main.js` and `dist/plugin/manifest.json`.
+Copy both into `.obsidian/plugins/basalt/` in a vault.
+
+Config lives in the plugin's own `data.json`, under `.obsidian`, which Obsidian
+never syncs. The index sits beside it.
+
+### Neither shell is tested, and they are built so that matters less
+
+`main.ts` and `obsidian/vault.ts` need Obsidian running, so no test here touches
+them. What holds them up is that everything they could get wrong is somewhere
+else: the reconnect loop, the settle loop and the report arithmetic are in
+`core/client.ts`, which the CLI test drives against a real server.
+
+What is checked, in `src/build.test.ts`, is that the plugin bundle needs nothing
+but `obsidian` and contains no `node:` import. That is the regression that would
+otherwise compile, pass every test, and fail only on a phone.

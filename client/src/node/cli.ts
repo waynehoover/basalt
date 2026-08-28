@@ -25,9 +25,9 @@ import { hostname } from "node:os";
 import { resolve } from "node:path";
 
 import { deriveKeys, generateSecret } from "../core/crypto.ts";
-import { Engine, type SyncReport } from "../core/engine.ts";
+import { Client, runForever, type ClientOptions } from "../core/client.ts";
+import type { SyncReport } from "../core/engine.ts";
 import { formatPairing, parsePairing } from "../core/pairing.ts";
-import { Backoff, ProtocolError, Transport } from "../core/transport.ts";
 import { JsonIndexStore, NodeVault } from "./vault.ts";
 import { indexPath, loadConfig, removeState, saveConfig, type Config } from "./config.ts";
 
@@ -167,63 +167,49 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
     const config = await mustLoad(args.dir);
     if (args.watch) return await watchForever(config, args, io);
 
-    const session = await open(config, args, io);
+    const client = await open(config, args, io);
     try {
-        const report = await session.settle();
-        report_(report, args, io, session.serverCursor);
+        const report = await client.settle();
+        report_(report, args, io, client.serverCursor);
         // A file that can never sync is not a successful run, whatever else
         // worked. Exiting zero here is how a broken vault stays broken quietly
         // in somebody's cron.
         return report.skipped > 0 ? 1 : 0;
     } finally {
-        session.close();
+        client.close();
     }
 }
 
 /**
- * Syncs, then keeps syncing, and reconnects when the connection goes.
+ * Syncs, then keeps syncing.
  *
- * The transport deliberately does not reconnect itself, because a client that
- * exits wants to fail where a client that stays wants to wait. This is the
- * second kind, so the backoff lives here.
- *
- * A network that comes and goes is the normal case for a laptop, not an error,
- * so a dropped connection is reported and retried rather than fatal. What is
- * fatal is a refusal that would fail identically forever: a bad token, or a
- * cursor the server says is impossible. Retrying those is a loop that never
- * ends and never tells anybody why.
+ * The reconnecting is `runForever` in core, because the plugin needs exactly the
+ * same loop for exactly the same reasons. What is left here is what a shell
+ * should own: deciding what to print.
  */
 async function watchForever(config: Config, args: Args, io: Console): Promise<number> {
-    const backoff = new Backoff(0, 300_000, 5_000, true);
-    for (;;) {
-        let session: Session | undefined;
-        try {
-            session = await open(config, args, io);
-            backoff.success(Date.now());
-            const first = await session.settle();
-            report_(first, args, io, session.serverCursor);
+    let fatal: Error | undefined;
+    await runForever(await clientOptions(config, args, io), {
+        onSynced: (report, serverCursor) => {
+            report_(report, args, io, serverCursor);
             if (!args.json) io.err("Watching for changes. Ctrl-C to stop.");
-            const cause = await session.runUntilClosed();
-            io.err(`Disconnected: ${cause.message}`);
-            if (cause instanceof ProtocolError && cause.fatal) {
-                io.err("That will not fix itself by trying again.");
-                return 1;
-            }
-        } catch (err) {
-            const e = err as Error;
-            if (e instanceof ProtocolError && e.fatal) {
-                io.err(`basalt: ${e.message}`);
-                return 1;
-            }
-            io.err(`Cannot reach the server: ${e.message}`);
-        } finally {
-            session?.close();
-        }
-        backoff.fail(Date.now());
-        const wait = backoff.delay();
-        io.err(`Trying again in ${Math.max(1, Math.round(wait / 1000))}s.`);
-        await sleep(wait);
+        },
+        onDisconnected: (cause, retryIn) => {
+            io.err(`Disconnected: ${cause.message}. Trying again in ${seconds(retryIn)}.`);
+        },
+        onUnreachable: (cause, retryIn) => {
+            io.err(`Cannot reach the server: ${cause.message}. Trying again in ${seconds(retryIn)}.`);
+        },
+        onFatal: (cause) => {
+            fatal = cause;
+        },
+    });
+    if (fatal) {
+        io.err(`basalt: ${fatal.message}`);
+        io.err("That will not fix itself by trying again.");
+        return 1;
     }
+    return 0;
 }
 
 async function cmdStatus(args: Args, io: Console): Promise<number> {
@@ -244,9 +230,9 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // could not reach the server is the kind of status rule 7 is about.
     let server: { reachable: boolean; cursor?: number; behind?: number; error?: string };
     try {
-        const session = await open(config, args, io);
-        server = { reachable: true, cursor: session.serverCursor, behind: Math.max(0, session.serverCursor - local.cursor) };
-        session.close();
+        const client = await open(config, args, io);
+        server = { reachable: true, cursor: client.serverCursor, behind: Math.max(0, client.serverCursor - local.cursor) };
+        client.close();
     } catch (err) {
         server = { reachable: false, error: (err as Error).message };
     }
@@ -285,142 +271,30 @@ async function cmdUnlink(args: Args, io: Console): Promise<number> {
  * Wiring
  * ---------------------------------------------------------------- */
 
-interface Session {
-    engine: Engine;
-    transport: Transport;
-    serverCursor: number;
-    settle(): Promise<SyncReport>;
-    /** Resolves with the reason when the connection ends. */
-    runUntilClosed(): Promise<Error>;
-    close(): void;
+/** Assembles the four objects, which is the whole of what a shell does. */
+async function open(config: Config, args: Args, io?: Console): Promise<Client> {
+    const client = new Client(await clientOptions(config, args, io));
+    await client.connect();
+    return client;
 }
 
-/** Assembles the four objects, which is the whole of what a shell does. */
-async function open(config: Config, args: Args, io: Console): Promise<Session> {
-    const keys = await deriveKeys(config.secret);
-    const vault = new NodeVault(args.dir);
-    const store = new JsonIndexStore(indexPath(args.dir));
-
-    let engine!: Engine;
-    let caughtUp = false;
-    let ended: ((cause: Error) => void) | undefined;
-    let endedWith: Error | undefined;
-
-    const transport = new Transport(config.url, {
-        onBatch: async (batch) => {
-            await engine.acceptBatch(batch);
-        },
-        onCaughtUp: () => {
-            caughtUp = true;
-        },
-        onClosed: (cause) => {
-            endedWith = cause;
-            ended?.(cause);
-        },
-        timeoutMs: args.timeout,
-    });
-    engine = new Engine({
-        vault,
-        store,
-        keys,
-        transport,
-        device: config.device,
-        vaultId: config.vaultId,
+async function clientOptions(config: Config, args: Args, io?: Console): Promise<ClientOptions> {
+    return {
+        vault: new NodeVault(args.dir),
+        store: new JsonIndexStore(indexPath(args.dir)),
+        keys: await deriveKeys(config.secret),
+        url: config.url,
         token: config.token,
+        vaultId: config.vaultId,
+        device: config.device,
+        timeoutMs: args.timeout,
         // A one-shot sync does not defer a file to a next pass it will never
         // run. A watching one does, because there is one.
         coalesceWrites: args.watch,
-        ...(args.verbose
+        ...(args.verbose && io
             ? { log: (m: string, ...rest: unknown[]) => io.err(`  ${m} ${rest.map(brief).join(" ")}`.trimEnd()) }
             : {}),
-    });
-
-    await transport.connect();
-    const limits = await engine.start();
-
-    // Everything the server already had must arrive before the first pass
-    // decides anything, or the pass sees a vault the server has files for and
-    // calls them local-only.
-    const deadline = Date.now() + args.timeout;
-    while (!caughtUp && Date.now() < deadline) await sleep(25);
-    if (!caughtUp) throw new Error("the server never finished sending what it already had");
-
-    return {
-        engine,
-        transport,
-        serverCursor: limits.cursor,
-        async settle() {
-            // Passes until one changes nothing. Downloads produce more work, and
-            // an upload can be answered by a relay that needs acting on.
-            //
-            // The passes are added together rather than the last one returned.
-            // The last pass is by construction the one that found nothing left
-            // to do, so returning it would tell every successful sync that it
-            // had done nothing.
-            let pass = await engine.sync();
-            let total = pass;
-            for (let i = 0; i < 8 && didSomething(pass); i++) {
-                await sleep(60);
-                pass = await engine.sync();
-                total = accumulate(total, pass);
-            }
-            return total;
-        },
-        async runUntilClosed() {
-            if (endedWith) return endedWith;
-            // The watcher says when to look and the timer is the backstop for a
-            // platform where watching does not work. Neither decides anything:
-            // the scan does, and it re-reads the vault every time, so a missed
-            // event costs latency and never correctness.
-            const stop = vault.watch?.(() => void engine.sync().catch(() => {}));
-            const ticker = setInterval(() => void engine.sync().catch(() => {}), 30_000);
-            try {
-                return await new Promise<Error>((resolveWith) => {
-                    ended = resolveWith;
-                });
-            } finally {
-                clearInterval(ticker);
-                stop?.();
-            }
-        },
-        close() {
-            transport.close();
-        },
     };
-}
-
-/**
- * Adds a pass onto the running total.
- *
- * The work counters add up, because they count things that happened. The state
- * counters do not: `unchanged`, `waiting` and `skipped` describe how the vault
- * looks at the end of a pass, and summing them across passes would report one
- * unchanged file four times for having been looked at four times.
- */
-function accumulate(total: SyncReport, pass: SyncReport): SyncReport {
-    return {
-        uploaded: total.uploaded + pass.uploaded,
-        downloaded: total.downloaded + pass.downloaded,
-        merged: total.merged + pass.merged,
-        conflicted: total.conflicted + pass.conflicted,
-        deletedLocally: total.deletedLocally + pass.deletedLocally,
-        deletedRemotely: total.deletedRemotely + pass.deletedRemotely,
-        restored: total.restored + pass.restored,
-        foldersCreated: total.foldersCreated + pass.foldersCreated,
-        chunksSent: total.chunksSent + pass.chunksSent,
-        bytesSent: total.bytesSent + pass.bytesSent,
-        unchanged: pass.unchanged,
-        waiting: pass.waiting,
-        retrying: pass.retrying,
-        skipped: pass.skipped,
-    };
-}
-
-function didSomething(r: SyncReport): boolean {
-    return (
-        r.uploaded + r.downloaded + r.merged + r.conflicted + r.deletedLocally + r.deletedRemotely + r.restored + r.foldersCreated + r.waiting >
-        0
-    );
 }
 
 function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): void {
@@ -547,6 +421,10 @@ export function normaliseUrl(input: string): string {
     if (text.startsWith("https://")) return "wss://" + text.slice("https://".length);
     if (text.includes("://")) throw new Error(`a server address is ws:// or wss://, not ${text.split("://")[0]}://`);
     return "wss://" + text;
+}
+
+function seconds(ms: number): string {
+    return `${Math.max(1, Math.round(ms / 1000))}s`;
 }
 
 function bytes(n: number): string {

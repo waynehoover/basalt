@@ -167,3 +167,52 @@ function checksum(body: Uint8Array): Uint8Array {
     crc = (crc ^ 0xffffffff) >>> 0;
     return new Uint8Array([(crc >>> 24) & 0xff, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff]);
 }
+
+/* ---------------------------------------------------------------- *
+ * What a paired device stores
+ * ---------------------------------------------------------------- */
+
+/**
+ * A pairing plus this device's name for itself.
+ *
+ * The name is local: it is what appears in a conflict copy's filename, so it
+ * wants to be the thing you would call the machine rather than anything the
+ * other devices agreed on.
+ */
+export interface DeviceConfig extends Pairing {
+    readonly device: string;
+}
+
+/** The stored form, which is JSON on both platforms. */
+export function encodeConfig(config: DeviceConfig): Record<string, string> {
+    return {
+        url: config.url,
+        token: config.token,
+        vaultId: config.vaultId,
+        device: config.device,
+        secret: base64urlEncode(config.secret),
+    };
+}
+
+/**
+ * Reads stored config, refusing anything incomplete.
+ *
+ * Same reasoning as the pairing string: a config that half-parses gives a device
+ * a truncated secret, which derives keys that are perfectly valid and completely
+ * wrong. The vault would sync and decrypt nothing. `where` names the file, so
+ * the error says which one.
+ */
+export function decodeConfig(raw: unknown, where: string): DeviceConfig {
+    if (typeof raw !== "object" || raw === null) throw new Error(`${where} does not hold a configuration`);
+    const record = raw as Record<string, unknown>;
+    const str = (key: string): string => {
+        const value = record[key];
+        if (typeof value !== "string" || value === "") throw new Error(`${where} has no ${key}`);
+        return value;
+    };
+    const secret = base64urlDecode(str("secret"));
+    if (secret.length !== SECRET_LENGTH) {
+        throw new Error(`${where} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH}`);
+    }
+    return { url: str("url"), token: str("token"), vaultId: str("vaultId"), device: str("device"), secret };
+}
