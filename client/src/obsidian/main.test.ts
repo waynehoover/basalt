@@ -101,7 +101,7 @@ describe("loading", () => {
 
     it("registers the things a plugin registers", async () => {
         const { plugin, app } = await load();
-        expect(plugin.commands.map((c) => c.id).sort()).toEqual(["show-status", "sync-now"]);
+        expect(plugin.commands.map((c) => c.id).sort()).toEqual(["recover-deleted", "show-status", "sync-now"]);
         expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt"]);
         expect(plugin.statusBarItems.length).toBe(1);
         // create, modify, delete, rename. Without these it only syncs on a timer.
@@ -451,6 +451,119 @@ describe("when things go wrong", () => {
         expect(said, `notices were: ${said}`).toMatch(/cannot sync/);
         // And the refusal did not stop the file that was fine.
         expect(status(plugin)).toMatch(/stuck/);
+    }, 300_000);
+});
+
+describe("recovering a deleted note from the app", () => {
+    it("lists what the server still has, and puts one back", async () => {
+        await fresh();
+        const { plugin, app } = await load();
+        app.vault.adapter.seed("keep.md", "still here");
+        app.vault.adapter.seed("gone.md", "# Gone\n\nBut not forgotten.\n");
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        await app.vault.adapter.remove("gone.md");
+        await plugin.syncNow();
+        expect(app.vault.adapter.text("gone.md")).toBeUndefined();
+
+        built.length = 0;
+        notices.length = 0;
+        await plugin.runCommand("recover-deleted");
+        await until(
+            "the list to load",
+            () => modals.at(-1)!.contentEl.allText().length > "Deleted notes".length,
+            15_000
+        );
+        const row = built.find((s) => s.name === "gone.md");
+        expect(row, `the modal said: ${modals.at(-1)!.contentEl.allText()}`).toBeDefined();
+        expect(built.map((s) => s.name)).not.toContain("keep.md");
+        await row!.buttons[0]!.click();
+
+        await until("the note to come back", () => app.vault.adapter.text("gone.md") !== undefined);
+        expect(app.vault.adapter.text("gone.md")).toBe("# Gone\n\nBut not forgotten.\n");
+        expect(notices.map((n) => n.message).join(" ")).toMatch(/Restored/);
+    }, 300_000);
+
+    it("says nothing has been deleted when nothing has", async () => {
+        await fresh();
+        const { plugin, app } = await load();
+        app.vault.adapter.seed("keep.md", "here");
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        await plugin.runCommand("recover-deleted");
+        await until("the list to load", () => modals.at(-1)!.contentEl.allText().includes("Nothing has been"));
+        expect(modals.at(-1)!.contentEl.allText()).toMatch(/Nothing has been deleted/);
+    }, 300_000);
+
+    /**
+     * An empty list and an unanswerable question look identical on screen and
+     * mean opposite things. Somebody opening this has already lost a note.
+     */
+    it("says it could not ask, rather than showing an empty list", async () => {
+        await fresh();
+        const { plugin } = await load();
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+        await server.cleanup();
+        await until("it to notice", () => plugin.currentState.kind === "offline");
+
+        await plugin.runCommand("recover-deleted");
+        await until("the modal to answer", () => modals.at(-1)!.contentEl.allText().includes("Cannot ask"));
+        const shown = modals.at(-1)!.contentEl.allText();
+        expect(shown).toMatch(/Cannot ask the server/);
+        expect(shown).not.toMatch(/Nothing has been deleted/);
+    }, 300_000);
+});
+
+describe("renames, which only Obsidian can report", () => {
+    /**
+     * A rename has to travel as one operation.
+     *
+     * A filesystem scan cannot see one: it finds a path gone and another
+     * arrived and has nothing connecting them, which is why the headless client
+     * reports a rename as a deletion. Obsidian does know, and hands the old path
+     * to its rename event, and until that was wired up the engine was never told
+     * either. Every rename then retired the old path as a deletion, and the list
+     * of deleted notes filled with phantoms of files that still exist.
+     */
+    it("tells the engine the old path, so it is one operation and not two", async () => {
+        await fresh();
+        const { plugin, app } = await load();
+        app.vault.adapter.seed("old-name.md", "the same content throughout");
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        // Obsidian moves the file and says so, old path included.
+        await app.vault.adapter.rename("old-name.md", "new-name.md");
+        app.vault.fire("rename", { path: "new-name.md" }, "old-name.md");
+        for (let i = 0; i < 4; i++) await plugin.syncNow();
+
+        // The server knows it was a rename, so the old path is not offered as
+        // something to recover.
+        const client = (plugin as unknown as { client?: { deleted(): Promise<{ path: string }[]> } }).client;
+        const gone = (await client!.deleted()).map((v) => v.path);
+        expect(gone, `deleted list was ${JSON.stringify(gone)}`).not.toContain("old-name.md");
+    }, 300_000);
+
+    it("still moves the file when nothing told it the old path", async () => {
+        // The delete-plus-add path, which is what happens on any platform that
+        // cannot report a rename. Noisier, and it must still not lose anything.
+        await fresh();
+        const { plugin, app } = await load();
+        app.vault.adapter.seed("before.md", "content that moves");
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        await app.vault.adapter.rename("before.md", "after.md");
+        await plugin.syncNow();
+        await plugin.syncNow();
+
+        const client = (plugin as unknown as { client?: { deleted(): Promise<{ path: string }[]> } }).client;
+        const gone = (await client!.deleted()).map((v) => v.path);
+        expect(gone).toContain("before.md");
+        expect(app.vault.adapter.text("after.md")).toBe("content that moves");
     }, 300_000);
 });
 

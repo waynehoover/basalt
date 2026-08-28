@@ -104,6 +104,13 @@ type In struct {
 
 	// get
 	UID int64 `json:"uid"`
+
+	// history
+	//
+	// Before paginates: the oldest uid already held, to ask for the page before
+	// it. Zero starts at the newest. Limit is advisory and the server bounds it.
+	Before int64 `json:"before"`
+	Limit  int   `json:"limit"`
 }
 
 // PutMeta is the metadata of one version. It is nested rather than flat so that
@@ -224,6 +231,39 @@ type Chunks struct {
 	UID    int64    `json:"uid"`
 	Size   int64    `json:"size"`
 	Chunks []string `json:"chunks"`
+}
+
+// History answers a history request with every version of one path, newest
+// first.
+//
+// Read-only, like Deleted below, and that is the whole of the recovery
+// protocol. Restoring is not a server operation: a client asks for the history,
+// fetches the version it wants with the ordinary `get`, writes it into the
+// vault, and the ordinary sync uploads it as a new version. That leaves the
+// server with no new way to mutate a vault, and the client had to download the
+// content regardless, so the extra op would have bought nothing.
+//
+// Entries is never null. A client that iterates it would crash on exactly the
+// answers it is meant to handle, which is the same reasoning as Batch.
+type History struct {
+	Res string `json:"res"` // "history"
+	// Path echoes the request, so a client with several in flight can tell
+	// which answer it is holding. Still sealed; the server has never seen the
+	// plaintext and cannot start now.
+	Path    string        `json:"path"`
+	Entries []store.Entry `json:"entries"`
+}
+
+// Deleted answers a deleted request with every path whose newest version is a
+// deletion.
+//
+// Renames are suppressed, and not optionally. A rename leaves a deletion behind
+// at the old path, so without suppression most of this list is phantom
+// deletions of files that still exist under another name, and a recovery list
+// that is mostly noise is one nobody reads.
+type Deleted struct {
+	Res     string        `json:"res"` // "deleted"
+	Entries []store.Entry `json:"entries"`
 }
 
 // Pong answers a ping. A client behind NAT needs something to send.

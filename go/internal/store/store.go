@@ -547,10 +547,30 @@ func (s *Store) HistoryForPath(vaultID, path string, beforeUID int64, limit int)
 
 // Deleted returns paths whose newest version is a deletion.
 //
-// suppressRenames drops deletions that were really the source side of a rename,
-// identified by a later entry naming this path as its prev. Without it every
-// rename shows up in the deleted list as a phantom deletion, and the list stops
-// being usable for recovery because most of it is noise.
+// suppressRenames drops deletions that were really the source side of a rename.
+// Without it every rename shows up as a phantom deletion of a file that still
+// exists under another name, and a recovery list that is mostly noise is one
+// nobody reads.
+//
+// # Recognising the tail of a rename
+//
+// A rename is two entries: the new path carrying prev, and the old path
+// retired. The test for "this deletion is a rename" cannot be "some later entry
+// names this path as its prev", because a client does the two halves in
+// whichever order its scan reaches them, and the natural order is to publish
+// the new path first. That version of this query suppressed one order and not
+// the other, and the only test it had used the order clients do not produce.
+//
+// Nor can the ordering be dropped altogether. A path can be renamed away and
+// then used again by a new file, and the deletion of *that* file is real and
+// must be listed; a bare "anything ever named this as its prev" would hide it
+// forever.
+//
+// So the test is whether the rename happened after the version of this path
+// that is now being deleted, rather than after the deletion record itself:
+// there is no intervening incarnation of the path between the rename and the
+// deletion. That holds for both orders of the two halves, and stops holding as
+// soon as the path is reused.
 func (s *Store) Deleted(vaultID string, suppressRenames bool) ([]Entry, error) {
 	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path
 	        FROM entries e
@@ -560,7 +580,12 @@ func (s *Store) Deleted(vaultID string, suppressRenames bool) ([]Entry, error) {
 	if suppressRenames {
 		q += ` AND NOT EXISTS (
 		         SELECT 1 FROM entries r
-		          WHERE r.vault_id = e.vault_id AND r.prev_path = e.path AND r.uid > e.uid)`
+		          WHERE r.vault_id = e.vault_id
+		            AND r.prev_path = e.path
+		            AND r.uid > COALESCE(
+		                  (SELECT MAX(p.uid) FROM entries p
+		                    WHERE p.vault_id = e.vault_id AND p.path = e.path AND p.uid < e.uid),
+		                  0))`
 	}
 	q += ` ORDER BY e.uid DESC`
 

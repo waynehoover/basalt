@@ -253,6 +253,10 @@ func (s *Session) dispatch(m wire.In) error {
 		return s.handleGet(m)
 	case "fetch":
 		return s.handleFetch(m)
+	case "history":
+		return s.handleHistory(m)
+	case "deleted":
+		return s.handleDeleted(m)
 	case "hello":
 		return s.fatal(wire.CodeProtoState, errors.New("hello sent twice"))
 	default:
@@ -682,6 +686,57 @@ func (s *Session) commit(e store.Entry) (int64, error) {
 /* ---------------------------------------------------------------- *
  * get and fetch
  * ---------------------------------------------------------------- */
+
+// handleHistory answers with every version of one path, newest first.
+//
+// The path arrives sealed and is used sealed. The server has never been able to
+// read a path and this is not the place to start: it is a key in a table here,
+// nothing more, and an unknown one simply has no versions.
+//
+// An empty list is not an error. The server cannot tell a path that never
+// existed from one whose history was purged, because both are absent, and
+// inventing a distinction it cannot support would be a lie in a recovery tool.
+func (s *Session) handleHistory(m wire.In) error {
+	if m.Path == "" {
+		return s.reject(wire.CodeBadName, errors.New("history needs a path"))
+	}
+	if m.Before < 0 {
+		return s.reject(wire.CodeProtoState, fmt.Errorf("negative before %d", m.Before))
+	}
+
+	entries, err := s.srv.st.HistoryForPath(s.vaultID, m.Path, m.Before, m.Limit)
+	if err != nil {
+		s.srv.log.Error("history", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("could not read history"))
+	}
+	return s.writeJSON(wire.History{Res: "history", Path: m.Path, Entries: nonNil(entries)})
+}
+
+// handleDeleted answers with every path whose newest version is a deletion.
+//
+// This is the list somebody reads when they have lost a note and do not know
+// what it was called, so the ordering is newest first and renames are
+// suppressed. See wire.Deleted for why suppression is not optional.
+func (s *Session) handleDeleted(m wire.In) error {
+	entries, err := s.srv.st.Deleted(s.vaultID, true)
+	if err != nil {
+		s.srv.log.Error("deleted", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("could not list deletions"))
+	}
+	return s.writeJSON(wire.Deleted{Res: "deleted", Entries: nonNil(entries)})
+}
+
+// nonNil keeps an empty result an empty array rather than JSON null.
+//
+// The same reasoning as Batch's entries, and the same bug: a client iterating
+// null crashes on exactly the answers it exists to handle, and "no deleted
+// notes" is the answer it will see most often.
+func nonNil(entries []store.Entry) []store.Entry {
+	if entries == nil {
+		return []store.Entry{}
+	}
+	return entries
+}
 
 func (s *Session) handleGet(m wire.In) error {
 	if m.UID <= 0 {

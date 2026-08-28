@@ -1101,3 +1101,63 @@ func uids(entries []Entry) []int64 {
 	}
 	return out
 }
+
+// The other order, which is the one clients actually produce.
+//
+// A rename is two entries, and a client publishes the new path before retiring
+// the old one, because that is the order its scan reaches them in. The original
+// suppression asked for "a later entry names this path as its prev", which is
+// only true when the deletion is written first, and the only test it had used
+// exactly that order. Every real rename showed up as a phantom deletion.
+func TestRenameDeletionIsSuppressedWhenTheNewPathIsPublishedFirst(t *testing.T) {
+	h := newTestStore(t)
+	old := h.file(t, "old.md", "the note")
+
+	// New path first, carrying prev. Then the old path is retired.
+	if _, err := h.AppendEntry("v1", Entry{
+		Path: "new.md", Prev: "old.md", Size: old.Size, MTime: 50, Chunks: old.Chunks,
+	}); err != nil {
+		t.Fatalf("append new: %v", err)
+	}
+	if _, err := h.AppendEntry("v1", Entry{Path: "old.md", Deleted: true, MTime: 51}); err != nil {
+		t.Fatalf("delete old: %v", err)
+	}
+
+	got, err := h.Deleted("v1", true)
+	if err != nil {
+		t.Fatalf("deleted: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("a rename shows as %d deletions: %v", len(got), got[0].Path)
+	}
+}
+
+// And the case the ordering requirement exists to protect: a path renamed away
+// and then used again by a different file. That file's deletion is real, and
+// hiding it forever because the name was once renamed would lose it.
+func TestADeletionIsStillListedWhenThePathWasReusedAfterARename(t *testing.T) {
+	h := newTestStore(t)
+	first := h.file(t, "notes.md", "the original")
+	if _, err := h.AppendEntry("v1", Entry{
+		Path: "moved.md", Prev: "notes.md", Size: first.Size, MTime: 11, Chunks: first.Chunks,
+	}); err != nil {
+		t.Fatalf("append rename: %v", err)
+	}
+	if _, err := h.AppendEntry("v1", Entry{Path: "notes.md", Deleted: true, MTime: 12}); err != nil {
+		t.Fatalf("delete after rename: %v", err)
+	}
+
+	// Later, something new takes the name and is then deleted for real.
+	h.file(t, "notes.md", "a different note entirely")
+	if _, err := h.AppendEntry("v1", Entry{Path: "notes.md", Deleted: true, MTime: 31}); err != nil {
+		t.Fatalf("delete the reused path: %v", err)
+	}
+
+	got, err := h.Deleted("v1", true)
+	if err != nil {
+		t.Fatalf("deleted: %v", err)
+	}
+	if len(got) != 1 || got[0].Path != "notes.md" {
+		t.Fatalf("a real deletion was hidden by an old rename: %v", got)
+	}
+}

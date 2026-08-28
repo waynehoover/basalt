@@ -608,8 +608,14 @@ export class Engine {
         synced(entry, entry.hash, entry.chunks, remote.uid, this.now());
     }
 
-    /** Downloads and reassembles one version's plaintext. */
-    private async contentOf(uid: number): Promise<Uint8Array> {
+    /**
+     * Downloads and reassembles one version's plaintext.
+     *
+     * Public because recovery needs it: restoring an old version is fetching
+     * its content and writing it back, and there is no reason for a second copy
+     * of the reassembly to exist for that.
+     */
+    async contentOf(uid: number): Promise<Uint8Array> {
         const meta = await this.opts.transport.get(uid);
         if (meta.chunks.length === 0) return new Uint8Array(0);
         const bodies = await this.opts.transport.fetch(meta.chunks);

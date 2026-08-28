@@ -45,6 +45,9 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
   basalt sync                               sync once and exit
   basalt sync --watch                       sync, then keep syncing
   basalt status                             what this device thinks the state is
+  basalt deleted                            notes the server still has and you do not
+  basalt history PATH                       every version the server holds of one note
+  basalt restore PATH                       put a note back, newest version first
   basalt unlink                             forget the pairing, keep the notes
 
 Options
@@ -53,6 +56,9 @@ Options
   --vault-id ID    which vault on the server (default: default)
   --json           machine-readable output
   --timeout MS     how long to wait on the server (default: 30000)
+  --uid N          restore one exact version, from basalt history
+  --to PATH        restore somewhere other than where it came from
+  --limit N        how many versions history shows (default: 20)
 `;
 
 export async function run(argv: readonly string[], io: Console): Promise<number> {
@@ -81,6 +87,12 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
                 return await cmdSync(args, io);
             case "status":
                 return await cmdStatus(args, io);
+            case "deleted":
+                return await cmdDeleted(args, io);
+            case "history":
+                return await cmdHistory(args, io);
+            case "restore":
+                return await cmdRestore(args, io);
             case "unlink":
                 return await cmdUnlink(args, io);
             default:
@@ -256,6 +268,119 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     return 1;
 }
 
+/* ---------------------------------------------------------------- *
+ * Recovery
+ * ---------------------------------------------------------------- */
+
+/**
+ * Notes the server still holds and this vault does not.
+ *
+ * The whole point of keeping every version is that this list exists. Until it
+ * did, a deleted note was safe and unreachable, which is only half a promise.
+ */
+async function cmdDeleted(args: Args, io: Console): Promise<number> {
+    const config = await mustLoad(args.dir);
+    const client = await open(config, args, io);
+    try {
+        const gone = await client.deleted();
+        if (args.json) {
+            io.out(JSON.stringify({ ok: true, deleted: gone }));
+            return 0;
+        }
+        if (gone.length === 0) {
+            io.out("Nothing has been deleted from this vault.");
+            return 0;
+        }
+        for (const v of gone) {
+            io.out(`${when(v.mtime)}  ${v.device.padEnd(12)}  ${v.path}`);
+        }
+        io.out("");
+        io.out(`${gone.length} deleted, all still recoverable. basalt restore PATH brings one back.`);
+        return 0;
+    } finally {
+        client.close();
+    }
+}
+
+/** Every version of one note, newest first. */
+async function cmdHistory(args: Args, io: Console): Promise<number> {
+    const path = args.rest[0];
+    if (!path) throw new Error("history needs the path of a note");
+    const config = await mustLoad(args.dir);
+    const client = await open(config, args, io);
+    try {
+        const versions = await client.history(path, { limit: args.limit });
+        if (args.json) {
+            io.out(JSON.stringify({ ok: true, path, versions }));
+            return 0;
+        }
+        if (versions.length === 0) {
+            // The server cannot tell a path it never had from one whose history
+            // was purged, so neither can this. Saying which would be a guess in
+            // the one tool where a guess is least welcome.
+            io.out(`The server holds no versions of ${path}.`);
+            return 0;
+        }
+        for (const v of versions) {
+            const what = v.deleted ? "deleted" : v.folder ? "folder" : `${bytes(v.size)}`;
+            io.out(`${String(v.uid).padStart(7)}  ${when(v.mtime)}  ${v.device.padEnd(12)}  ${what}`);
+        }
+        io.out("");
+        io.out("basalt restore PATH --uid N brings one of these back.");
+        return 0;
+    } finally {
+        client.close();
+    }
+}
+
+/**
+ * Puts a note back.
+ *
+ * Never overwrites. If something already occupies the path, the restored copy
+ * lands beside it and both are reported: a recovery tool that can destroy the
+ * thing you still have is worse than none.
+ */
+async function cmdRestore(args: Args, io: Console): Promise<number> {
+    const path = args.rest[0];
+    if (!path) throw new Error("restore needs the path of a note");
+    const config = await mustLoad(args.dir);
+    const client = await open(config, args, io);
+    try {
+        let version;
+        if (args.uid !== undefined) {
+            const versions = await client.history(path, { limit: 500 });
+            version = versions.find((v) => v.uid === args.uid);
+            if (!version) throw new Error(`the server has no version ${args.uid} of ${path}`);
+            // Whether that version can be restored is Client.restore's to say,
+            // and it says it. A second check here would be a duplicate that no
+            // test could pin: remove either one and the other still refuses.
+        } else {
+            version = await client.newestContentVersion(path);
+            if (!version) throw new Error(`the server holds no version of ${path} with any content in it`);
+        }
+
+        const done = await client.restore(version, args.to);
+        // Sent straight away rather than left for the next sync. Somebody who
+        // has just recovered a note should not have to know that it is only on
+        // this device until something else happens.
+        const report = await client.settle({ coalesceWrites: false });
+
+        if (args.json) {
+            // `restored` is already a counter on the report, so the path is `path`.
+            io.out(JSON.stringify({ ok: true, path: done.path, uid: version.uid, bytes: done.bytes, sync: report }));
+            return 0;
+        }
+        io.out(`Restored version ${version.uid} of ${path} (${bytes(done.bytes)}, from ${when(version.mtime)}).`);
+        if (done.path !== (args.to ?? path)) {
+            io.out(`Written to ${done.path}, because something is already at ${args.to ?? path}.`);
+        }
+        if (report.uploaded > 0) io.out("Sent to the server, so your other devices will pick it up.");
+        return 0;
+    } finally {
+        client.close();
+    }
+}
+
 async function cmdUnlink(args: Args, io: Console): Promise<number> {
     const config = await loadConfig(args.dir).catch(() => undefined);
     await removeState(args.dir);
@@ -342,6 +467,9 @@ interface Args {
     token?: string;
     json: boolean;
     watch: boolean;
+    uid?: number;
+    to?: string;
+    limit: number;
     verbose: boolean;
     help: boolean;
     timeout: number;
@@ -355,12 +483,13 @@ export function parseArgs(argv: readonly string[]): Args {
         vaultId: "default",
         json: false,
         watch: false,
+        limit: 20,
         verbose: false,
         help: false,
         timeout: 30_000,
     };
 
-    const takes = new Set(["--dir", "--device", "--vault-id", "--server", "--token", "--timeout"]);
+    const takes = new Set(["--dir", "--device", "--vault-id", "--server", "--token", "--timeout", "--uid", "--to", "--limit"]);
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i]!;
         let value: string | undefined;
@@ -380,6 +509,19 @@ export function parseArgs(argv: readonly string[]): Args {
                 const ms = Number(value);
                 if (!Number.isFinite(ms) || ms <= 0) throw new Error(`--timeout wants a number of milliseconds, not ${value}`);
                 args.timeout = ms;
+                break;
+            }
+            case "--uid": {
+                const uid = Number(value);
+                if (!Number.isInteger(uid) || uid <= 0) throw new Error(`--uid wants a version number, not ${value}`);
+                args.uid = uid;
+                break;
+            }
+            case "--to": args.to = value!; break;
+            case "--limit": {
+                const limit = Number(value);
+                if (!Number.isInteger(limit) || limit <= 0) throw new Error(`--limit wants a count, not ${value}`);
+                args.limit = limit;
                 break;
             }
             case "--json": args.json = true; break;
@@ -421,6 +563,14 @@ export function normaliseUrl(input: string): string {
     if (text.startsWith("https://")) return "wss://" + text.slice("https://".length);
     if (text.includes("://")) throw new Error(`a server address is ws:// or wss://, not ${text.split("://")[0]}://`);
     return "wss://" + text;
+}
+
+/** A timestamp somebody can read, which is the point of a recovery listing. */
+function when(ms: number): string {
+    if (!Number.isFinite(ms) || ms <= 0) return "unknown         ";
+    const d = new Date(ms);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 function seconds(ms: number): string {

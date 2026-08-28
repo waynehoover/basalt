@@ -431,15 +431,15 @@ func (c *client) closed() bool {
 	defer cancel()
 	for {
 		_, _, err := c.conn.Read(ctx)
-		if err != nil {
-			return true
+		if err == nil {
+			// Something still queued. Only the hang-up settles it.
+			continue
 		}
-		// Drain anything still queued; only the hang-up settles it.
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
+		// A read that failed because this side stopped waiting is not a
+		// hang-up. Reporting it as one made every assertion of "the session
+		// closed" pass whether it did or not, including for a server that
+		// stayed open and idle.
+		return ctx.Err() == nil
 	}
 }
 

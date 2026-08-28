@@ -586,6 +586,47 @@ export class Transport {
     }
 
     /**
+     * Every version of one path, newest first.
+     *
+     * The path goes up sealed and comes back sealed. The server has never been
+     * able to read one and this does not change that: recovery is a client
+     * asking a blind store what it is holding.
+     *
+     * An empty list means the server has no versions of that path. It cannot
+     * tell "never existed" from "history purged", so neither can this.
+     */
+    async history(
+        sealedPath: string,
+        opts: { before?: number; limit?: number } = {}
+    ): Promise<WireEntry[]> {
+        const reply = await this.request({
+            op: "history",
+            path: sealedPath,
+            ...(opts.before !== undefined ? { before: opts.before } : {}),
+            ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+        });
+        if (reply["res"] !== "history") {
+            throw new ProtocolError("protostate", `expected history, got ${JSON.stringify(reply)}`);
+        }
+        return entriesOf(reply["entries"], "history");
+    }
+
+    /**
+     * Every path whose newest version is a deletion, newest first.
+     *
+     * Renames are suppressed by the server and not optionally: a rename leaves
+     * a deletion behind at the old path, and a recovery list that is mostly
+     * phantom deletions of files that still exist is one nobody reads.
+     */
+    async deleted(): Promise<WireEntry[]> {
+        const reply = await this.request({ op: "deleted" });
+        if (reply["res"] !== "deleted") {
+            throw new ProtocolError("protostate", `expected deleted, got ${JSON.stringify(reply)}`);
+        }
+        return entriesOf(reply["entries"], "deleted");
+    }
+
+    /**
      * Downloads chunk bodies, in the order asked for.
      *
      * The server refuses the whole fetch if it lacks any of them, so a partial
@@ -731,4 +772,19 @@ function describeClose(ev: { code?: number; reason?: string }): string {
     const code = ev.code ?? 0;
     const reason = ev.reason ? `, ${ev.reason}` : "";
     return `code ${code}${reason}`;
+}
+
+/**
+ * Reads an entry list off the wire, refusing anything that is not one.
+ *
+ * Not `Array.isArray(x) ? x : []`. A server that answered null, or answered
+ * with a field missing, would become "there is nothing to recover", and the one
+ * moment somebody runs this is the moment they have lost a note. An unreadable
+ * answer has to be an error.
+ */
+function entriesOf(value: unknown, what: string): WireEntry[] {
+    if (!Array.isArray(value)) {
+        throw new ProtocolError("protostate", `${what} came back without a list of entries`);
+    }
+    return value as WireEntry[];
 }

@@ -23,12 +23,19 @@ let built: Promise<string> | undefined;
 let buildDir: string | undefined;
 
 /**
- * Builds the server once per process.
+ * The server binary, built once.
  *
- * Built rather than assumed present: a test that silently skips because it could
- * not find the server is a test that reports success for having done nothing.
+ * `vitest.global-setup.ts` builds it before any worker starts and names it in
+ * the environment, which is the ordinary path. The fallback below builds one
+ * here, for a file run outside that setup.
+ *
+ * Built rather than assumed present either way: a test that silently skips
+ * because it could not find the server is a test that reports success for
+ * having done nothing.
  */
 export function serverBinary(): Promise<string> {
+    const shared = process.env["BASALT_TEST_BINARY"];
+    if (shared) return Promise.resolve(shared);
     built ??= (async () => {
         buildDir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
         const binary = join(buildDir, "basalt");
@@ -41,7 +48,15 @@ export function serverBinary(): Promise<string> {
     return built;
 }
 
+/**
+ * Removes a binary this file built.
+ *
+ * Never the shared one: it belongs to the whole run, and a file that deleted it
+ * on its way out would break every other file still using it. That is not
+ * hypothetical, it is what happens when several files run at once.
+ */
 export async function cleanupBinary(): Promise<void> {
+    if (process.env["BASALT_TEST_BINARY"]) return;
     if (buildDir) await rm(buildDir, { recursive: true, force: true });
     buildDir = undefined;
     built = undefined;

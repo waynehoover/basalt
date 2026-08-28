@@ -12,7 +12,7 @@ where theirs is better. This is the list on its own terms.
 
 ## The unusual ones
 
-Six things Basalt does that its two predecessors do not. If there is a reason to
+Seven things Basalt does that its two predecessors do not. If there is a reason to
 use this rather than either, it is these.
 
 ### 1. A merge that refuses rather than mangling
@@ -69,7 +69,31 @@ Measured against whole-file sync:
 Chunks are compressed before they are encrypted, which takes a full first sync of
 a vault's text from 108% of its plaintext to 67%.
 
-### 5. One engine, a plugin and a command line
+### 5. Everything you deleted is still there, and you can get it back
+
+**Built.** The server has kept every version of every note and every deletion
+since the beginning, and now there is a way to reach it.
+
+```
+basalt deleted                      what the server still has and you do not
+basalt history "Quarterly plan.md"  every version, newest first
+basalt restore "Quarterly plan.md"  put it back
+```
+
+In Obsidian it is one command, "Recover a deleted note", and a list with a
+button beside each.
+
+Restoring is not a server operation. The client fetches the version it wants
+with the ordinary `get`, writes it into the vault, and the ordinary sync sends
+it on to the other devices. The server keeps exactly one way to change a vault,
+which is the one everything else already uses.
+
+Nothing is ever overwritten. Restoring onto a path you have since reused puts
+the recovered copy beside what is there and tells you, because a recovery tool
+that can destroy the thing you still have is worse than none. A restored note
+keeps the timestamp it was written with rather than the moment you recovered it.
+
+### 6. One engine, a plugin and a command line
 
 **Built, and half of it unverified.** The sync engine, the crypto, the chunker and the merge are
 platform-free; Obsidian's Vault API and the filesystem are two adapters behind
@@ -97,7 +121,7 @@ plugin bundle is built and read, and a test fails if a single `node:` import has
 reached it. That regression compiles, passes every unit test, and only shows up
 when somebody opens Obsidian on a phone.
 
-### 6. A backup that is a directory, and a server that checks itself
+### 7. A backup that is a directory, and a server that checks itself
 
 **Built.** `basalt backup -to DIR` produces a directory that *is* a data
 directory: restoring is copying it back. Incremental, because chunks are named by
@@ -121,7 +145,7 @@ match on the way in.
 | Per-chunk deduplication across files and versions | **Built** |
 | Compression before encryption | **Built** |
 | Renames as one operation rather than a delete and an add | **Built** |
-| Deletions as records, so a deleted note is recoverable | **Built** server side |
+| Deletions as records, so a deleted note is recoverable | **Built**, and reachable |
 | Three-way merge for text | **Built** |
 | Conflict copies for anything that cannot merge | **Built** |
 | Live relay between connected devices | **Built** |
@@ -143,7 +167,7 @@ match on the way in.
 | Directory locks, so maintenance cannot race a running server | **Built** |
 | Refuses a client whose cursor is ahead of its own | **Built** |
 | Live device limit, refused rather than degraded | **Built** |
-| Exposing history or restore over the wire | **Designed** |
+| Exposing history and the deleted list over the wire | **Built**, read-only |
 | Prometheus, a web UI, anything that reads your vault | **Refused** |
 
 ## The client
@@ -222,7 +246,4 @@ Stated plainly, because a features list that only lists features is marketing.
   including a server that refused every browser client and so had never let a
   plugin connect at all (`docs/client-design.md`). What it has not had is
   ordinary use over days, or a second real device, or a phone.
-- **No recovery interface.** The server keeps every version and every deletion
-  and exposes none of it: there is no `history` or `restore` operation on the
-  wire, so a deleted note is safe and not yet reachable.
 - **No packaging.** No release, no plugin listing, no systemd unit.

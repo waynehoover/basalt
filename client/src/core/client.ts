@@ -16,9 +16,16 @@
  */
 
 import { Engine, type SyncOptions, type SyncReport } from "./engine.ts";
-import { Backoff, ProtocolError, Transport, type ServerLimits, type SocketLike } from "./transport.ts";
+import {
+    Backoff,
+    ProtocolError,
+    Transport,
+    type ServerLimits,
+    type SocketLike,
+    type WireEntry,
+} from "./transport.ts";
 import type { IndexStore, Vault } from "./vault.ts";
-import type { VaultKeys } from "./crypto.ts";
+import { openPath, sealPath, type VaultKeys } from "./crypto.ts";
 
 export interface ClientOptions {
     readonly vault: Vault;
@@ -161,9 +168,129 @@ export class Client {
         }
     }
 
+    /* ------------------------------------------------------------ *
+     * Recovery
+     * ------------------------------------------------------------ */
+
+    /**
+     * Every version of one note, newest first.
+     *
+     * The path is sealed on the way out and the answer's paths are unsealed on
+     * the way back, so the server takes no part in any of it beyond looking up
+     * a key in a table.
+     */
+    async history(path: string, opts: { before?: number; limit?: number } = {}): Promise<Version[]> {
+        const sealed = await sealPath(this.opts.keys, path);
+        const entries = await this.transport.history(sealed, opts);
+        return entries.map((e) => this.asVersion(e, path));
+    }
+
+    /**
+     * Every note whose newest version is a deletion, newest first.
+     *
+     * This is the list somebody reads when they know a note is gone and cannot
+     * remember what it was called, which is why the paths are unsealed here
+     * rather than left for the caller.
+     */
+    async deleted(): Promise<Version[]> {
+        const entries = await this.transport.deleted();
+        const out: Version[] = [];
+        for (const e of entries) {
+            out.push(this.asVersion(e, await openPath(this.opts.keys, e.path)));
+        }
+        return out;
+    }
+
+    /**
+     * Puts a version back into the vault.
+     *
+     * Deliberately not a server operation. Restoring is fetching the content
+     * and writing it where it belongs; the ordinary sync then uploads it as a
+     * new version, through the one put path that everything else already uses
+     * and that is tested to death. A server-side restore would be a second way
+     * to change a vault, and the client would have had to download the content
+     * anyway.
+     *
+     * Nothing is overwritten. If something already occupies the path, the
+     * restored copy goes beside it under a distinct name and both are returned,
+     * because a recovery tool that can destroy the thing you have is worse than
+     * no recovery tool.
+     */
+    async restore(version: Version, to?: string): Promise<{ path: string; bytes: number }> {
+        if (version.deleted) {
+            throw new Error(`version ${version.uid} of ${version.path} is the deletion itself, not a version to restore`);
+        }
+        if (version.folder) {
+            const at = to ?? version.path;
+            await this.opts.vault.mkdir(at);
+            return { path: at, bytes: 0 };
+        }
+
+        const content = await this.engine.contentOf(version.uid);
+        const wanted = to ?? version.path;
+        const at = (await this.opts.vault.exists(wanted)) ? restoredCopyPath(wanted, version) : wanted;
+        await this.opts.vault.write(at, content, { mtime: version.mtime, ctime: version.ctime });
+        return { path: at, bytes: content.length };
+    }
+
+    /** The newest version of a path that had content, or undefined. */
+    async newestContentVersion(path: string): Promise<Version | undefined> {
+        const versions = await this.history(path, { limit: 50 });
+        return versions.find((v) => !v.deleted);
+    }
+
+    private asVersion(e: WireEntry, path: string): Version {
+        return {
+            uid: e.uid,
+            path,
+            size: e.size,
+            ctime: e.ctime,
+            mtime: e.mtime,
+            folder: e.folder,
+            deleted: e.deleted,
+            device: e.device,
+            chunks: e.chunks?.length ?? 0,
+        };
+    }
+
     close(): void {
         this.transport.close();
     }
+}
+
+/** One version of one note, as recovery talks about it. */
+export interface Version {
+    readonly uid: number;
+    /** Plaintext, unsealed by whoever asked. */
+    readonly path: string;
+    readonly size: number;
+    readonly ctime: number;
+    readonly mtime: number;
+    readonly folder: boolean;
+    /** True for the record of a deletion, which is a version like any other. */
+    readonly deleted: boolean;
+    /** The device that wrote it. */
+    readonly device: string;
+    /** How many chunks it is stored in. Zero for a folder, a deletion, or empty. */
+    readonly chunks: number;
+}
+
+/**
+ * Where a restore goes when the path is already occupied.
+ *
+ * Same shape as a conflict copy and the same reason: the thing you already have
+ * is never overwritten by something arriving from elsewhere. Somebody restoring
+ * a note from last week onto a note they have been editing today should end up
+ * with both.
+ */
+export function restoredCopyPath(path: string, version: Version): string {
+    const slash = path.lastIndexOf("/");
+    const dir = slash === -1 ? "" : path.slice(0, slash + 1);
+    const name = slash === -1 ? path : path.slice(slash + 1);
+    const dot = name.lastIndexOf(".");
+    const stem = dot <= 0 ? name : name.slice(0, dot);
+    const ext = dot <= 0 ? "" : name.slice(dot);
+    return `${dir}${stem} (restored ${version.uid})${ext}`;
 }
 
 /** What a long-running client tells whoever is watching it. */

@@ -8,6 +8,7 @@ Transport is a single WebSocket. Text frames are JSON control messages, binary
 frames are chunk bodies. Everything except sizes and timestamps is encrypted by
 the client before it is sent.
 
+
 ## Design rules
 
 **Name the outcome.** No reply means "success" generically. In Obsidian's
@@ -205,6 +206,44 @@ something else: a real, zero-byte note.
 A deletion is an entry with `deleted:true`, not the absence of one. That record
 is what makes the file recoverable and what stops a vault of deleted files from
 looking like an empty vault.
+
+## Recovery
+
+Two operations, both read-only. Between them a client can find out what the
+server is holding that the vault no longer has, and then use the ordinary `get`
+to pull it back.
+
+| | |
+|---|---|
+| `history` | `{op, path, before?, limit?}` answered by `{res:"history", path, entries}` |
+| `deleted` | `{op}` answered by `{res:"deleted", entries}` |
+
+`path` is sealed, going up and coming back. The server has never been able to
+read a path and recovery does not change that: it is a key in a table.
+
+`history` returns every version of one path, newest first, deletions included,
+because a history that stops at the last version with content does not say what
+happened. `before` pages backwards: pass the oldest uid already held. An empty
+list is not an error and is not distinguishable from a purged history, because
+the server cannot tell those apart and inventing the distinction would be a lie
+in a recovery tool.
+
+`deleted` returns every path whose newest version is a deletion, newest first,
+with renames suppressed. Suppression is not optional: a rename retires the old
+path, so without it most of the list is phantom deletions of files that still
+exist under another name.
+
+`entries` is an array in both, never null, for the same reason batches carry an
+array: a client iterating null crashes on exactly the answer it exists to
+handle, and for `deleted` that is the common case.
+
+### Restoring is not an operation
+
+There is no `restore` on the wire and there is not going to be one. A client
+asks for the history, fetches the version it wants with `get`, writes it into
+the vault, and the ordinary sync uploads it as a new version. That leaves the
+server with one way to change a vault, the one that is already tested to death,
+and the client had to download the content regardless.
 
 ## Crypto
 

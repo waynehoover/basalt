@@ -481,3 +481,89 @@ describe("reconnect pacing", () => {
         expect(b.isReady(1_000)).toBe(true);
     });
 });
+
+/**
+ * Recovery is the one place where "there is nothing" and "I could not tell" are
+ * most easily confused, and where confusing them costs most: somebody is
+ * looking for a note they have lost.
+ */
+describe("recovery answers from a server that answers badly", () => {
+    it("asks with the sealed path and reads back what it is given", async () => {
+        const { t, socket } = await helloed();
+        const asked = t.history("SEALED-PATH", { before: 40, limit: 5 });
+        await settle();
+        expect(socket.sentText.at(-1)).toMatchObject({
+            op: "history",
+            path: "SEALED-PATH",
+            before: 40,
+            limit: 5,
+        });
+
+        socket.reply({ res: "history", path: "SEALED-PATH", entries: [{ uid: 3 }, { uid: 2 }] });
+        expect((await asked).map((e) => e.uid)).toEqual([3, 2]);
+    });
+
+    it("omits paging fields it was not given, rather than sending zeroes", async () => {
+        // Zero means "start at the newest" to the server, which is the same
+        // thing, but sending a limit of zero would ask for the default and look
+        // deliberate. Absent is the honest way to say nothing was specified.
+        const { t, socket } = await helloed();
+        void t.history("SEALED");
+        await settle();
+        const sent = socket.sentText.at(-1)!;
+        expect("before" in sent).toBe(false);
+        expect("limit" in sent).toBe(false);
+    });
+
+    /**
+     * The one that matters. A reply with no entries field, or a null one, must
+     * not become "nothing was deleted": that is the answer somebody acts on by
+     * concluding their note is unrecoverable.
+     */
+    it("refuses an answer with no list in it rather than reading it as empty", async () => {
+        for (const bad of [
+            { res: "deleted" },
+            { res: "deleted", entries: null },
+            { res: "deleted", entries: "none" },
+            { res: "deleted", entries: 0 },
+        ]) {
+            const { t, socket } = await helloed();
+            const asked = t.deleted();
+            await settle();
+            socket.reply(bad);
+            await expect(asked, JSON.stringify(bad)).rejects.toThrow(/without a list of entries/);
+        }
+    });
+
+    it("refuses a history answer with no list in it", async () => {
+        const { t, socket } = await helloed();
+        const asked = t.history("SEALED");
+        await settle();
+        socket.reply({ res: "history", path: "SEALED", entries: null });
+        await expect(asked).rejects.toThrow(/without a list of entries/);
+    });
+
+    it("refuses an answer to a question it did not ask", async () => {
+        const { t, socket } = await helloed();
+        const asked = t.deleted();
+        await settle();
+        socket.reply({ res: "chunks", uid: 1, size: 0, chunks: [] });
+        await expect(asked).rejects.toThrow(/expected deleted/);
+    });
+
+    it("passes on a refusal rather than reporting an empty vault", async () => {
+        const { t, socket } = await helloed();
+        const asked = t.history("SEALED");
+        await settle();
+        socket.reply({ res: "err", code: "internal", msg: "could not read history" });
+        await expect(asked).rejects.toThrow(/could not read history/);
+    });
+
+    it("accepts an empty list, which is the ordinary answer", async () => {
+        const { t, socket } = await helloed();
+        const asked = t.deleted();
+        await settle();
+        socket.reply({ res: "deleted", entries: [] });
+        expect(await asked).toEqual([]);
+    });
+});

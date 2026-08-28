@@ -23,7 +23,7 @@
 
 import { Modal, Notice, Plugin, Setting, type TAbstractFile, type TextComponent } from "obsidian";
 
-import { Client, runForever, summarise, type ClientOptions } from "../core/client.ts";
+import { Client, runForever, summarise, type ClientOptions, type Version } from "../core/client.ts";
 import { deriveKeys, generateSecret } from "../core/crypto.ts";
 import type { SyncReport } from "../core/engine.ts";
 import {
@@ -65,6 +65,11 @@ export default class BasaltPlugin extends Plugin {
             name: "Show status",
             callback: () => new BasaltModal(this).open(),
         });
+        this.addCommand({
+            id: "recover-deleted",
+            name: "Recover a deleted note",
+            callback: () => new RecoverModal(this).open(),
+        });
 
         // Obsidian's own events, rather than a watcher. They are what the
         // platform gives, they work on mobile, and they say when to look rather
@@ -82,7 +87,18 @@ export default class BasaltPlugin extends Plugin {
             this.registerEvent(this.app.vault.on("create", () => this.nudge()));
             this.registerEvent(this.app.vault.on("modify", () => this.nudge()));
             this.registerEvent(this.app.vault.on("delete", () => this.nudge()));
-            this.registerEvent(this.app.vault.on("rename", (_f: TAbstractFile, _old: string) => this.nudge()));
+            // The old path is the whole point of this event. A rename that
+            // arrives as a delete plus an add still moves the file, but it
+            // retires the old path as a deletion, and the list of deleted notes
+            // is then mostly phantoms of files that still exist under another
+            // name. The engine turns the pair into one operation, and until
+            // this line existed nothing ever told it one had happened.
+            this.registerEvent(
+                this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
+                    this.client?.engine.noteRename(oldPath, file.path);
+                    this.nudge();
+                })
+            );
         });
 
         try {
@@ -302,6 +318,42 @@ export default class BasaltPlugin extends Plugin {
         return formatPairing(config);
     }
 
+    /* ------------------------------------------------------------ *
+     * Recovery
+     * ------------------------------------------------------------ */
+
+    /**
+     * Notes the server still holds and this vault does not.
+     *
+     * Needs a connection, and says so rather than showing an empty list. "There
+     * is nothing to recover" and "I could not ask" are different answers, and
+     * confusing them in a recovery tool is the worst place to do it.
+     */
+    async deletedNotes(): Promise<Version[]> {
+        if (!this.client) throw new Error("not connected, so there is no way to ask what the server has");
+        return this.client.deleted();
+    }
+
+    /**
+     * Puts a note back, never over the top of something already there.
+     *
+     * What the deleted list hands over is the *deletion*, which is a version
+     * like any other and has no content in it. What has to be restored is the
+     * version before it, so that is looked up here rather than assumed.
+     */
+    async recover(deletion: Version): Promise<string> {
+        if (!this.client) throw new Error("not connected, so there is nothing to restore from");
+        const version = await this.client.newestContentVersion(deletion.path);
+        if (!version) {
+            throw new Error(`the server holds no version of ${deletion.path} with any content in it`);
+        }
+        const done = await this.client.restore(version);
+        // Sent now rather than at the next pass, so the other devices get it
+        // without anybody having to know that they would not have.
+        await this.client.settle({ coalesceWrites: false });
+        return done.path;
+    }
+
     /** The string another device needs, or undefined when this one is unpaired. */
     invite(): string | undefined {
         return this.config ? formatPairing(this.config) : undefined;
@@ -457,6 +509,16 @@ class BasaltModal extends Modal {
         }
 
         new Setting(contentEl)
+            .setName("Recover a deleted note")
+            .setDesc("The server keeps every version of everything, including what you have deleted.")
+            .addButton((b) =>
+                b.setButtonText("Browse deleted").onClick(() => {
+                    this.close();
+                    new RecoverModal(this.plugin).open();
+                })
+            );
+
+        new Setting(contentEl)
             .setName("Unlink this vault")
             .setDesc("Stops syncing. Every note stays where it is, here and on the server.")
             .addButton((b) =>
@@ -535,6 +597,77 @@ class BasaltModal extends Modal {
                 }
             })
         );
+    }
+}
+
+/**
+ * What the server still has and this vault does not.
+ *
+ * The only interface to the safety net. Deliberately a list of notes and a
+ * button each, with no options: recovery is something somebody reaches for once
+ * in a bad afternoon, and it should not be a thing to learn.
+ */
+class RecoverModal extends Modal {
+    constructor(private readonly plugin: BasaltPlugin) {
+        super(plugin.app);
+    }
+
+    override onOpen(): void {
+        void this.render();
+    }
+
+    override onClose(): void {
+        this.contentEl.empty();
+    }
+
+    private async render(): Promise<void> {
+        const { contentEl } = this;
+        contentEl.empty();
+        contentEl.createEl("h2", { text: "Deleted notes" });
+
+        let deleted: Version[];
+        try {
+            deleted = await this.plugin.deletedNotes();
+        } catch (err) {
+            // Not an empty list. "There is nothing to recover" and "I could not
+            // ask" are different answers and this is the worst place to confuse
+            // them.
+            contentEl.createEl("p", { text: `Cannot ask the server: ${(err as Error).message}` });
+            return;
+        }
+
+        if (deleted.length === 0) {
+            contentEl.createEl("p", { text: "Nothing has been deleted from this vault." });
+            return;
+        }
+
+        contentEl.createEl("p", {
+            text: `${deleted.length} ${deleted.length === 1 ? "note is" : "notes are"} recoverable. Restoring puts one back and sends it to your other devices.`,
+        });
+
+        for (const version of deleted) {
+            new Setting(contentEl)
+                .setName(version.path)
+                .setDesc(`Deleted ${new Date(version.mtime).toLocaleString()}, last written on ${version.device}`)
+                .addButton((b) =>
+                    b
+                        .setButtonText("Restore")
+                        .setCta()
+                        .onClick(async () => {
+                            try {
+                                const at = await this.plugin.recover(version);
+                                new Notice(
+                                    at === version.path
+                                        ? `Restored ${at}.`
+                                        : `Restored to ${at}, because something is already at ${version.path}.`
+                                );
+                                await this.render();
+                            } catch (err) {
+                                new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+                            }
+                        })
+                );
+        }
     }
 }
 

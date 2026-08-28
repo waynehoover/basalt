@@ -149,3 +149,39 @@ Then enable it in Obsidian's community plugins list. Note that the root secret
 lives in `.obsidian/plugins/basalt/data.json` in the clear, which is the same
 exposure as the headless client's `config.json` and is inherent: the device has
 to be able to decrypt the vault without asking anybody.
+
+## Recovery
+
+The server has kept every version of every note and every deletion since the
+first commit. These are how you reach it.
+
+```
+basalt deleted                       what the server still has and this vault does not
+basalt history "Quarterly plan.md"   every version, newest first, deletions included
+basalt restore "Quarterly plan.md"   put the newest version with content back
+basalt restore "Q.md" --uid 42       put one exact version back
+basalt restore "Q.md" --to old/Q.md  put it somewhere else
+```
+
+In the plugin it is one command, "Recover a deleted note", and a list with a
+button beside each.
+
+Two things worth knowing. Restoring never overwrites: if the path is occupied
+the recovered copy lands beside it under `(restored N)` and says so. And a
+restored note keeps the timestamp it was written with, not the moment it was
+recovered, so a note from March does not sort to the top of everything.
+
+Restoring is not a server operation. The client fetches the version with the
+ordinary `get`, writes it, and the ordinary sync sends it on. The server keeps
+one way to change a vault.
+
+### Renames, and why the headless client reports them as deletions
+
+A filesystem scan cannot tell a rename from a delete plus a create: one path is
+gone, another has arrived, and nothing connects them. Obsidian does know, and
+its rename event carries the old path, so the plugin tells the engine and the
+rename travels as one operation and stays out of the deleted list.
+
+The headless client gets no such event and reports what it saw. Nothing is lost
+either way: the content is on the server under both names, and deduplication
+means the second name cost nothing to store.
