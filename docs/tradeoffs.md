@@ -89,6 +89,13 @@ edit inside a code fence would fix it and would also refuse the three cases
 above that merge correctly, which is the worse trade, so it stands as a known
 limit rather than a fixed one.
 
+`node-diff3` was tried as a replacement, since it is maintained, pure JavaScript
+and has the notion of a conflicting region that diff-match-patch lacks. It
+conflicted on five of the eight cases that merge cleanly here, including two
+devices appending to a daily note, and caught nothing the four checks miss. It
+is line-wise, and a Markdown paragraph is one line. The measurement is in
+`client/src/core/merge.ts`.
+
 ## One backend, against many
 
 They support WebDAV, S3, Google Drive and a module system. Basalt supports one
@@ -146,13 +153,11 @@ Said plainly, because a comparison that only runs one way is an advertisement.
 - **Field testing.** 351 and 2890 stars against a plugin that has run in a real
   vault once, for minutes.
 - **Backends.** They work with storage you already pay for.
-- **Merging.** Their region-aware diff3 handles the code-block case above, and
-  `node-diff3` on npm is maintained and pure JavaScript, where the library used
+- **Merging.** Their region-aware diff3 handles the code-block case above. It is
+  the region splitting that does it, not diff3 itself, which was tried here and
+  is too coarse for prose. And their library is maintained, where the one used
   here has not been published since 2020.
 - **Reach.** They are installable from Obsidian's community list.
-- **Round trips.** Their engine overlaps requests; this one sends exactly one at
-  a time, because a reply carries no request id. On a 400ms link that is most of
-  the sync time, and `docs/benchmark.md` measures it.
 
 ## What reading them changed here
 
@@ -162,6 +167,9 @@ Said plainly, because a comparison that only runs one way is an advertisement.
   large, folders several deep. Half the large ones incompressible here, because
   prose is what hid a chunk-size defect for months.
 - Correctness reported next to speed, which is their idea and a good one.
+- Batched writes and batched reads. Their engine overlaps requests to hide
+  latency; measuring against that is what made a first sync's 314 round trips
+  look like the defect it was. `docs/benchmark.md` has the before and after.
 - A parse check on merged JSON, for canvas files. It turned out every shape that
   would break one is already refused by an existing check, which is worth
   knowing and is why the check is documented as unreached.

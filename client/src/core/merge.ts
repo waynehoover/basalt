@@ -88,6 +88,31 @@
  * because the flags are the precise defect this module exists to invert. What is
  * not done is pretending they are tested.
  *
+ * ## Why not node-diff3, which is the algorithm git uses
+ *
+ * `node-diff3` (3.2.1, June 2026, pure JS) does a real three-way merge with
+ * proper conflict regions, which is precisely the notion diff-match-patch lacks
+ * and which the four checks above exist to reconstruct. On the face of it, it
+ * should replace all of them.
+ *
+ * It was tried against the cases in merge.test.ts. It conflicted on five of the
+ * eight that merge cleanly here, and caught nothing that the checks above miss:
+ *
+ *   - two devices appending to a daily note
+ *   - two devices inserting at the same point
+ *   - two words changed in one long paragraph
+ *   - two words changed in one sentence
+ *
+ * The reason is granularity. diff3 is line-wise, and a Markdown paragraph is one
+ * line, so any two edits to one paragraph collide. Basalt's notes are prose,
+ * where that is the common case rather than the rare one, and it would mean a
+ * conflict copy most days for the most ordinary thing two devices do.
+ *
+ * So the trade is real and it goes the other way: diff3 is safer per line and
+ * far too coarse per note. It is worth revisiting if character-level three-way
+ * merging appears in a maintained library; diff-match-patch has shipped nothing
+ * since 2020, which is a risk this file carries knowingly.
+ *
  * ## Where this sits between the two predecessors
  *
  * Obsidian merges silently and drops what does not fit. LiveSync mostly opens a
