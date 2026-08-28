@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/waynehoover/basalt/internal/wire"
@@ -290,5 +291,39 @@ func (c *client) rename(to, from string, bodies ...string) int64 {
 	default:
 		c.t.Fatalf("%s: rename to %s: unexpected reply %v", c.name, to, m)
 		return 0
+	}
+}
+
+// A vault accumulates deletions for as long as it exists. An unbounded answer
+// is one frame that grows without limit, and a silently truncated one is worse:
+// somebody reads a short list, does not find their note, and concludes it is
+// gone.
+func TestDeletedIsBoundedAndSaysWhenItWasCut(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	for i := 0; i < 12; i++ {
+		path := fmt.Sprintf("note-%02d.md", i)
+		cl.put(path, fmt.Sprintf("body %d", i))
+		cl.remove(path)
+	}
+
+	var page wire.Deleted
+	cl.sendJSON(wire.In{Op: "deleted", Limit: 5})
+	cl.recvInto("deleted", &page)
+
+	if len(page.Entries) != 5 {
+		t.Fatalf("asked for 5 deletions, got %d", len(page.Entries))
+	}
+	if !page.More {
+		t.Fatal("the list was cut short and did not say so")
+	}
+
+	// And when it fits, it says so too, rather than always claiming more.
+	cl.sendJSON(wire.In{Op: "deleted", Limit: 100})
+	cl.recvInto("deleted", &page)
+	if len(page.Entries) != 12 || page.More {
+		t.Fatalf("got %d deletions with more=%v, want 12 and false", len(page.Entries), page.More)
 	}
 }

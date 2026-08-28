@@ -23,13 +23,21 @@
 
 import { Modal, Notice, Plugin, Setting, type TAbstractFile, type TextComponent } from "obsidian";
 
-import { Client, runForever, summarise, type ClientOptions, type Version } from "../core/client.ts";
+import {
+    Client,
+    runForever,
+    summarise,
+    type ClientOptions,
+    type DeletedList,
+    type Version,
+} from "../core/client.ts";
 import { deriveKeys, generateSecret } from "../core/crypto.ts";
 import type { SyncReport } from "../core/engine.ts";
 import {
     decodeConfig,
     encodeConfig,
     formatPairing,
+    normaliseUrl,
     parsePairing,
     type DeviceConfig,
 } from "../core/pairing.ts";
@@ -329,7 +337,7 @@ export default class BasaltPlugin extends Plugin {
      * is nothing to recover" and "I could not ask" are different answers, and
      * confusing them in a recovery tool is the worst place to do it.
      */
-    async deletedNotes(): Promise<Version[]> {
+    async deletedNotes(): Promise<DeletedList> {
         if (!this.client) throw new Error("not connected, so there is no way to ask what the server has");
         return this.client.deleted();
     }
@@ -625,7 +633,7 @@ class RecoverModal extends Modal {
         contentEl.empty();
         contentEl.createEl("h2", { text: "Deleted notes" });
 
-        let deleted: Version[];
+        let deleted: DeletedList;
         try {
             deleted = await this.plugin.deletedNotes();
         } catch (err) {
@@ -636,16 +644,23 @@ class RecoverModal extends Modal {
             return;
         }
 
-        if (deleted.length === 0) {
+        if (deleted.notes.length === 0) {
             contentEl.createEl("p", { text: "Nothing has been deleted from this vault." });
             return;
         }
 
+        const n = deleted.notes.length;
         contentEl.createEl("p", {
-            text: `${deleted.length} ${deleted.length === 1 ? "note is" : "notes are"} recoverable. Restoring puts one back and sends it to your other devices.`,
+            text: `${n} ${n === 1 ? "note is" : "notes are"} recoverable. Restoring puts one back and sends it to your other devices.`,
         });
+        if (deleted.more) {
+            // Never a short list that looks complete.
+            contentEl.createEl("p", {
+                text: "There are older deletions than these. basalt deleted --limit N on the command line shows more.",
+            });
+        }
 
-        for (const version of deleted) {
+        for (const version of deleted.notes) {
             new Setting(contentEl)
                 .setName(version.path)
                 .setDesc(`Deleted ${new Date(version.mtime).toLocaleString()}, last written on ${version.device}`)
@@ -686,19 +701,3 @@ function longStatus(state: State): string {
     }
 }
 
-/**
- * Accepts what a person is likely to type.
- *
- * The same rule as the CLI, and the same reasoning: a bare host gets TLS,
- * because TLS is terminated in front of the server and the plain case is the one
- * worth being explicit about.
- */
-function normaliseUrl(input: string): string {
-    const text = input.trim().replace(/\/+$/, "");
-    if (text === "") throw new Error("that is not a server address");
-    if (text.startsWith("ws://") || text.startsWith("wss://")) return text;
-    if (text.startsWith("http://")) return "ws://" + text.slice("http://".length);
-    if (text.startsWith("https://")) return "wss://" + text.slice("https://".length);
-    if (text.includes("://")) throw new Error(`a server address is ws:// or wss://, not ${text.split("://")[0]}://`);
-    return "wss://" + text;
-}

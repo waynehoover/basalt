@@ -178,7 +178,15 @@ export class Engine {
     private readonly pending = new Set<string>();
     private readonly retries = new Map<string, Retry>();
     /** Paths that can never sync. Kept apart from retries on purpose. */
-    private readonly skipped = new Map<string, string>();
+    /**
+     * Paths written off, and what the file looked like when they were.
+     *
+     * The fingerprint is the point. "Permanent" describes the file, not the
+     * path, and a file can be changed: somebody whose note is refused for being
+     * too large shortens it. Without the fingerprint the path stayed written
+     * off until the application restarted, and nothing said so.
+     */
+    private readonly skipped = new Map<string, { why: string; fingerprint: string }>();
     /** Sealed path to plaintext, so a path is unsealed once per session. */
     private readonly unsealed = new Map<string, string>();
 
@@ -359,9 +367,16 @@ export class Engine {
         const paths = new Set<string>([...onDisk.keys(), ...this.entries.keys(), ...this.remote.keys()]);
 
         for (const path of [...paths].sort()) {
-            if (this.skipped.has(path)) {
-                report.skipped++;
-                continue;
+            const skip = this.skipped.get(path);
+            if (skip) {
+                if (fingerprintOf(this.entries.get(path)) === skip.fingerprint) {
+                    report.skipped++;
+                    continue;
+                }
+                // Changed since it was written off. Whatever was wrong with it
+                // may not be any more, and the only way to find out is to try.
+                this.skipped.delete(path);
+                this.log("skipped file changed, trying again", path);
             }
             const retry = this.retries.get(path);
             if (retry && retry.at > now) {
@@ -718,7 +733,7 @@ export class Engine {
         const permanent = code !== undefined && ["badentry", "badname", "toolarge"].includes(code);
 
         if (permanent) {
-            this.skipped.set(path, message);
+            this.skipped.set(path, { why: message, fingerprint: fingerprintOf(this.entries.get(path)) });
             report.skipped++;
             this.log("skipped for good", path, message);
             return;
@@ -770,4 +785,16 @@ function add(a: SyncReport, b: SyncReport): SyncReport {
     const out = { ...a };
     for (const k of Object.keys(out) as (keyof SyncReport)[]) out[k] = a[k] + b[k];
     return out;
+}
+
+/**
+ * Enough of a file to notice it changed.
+ *
+ * Modification time and size rather than a content hash, because this is read
+ * before the pass decides whether to re-read anything, and a hash would mean
+ * reading every written-off file on every pass to find out whether it was still
+ * written off.
+ */
+function fingerprintOf(entry: IndexEntry | undefined): string {
+    return entry ? `${entry.mtime}:${entry.size}` : "gone";
 }

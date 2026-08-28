@@ -718,12 +718,12 @@ func (s *Session) handleHistory(m wire.In) error {
 // what it was called, so the ordering is newest first and renames are
 // suppressed. See wire.Deleted for why suppression is not optional.
 func (s *Session) handleDeleted(m wire.In) error {
-	entries, err := s.srv.st.Deleted(s.vaultID, true)
+	entries, more, err := s.srv.st.Deleted(s.vaultID, true, m.Limit)
 	if err != nil {
 		s.srv.log.Error("deleted", "vault", s.vaultID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("could not list deletions"))
 	}
-	return s.writeJSON(wire.Deleted{Res: "deleted", Entries: nonNil(entries)})
+	return s.writeJSON(wire.Deleted{Res: "deleted", Entries: nonNil(entries), More: more})
 }
 
 // nonNil keeps an empty result an empty array rather than JSON null.

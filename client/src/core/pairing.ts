@@ -216,3 +216,25 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     }
     return { url: str("url"), token: str("token"), vaultId: str("vaultId"), device: str("device"), secret };
 }
+
+/**
+ * Accepts what a person is likely to type as a server address.
+ *
+ * `http` and `https` because that is what somebody copies out of a browser, and
+ * a bare host because that is what somebody types. A bare host gets TLS, because
+ * TLS is terminated in front of the server and the plain case is the one worth
+ * being explicit about.
+ *
+ * Here rather than in a shell because both shells need it, and they had a
+ * byte-identical copy each. That is the thing `core` exists to prevent: two
+ * copies of a rule are two rules, and only one of them had a test.
+ */
+export function normaliseUrl(input: string): string {
+    const text = input.trim().replace(/\/+$/, "");
+    if (text === "") throw new Error("that is not a server address");
+    if (text.startsWith("ws://") || text.startsWith("wss://")) return text;
+    if (text.startsWith("http://")) return "ws://" + text.slice("http://".length);
+    if (text.startsWith("https://")) return "wss://" + text.slice("https://".length);
+    if (text.includes("://")) throw new Error(`a server address is ws:// or wss://, not ${text.split("://")[0]}://`);
+    return "wss://" + text;
+}

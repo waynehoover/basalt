@@ -27,7 +27,9 @@ import { resolve } from "node:path";
 import { deriveKeys, generateSecret } from "../core/crypto.ts";
 import { Client, runForever, type ClientOptions } from "../core/client.ts";
 import type { SyncReport } from "../core/engine.ts";
-import { formatPairing, parsePairing } from "../core/pairing.ts";
+import { formatPairing, normaliseUrl, parsePairing } from "../core/pairing.ts";
+
+export { normaliseUrl };
 import { JsonIndexStore, NodeVault } from "./vault.ts";
 import { indexPath, loadConfig, removeState, saveConfig, type Config } from "./config.ts";
 
@@ -282,20 +284,23 @@ async function cmdDeleted(args: Args, io: Console): Promise<number> {
     const config = await mustLoad(args.dir);
     const client = await open(config, args, io);
     try {
-        const gone = await client.deleted();
+        const gone = await client.deleted(args.limit > 20 ? args.limit : undefined);
         if (args.json) {
-            io.out(JSON.stringify({ ok: true, deleted: gone }));
-            return 0;
+            io.out(JSON.stringify({ ok: true, deleted: gone.notes, more: gone.more }));
+            return gone.more ? 0 : 0;
         }
-        if (gone.length === 0) {
+        if (gone.notes.length === 0) {
             io.out("Nothing has been deleted from this vault.");
             return 0;
         }
-        for (const v of gone) {
+        for (const v of gone.notes) {
             io.out(`${when(v.mtime)}  ${v.device.padEnd(12)}  ${v.path}`);
         }
         io.out("");
-        io.out(`${gone.length} deleted, all still recoverable. basalt restore PATH brings one back.`);
+        io.out(`${gone.notes.length} deleted, all still recoverable. basalt restore PATH brings one back.`);
+        // Never a short list that looks complete. Somebody reading one and not
+        // finding their note concludes it is gone.
+        if (gone.more) io.out("There are older deletions than these. --limit N shows more.");
         return 0;
     } finally {
         client.close();
@@ -547,23 +552,6 @@ async function mustLoad(dir: string): Promise<Config> {
     return config;
 }
 
-/**
- * Accepts what a person is likely to type and turns it into a WebSocket URL.
- *
- * `http` and `https` are accepted because that is what somebody copies out of a
- * browser, and a bare host is accepted because that is what somebody types.
- * `wss` is assumed for a bare host, because TLS is terminated in front of the
- * server and the plain case is the one worth making explicit.
- */
-export function normaliseUrl(input: string): string {
-    const text = input.trim().replace(/\/+$/, "");
-    if (text === "") throw new Error("that is not a server address");
-    if (text.startsWith("ws://") || text.startsWith("wss://")) return text;
-    if (text.startsWith("http://")) return "ws://" + text.slice("http://".length);
-    if (text.startsWith("https://")) return "wss://" + text.slice("https://".length);
-    if (text.includes("://")) throw new Error(`a server address is ws:// or wss://, not ${text.split("://")[0]}://`);
-    return "wss://" + text;
-}
 
 /** A timestamp somebody can read, which is the point of a recovery listing. */
 function when(ms: number): string {

@@ -194,7 +194,7 @@ match on the way in.
 | Deterministic sealing, so dedup works without the server holding a key | **Built** |
 | Paths sealed and reversible, so a device can recover a filename | **Built** |
 | Server stores no key material and terminates no TLS | **Built** |
-| PBKDF2 at 310,000 iterations for a passphrase-derived vault | **Built** |
+| PBKDF2 at 310,000 iterations for a passphrase-derived vault | **Written**, and nothing calls it |
 | Authentication by token, compared in constant time | **Built** |
 | Server storing only a hash of the auth key | **Designed** |
 

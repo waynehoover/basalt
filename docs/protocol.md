@@ -216,7 +216,7 @@ to pull it back.
 | | |
 |---|---|
 | `history` | `{op, path, before?, limit?}` answered by `{res:"history", path, entries}` |
-| `deleted` | `{op}` answered by `{res:"deleted", entries}` |
+| `deleted` | `{op, limit?}` answered by `{res:"deleted", entries, more}` |
 
 `path` is sealed, going up and coming back. The server has never been able to
 read a path and recovery does not change that: it is a key in a table.
@@ -228,8 +228,12 @@ list is not an error and is not distinguishable from a purged history, because
 the server cannot tell those apart and inventing the distinction would be a lie
 in a recovery tool.
 
-`deleted` returns every path whose newest version is a deletion, newest first,
-with renames suppressed. Suppression is not optional: a rename retires the old
+`deleted` returns paths whose newest version is a deletion, newest first, with
+renames suppressed. It is bounded at 1000, because a vault accumulates deletions
+for as long as it exists and an unbounded answer is one frame that grows without
+limit. `more` says the list was cut short, and a client must show that: a
+truncated list that does not say so is one somebody reads before concluding
+their note is gone. Suppression is not optional: a rename retires the old
 path, so without it most of the list is phantom deletions of files that still
 exist under another name.
 

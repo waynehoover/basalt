@@ -264,6 +264,11 @@ type History struct {
 type Deleted struct {
 	Res     string        `json:"res"` // "deleted"
 	Entries []store.Entry `json:"entries"`
+	// More says the list was cut short. A vault accumulates deletions for as
+	// long as it exists, so the answer is bounded; saying nothing about it
+	// would hand somebody a short list that looks complete, and the note they
+	// are looking for is exactly the one that might be missing from it.
+	More bool `json:"more"`
 }
 
 // Pong answers a ping. A client behind NAT needs something to send.

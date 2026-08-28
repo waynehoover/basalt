@@ -84,6 +84,30 @@ export class Client {
         this.engine = engine;
     }
 
+    /**
+     * One thing at a time on the wire.
+     *
+     * The transport allows a single request in flight and throws otherwise, on
+     * purpose: replies carry no request id, so a second question would resolve
+     * into the first one's slot. The engine is single-flight and so never trips
+     * it, which was the whole story until recovery arrived.
+     *
+     * Recovery is not part of the engine. Somebody browsing deleted notes while
+     * the background sync ticks is two callers, and they collide. So everything
+     * here that touches the wire queues behind everything else that does.
+     *
+     * The granularity is one engine pass, not one settle, so a question does
+     * not wait behind eight of them.
+     */
+    private queue: Promise<unknown> = Promise.resolve();
+
+    private serial<T>(work: () => Promise<T>): Promise<T> {
+        // Runs on both paths: one caller's failure must not stop the next.
+        const next = this.queue.then(work, work);
+        this.queue = next.catch(() => undefined);
+        return next;
+    }
+
     /** The newest uid the server held when this client said hello. */
     get serverCursor(): number {
         return this.limits?.cursor ?? 0;
@@ -119,14 +143,20 @@ export class Client {
      * bug, caught by the first end-to-end test that read the output.
      */
     async settle(opts: SyncOptions = {}, maxPasses = 8): Promise<SyncReport> {
-        let pass = await this.engine.sync(opts);
+        // Each pass queues separately, so a recovery question asked halfway
+        // through waits for one pass rather than for all of them.
+        let pass = await this.pass(opts);
         let total = pass;
         for (let i = 0; i < maxPasses && didSomething(pass); i++) {
             await sleep(60);
-            pass = await this.engine.sync(opts);
+            pass = await this.pass(opts);
             total = accumulate(total, pass);
         }
         return total;
+    }
+
+    private pass(opts: SyncOptions): Promise<SyncReport> {
+        return this.serial(() => this.engine.sync(opts));
     }
 
     /**
@@ -161,7 +191,7 @@ export class Client {
      */
     async sync(opts: SyncOptions = {}): Promise<SyncReport | undefined> {
         try {
-            return await this.engine.sync(opts);
+            return await this.pass(opts);
         } catch (err) {
             this.opts.log?.("sync failed", (err as Error).message);
             return undefined;
@@ -181,7 +211,7 @@ export class Client {
      */
     async history(path: string, opts: { before?: number; limit?: number } = {}): Promise<Version[]> {
         const sealed = await sealPath(this.opts.keys, path);
-        const entries = await this.transport.history(sealed, opts);
+        const entries = await this.serial(() => this.transport.history(sealed, opts));
         return entries.map((e) => this.asVersion(e, path));
     }
 
@@ -192,13 +222,13 @@ export class Client {
      * remember what it was called, which is why the paths are unsealed here
      * rather than left for the caller.
      */
-    async deleted(): Promise<Version[]> {
-        const entries = await this.transport.deleted();
-        const out: Version[] = [];
-        for (const e of entries) {
-            out.push(this.asVersion(e, await openPath(this.opts.keys, e.path)));
+    async deleted(limit?: number): Promise<DeletedList> {
+        const answer = await this.serial(() => this.transport.deleted(limit));
+        const notes: Version[] = [];
+        for (const e of answer.entries) {
+            notes.push(this.asVersion(e, await openPath(this.opts.keys, e.path)));
         }
-        return out;
+        return { notes, more: answer.more };
     }
 
     /**
@@ -226,14 +256,21 @@ export class Client {
             return { path: at, bytes: 0 };
         }
 
-        const content = await this.engine.contentOf(version.uid);
+        // Queued like a pass, because reassembling a version is several
+        // requests and a sync starting in the middle of them would collide.
+        const content = await this.serial(() => this.engine.contentOf(version.uid));
         const wanted = to ?? version.path;
         const at = (await this.opts.vault.exists(wanted)) ? restoredCopyPath(wanted, version) : wanted;
         await this.opts.vault.write(at, content, { mtime: version.mtime, ctime: version.ctime });
         return { path: at, bytes: content.length };
     }
 
-    /** The newest version of a path that had content, or undefined. */
+    /**
+     * The newest version of a path that had content, or undefined.
+     *
+     * Not queued itself: it is a call to `history`, which is. Queuing here as
+     * well would be a lock waiting for itself.
+     */
     async newestContentVersion(path: string): Promise<Version | undefined> {
         const versions = await this.history(path, { limit: 50 });
         return versions.find((v) => !v.deleted);
@@ -256,6 +293,18 @@ export class Client {
     close(): void {
         this.transport.close();
     }
+}
+
+/**
+ * What the server is still holding that the vault is not.
+ *
+ * `more` rather than just a list, because the answer is bounded and a truncated
+ * list that does not say so is one somebody reads and concludes their note is
+ * gone.
+ */
+export interface DeletedList {
+    readonly notes: Version[];
+    readonly more: boolean;
 }
 
 /** One version of one note, as recovery talks about it. */

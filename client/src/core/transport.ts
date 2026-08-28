@@ -618,12 +618,15 @@ export class Transport {
      * a deletion behind at the old path, and a recovery list that is mostly
      * phantom deletions of files that still exist is one nobody reads.
      */
-    async deleted(): Promise<WireEntry[]> {
-        const reply = await this.request({ op: "deleted" });
+    async deleted(limit?: number): Promise<{ entries: WireEntry[]; more: boolean }> {
+        const reply = await this.request({ op: "deleted", ...(limit !== undefined ? { limit } : {}) });
         if (reply["res"] !== "deleted") {
             throw new ProtocolError("protostate", `expected deleted, got ${JSON.stringify(reply)}`);
         }
-        return entriesOf(reply["entries"], "deleted");
+        // `more` says the server cut the list short. Dropping it would hand
+        // somebody a short list that looks complete, and the note they are
+        // looking for is exactly the one that might be missing from it.
+        return { entries: entriesOf(reply["entries"], "deleted"), more: reply["more"] === true };
     }
 
     /**

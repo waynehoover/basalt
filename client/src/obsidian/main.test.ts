@@ -542,8 +542,8 @@ describe("renames, which only Obsidian can report", () => {
 
         // The server knows it was a rename, so the old path is not offered as
         // something to recover.
-        const client = (plugin as unknown as { client?: { deleted(): Promise<{ path: string }[]> } }).client;
-        const gone = (await client!.deleted()).map((v) => v.path);
+        const client = (plugin as unknown as { client?: { deleted(): Promise<{ notes: { path: string }[] }> } }).client;
+        const gone = (await client!.deleted()).notes.map((v) => v.path);
         expect(gone, `deleted list was ${JSON.stringify(gone)}`).not.toContain("old-name.md");
     }, 300_000);
 
@@ -560,8 +560,8 @@ describe("renames, which only Obsidian can report", () => {
         await plugin.syncNow();
         await plugin.syncNow();
 
-        const client = (plugin as unknown as { client?: { deleted(): Promise<{ path: string }[]> } }).client;
-        const gone = (await client!.deleted()).map((v) => v.path);
+        const client = (plugin as unknown as { client?: { deleted(): Promise<{ notes: { path: string }[] }> } }).client;
+        const gone = (await client!.deleted()).notes.map((v) => v.path);
         expect(gone).toContain("before.md");
         expect(app.vault.adapter.text("after.md")).toBe("content that moves");
     }, 300_000);

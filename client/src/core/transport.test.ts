@@ -520,6 +520,18 @@ describe("recovery answers from a server that answers badly", () => {
      * not become "nothing was deleted": that is the answer somebody acts on by
      * concluding their note is unrecoverable.
      */
+    it("carries the server saying the list was cut short", async () => {
+        // Dropping this hands somebody a short list that looks complete, and
+        // the note they are looking for is exactly the one that might be
+        // missing from it.
+        const { t, socket } = await helloed();
+        const asked = t.deleted(2);
+        await settle();
+        expect(socket.sentText.at(-1)).toMatchObject({ op: "deleted", limit: 2 });
+        socket.reply({ res: "deleted", entries: [{ uid: 9 }, { uid: 8 }], more: true });
+        expect((await asked).more).toBe(true);
+    });
+
     it("refuses an answer with no list in it rather than reading it as empty", async () => {
         for (const bad of [
             { res: "deleted" },
@@ -564,6 +576,6 @@ describe("recovery answers from a server that answers badly", () => {
         const asked = t.deleted();
         await settle();
         socket.reply({ res: "deleted", entries: [] });
-        expect(await asked).toEqual([]);
+        expect(await asked).toEqual({ entries: [], more: false });
     });
 });

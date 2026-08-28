@@ -419,7 +419,7 @@ func TestABackupKeepsHistoryAndDeletions(t *testing.T) {
 	if string(body) != "version one" {
 		t.Fatalf("oldest body is %q", body)
 	}
-	del, err := restored.Deleted("v1", true)
+	del, _, err := restored.Deleted("v1", true, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}

@@ -44,7 +44,7 @@ class Device {
 
     constructor(readonly name: string) {}
 
-    async connect(server: TestServer): Promise<void> {
+    async connect(server: TestServer, log?: (message: string) => void): Promise<void> {
         this.caughtUp = false;
         this.transport = new Transport(server.wsUrl, {
             onBatch: async (b) => {
@@ -67,6 +67,7 @@ class Device {
             // A clock the test advances, so the size-scaled write debounce does
             // not decide when a sync may happen.
             now: () => (this.clock += 60_000),
+            ...(log ? { log } : {}),
         });
         await this.transport.connect();
         await this.engine.start();
@@ -98,10 +99,10 @@ async function fresh(): Promise<TestServer> {
     return server;
 }
 
-async function device(name: string): Promise<Device> {
+async function device(name: string, log?: (message: string) => void): Promise<Device> {
     const d = new Device(name);
     devices.push(d);
-    await d.connect(server);
+    await d.connect(server, log);
     return d;
 }
 
@@ -693,4 +694,54 @@ describe("the guards the happy path hides", () => {
         const settled = await a.engine.sync();
         expect(settled.uploaded).toBe(0);
     }, 120_000);
+});
+
+describe("a file that could not sync, and then could", () => {
+    /**
+     * A permanent refusal stops the retries, which is right: a file the server
+     * will reject for the same reason every time is noise that hides everything
+     * else. But "permanent" describes the *file*, not the path, and a file can
+     * be changed.
+     *
+     * Somebody whose note is refused for being too large shortens it, and
+     * nothing happens, because the path was written off. The only way back was
+     * to restart the application, and nothing said so.
+     *
+     * The refusal used here is an over-long name, which shortening the file does
+     * not fix, so it is refused again. That is the correct outcome and not the
+     * property being tested: what is tested is that it was tried at all, and the
+     * log is where an attempt is observable.
+     */
+    it("tries again once the file has changed", async () => {
+        await fresh();
+        const said: string[] = [];
+        const a = await device("a", (m) => said.push(m));
+
+        // One filename past the server's limit: the cheapest permanent refusal
+        // that lands on exactly one path. A deep path would refuse every folder
+        // above it too.
+        const tooLong = `${"x".repeat(5000)}.md`;
+        await a.vault.edit(tooLong, "refused", 1_000);
+        await a.vault.edit("fine.md", "accepted", 1_000);
+
+        const refused = await a.settle();
+        expect(refused.skipped, `report was ${JSON.stringify(refused)}`).toBe(1);
+        expect(said.filter((m) => m === "skipped for good").length).toBe(1);
+
+        // Unchanged, so it stays written off rather than being asked again.
+        await a.settle();
+        expect(said.filter((m) => m === "skipped for good").length).toBe(1);
+        expect(said.filter((m) => m.startsWith("skipped file changed")).length).toBe(0);
+
+        // Now the file changes.
+        await a.vault.edit(tooLong, "different content entirely", 2_000);
+        await a.settle();
+        expect(
+            said.filter((m) => m.startsWith("skipped file changed")).length,
+            "a changed file was never tried again"
+        ).toBe(1);
+        // Tried, and refused again, which is the honest outcome for a name that
+        // is still too long.
+        expect(said.filter((m) => m === "skipped for good").length).toBe(2);
+    }, 300_000);
 });

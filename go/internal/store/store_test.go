@@ -512,7 +512,7 @@ func TestAVaultOfDeletedFilesIsNotAnEmptyVault(t *testing.T) {
 	if st.Versions != 6 {
 		t.Fatalf("Versions = %d, want 6: deletions are entries", st.Versions)
 	}
-	del, err := h.Deleted("v1", true)
+	del, _, err := h.Deleted("v1", true, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -536,7 +536,7 @@ func TestRenameDeletionIsSuppressedInTheDeletedList(t *testing.T) {
 		t.Fatalf("append new: %v", err)
 	}
 
-	suppressed, err := h.Deleted("v1", true)
+	suppressed, _, err := h.Deleted("v1", true, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -544,7 +544,7 @@ func TestRenameDeletionIsSuppressedInTheDeletedList(t *testing.T) {
 		t.Fatalf("rename shows as %d deletions: %v", len(suppressed), suppressed[0].Path)
 	}
 	// Unsuppressed it is still visible, because the record itself is real.
-	raw, err := h.Deleted("v1", false)
+	raw, _, err := h.Deleted("v1", false, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -1123,7 +1123,7 @@ func TestRenameDeletionIsSuppressedWhenTheNewPathIsPublishedFirst(t *testing.T) 
 		t.Fatalf("delete old: %v", err)
 	}
 
-	got, err := h.Deleted("v1", true)
+	got, _, err := h.Deleted("v1", true, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}
@@ -1153,7 +1153,7 @@ func TestADeletionIsStillListedWhenThePathWasReusedAfterARename(t *testing.T) {
 		t.Fatalf("delete the reused path: %v", err)
 	}
 
-	got, err := h.Deleted("v1", true)
+	got, _, err := h.Deleted("v1", true, 0)
 	if err != nil {
 		t.Fatalf("deleted: %v", err)
 	}

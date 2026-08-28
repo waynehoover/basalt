@@ -571,7 +571,18 @@ func (s *Store) HistoryForPath(vaultID, path string, beforeUID int64, limit int)
 // there is no intervening incarnation of the path between the rename and the
 // deletion. That holds for both orders of the two halves, and stops holding as
 // soon as the path is reused.
-func (s *Store) Deleted(vaultID string, suppressRenames bool) ([]Entry, error) {
+// DeletedMax is the most deletions one call will return.
+//
+// Bounded because a vault accumulates deletions for as long as it exists, and
+// an unbounded answer is a single frame that grows without limit. The caller is
+// told when it was truncated rather than being handed a short list that looks
+// complete: rule 7, and a recovery list quietly missing the note somebody is
+// looking for is the worst version of it.
+const DeletedMax = 1000
+
+// Deleted returns paths whose newest version is a deletion, newest first, and
+// whether there were more than it returned.
+func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Entry, bool, error) {
 	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path
 	        FROM entries e
 	        JOIN (SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path) latest
@@ -587,9 +598,21 @@ func (s *Store) Deleted(vaultID string, suppressRenames bool) ([]Entry, error) {
 		                    WHERE p.vault_id = e.vault_id AND p.path = e.path AND p.uid < e.uid),
 		                  0))`
 	}
-	q += ` ORDER BY e.uid DESC`
+	if limit <= 0 || limit > DeletedMax {
+		limit = DeletedMax
+	}
+	// One more than asked for, so "there are more" is a fact rather than a
+	// guess from a full page.
+	q += ` ORDER BY e.uid DESC LIMIT ?`
 
-	return s.manyEntries(vaultID, q, vaultID, vaultID)
+	entries, err := s.manyEntries(vaultID, q, vaultID, vaultID, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(entries) > limit {
+		return entries[:limit], true, nil
+	}
+	return entries, false, nil
 }
 
 func (s *Store) manyEntries(vaultID, query string, args ...any) ([]Entry, error) {
