@@ -529,12 +529,12 @@ describe("the guards the happy path hides", () => {
      * A device that was not part of the conflict still ends up with both
      * versions.
      *
-     * Being straight about what this does and does not pin down: it passes with
-     * the conflict copy's upload removed, so it is not a test *of* that upload.
-     * Some other path carries both versions here, and which one has not been
-     * established. The upload stays because a third device having only the
-     * version that won the real path is the obvious failure and is what it
-     * exists to prevent; what is missing is a case that isolates it.
+     * This one passes with the conflict copy's upload removed, and the reason is
+     * worth writing down rather than leaving as a puzzle: the copy is a new file
+     * in the vault, so the very next scan finds it and uploads it like any other
+     * new file. The scan is the backstop. The explicit upload only makes it
+     * happen a round earlier, and the test below is the one that shows why a
+     * round earlier matters.
      */
     it("carries both versions to a device that was not part of the conflict", async () => {
         await fresh();
@@ -555,6 +555,122 @@ describe("the guards the happy path hides", () => {
         const all = Object.values(c.vault.snapshot()).join("\n---\n");
         expect(all, "c never received A's version").toContain("A's completely different sentence");
         expect(all, "c never received B's version").toContain("B's entirely other sentence");
+    }, 300_000);
+
+    /**
+     * The device that detected the conflict sends both versions before it can
+     * stop.
+     *
+     * The scan is the backstop for the conflict copy, and a backstop that needs
+     * another pass is not one for the case that matters: B notices the conflict,
+     * writes the copy, and then the laptop lid closes. If the copy has not
+     * already left, the only place A's own text still exists is A, and A is about
+     * to download B's version over it.
+     *
+     * So B syncs exactly once here and then goes away for good. Everything A
+     * recovers, it recovers from what that single pass uploaded.
+     */
+    it("gets both versions off the device before it stops syncing", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        await a.vault.edit("note.md", "# Note\n\nThe original sentence.\n");
+        await convergeBoth(a, b);
+
+        await a.vault.edit("note.md", "# Note\n\nA's completely different sentence.\n");
+        await b.vault.edit("note.md", "# Note\n\nB's entirely other sentence.\n");
+
+        // A publishes first, so it is B that finds the conflict.
+        await a.engine.sync();
+        await new Promise((r) => setTimeout(r, 120));
+        const report = await b.engine.sync();
+        expect(report.conflicted, "B was meant to be the one that conflicted").toBe(1);
+
+        // And B is gone. One pass, no second chance.
+        b.close();
+        await new Promise((r) => setTimeout(r, 120));
+
+        await a.settle(6);
+
+        const all = Object.values(a.vault.snapshot()).join("\n---\n");
+        expect(all, "A lost its own version").toContain("A's completely different sentence");
+        expect(all, "A never received B's version").toContain("B's entirely other sentence");
+    }, 300_000);
+
+    /**
+     * Two devices that independently arrive at the same content have synced,
+     * and the index has to say so.
+     *
+     * The same note typed twice, or restored from the same backup twice. Nothing
+     * is transferred, so it is tempting to call it a no-op. It is not: if the
+     * ancestor does not move to the content both sides hold, the next pair of
+     * edits merges against a version neither device has ever had, which is a
+     * conflict reported for two edits that never overlapped.
+     *
+     * Nothing else in this file pins that down, because everywhere else the
+     * ancestor was already recorded by whichever transfer put the content there.
+     * Here there was no transfer.
+     */
+    it("records the ancestor when both devices already agree", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        const base = ["# Note", "", "First paragraph.", "", "Second paragraph.", "", "Third paragraph."].join("\n");
+        // Typed on both, neither having seen the other. Byte for byte the same.
+        await a.vault.edit("note.md", base);
+        await b.vault.edit("note.md", base);
+        await convergeBoth(a, b, 6);
+
+        // Now the edits that must merge rather than collide.
+        await a.vault.edit("note.md", base.replace("First paragraph.", "First paragraph, edited on A."));
+        await b.vault.edit("note.md", base.replace("Third paragraph.", "Third paragraph, edited on B."));
+        await convergeBoth(a, b, 6);
+
+        for (const d of [a, b]) {
+            const text = d.vault.text("note.md") ?? "";
+            expect(text, `${d.name} lost A's edit`).toContain("edited on A");
+            expect(text, `${d.name} lost B's edit`).toContain("edited on B");
+            expect(d.vault.paths().filter((x) => x.includes("Conflicted copy")), `${d.name} conflicted`).toEqual([]);
+        }
+    }, 300_000);
+
+    /**
+     * A download records the ancestor itself, rather than leaving it for the
+     * next pass to notice.
+     *
+     * Once a file has been downloaded, local and remote agree, so the pass above
+     * would set the ancestor on the following scan anyway. That makes the two
+     * mechanisms cover for each other, and cover is not the same as either one
+     * being tested. This closes the window between them: B downloads and the
+     * user edits straight away, so there is no following scan in which both
+     * sides still agree.
+     */
+    it("records the ancestor on the download itself", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        const base = ["# Note", "", "First paragraph.", "", "Second paragraph.", "", "Third paragraph."].join("\n");
+        await a.vault.edit("note.md", base);
+        await a.engine.sync();
+        await new Promise((r) => setTimeout(r, 150));
+
+        await b.engine.sync();
+        expect(b.vault.text("note.md"), "B was meant to have downloaded it by now").toBe(base);
+
+        // Edited before any pass in which local and remote still agree.
+        await b.vault.edit("note.md", base.replace("Third paragraph.", "Third paragraph, edited on B."));
+        await a.vault.edit("note.md", base.replace("First paragraph.", "First paragraph, edited on A."));
+        await convergeBoth(a, b, 6);
+
+        for (const d of [a, b]) {
+            const text = d.vault.text("note.md") ?? "";
+            expect(text, `${d.name} lost A's edit`).toContain("edited on A");
+            expect(text, `${d.name} lost B's edit`).toContain("edited on B");
+            expect(d.vault.paths().filter((x) => x.includes("Conflicted copy")), `${d.name} conflicted`).toEqual([]);
+        }
     }, 300_000);
 
     it("runs one pass at a time however often it is asked", async () => {

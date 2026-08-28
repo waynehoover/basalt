@@ -18,24 +18,27 @@
  *     work queue cannot tell those apart, which is why Obsidian keeps
  *     `fileRetry` and `skippedFiles` as separate tables and so does this.
  *
- * ## What is not covered by a test
+ * ## What the tests pin down
  *
- * Thirteen of sixteen deliberate breakages of this file are caught by two
- * engines converging through a real server. Three are not, and they are named
- * here rather than left for somebody to discover by deleting them:
+ * Every one of sixteen deliberate breakages of this file is caught by two
+ * engines converging through a real server. Three of them took a specific case
+ * to catch, and those cases are worth knowing about because each one is a real
+ * way to lose a note:
  *
- *   - Moving the ancestor when the two sides already agree, and recording what
- *     was synced after a download. These cover each other: remove either and the
- *     other still sets the ancestor, so no test sees a single removal. Both are
- *     needed and neither is individually pinned.
- *   - Uploading the conflict copy. A third device should otherwise receive only
- *     the version that won the real path, but the test written for that passes
- *     with the upload removed, so something else is carrying both versions and
- *     what has not been established.
+ *   - Moving the ancestor when the two sides already agree. Nothing transfers,
+ *     so it looks like a no-op; skip it and the next pair of edits merges
+ *     against a version neither device ever had.
+ *   - Recording the ancestor on the download itself. The line above would set it
+ *     on the following pass anyway, so the two cover each other. The case that
+ *     separates them is a user editing straight after a download, before any
+ *     pass in which both sides still agree.
+ *   - Uploading the conflict copy rather than waiting for the next scan to find
+ *     it as a new file. The scan is a real backstop, and it is no use when the
+ *     device that found the conflict syncs once and then stops: the other device
+ *     downloads the winning version over its own text, and its own text is gone.
  *
- * All three stay. Each is a line, each has a reason, and "no current test
- * notices" is a fact about the tests rather than about the inputs a vault will
- * produce. What is not done is calling them tested.
+ * None of the three is caught by asserting that two devices agree, which is
+ * rule 10 of docs/philosophy.md in its natural habitat.
  */
 
 import { looksLikeText, chunkBytes, sizesFor } from "./chunk.ts";
