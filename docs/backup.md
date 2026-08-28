@@ -163,3 +163,28 @@ what:
 If you only do one, do the device one: it is readable. If you can do both, the
 server backup is what holds the history and what survives losing everything you
 type on.
+
+## What the commands refuse
+
+Only `serve` creates a data directory. On a first run there is nothing there
+yet and that is the normal case.
+
+`backup`, `verify` and `purge` refuse a `-data` path that is not already one.
+A mistyped path used to be created on the spot, so the backup succeeded, of
+nothing, and said so. Somebody who rotates their backups on the strength of
+"backed up to ..." would have thrown away the copy that had their notes in it.
+The check happens before the lock is taken, because taking a lock creates the
+directory to hold the lock file, and a refusal that leaves litter in whatever
+place the typo pointed at is only half a refusal.
+
+## Reclaiming space with purge
+
+`purge` spares unreferenced bodies written within the last hour, in case they
+belong to a push that uploaded but had not yet committed. Purge holds the data
+directory exclusively, so no server can be running while it works, and the
+window is really for the debris of a server killed mid-upload.
+
+That default reclaims nothing at all on a server stopped a moment ago, which is
+exactly when somebody purges to free space. `-grace 0` says to collect
+everything unreferenced. It is safe when nothing was interrupted, and the way to
+know is that you stopped the server yourself.

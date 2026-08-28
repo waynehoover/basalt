@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -27,31 +28,37 @@ import (
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
+	if err := run(context.Background(), os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, "basalt:", err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string) error {
+// run is main with somewhere to write to, so that what these commands report
+// can be read by a test rather than only by a person.
+//
+// What they report is not decoration. Rule 5 is that an operation which makes a
+// list smaller prints its arithmetic, and backup and purge both do; an
+// untestable print is an untestable promise.
+func run(ctx context.Context, args []string, out io.Writer) error {
 	// Subcommands come before flag parsing so `basalt verify -deep` reads the
 	// way it looks.
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd, rest := args[0], args[1:]
 		switch cmd {
 		case "verify":
-			return cmdVerify(rest)
+			return cmdVerify(rest, out)
 		case "purge":
-			return cmdPurge(rest)
+			return cmdPurge(rest, out)
 		case "serve":
-			return cmdServe(rest)
+			return cmdServe(ctx, rest, out)
 		case "backup":
-			return cmdBackup(rest)
+			return cmdBackup(rest, out)
 		default:
 			return fmt.Errorf("unknown command %q (try serve, backup, verify, purge)", cmd)
 		}
 	}
-	return cmdServe(args)
+	return cmdServe(ctx, args, out)
 }
 
 // dataFlags are shared by every subcommand, because every one of them opens the
@@ -84,6 +91,41 @@ func openStore(dataDir string) (*store.Store, error) {
 	return store.Open(dbPath, chunkDir)
 }
 
+// openExisting is openStore for the commands that must not create one.
+//
+// Only `serve` has any business making a data directory: on first run there is
+// nothing there yet and that is the normal case. For the other three it means
+// somebody mistyped `-data`, and creating an empty one turns a typo into a
+// successful backup of nothing, a clean verify of nothing, and a purge that
+// reports it removed nothing. The backup is the dangerous one: a person who
+// rotates on the strength of a success message has now thrown away the copy
+// that had their notes in it.
+func openExisting(dataDir, verb string) (*store.Store, error) {
+	if err := requireDataDir(dataDir, verb); err != nil {
+		return nil, err
+	}
+	return openStore(dataDir)
+}
+
+// requireDataDir refuses a path that is not already a data directory.
+//
+// Called before the lock rather than after, because taking a lock creates the
+// directory to put the lock file in. Checked afterwards, a mistyped -data was
+// still refused and still left an empty directory with a lock file in it,
+// which is litter in whatever place the typo pointed at.
+func requireDataDir(dataDir, verb string) error {
+	dbPath, _ := store.DataDir(dataDir)
+	if _, err := os.Stat(dbPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf(
+				"there is no basalt data directory at %s, so there is nothing to %s.\n"+
+					"Check the -data path. Only `basalt serve` creates one.", dataDir, verb)
+		}
+		return err
+	}
+	return nil
+}
+
 // locked turns a lock refusal into something a person can act on.
 //
 // A shared holder records nothing in its own lock file, so a refusal on the data
@@ -111,7 +153,12 @@ const stopFirst = "Stop the running basalt process and try again."
  * serve
  * ---------------------------------------------------------------- */
 
-func cmdServe(args []string) error {
+// cmdServe blocks until the context is cancelled or a signal arrives.
+//
+// The context is how a test stops it. Before it existed, serving could only be
+// ended by signalling the process, which in a test means signalling the test
+// runner, so nothing here could be exercised at all.
+func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
 	addr := fs.String("addr", ":3003", "listen address")
@@ -173,9 +220,9 @@ func cmdServe(args []string) error {
 		// No WriteTimeout: these are long-lived websockets.
 	}
 
-	printSetup(*addr, *vault, token, fresh)
+	printSetup(out, *addr, *vault, token, fresh)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	errc := make(chan error, 1)
@@ -201,20 +248,20 @@ func cmdServe(args []string) error {
 	}
 }
 
-func printSetup(addr, vault, token string, fresh bool) {
+func printSetup(out io.Writer, addr, vault, token string, fresh bool) {
 	host := addr
 	if strings.HasPrefix(addr, ":") {
 		host = "<this-host>" + addr
 	}
 	if fresh {
-		fmt.Println("A new auth token was generated for this server.")
+		fmt.Fprintln(out, "A new auth token was generated for this server.")
 	}
-	fmt.Printf("basalt listening on %s, serving vault %q\n", addr, vault)
-	fmt.Printf("  %s#%s\n", host, token)
-	fmt.Println()
-	fmt.Println("That token authenticates a device. It is not the encryption key:")
-	fmt.Println("the vault passphrase is generated on your first device and this")
-	fmt.Println("server never sees it, so it cannot read anything it stores.")
+	fmt.Fprintf(out, "basalt listening on %s, serving vault %q\n", addr, vault)
+	fmt.Fprintf(out, "  %s#%s\n", host, token)
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "That token authenticates a device. It is not the encryption key:")
+	fmt.Fprintln(out, "the vault passphrase is generated on your first device and this")
+	fmt.Fprintln(out, "server never sees it, so it cannot read anything it stores.")
 }
 
 // loadOrCreateToken reads the auth token, creating one on first run.
@@ -276,7 +323,7 @@ func newToken() (string, error) {
  * verify
  * ---------------------------------------------------------------- */
 
-func cmdVerify(args []string) error {
+func cmdVerify(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
 	deep := fs.Bool("deep", false, "read every chunk and check it against its name")
@@ -285,13 +332,17 @@ func cmdVerify(args []string) error {
 	}
 
 	// Read-only, so shared: this runs happily against a live server.
+	if err := requireDataDir(*dataDir, "verify"); err != nil {
+		return err
+	}
+
 	lock, err := dirlock.Shared(*dataDir, dirlock.Data)
 	if err != nil {
 		return locked(err, *dataDir, "verify", stopFirst)
 	}
 	defer lock.Release()
 
-	st, err := openStore(*dataDir)
+	st, err := openExisting(*dataDir, "verify")
 	if err != nil {
 		return err
 	}
@@ -303,9 +354,9 @@ func cmdVerify(args []string) error {
 	}
 	// Both numbers, always. Zero faults out of zero checks is not a healthy
 	// vault, and reporting only the faults makes those two look identical.
-	fmt.Printf("checked %d chunk references, %d faults\n", checked, len(faults))
+	fmt.Fprintf(out, "checked %d chunk references, %d faults\n", checked, len(faults))
 	for _, f := range faults {
-		fmt.Println(" ", f)
+		fmt.Fprintln(out, " ", f)
 	}
 	if len(faults) > 0 {
 		return fmt.Errorf("%d entries cannot be served", len(faults))
@@ -317,17 +368,36 @@ func cmdVerify(args []string) error {
  * purge
  * ---------------------------------------------------------------- */
 
-func cmdPurge(args []string) error {
+func cmdPurge(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
 	vault := fs.String("vault", "default", "vault to purge")
+	// The grace window spares bodies uploaded so recently that the entry
+	// referencing them may not have been committed yet. Purge holds the data
+	// directory exclusively, so no server can be running while it works and
+	// nothing can be in flight; the window is for the debris of a server killed
+	// mid-push, whose bodies are indistinguishable from those of a push about
+	// to complete.
+	//
+	// It is a flag because the default reclaims nothing at all on a server
+	// stopped a moment ago, which is exactly when somebody purges to free
+	// space. They would see everything spared and have no way to say otherwise.
+	grace := fs.Duration("grace", chunks.DefaultGrace,
+		"spare unreferenced bodies written within this long, in case a push was interrupted mid-upload")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *grace < 0 {
+		return fmt.Errorf("-grace cannot be negative, and %s is", *grace)
 	}
 
 	// Exclusive: purge is the only thing that deletes chunk bodies, and the
 	// store's mutex only serialises that against commits in the *same* process.
 	// Taking this exclusively is what stops it racing a running server.
+	if err := requireDataDir(*dataDir, "purge"); err != nil {
+		return err
+	}
+
 	lock, err := dirlock.Exclusive(*dataDir, dirlock.Data, "purge")
 	if err != nil {
 		return locked(err, *dataDir, "purge",
@@ -335,19 +405,19 @@ func cmdPurge(args []string) error {
 	}
 	defer lock.Release()
 
-	st, err := openStore(*dataDir)
+	st, err := openExisting(*dataDir, "purge")
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	rep, err := st.Purge(*vault, chunks.DefaultGrace)
+	rep, err := st.Purge(*vault, *grace)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("versions %d -> %d (removed %d)\n",
+	fmt.Fprintf(out, "versions %d -> %d (removed %d)\n",
 		rep.VersionsBefore, rep.VersionsAfter, rep.VersionsRemoved)
-	fmt.Printf("chunks %d live, %d deleted, %d spared as too recent to collect\n",
+	fmt.Fprintf(out, "chunks %d live, %d deleted, %d spared as too recent to collect\n",
 		rep.ChunksLive, rep.ChunksDeleted, rep.ChunksSpared)
 
 	// Purging is the one operation that deletes data, so it verifies what it
@@ -358,16 +428,16 @@ func cmdPurge(args []string) error {
 	}
 	if len(faults) > 0 {
 		for _, f := range faults {
-			fmt.Println(" ", f)
+			fmt.Fprintln(out, " ", f)
 		}
 		return fmt.Errorf("purge left %d unserveable entries out of %d references", len(faults), checked)
 	}
-	fmt.Printf("verified %d chunk references, all present\n", checked)
+	fmt.Fprintf(out, "verified %d chunk references, all present\n", checked)
 	if rep.VersionsRemoved > 0 {
 		// Purge is the one command that destroys something no device holds a
 		// copy of: old versions, and the deletion records that make a deleted
 		// note recoverable. Saying so after the fact is the least it can do.
-		fmt.Printf("\n%d versions are gone for good. Only a backup taken before now has them.\n",
+		fmt.Fprintf(out, "\n%d versions are gone for good. Only a backup taken before now has them.\n",
 			rep.VersionsRemoved)
 	}
 	return nil
@@ -377,7 +447,7 @@ func cmdPurge(args []string) error {
  * backup
  * ---------------------------------------------------------------- */
 
-func cmdBackup(args []string) error {
+func cmdBackup(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("backup", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
 	to := fs.String("to", "", "directory to back up into (required)")
@@ -392,6 +462,10 @@ func cmdBackup(args []string) error {
 
 	// Shared: a backup only reads, so it does not need the server stopped. It
 	// does need purge held off, which the shared lock does.
+	if err := requireDataDir(*dataDir, "back up"); err != nil {
+		return err
+	}
+
 	lock, err := dirlock.Shared(*dataDir, dirlock.Data)
 	if err != nil {
 		return locked(err, *dataDir, "backup",
@@ -399,7 +473,7 @@ func cmdBackup(args []string) error {
 	}
 	defer lock.Release()
 
-	st, err := openStore(*dataDir)
+	st, err := openExisting(*dataDir, "back up")
 	if err != nil {
 		return err
 	}
@@ -408,7 +482,7 @@ func cmdBackup(args []string) error {
 	rep, err := st.Backup(*to, *deep)
 	if err != nil {
 		// The numbers so far are still worth printing: they say how far it got.
-		fmt.Println(rep)
+		fmt.Fprintln(out, rep)
 		return err
 	}
 
@@ -422,32 +496,32 @@ func cmdBackup(args []string) error {
 		return fmt.Errorf("copying the auth token into the backup: %w", err)
 	}
 
-	fmt.Printf("backed up to %s\n", rep.Dir)
-	fmt.Printf("  %d vaults, %d chunk references, %d bodies copied (%s)\n",
+	fmt.Fprintf(out, "backed up to %s\n", rep.Dir)
+	fmt.Fprintf(out, "  %d vaults, %d chunk references, %d bodies copied (%s)\n",
 		rep.Vaults, rep.Refs, rep.Copied, humanBytes(rep.Bytes))
-	fmt.Printf("  %d bodies at source, %d in the backup\n", rep.SourceBodies, rep.DestBodies)
-	fmt.Printf("  verified %d chunk references in the backup, all present\n", rep.Verified)
+	fmt.Fprintf(out, "  %d bodies at source, %d in the backup\n", rep.SourceBodies, rep.DestBodies)
+	fmt.Fprintf(out, "  verified %d chunk references in the backup, all present\n", rep.Verified)
 	if rep.SourceBodies != rep.DestBodies {
 		// Expected, and explained rather than left as a discrepancy: the backup
 		// holds what committed entries reference, and the source may also hold
 		// bodies from a push that never committed.
-		fmt.Printf("  (%d source bodies are referenced by no entry and were not copied)\n",
+		fmt.Fprintf(out, "  (%d source bodies are referenced by no entry and were not copied)\n",
 			rep.SourceBodies-rep.DestBodies)
 	}
 
 	if tokenCopied {
-		fmt.Println("  the device auth token is in the backup, so a restore needs no re-pairing")
+		fmt.Fprintln(out, "  the device auth token is in the backup, so a restore needs no re-pairing")
 	}
 
 	// The copy is ciphertext. Saying so every time is the point: a backup
 	// without the passphrase restores nothing, and that is the one part of this
 	// no command can check.
-	fmt.Println()
-	fmt.Println("This backup is ciphertext. Restoring it needs your vault passphrase,")
-	fmt.Println("which this server has never seen. Keep that written down somewhere")
-	fmt.Println("else, or the backup is a pile of bytes nobody can read.")
-	fmt.Printf("\nTo restore: point the server at it, or copy it back.\n")
-	fmt.Printf("  basalt verify -deep -data %s\n", rep.Dir)
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "This backup is ciphertext. Restoring it needs your vault passphrase,")
+	fmt.Fprintln(out, "which this server has never seen. Keep that written down somewhere")
+	fmt.Fprintln(out, "else, or the backup is a pile of bytes nobody can read.")
+	fmt.Fprintf(out, "\nTo restore: point the server at it, or copy it back.\n")
+	fmt.Fprintf(out, "  basalt verify -deep -data %s\n", rep.Dir)
 	return nil
 }
 
