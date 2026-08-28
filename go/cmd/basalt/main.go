@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +27,13 @@ import (
 	"github.com/waynehoover/basalt/internal/server"
 	"github.com/waynehoover/basalt/internal/store"
 )
+
+// version is stamped at build time with -X main.version=...
+//
+// A deployed server that cannot say what it is running is one you reason about
+// from memory. It is printed at startup and by `basalt version`, so the answer
+// is in the journal of every machine this is on.
+var version = "dev"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout); err != nil {
@@ -54,8 +62,13 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 			return cmdServe(ctx, rest, out)
 		case "backup":
 			return cmdBackup(rest, out)
+		case "service":
+			return cmdService(rest, out)
+		case "version":
+			fmt.Fprintf(out, "basalt %s %s/%s %s\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+			return nil
 		default:
-			return fmt.Errorf("unknown command %q (try serve, backup, verify, purge)", cmd)
+			return fmt.Errorf("unknown command %q (try serve, backup, verify, purge, service, version)", cmd)
 		}
 	}
 	return cmdServe(ctx, args, out)
@@ -266,7 +279,7 @@ func printSetup(out io.Writer, addr, vault, token string, fresh bool) {
 	if fresh {
 		fmt.Fprintln(out, "A new auth token was generated for this server.")
 	}
-	fmt.Fprintf(out, "basalt listening on %s, serving vault %q\n", addr, vault)
+	fmt.Fprintf(out, "basalt %s listening on %s, serving vault %q\n", version, addr, vault)
 	fmt.Fprintf(out, "  %s#%s\n", host, token)
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "That token authenticates a device. It is not the encryption key:")

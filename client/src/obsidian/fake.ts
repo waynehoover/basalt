@@ -27,7 +27,7 @@
  * code, which is where its bugs are.
  */
 
-import type { DataAdapter, DataWriteOptions, ListedFiles, Stat } from "obsidian";
+import type { DataAdapter, DataWriteOptions, ListedFiles, Stat, TAbstractFile, Vault } from "obsidian";
 
 /**
  * Obsidian's `normalizePath`, as it actually ships.
@@ -245,6 +245,28 @@ export class FakeAdapter implements DataAdapter {
         return file ? new TextDecoder().decode(file.binary) : undefined;
     }
 
+    /**
+     * What Obsidian's own index would hold: every file and folder, with each
+     * file's times and size attached.
+     *
+     * The real one is in memory and already populated, which is why the plugin
+     * reads it rather than asking the adapter about every file in turn.
+     */
+    index(): TAbstractFile[] {
+        const out: TAbstractFile[] = [];
+        for (const path of this.folders) {
+            out.push({ path, name: path.split("/").pop() ?? path } as unknown as TAbstractFile);
+        }
+        for (const [path, f] of this.files) {
+            out.push({
+                path,
+                name: path.split("/").pop() ?? path,
+                stat: { ctime: f.ctime, mtime: f.mtime, size: f.binary.length },
+            } as unknown as TAbstractFile);
+        }
+        return out;
+    }
+
     /** Every path that exists, files and folders, for comparing two vaults. */
     everything(): string[] {
         return [...this.files.keys(), ...this.folders].sort();
@@ -253,4 +275,34 @@ export class FakeAdapter implements DataAdapter {
     filePaths(): string[] {
         return [...this.files.keys()].sort();
     }
+}
+
+/**
+ * Obsidian's `Vault`, faked down to what the plugin reads from it.
+ *
+ * The plugin takes the vault rather than the adapter now, because the vault
+ * carries the index: `getAllLoadedFiles` is what the application already has in
+ * memory, and reading it costs nothing where asking the adapter about every
+ * file in turn costs one call each.
+ *
+ * Only what is used. A plugin that started reading more of the Vault API would
+ * fail here loudly rather than quietly working against a fake that agreed with
+ * it.
+ */
+export class FakeVaultIndex {
+    readonly adapter: FakeAdapter;
+    configDir = ".obsidian";
+
+    constructor(adapter: FakeAdapter = new FakeAdapter()) {
+        this.adapter = adapter;
+    }
+
+    getAllLoadedFiles(): TAbstractFile[] {
+        return this.adapter.index();
+    }
+}
+
+/** The fake, typed as the interface the plugin holds. */
+export function asVault(index: FakeVaultIndex): Vault {
+    return index as unknown as Vault;
 }

@@ -56,12 +56,18 @@ export default class BasaltPlugin extends Plugin {
     private client: Client | undefined;
     private state: State = { kind: "unpaired" };
     private statusEl: HTMLElement | undefined;
+    private ribbonEl: HTMLElement | undefined;
     private running = false;
     private nudgeTimer: ReturnType<typeof setTimeout> | undefined;
 
     override async onload(): Promise<void> {
+        // Obsidian mobile has no status bar. addStatusBarItem returns an
+        // element nothing displays there, so on a phone this is the plugin
+        // talking to itself. The ribbon is on both, so the state goes there too:
+        // its tooltip is the same sentence, and it is the thing somebody taps
+        // when they want to know.
         this.statusEl = this.addStatusBarItem();
-        this.addRibbonIcon("refresh-cw", "Basalt", () => new BasaltModal(this).open());
+        this.ribbonEl = this.addRibbonIcon("refresh-cw", "Basalt", () => new BasaltModal(this).open());
 
         this.addCommand({
             id: "sync-now",
@@ -198,7 +204,7 @@ export default class BasaltPlugin extends Plugin {
         const keys = await deriveKeys(config.secret);
         const derived = authToken(keys);
         return {
-            vault: new ObsidianVault(this.app.vault.adapter, configDir),
+            vault: new ObsidianVault(this.app.vault, configDir),
             store: new ObsidianIndexStore(this.app.vault.adapter, this.indexPath(configDir)),
             keys,
             url: config.url,
@@ -416,6 +422,9 @@ export default class BasaltPlugin extends Plugin {
     private setState(state: State): void {
         this.state = state;
         this.statusEl?.setText(`Basalt: ${shortStatus(state)}`);
+        // Where a phone can see it. `aria-label` is what Obsidian renders as a
+        // ribbon tooltip, and it is also what a screen reader reads out.
+        this.ribbonEl?.setAttribute("aria-label", `Basalt: ${longStatus(state)}`);
         for (const listener of this.listeners) listener(state);
     }
 
@@ -491,8 +500,22 @@ class BasaltModal extends Modal {
         }
 
         const status = contentEl.createEl("p");
+        const advice = contentEl.createEl("p", { cls: "basalt-advice" });
         this.unwatch = this.plugin.watchState((state) => {
             status.setText(longStatus(state));
+            // The server refuses a browser origin it does not know, and the
+            // only thing that knows this device's origin is this device. The
+            // desktop one is in the built-in list; the mobile ones are
+            // Capacitor's documented defaults and have never been checked
+            // against a device, so an offline phone should be able to say what
+            // to add rather than leaving somebody to guess.
+            advice.setText(
+                state.kind === "offline"
+                    ? `If it never connects, this device's origin is ${origin()}. ` +
+                          `A server that does not know it refuses the connection, and logs the same thing. ` +
+                          `Restart it with -allow-origin ${origin()}`
+                    : ""
+            );
         });
 
         new Setting(contentEl)
@@ -714,6 +737,18 @@ class RecoverModal extends Modal {
                 );
         }
     }
+}
+
+/**
+ * This device's browser origin, which is what a server checks a plugin against.
+ *
+ * `app://obsidian.md` on desktop, and something Capacitor chooses on a phone.
+ * Read rather than assumed, because the assumption is the thing that might be
+ * wrong.
+ */
+function origin(): string {
+    const l = (globalThis as { location?: { origin?: string } }).location;
+    return l?.origin ?? "unknown";
 }
 
 function longStatus(state: State): string {

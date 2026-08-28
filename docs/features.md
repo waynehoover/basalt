@@ -188,6 +188,9 @@ match on the way in.
 | Filesystem adapter | **Built** |
 | Obsidian Vault API adapter | **Built**, against a fake of Obsidian's own interface |
 | Obsidian plugin shell | **Built**, and run once in a real vault |
+| Scanning from Obsidian's own index, not one stat per file | **Built** |
+| A hardened systemd unit, printed with real paths | **Built** |
+| Static binaries for linux and macOS, and a plugin folder | **Built** |
 | Reconnect with backoff and jitter | **Built** |
 | Headless CLI | **Built** |
 | Pairing | **Built**, one string carrying the address and the secret |
@@ -263,4 +266,3 @@ Stated plainly, because a features list that only lists features is marketing.
   including a server that refused every browser client and so had never let a
   plugin connect at all (`docs/client-design.md`). What it has not had is
   ordinary use over days, or a second real device, or a phone.
-- **No packaging.** No release, no plugin listing, no systemd unit.

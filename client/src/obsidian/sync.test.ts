@@ -16,7 +16,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "../core/client.ts";
 import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
-import { FakeAdapter } from "./fake.ts";
+import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
 const SECRET = new Uint8Array(20).fill(77);
@@ -40,7 +40,7 @@ class Device {
 
     async connect(server: TestServer): Promise<void> {
         this.client = new Client({
-            vault: new ObsidianVault(this.adapter, ".obsidian"),
+            vault: new ObsidianVault(asVault(new FakeVaultIndex(this.adapter)), ".obsidian"),
             // Where the plugin puts it: inside its own folder, under
             // `.obsidian`, which never syncs.
             store: new ObsidianIndexStore(this.adapter, ".obsidian/plugins/basalt/index.json"),

@@ -714,3 +714,60 @@ describe("the modal, which is not a settings tab", () => {
         expect(plugin.paired).toBe(false);
     });
 });
+
+describe("on a device with no status bar", () => {
+    /**
+     * Obsidian mobile has no status bar, so `addStatusBarItem` returns an
+     * element nothing displays and the plugin's only ongoing feedback is the
+     * plugin talking to itself. The ribbon is on both, so the state goes there
+     * too, as the tooltip somebody gets by holding the icon.
+     */
+    it("puts the state on the ribbon as well", async () => {
+        await fresh();
+        const { plugin } = await load();
+        const ribbon = plugin.ribbonIcons[0]!;
+        expect(ribbon.title).toBe("Basalt");
+
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        // The same sentence the status bar carries, somewhere a phone shows it.
+        const label = ribbon.el.attributes.get("aria-label") ?? "";
+        expect(label, `the ribbon says ${JSON.stringify(label)}`).toMatch(/^Basalt: /);
+        expect(label).not.toMatch(/connecting/);
+    }, 300_000);
+
+    /**
+     * A server refuses a browser origin it does not know, and the only thing
+     * that knows this device's origin is this device. The mobile origins in the
+     * server's list are Capacitor's documented defaults and have never been
+     * checked against a device, so an offline phone has to be able to say what
+     * to add rather than leaving somebody guessing.
+     */
+    it("says what to allow when it cannot connect", async () => {
+        await fresh();
+        const { plugin } = await load();
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+        await server.cleanup();
+        await until("it to notice", () => plugin.currentState.kind === "offline");
+
+        built.length = 0;
+        plugin.ribbonIcons[0]!.callback();
+        await until("the modal to say so", () => modals.at(-1)!.contentEl.allText().includes("-allow-origin"));
+        const shown = modals.at(-1)!.contentEl.allText();
+        expect(shown).toMatch(/allow-origin/);
+        expect(shown, "it did not say what this device's origin actually is").toMatch(/origin is \S+/);
+    }, 300_000);
+
+    it("says nothing about origins while it is working", async () => {
+        await fresh();
+        const { plugin } = await load();
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        built.length = 0;
+        plugin.ribbonIcons[0]!.callback();
+        expect(modals.at(-1)!.contentEl.allText()).not.toMatch(/allow-origin/);
+    }, 300_000);
+});

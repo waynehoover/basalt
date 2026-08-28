@@ -13,7 +13,7 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { FakeAdapter, normalizePath } from "./fake.ts";
+import { FakeAdapter, FakeVaultIndex, asVault, normalizePath } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
 let adapter: FakeAdapter;
@@ -21,7 +21,7 @@ let vault: ObsidianVault;
 
 beforeEach(() => {
     adapter = new FakeAdapter();
-    vault = new ObsidianVault(adapter, ".obsidian");
+    vault = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
 });
 
 const enc = new TextEncoder();
@@ -97,7 +97,7 @@ describe("listing", () => {
      * with a custom one uploaded its own key.
      */
     it("leaves alone whatever Obsidian calls its config folder", async () => {
-        const odd = new ObsidianVault(adapter, ".my-config");
+        const odd = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".my-config");
         adapter.seed(".my-config/plugins/basalt/data.json", "the root secret lives here");
         adapter.seed("real.md", "x");
         expect((await odd.list()).map((f) => f.path)).toEqual(["real.md"]);
@@ -112,7 +112,7 @@ describe("listing", () => {
         // Anything else means the exclusion would not match what it should, and
         // a silently wrong exclusion is how the secret gets uploaded.
         for (const bad of ["", "/", "a/b"]) {
-            expect(() => new ObsidianVault(adapter, bad), JSON.stringify(bad)).toThrow(/plain name/);
+            expect(() => new ObsidianVault(asVault(new FakeVaultIndex(adapter)), bad), JSON.stringify(bad)).toThrow(/plain name/);
         }
     });
 
@@ -335,3 +335,65 @@ describe("the index", () => {
         expect((await store.load())?.cursor).toBe(1);
     });
 });
+
+/**
+ * The scan reads Obsidian's own index rather than asking the adapter about
+ * every file in turn.
+ *
+ * On a desktop the difference is wasteful; on a phone it is the difference
+ * between a scan you do not notice and one you do, since every adapter call
+ * crosses into the platform. The listing happens on every pass, so the cost is
+ * per pass, for ever.
+ */
+describe("what a scan costs", () => {
+    it("does not ask the adapter about each file", async () => {
+        const a = new FakeAdapter();
+        for (let i = 0; i < 200; i++) a.seed(`folder${i % 10}/note-${i}.md`, "x");
+        const counting = new CountingAdapter(a);
+        const v = new ObsidianVault(asVault(new FakeVaultIndex(counting as unknown as FakeAdapter)), ".obsidian");
+
+        const listed = await v.list();
+        expect(listed.length).toBe(210); // 200 notes and the 10 folders
+
+        expect(
+            { stat: counting.stats, list: counting.lists },
+            `a 200 file vault cost ${counting.stats} stat and ${counting.lists} list calls`
+        ).toEqual({ stat: 0, list: 0 });
+    });
+
+    it("still reports what the walk did", async () => {
+        // The same answers as before, from a different source. Folders with no
+        // stat, files with theirs.
+        const a = new FakeAdapter();
+        a.seed("notes/deep/two.md", "two");
+        a.seed("top.md", "top");
+        const v = new ObsidianVault(asVault(new FakeVaultIndex(a)), ".obsidian");
+
+        const byPath = new Map((await v.list()).map((f) => [f.path, f]));
+        expect([...byPath.keys()].sort()).toEqual(["notes", "notes/deep", "notes/deep/two.md", "top.md"]);
+        expect(byPath.get("notes")?.folder).toBe(true);
+        expect(byPath.get("top.md")?.folder).toBe(false);
+        expect(byPath.get("top.md")?.size).toBe(3);
+        expect(byPath.get("top.md")?.mtime).toBeGreaterThan(0);
+    });
+});
+
+/** Counts what the plugin asks of the adapter, which is meant to be nothing. */
+class CountingAdapter {
+    stats = 0;
+    lists = 0;
+
+    constructor(private readonly inner: FakeAdapter) {}
+
+    index() {
+        return this.inner.index();
+    }
+    async stat(p: string) {
+        this.stats++;
+        return this.inner.stat(p);
+    }
+    async list(p: string) {
+        this.lists++;
+        return this.inner.list(p);
+    }
+}

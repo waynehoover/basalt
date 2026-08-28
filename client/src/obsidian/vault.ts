@@ -44,7 +44,7 @@
  * reads and writes still land on the real file.
  */
 
-import { normalizePath, type DataAdapter } from "obsidian";
+import { normalizePath, type DataAdapter, type TAbstractFile, type Vault as ObsidianVaultApi } from "obsidian";
 
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
 
@@ -63,6 +63,18 @@ import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts"
  */
 const NEVER_SYNC = new Set([".basalt", ".trash", ".git", ".DS_Store"]);
 
+/**
+ * A file's size and times, or undefined when the thing is a folder.
+ *
+ * Structural rather than an `instanceof TFile`, because class identity across a
+ * plugin boundary works until a build changes and then fails in a way that
+ * looks like an empty vault.
+ */
+function statOf(item: TAbstractFile): { mtime: number; ctime: number; size: number } | undefined {
+    const stat = (item as { stat?: { mtime: number; ctime: number; size: number } }).stat;
+    return stat && typeof stat.size === "number" ? stat : undefined;
+}
+
 export class ObsidianVault implements Vault {
     /**
      * Normalized path to the adapter's own name for it, where they differ.
@@ -75,16 +87,19 @@ export class ObsidianVault implements Vault {
      */
     private readonly actualName = new Map<string, string>();
     private readonly ignore: Set<string>;
+    private readonly adapter: DataAdapter;
 
     /**
+     * @param vault Obsidian's own vault, read for its index of what exists.
      * @param configDir Obsidian's own config folder, from `Vault.configDir`.
      *   Required rather than defaulted, because the default would be right
      *   almost always and catastrophic the rest of the time.
      */
     constructor(
-        private readonly adapter: DataAdapter,
+        private readonly vault: ObsidianVaultApi,
         configDir: string
     ) {
+        this.adapter = vault.adapter;
         const name = configDir.replace(/^\/+|\/+$/g, "");
         if (name === "" || name.includes("/")) {
             // Obsidian's config dir is a single folder at the vault root. If it
@@ -95,54 +110,47 @@ export class ObsidianVault implements Vault {
         this.ignore = new Set([...NEVER_SYNC, name]);
     }
 
+    /**
+     * Everything in the vault, from Obsidian's own index.
+     *
+     * `getAllLoadedFiles` returns what the application already has in memory,
+     * with each file's size and times attached. The alternative, and what this
+     * did first, was to walk `adapter.list` and `stat` every file. That is one
+     * call per file per pass through the adapter, which on a desktop is merely
+     * wasteful and on a phone is the difference between a scan you do not
+     * notice and one you do. The walk is gone; nothing is read that Obsidian
+     * has not already read.
+     *
+     * A folder is told from a file structurally, by whether it carries a
+     * `stat`, rather than by `instanceof`. Class identity across a plugin
+     * boundary is a thing that works until a build changes.
+     */
     async list(): Promise<FileStat[]> {
         const out: FileStat[] = [];
         this.actualName.clear();
 
-        // `adapter.list` is not recursive, so this walks. Breadth-first with an
-        // explicit queue rather than recursion: a vault with a pathological
-        // folder depth should not decide how deep the stack goes.
-        //
-        // The queue holds the adapter's own names, because that is what it will
-        // be asked with next. What goes into `out` is the normalized name,
-        // because that is what the engine will hold and hand back.
-        const queue: string[] = ["/"];
-        while (queue.length > 0) {
-            const dir = queue.shift()!;
-            const listed = await this.adapter.list(dir);
+        for (const item of this.vault.getAllLoadedFiles()) {
+            const raw = trimLeadingSlash(item.path);
+            if (raw === "" || raw === "/") continue; // the vault root itself
+            const path = this.register(raw);
+            if (this.ignored(path)) continue;
 
-            for (const folder of listed.folders) {
-                const raw = trimLeadingSlash(folder);
-                const path = this.register(raw);
-                if (this.ignored(path)) continue;
+            const stat = statOf(item);
+            if (stat === undefined) {
                 out.push({ path, folder: true, mtime: 0, ctime: 0, size: 0 });
-                queue.push(raw);
+                continue;
             }
-            for (const file of listed.files) {
-                const raw = trimLeadingSlash(file);
-                const path = this.register(raw);
-                if (this.ignored(path)) continue;
-                // Stat by the adapter's own name, not the normalized one. The
-                // path came from the adapter a line ago; renaming it before
-                // asking about it is how a note went missing.
-                const stat = await this.adapter.stat(raw);
-                // A file that is listed and then does not stat is a deletion
-                // that happened in between, which is ordinary. It is only a
-                // silent omission when the path was mangled first, and it is
-                // not mangled here.
-                if (!stat || stat.type !== "file") continue;
-                out.push({
-                    path,
-                    folder: false,
-                    mtime: stat.mtime,
-                    // Carried because the protocol carries it, and read by
-                    // nothing that decides. Obsidian ships native addons for
-                    // five platforms to get this value in its headless client,
-                    // which is a fair measure of how much it is worth.
-                    ctime: stat.ctime,
-                    size: stat.size,
-                });
-            }
+            out.push({
+                path,
+                folder: false,
+                mtime: stat.mtime,
+                // Carried because the protocol carries it, and read by nothing
+                // that decides. Obsidian ships native addons for five platforms
+                // to get this value in its headless client, which is a fair
+                // measure of how much it is worth.
+                ctime: stat.ctime,
+                size: stat.size,
+            });
         }
         return out;
     }

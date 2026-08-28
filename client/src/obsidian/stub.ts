@@ -63,6 +63,12 @@ export class FakeEl {
         /* Inputs in this stub are driven directly, not through events. */
     }
 
+    readonly attributes = new Map<string, string>();
+
+    setAttribute(name: string, value: string): void {
+        this.attributes.set(name, value);
+    }
+
     /** Every string anywhere in the tree, for asserting on what was rendered. */
     allText(): string {
         return [this.text, ...this.children.map((c) => c.allText())].filter(Boolean).join("\n");
@@ -77,6 +83,11 @@ type VaultEvent = "create" | "modify" | "delete" | "rename";
 
 export class FakeVault {
     readonly adapter = new FakeAdapter();
+
+    /** What the plugin reads instead of asking the adapter about every file. */
+    getAllLoadedFiles() {
+        return this.adapter.index();
+    }
     /** Obsidian's own: "typically `.obsidian` but it could be different". */
     configDir = ".obsidian";
     private readonly handlers = new Map<VaultEvent, ((...args: unknown[]) => void)[]>();
@@ -164,7 +175,7 @@ export class Plugin extends Component {
     /** What `saveData` wrote, which Obsidian keeps in the plugin's data.json. */
     savedData: unknown = null;
     readonly statusBarItems: FakeEl[] = [];
-    readonly ribbonIcons: { icon: string; title: string; callback: () => void }[] = [];
+    readonly ribbonIcons: { icon: string; title: string; callback: () => void; el: FakeEl }[] = [];
     readonly commands: { id: string; name: string; callback?: () => void }[] = [];
     readonly registeredEvents: unknown[] = [];
 
@@ -182,8 +193,9 @@ export class Plugin extends Component {
     }
 
     addRibbonIcon(icon: string, title: string, callback: (evt: unknown) => void): FakeEl {
-        this.ribbonIcons.push({ icon, title, callback: () => callback(undefined) });
-        return new FakeEl("div", "ribbon");
+        const el = new FakeEl("div", "ribbon");
+        this.ribbonIcons.push({ icon, title, callback: () => callback(undefined), el });
+        return el;
     }
 
     addCommand(command: { id: string; name: string; callback?: () => void }): typeof command {

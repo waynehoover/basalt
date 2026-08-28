@@ -705,3 +705,113 @@ func TestServeCreatesADataDirectoryOnItsFirstRun(t *testing.T) {
 		t.Fatalf("serve did not create the database: %v", err)
 	}
 }
+
+/* ---------------------------------------------------------------- *
+ * service
+ * ---------------------------------------------------------------- */
+
+// The unit is printed rather than installed. Writing into /etc needs root, and
+// a program that asks for root to do something you could read first is one that
+// gets run as root for the rest of its life.
+func TestServicePrintsAUnitWithRealPathsInIt(t *testing.T) {
+	dir := seeded(t)
+	out := mustRun(t, "service", "-data", dir, "-addr", "127.0.0.1:3010", "-vault", "notes", "-user", "basalt")
+
+	for _, want := range []string{
+		"[Unit]",
+		"[Service]",
+		"[Install]",
+		"User=basalt",
+		"-addr 127.0.0.1:3010",
+		"-vault notes",
+		"ReadWritePaths=" + dir,
+		"WantedBy=multi-user.target",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the unit has no %q in it:\n%s", want, out)
+		}
+	}
+	// No placeholders. A unit with one in it fails on first start with a
+	// message about a path nobody typed.
+	for _, bad := range []string{"<", "PATH_TO", "CHANGEME", "%%"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("the unit still has %q in it:\n%s", bad, out)
+		}
+	}
+	if !strings.Contains(out, "-data "+dir) {
+		t.Fatalf("ExecStart does not name the data directory:\n%s", out)
+	}
+}
+
+// This process holds every note somebody has and needs one directory and one
+// socket. The unit says so to the kernel, so a defect in it has somewhere it
+// cannot reach.
+func TestTheUnitIsHardened(t *testing.T) {
+	dir := seeded(t)
+	out := mustRun(t, "service", "-data", dir)
+
+	for _, want := range []string{
+		"NoNewPrivileges=true",
+		"ProtectSystem=strict",
+		"PrivateTmp=true",
+		"CapabilityBoundingSet=",
+		"RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX",
+		"SystemCallFilter=@system-service",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the unit is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+/**
+ * The hardening line that looks most obviously right is the one that would stop
+ * the server starting. The default data directory is inside a home directory,
+ * and ProtectHome=true makes that unreadable to the unit.
+ */
+func TestProtectHomeIsOnlySetWhenItWouldNotBreakTheService(t *testing.T) {
+	inHome := mustRun(t, "service", "-data", "/home/somebody/.basalt")
+	if strings.Contains(inHome, "\nProtectHome=true") {
+		t.Fatalf("ProtectHome was set on a data directory inside a home:\n%s", inHome)
+	}
+	if !strings.Contains(inHome, "ProtectHome is left off") {
+		t.Fatalf("nothing said why ProtectHome was missing:\n%s", inHome)
+	}
+
+	elsewhere := mustRun(t, "service", "-data", "/var/lib/basalt")
+	if !strings.Contains(elsewhere, "\nProtectHome=true") {
+		t.Fatalf("ProtectHome was left off where it would have been safe:\n%s", elsewhere)
+	}
+}
+
+// Restarting must not be something a person has to notice. A sync server that
+// stays down after one bad night is one you find out about from a device that
+// has been quietly not syncing.
+func TestTheUnitComesBackByItself(t *testing.T) {
+	out := mustRun(t, "service", "-data", "/var/lib/basalt")
+	if !strings.Contains(out, "Restart=always") {
+		t.Fatalf("the unit does not restart:\n%s", out)
+	}
+	// And stops the way serve is written to be stopped, which is what makes an
+	// ack mean stored across a restart.
+	if !strings.Contains(out, "KillSignal=SIGTERM") {
+		t.Fatalf("the unit does not stop with SIGTERM:\n%s", out)
+	}
+}
+
+func TestServiceTellsYouHowToInstallIt(t *testing.T) {
+	out := mustRun(t, "service", "-data", "/var/lib/basalt")
+	for _, want := range []string{"systemctl daemon-reload", "systemctl enable --now basalt", "journalctl"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the notes do not mention %q:\n%s", want, out)
+		}
+	}
+	// Purge needs the server stopped and backup does not. Getting that wrong is
+	// a purge that refuses, or worse, a habit of stopping sync to back up.
+	if !strings.Contains(out, "systemctl stop basalt && ") {
+		t.Fatalf("the notes do not say purge needs the server stopped:\n%s", out)
+	}
+	if strings.Contains(out, "systemctl stop basalt && ") && !strings.Contains(out, "Backups do not need the server stopped") {
+		t.Fatalf("the notes do not say backup does not:\n%s", out)
+	}
+}
