@@ -27,6 +27,7 @@ import { cpus, totalmem } from "node:os";
 import { Client } from "./src/core/client.ts";
 import { authToken, deriveKeys } from "./src/core/crypto.ts";
 import { TestServer, serverBinary } from "./src/core/test-server.ts";
+import { LatencyProxy, type Wire } from "./src/core/latency.ts";
 import { JsonIndexStore, NodeVault } from "./src/node/vault.ts";
 import type { SyncReport } from "./src/core/engine.ts";
 
@@ -119,14 +120,39 @@ function row(label: string, ms: number, r?: SyncReport, bytes?: number) {
     console.log(`  ${label.padEnd(34)} ${secs(ms).padStart(7)} s  ${rate.padStart(10)}  ${sent}`);
 }
 
+/**
+ * The wires to measure over.
+ *
+ * 400ms is Sync Engine's published environment, and it is here so that a figure
+ * from this project can be read next to theirs without pretending the two were
+ * measured together. 2.6 MiB/s is their upload speed, for the same reason.
+ */
+const WIRES: Array<{ name: string; wire: Wire }> = [
+    { name: "loopback", wire: { rttMs: 0 } },
+    { name: "20ms, a LAN or a close tailnet", wire: { rttMs: 20 } },
+    { name: "100ms, a server across a country", wire: { rttMs: 100 } },
+    { name: "400ms and 2.6 MiB/s", wire: { rttMs: 400, bytesPerSecond: 2.6 * 1024 * 1024 } },
+];
+
 async function main() {
     console.log("basalt: a whole vault, timed and checked");
     console.log(`  ${cpus()[0]?.model ?? "unknown cpu"}, ${cpus().length} cores, ${mib(totalmem())} MiB`);
-    console.log(`  ${process.release.name} ${process.versions.bun ? "bun " + process.versions.bun : process.version}, loopback`);
+    console.log(`  ${process.release.name} ${process.versions.bun ? "bun " + process.versions.bun : process.version}`);
 
     await serverBinary();
+    const only = process.env["BENCH_WIRE"];
+    for (const { name, wire } of WIRES) {
+        if (only && !name.startsWith(only)) continue;
+        console.log(`\n=== ${name} ===`);
+        await run(wire);
+    }
+}
+
+async function run(wire: Wire) {
     const server = new TestServer();
     await server.start();
+    const proxy = new LatencyProxy("127.0.0.1", server.port, wire);
+    await proxy.start();
     const keys = await deriveKeys(new Uint8Array(20).fill(31));
     const dirs: string[] = [];
     const clients: Client[] = [];
@@ -138,12 +164,13 @@ async function main() {
             vault: new NodeVault(dir),
             store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
             keys,
-            url: server.wsUrl,
+            url: proxy.url,
             ...server.credentials(authToken(keys)),
             vaultId: "default",
             device: name,
             timeoutMs: 120_000,
             coalesceWrites: false,
+            ...(process.env["BENCH_LOG"] ? { log: (m: string, ...r: unknown[]) => console.log(`    [${name}] ${m}`, ...r.slice(0, 1)) } : {}),
         });
         clients.push(c);
         await c.connect();
@@ -170,19 +197,23 @@ async function main() {
         const quiet = await a.c.settle({}, 4);
         row("nothing changed", performance.now() - t, quiet);
 
-        // A day's editing: a few notes touched, one attachment replaced.
-        for (let i = 0; i < 20; i++) {
-            const path = pathFor("small", i * 7, "md");
+        // A day's editing: a handful of notes touched, spread through the vault
+        // rather than adjacent, because adjacent files share folders and would
+        // flatter the folder handling.
+        const edits = Math.min(20, COUNTS.small);
+        const stride = Math.max(1, Math.floor(COUNTS.small / edits));
+        for (let i = 0; i < edits; i++) {
+            const path = pathFor("small", i * stride, "md");
             const body = await readFile(join(a.dir, path), "utf8");
             await writeFile(join(a.dir, path), body + "\na line added today.\n");
         }
         t = performance.now();
         const daily = await a.c.settle({}, 16);
-        row("20 notes edited, upload", performance.now() - t, daily);
+        row(`${edits} notes edited, upload`, performance.now() - t, daily);
 
         t = performance.now();
         const dailyDown = await b.c.settle({}, 16);
-        row("20 notes edited, download", performance.now() - t, dailyDown);
+        row(`${edits} notes edited, download`, performance.now() - t, dailyDown);
 
         // Correctness, next to the timings rather than assumed. This is the
         // idea worth taking from Sync Engine's harness.
@@ -198,10 +229,15 @@ async function main() {
         console.log(`  wrong or missing      ${wrong}`);
         console.log(`  arrived unasked for   ${extra}`);
         console.log(`  refused for good      ${up.skipped + down.skipped + daily.skipped + dailyDown.skipped}`);
+        // What latency multiplies. A design that asks once per file behaves
+        // very differently on a slow wire from one that asks once per pass.
+        console.log(`  round trips, upload   ${a.c.requestsSent} for ${files} files`);
+        console.log(`  round trips, download ${b.c.requestsSent}`);
         console.log("");
         console.log(wrong === 0 && extra === 0 && before.size === after.size ? "  correct" : "  NOT CORRECT");
     } finally {
         for (const c of clients) c.close();
+        await proxy.stop();
         await server.cleanup();
         for (const d of dirs) await rm(d, { recursive: true, force: true });
     }

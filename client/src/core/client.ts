@@ -114,6 +114,11 @@ export class Client {
         return next;
     }
 
+    /** How many requests this client has sent, which is what latency multiplies. */
+    get requestsSent(): number {
+        return this.transport.requestsSent;
+    }
+
     /** The newest uid the server held when this client said hello. */
     get serverCursor(): number {
         return this.limits?.cursor ?? 0;

@@ -152,6 +152,7 @@ match on the way in.
 | Conflict copies for anything that cannot merge | **Built** |
 | A merge refused when the result stops being valid JSON | **Built** |
 | Live relay between connected devices | **Built** |
+| Several requests in flight at once | **Refused for now**, one at a time, see benchmark |
 | Catch-up from a cursor after being offline | **Built** |
 | Write coalescing, scaled by file size | **Built** |
 | Per-file retry with backoff, kept apart from permanent refusals | **Built** |

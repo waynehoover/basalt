@@ -176,6 +176,20 @@ type Reply = Record<string, unknown>;
 export class Transport {
     private socket: SocketLike | undefined;
     private replyWaiter: Waiter<Reply> | undefined;
+
+    /**
+     * The timeout armed for the request in flight.
+     *
+     * Held separately so it can be disarmed by a caller that resolves its own
+     * request, which `fetch` does: the answer to a fetch is binary frames, not
+     * a reply, so the reply never arrives and the timer that was waiting for it
+     * is left running. It fires later, mid-sync, and closes the connection.
+     *
+     * That went unnoticed because on loopback a sync finishes long before the
+     * timeout. Adding four hundred milliseconds of latency to the benchmark
+     * made every large sync die exactly one timeout after its first fetch.
+     */
+    private replyTimer: ReturnType<typeof setTimeout> | undefined;
     private bodyWaiter: Waiter<Uint8Array> | undefined;
     /** Bodies that arrived before anything asked for them. Obsidian's dataQueue. */
     private readonly bodyQueue: Uint8Array[] = [];
@@ -187,6 +201,16 @@ export class Transport {
      * so this is the only thing that says whether one was asked for.
      */
     private expecting = 0;
+
+    /**
+     * How many requests this connection has sent.
+     *
+     * Latency multiplies round trips the way bandwidth multiplies bytes, so
+     * this is the number that says how a design behaves on a slow wire. Kept
+     * here rather than measured outside because only this class knows what a
+     * request is: a fetch is one, however many bodies come back.
+     */
+    requestsSent = 0;
     private closed = false;
     private closeReason: Error | undefined;
     /**
@@ -245,6 +269,7 @@ export class Transport {
         this.closed = true;
         this.closeReason = cause;
         this.log("transport closed", cause.message);
+        this.disarmReply();
         const reply = this.replyWaiter;
         const body = this.bodyWaiter;
         this.replyWaiter = undefined;
@@ -261,6 +286,14 @@ export class Transport {
         } catch {
             // A listener that throws does not get to leave the transport in a
             // half-closed state; it is already closed by this point.
+        }
+    }
+
+    /** Stops the timeout watching for a reply that is not coming. */
+    private disarmReply(): void {
+        if (this.replyTimer !== undefined) {
+            clearTimeout(this.replyTimer);
+            this.replyTimer = undefined;
         }
     }
 
@@ -429,25 +462,27 @@ export class Transport {
             // rather than a convention.
             throw new Error("a request is already in flight");
         }
+        this.requestsSent++;
         const timeoutMs = this.opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
         const reply = await new Promise<Reply>((resolve, reject) => {
             const timer = setTimeout(() => {
                 this.die(new ConnectionError(`no reply within ${timeoutMs}ms`));
             }, timeoutMs);
+            this.replyTimer = timer;
             this.replyWaiter = {
                 resolve: (v) => {
-                    clearTimeout(timer);
+                    this.disarmReply();
                     resolve(v);
                 },
                 reject: (e) => {
-                    clearTimeout(timer);
+                    this.disarmReply();
                     reject(e);
                 },
             };
             try {
                 this.send(value);
             } catch (err) {
-                clearTimeout(timer);
+                this.disarmReply();
                 this.replyWaiter = undefined;
                 reject(err instanceof Error ? err : new Error(String(err)));
             }
@@ -734,12 +769,17 @@ export class Transport {
             }
         } catch (err) {
             this.expecting = 0;
+            this.disarmReply();
+            this.replyWaiter = undefined;
             if (err instanceof ProtocolError && err.code === "badchunk") this.die(err);
             throw err;
         }
         this.expecting = Math.max(0, this.expecting - names.length);
-        // Nothing is coming for the request slot, so release it: the fetch is
-        // answered entirely in binary frames.
+        // Nothing is coming for the request slot, so release it *and* disarm
+        // the timeout waiting on it. The fetch is answered entirely in binary
+        // frames, so the reply this timer is watching for will never come, and
+        // leaving it running means it fires mid-sync and closes the connection.
+        this.disarmReply();
         this.replyWaiter = undefined;
         return bodies;
     }

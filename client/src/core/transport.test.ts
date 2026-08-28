@@ -740,3 +740,51 @@ describe("cutting to the ceiling the server advertised", () => {
         );
     });
 });
+
+/**
+ * A fetch is answered in binary frames, not with a reply, so the timeout armed
+ * for that reply is waiting for something that will never come. Left running it
+ * fires later, in the middle of a sync, and closes the connection.
+ *
+ * On loopback a sync finishes long before any timeout, which is why this went
+ * unnoticed. Adding four hundred milliseconds of latency to the benchmark made
+ * every large sync die exactly one timeout after its first fetch, with most of
+ * the vault missing and the client reporting that it had finished.
+ */
+describe("the timeout a fetch leaves behind", () => {
+    it("does not close the connection some time after a fetch succeeded", async () => {
+        const { t, socket } = await helloed(0, { timeoutMs: 120 });
+        const body = new Uint8Array([1, 2, 3]);
+        const name = await chunkName(body);
+
+        const fetching = t.fetch([name]);
+        await settle();
+        socket.body(body);
+        expect(await fetching).toHaveLength(1);
+
+        // Well past the timeout that was armed for the reply.
+        await new Promise((r) => setTimeout(r, 300));
+        expect(t.isClosed, "the connection died after a fetch that had already succeeded").toBe(false);
+
+        // And it is still usable, which is the property that matters.
+        const pinging = t.ping();
+        await settle();
+        socket.reply({ res: "pong" });
+        await expect(pinging).resolves.toBeUndefined();
+    });
+
+    it("does not leave one behind when a fetch fails either", async () => {
+        const { t, socket } = await helloed(0, { timeoutMs: 120 });
+        const fetching = t.fetch(["a".repeat(64)]);
+        await settle();
+        socket.reply({ res: "err", code: "nochunk", msg: "not held" });
+        await expect(fetching).rejects.toMatchObject({ code: "nochunk" });
+
+        await new Promise((r) => setTimeout(r, 300));
+        // A refusal is not a reason to close, and the timer must not make it one.
+        const pinging = t.ping();
+        await settle();
+        socket.reply({ res: "pong" });
+        await expect(pinging).resolves.toBeUndefined();
+    });
+});

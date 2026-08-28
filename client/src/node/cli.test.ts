@@ -538,3 +538,44 @@ describe("one secret", () => {
         expect(attempt.all).toMatch(/auth|not authorised/i);
     }, 300_000);
 });
+
+describe("what counts as a successful run", () => {
+    /**
+     * A sync that ends with files still failing has not finished. It reported
+     * zero once, because the settle loop stops when a pass produces no work and
+     * a pass where everything failed produces none: the connection had died
+     * half way through a large sync and the client said it was done.
+     */
+    it("exits non-zero when files are still failing", async () => {
+        await fresh();
+        const dir = await vaultDir("a");
+        await cli("init", "--dir", dir, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
+        await write(dir, "fine.md", "this one is ok\n");
+        await write(dir, "locked.md", "this one cannot be read\n");
+        await cli("sync", "--dir", dir);
+
+        // A file that cannot be read is the ordinary version of this: a
+        // permission, a file open exclusively by something else, a disk that
+        // answered once and not twice.
+        const { chmod } = await import("node:fs/promises");
+        await write(dir, "locked.md", "changed, and now unreadable\n");
+        await chmod(join(dir, "locked.md"), 0o000);
+        try {
+            const r = await cli("sync", "--dir", dir, "--json");
+            expect(r.json()["retrying"], `report was ${r.stdout}`).toBe(1);
+            expect(r.code, "a sync that could not read a file reported success").toBe(1);
+        } finally {
+            await chmod(join(dir, "locked.md"), 0o644);
+        }
+    }, 300_000);
+
+    it("still exits zero when there is simply nothing to do", async () => {
+        await fresh();
+        const dir = await vaultDir("a");
+        await cli("init", "--dir", dir, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
+        await write(dir, "note.md", "x\n");
+        await cli("sync", "--dir", dir);
+        const again = await cli("sync", "--dir", dir);
+        expect(again.code).toBe(0);
+    }, 300_000);
+});

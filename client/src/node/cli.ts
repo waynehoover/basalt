@@ -189,9 +189,11 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
         const report = await client.settle();
         report_(report, args, io, client.serverCursor);
         // A file that can never sync is not a successful run, whatever else
-        // worked. Exiting zero here is how a broken vault stays broken quietly
-        // in somebody's cron.
-        return report.skipped > 0 ? 1 : 0;
+        // worked, and neither is one still failing when the pass gave up.
+        // Exiting zero here is how a broken vault stays broken quietly in
+        // somebody's cron, and it is how a sync that lost its connection
+        // half way through once reported that it had finished.
+        return report.skipped > 0 || report.retrying > 0 ? 1 : 0;
     } finally {
         client.close();
     }

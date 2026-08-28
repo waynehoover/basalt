@@ -131,6 +131,9 @@ Said plainly, because a comparison that only runs one way is an advertisement.
 - **Backends.** They work with storage you already pay for.
 - **Merging.** Their region-aware diff3 handles the code-block case above.
 - **Reach.** They are installable from Obsidian's community list.
+- **Round trips.** Their engine overlaps requests; this one sends exactly one at
+  a time, because a reply carries no request id. On a 400ms link that is most of
+  the sync time, and `docs/benchmark.md` measures it.
 
 ## What reading them changed here
 
