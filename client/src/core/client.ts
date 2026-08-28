@@ -42,6 +42,8 @@ export interface ClientOptions {
     /** Whether to hold back a file written moments ago. See EngineOptions. */
     readonly coalesceWrites?: boolean;
     readonly log?: (message: string, ...rest: unknown[]) => void;
+    /** The path being worked on, and undefined when a pass ends. */
+    readonly onProgress?: (path: string | undefined) => void;
     /** Injectable for tests, and for a platform whose WebSocket is not global. */
     readonly socketFactory?: (url: string) => SocketLike;
 }
@@ -83,6 +85,7 @@ export class Client {
             ...(opts.claim !== undefined ? { claim: opts.claim } : {}),
             ...(opts.coalesceWrites !== undefined ? { coalesceWrites: opts.coalesceWrites } : {}),
             ...(opts.log !== undefined ? { log: opts.log } : {}),
+            ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
         });
         this.engine = engine;
     }

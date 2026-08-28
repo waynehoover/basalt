@@ -29,6 +29,8 @@
  * with tiny edits, too large and the hash takes longer to forget an edit that
  * has passed. It is not a tunable and there is no setting for it.
  */
+import { SEAL_OVERHEAD } from "./crypto.ts";
+
 export const WINDOW = 48;
 
 /** Multiplier for the rolling hash. */
@@ -117,10 +119,19 @@ export const TEXT_AS_BINARY_ABOVE = 4 * 1024 * 1024;
  * instead of rejected puts, and a client that has not asked yet still gets
  * something sane.
  */
-export function sizesFor(size: number, isText: boolean, serverChunkMax = BINARY_SIZES.max): ChunkSizes {
+export function sizesFor(size: number, isText: boolean, serverChunkMax: number = BINARY_SIZES.max): ChunkSizes {
+    if (!Number.isFinite(serverChunkMax) || serverChunkMax <= 0) serverChunkMax = BINARY_SIZES.max;
     const base = isText && size < TEXT_AS_BINARY_ABOVE ? TEXT_SIZES : BINARY_SIZES;
 
-    const max = Math.min(base.max, serverChunkMax);
+    // The ceiling is on the *sealed* chunk, and sealing adds a nonce, a tag and
+    // a marker byte. A cut made at exactly the ceiling therefore produces a
+    // body the server refuses, permanently, and the file never syncs.
+    //
+    // Nothing caught this for a long time because the test data compressed:
+    // deflate made the sealed chunk smaller than the plaintext and the overhead
+    // disappeared into the saving. Incompressible data is what an attachment
+    // actually is, and it does not.
+    const max = Math.min(base.max, serverChunkMax - SEAL_OVERHEAD);
     // A window's worth of data is the least that can produce a boundary at all,
     // so a maximum below it would make every chunk a forced cut and the rolling
     // hash pointless. Clamping up keeps the algorithm meaningful even if a

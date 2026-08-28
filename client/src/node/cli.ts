@@ -453,6 +453,16 @@ async function clientOptions(config: Config, args: Args, io?: Console): Promise<
         // A one-shot sync does not defer a file to a next pass it will never
         // run. A watching one does, because there is one.
         coalesceWrites: args.watch,
+        // Only while watching. A one-shot sync prints its report at the end and
+        // a line per path on the way would bury it; a client that stays running
+        // has nothing else to say between passes.
+        ...(args.watch && io
+            ? {
+                  onProgress: (path?: string) => {
+                      if (path !== undefined) io.err(`  ... ${path}`);
+                  },
+              }
+            : {}),
         ...(args.verbose && io
             ? { log: (m: string, ...rest: unknown[]) => io.err(`  ${m} ${rest.map(brief).join(" ")}`.trimEnd()) }
             : {}),

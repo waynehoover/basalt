@@ -771,3 +771,61 @@ describe("on a device with no status bar", () => {
         expect(modals.at(-1)!.contentEl.allText()).not.toMatch(/allow-origin/);
     }, 300_000);
 });
+
+describe("saying what it is working on", () => {
+    /**
+     * A large attachment is minutes inside one pass. Without a state for it the
+     * status shows the previous pass's result the whole time, so working and
+     * idle look exactly alike, which is rule 7 with the two conditions that
+     * matter most collapsed.
+     *
+     * Not a percentage. What somebody wants to know is whether it is doing
+     * something and what, and a byte counter for one file out of forty answers
+     * a question nobody asked.
+     */
+    it("reports the file it is on, once it has been on it a while", async () => {
+        await fresh();
+        const { plugin, app } = await load();
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        const seen: string[] = [];
+        const stop = plugin.watchState((s) => {
+            if (s.kind === "syncing") seen.push(s.path);
+        });
+
+        // Big enough that sealing it takes longer than the threshold.
+        const big = new Uint8Array(6 * 1024 * 1024);
+        crypto.getRandomValues(big.subarray(0, 65536));
+        for (let at = 65536; at < big.length; at += 65536) big.copyWithin(at, 0, 65536);
+        await app.vault.adapter.writeBinary("big.bin", big.buffer as ArrayBuffer, { mtime: 5000 });
+
+        await plugin.syncNow();
+        stop();
+        expect(seen, "nothing was said during the pass").toContain("big.bin");
+        // And it ends on a result rather than stuck saying it is working.
+        expect(plugin.currentState.kind).toBe("synced");
+    }, 300_000);
+
+    /**
+     * A pass over a settled vault visits every path and does nothing to any of
+     * them. Reporting each one would replace a useful summary with a blur.
+     */
+    it("says nothing while passing over a vault with nothing to do", async () => {
+        await fresh();
+        const { plugin, app } = await load();
+        app.vault.adapter.seed("a.md", "one");
+        app.vault.adapter.seed("b.md", "two");
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+        await plugin.syncNow();
+
+        const seen: string[] = [];
+        const stop = plugin.watchState((s) => {
+            if (s.kind === "syncing") seen.push(s.path);
+        });
+        await plugin.syncNow();
+        stop();
+        expect(seen, `a quiet pass announced ${JSON.stringify(seen)}`).toEqual([]);
+    }, 300_000);
+});

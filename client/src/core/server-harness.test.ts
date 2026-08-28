@@ -105,9 +105,7 @@ class Client {
         const sealed = await sealChunks(this.keys, parts);
         const result = await this.transport.put(
             await sealPath(this.keys, path),
-            { size: data.length, ctime: 1, mtime },
-            sealed
-        );
+            { size: data.length, ctime: 1, mtime }, sealed.map((c) => c.name), async (n) => sealed.find((c) => c.name === n)!.bytes);
         return { ...result, chunks: sealed.map((c) => c.name), plaintext: data };
     }
 
@@ -470,7 +468,7 @@ describe("refusals that the session survives", () => {
             // A size with no chunks, which is indistinguishable from an empty
             // file and so is refused rather than stored as one.
             await expect(
-                c.transport.put(await sealPath(c.keys, "bad.md"), { size: 4096, ctime: 1, mtime: 1 }, [])
+                c.transport.put(await sealPath(c.keys, "bad.md"), { size: 4096, ctime: 1, mtime: 1 }, [], async () => new Uint8Array(0))
             ).rejects.toMatchObject({ code: "badentry" });
 
             expect(c.transport.isClosed).toBe(false);

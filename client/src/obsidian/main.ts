@@ -48,6 +48,15 @@ type State =
     | { kind: "unpaired" }
     | { kind: "connecting" }
     | { kind: "synced"; summary: string; at: number }
+    /**
+     * Working, and on what.
+     *
+     * Sending a large attachment is minutes inside one pass, and without this
+     * the status shown is the previous pass's result, so working and idle look
+     * exactly alike. The path rather than a percentage: what somebody wants to
+     * know is whether it is doing something and what.
+     */
+    | { kind: "syncing"; path: string; since: number }
     | { kind: "offline"; why: string; retryAt: number }
     | { kind: "stopped"; why: string };
 
@@ -133,6 +142,7 @@ export default class BasaltPlugin extends Plugin {
     override onunload(): void {
         this.running = false;
         if (this.nudgeTimer !== undefined) clearTimeout(this.nudgeTimer);
+        if (this.workingTimer !== undefined) clearTimeout(this.workingTimer);
         this.client?.close();
     }
 
@@ -191,6 +201,29 @@ export default class BasaltPlugin extends Plugin {
         });
     }
 
+    /**
+     * Shows what is being worked on, without drowning the last real result.
+     *
+     * A pass over a settled vault visits every path and does nothing to any of
+     * them, so reporting each one would replace a useful summary with a blur.
+     * The state only moves once a path has been held for long enough to be
+     * worth mentioning, which in a quiet vault is never.
+     */
+    private working(path: string | undefined): void {
+        if (path === undefined) {
+            if (this.workingTimer !== undefined) clearTimeout(this.workingTimer);
+            this.workingTimer = undefined;
+            return;
+        }
+        if (this.workingTimer !== undefined) clearTimeout(this.workingTimer);
+        this.workingTimer = setTimeout(() => {
+            this.workingTimer = undefined;
+            this.setState({ kind: "syncing", path, since: Date.now() });
+        }, 400);
+    }
+
+    private workingTimer: ReturnType<typeof setTimeout> | undefined;
+
     /** Drops the spent first-run token from the saved settings. */
     private async forgetBootstrap(): Promise<void> {
         if (!this.config?.bootstrap) return;
@@ -216,6 +249,7 @@ export default class BasaltPlugin extends Plugin {
             claim: derived,
             vaultId: config.vaultId,
             device: config.device,
+            onProgress: (path) => this.working(path),
         };
     }
 
@@ -457,6 +491,8 @@ function shortStatus(state: State): string {
             return "not paired";
         case "connecting":
             return "connecting";
+        case "syncing":
+            return `syncing ${basename(state.path)}`;
         case "synced":
             return state.summary;
         case "offline":
@@ -746,6 +782,12 @@ class RecoverModal extends Modal {
  * Read rather than assumed, because the assumption is the thing that might be
  * wrong.
  */
+/** The last part of a path, because a status bar is one line. */
+function basename(path: string): string {
+    const at = path.lastIndexOf("/");
+    return at === -1 ? path : path.slice(at + 1);
+}
+
 function origin(): string {
     const l = (globalThis as { location?: { origin?: string } }).location;
     return l?.origin ?? "unknown";
@@ -757,6 +799,8 @@ function longStatus(state: State): string {
             return "Not paired.";
         case "connecting":
             return "Connecting.";
+        case "syncing":
+            return `Working on ${state.path}.`;
         case "synced":
             return `${state.summary}, as of ${new Date(state.at).toLocaleTimeString()}.`;
         case "offline":

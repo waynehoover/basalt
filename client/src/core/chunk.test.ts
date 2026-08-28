@@ -12,6 +12,7 @@ import {
     type Chunk,
     type ChunkSizes,
 } from "./chunk.ts";
+import { SEAL_OVERHEAD, deriveKeys, sealChunks } from "./crypto.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -358,12 +359,21 @@ describe("streaming", () => {
 
 describe("choosing sizes", () => {
     it("uses text sizes for small text and binary sizes for the rest", () => {
-        expect(sizesFor(1000, true)).toEqual(TEXT_SIZES);
-        expect(sizesFor(1000, false)).toEqual(BINARY_SIZES);
+        // The maximum is the one number that is not simply the table's: room is
+        // reserved for what sealing adds, or a chunk cut at the ceiling is a
+        // sealed chunk over it.
+        // Only bites when the table's own maximum is at or above the ceiling,
+        // which is the binary case and not the text one.
+        const reserved = (t: { min: number; avg: number; max: number }) => ({
+            ...t,
+            max: Math.min(t.max, BINARY_SIZES.max - SEAL_OVERHEAD),
+        });
+        expect(sizesFor(1000, true)).toEqual(reserved(TEXT_SIZES));
+        expect(sizesFor(1000, false)).toEqual(reserved(BINARY_SIZES));
         // A very large text file is data, not prose, and chunking it at 256
         // bytes would produce tens of thousands of chunks.
-        expect(sizesFor(TEXT_AS_BINARY_ABOVE, true)).toEqual(BINARY_SIZES);
-        expect(sizesFor(TEXT_AS_BINARY_ABOVE - 1, true)).toEqual(TEXT_SIZES);
+        expect(sizesFor(TEXT_AS_BINARY_ABOVE, true)).toEqual(reserved(BINARY_SIZES));
+        expect(sizesFor(TEXT_AS_BINARY_ABOVE - 1, true)).toEqual(reserved(TEXT_SIZES));
     });
 
     it("clamps to what the server said it would accept", () => {
@@ -479,4 +489,48 @@ describe("bytes that are not valid UTF-8, on the UTF-8 path", () => {
     );
     shouldTerminate("a single continuation byte", new Uint8Array([0x80]));
     shouldTerminate("one lead byte and nothing after it", new Uint8Array([0xf0]));
+});
+
+/**
+ * The server's ceiling is on the *sealed* chunk, and sealing adds a nonce, a
+ * tag and a marker byte. A cut made at exactly the ceiling produces a body the
+ * server refuses, permanently, and the file it belongs to never syncs.
+ *
+ * Nothing caught this for a long time because the test data compressed: deflate
+ * made the sealed chunk smaller than the plaintext and the overhead vanished
+ * into the saving. An attachment is a photo or a video and does not compress,
+ * which is how it was eventually found: a 12 MiB file of real random bytes,
+ * refused with "chunk exceeds chunkMax: 1048605 > 1048576".
+ */
+describe("chunks that have to survive being sealed", () => {
+    it("leaves room for what sealing adds", () => {
+        const sizes = sizesFor(64 * 1024 * 1024, false, 1024 * 1024);
+        expect(sizes.max + SEAL_OVERHEAD).toBeLessThanOrEqual(1024 * 1024);
+    });
+
+    it("respects a ceiling smaller than its own idea of one", () => {
+        // The parameter existed and the engine never passed it, so a server
+        // advertising something smaller was ignored.
+        const sizes = sizesFor(64 * 1024 * 1024, false, 64 * 1024);
+        expect(sizes.max).toBeLessThanOrEqual(64 * 1024 - SEAL_OVERHEAD);
+    });
+
+    it("keeps every sealed chunk of incompressible data under the ceiling", async () => {
+        const ceiling = 256 * 1024;
+        const keys = await deriveKeys(new Uint8Array(20).fill(4));
+        const bytes = new Uint8Array(4 * 1024 * 1024);
+        for (let at = 0; at < bytes.length; at += 65536) {
+            crypto.getRandomValues(bytes.subarray(at, Math.min(at + 65536, bytes.length)));
+        }
+
+        const sizes = sizesFor(bytes.length, false, ceiling);
+        const parts = [...chunkBytes(bytes, sizes, false)].map((c) => c.bytes);
+        const sealed = await sealChunks(keys, parts);
+
+        expect(sealed.length).toBeGreaterThan(8);
+        const worst = Math.max(...sealed.map((c) => c.bytes.length));
+        expect(worst, `the largest sealed chunk was ${worst} against a ceiling of ${ceiling}`).toBeLessThanOrEqual(
+            ceiling
+        );
+    });
 });

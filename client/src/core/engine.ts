@@ -87,6 +87,20 @@ export interface EngineOptions {
     readonly claim?: string;
     readonly now?: () => number;
     readonly log?: (message: string, ...rest: unknown[]) => void;
+    /**
+     * Called with the path being worked on, and undefined when a pass ends.
+     *
+     * Sending a large attachment is minutes of one await inside one pass, and
+     * without this a shell has nothing to say for the whole of it: the status
+     * it shows is the result of the *previous* pass, so working and idle look
+     * exactly alike. That is rule 7 of docs/philosophy.md, two conditions that
+     * must be told apart collapsed into one.
+     *
+     * A path rather than a percentage. What somebody wants to know is whether
+     * it is doing something and what, and a byte counter for a file that is
+     * one of forty in a pass answers a question nobody asked.
+     */
+    readonly onProgress?: (path: string | undefined) => void;
     /** Whether a path may be three-way merged. Defaults to text extensions. */
     readonly mergeable?: (path: string) => boolean;
     /**
@@ -240,6 +254,19 @@ export class Engine {
 
     private mergeable(path: string): boolean {
         return (this.opts.mergeable ?? looksLikeText)(path);
+    }
+
+    /**
+     * Chunk sizes for a file, against what this server said it would take.
+     *
+     * The server's ceiling was never passed. `sizesFor` takes it and defaults
+     * to the client's own idea of a maximum, so a server advertising something
+     * smaller was ignored and every chunk at the boundary was refused. Nothing
+     * noticed because the two numbers happen to be the same, and because the
+     * refusal only bites on data that does not compress.
+     */
+    private sizesFor(size: number, isText: boolean) {
+        return sizesFor(size, isText, this.limits?.chunkMax);
     }
 
     private get coalesce(): boolean {
@@ -449,12 +476,15 @@ export class Engine {
                 continue;
             }
             try {
+                this.opts.onProgress?.(path);
                 await this.reconcile(path, onDisk.get(path), report, now, coalesce);
                 this.retries.delete(path);
             } catch (err) {
                 this.recordFailure(path, err, report);
             }
         }
+
+        this.opts.onProgress?.(undefined);
 
         // Replaced rather than added to, so a path stops being blocked the
         // moment the file in its way is gone.
@@ -521,7 +551,7 @@ export class Engine {
     private async rehash(entry: IndexEntry, path: string): Promise<SealedChunk[]> {
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
-        const parts = [...chunkBytes(bytes, sizesFor(bytes.length, isText), isText)].map((c) => c.bytes);
+        const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map((c) => c.bytes);
         const sealed = await sealChunks(this.opts.keys, parts);
         entry.chunks = sealed.map((c) => c.name);
         entry.hash = contentId(entry.chunks);
@@ -640,7 +670,7 @@ export class Engine {
             });
             return;
         }
-        const sealed = await this.sealedFor(entry, path);
+        const plan = await this.planUpload(entry, path);
         const result = await this.opts.transport.put(
             await this.sealedPath(path),
             {
@@ -649,7 +679,8 @@ export class Engine {
                 mtime: entry.mtime,
                 ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
             },
-            sealed
+            plan.names,
+            plan.bodyOf
         );
         report.chunksSent += result.uploaded;
         report.bytesSent += result.bytes;
@@ -668,22 +699,78 @@ export class Engine {
     }
 
     /** The sealed chunks for a file, re-sealing only if the cache cannot serve. */
-    private async sealedFor(entry: IndexEntry, path: string): Promise<SealedChunk[]> {
+    /**
+     * Works out what a file's chunks are called, and how to produce one.
+     *
+     * The names have to be known before the put is sent, because the server
+     * answers with the subset it wants, so a file is chunked and sealed in full
+     * either way. What changes is whether the sealed bytes are then *kept*.
+     *
+     * Keeping them all is what this did, and for a 256 MiB attachment, which is
+     * the size the server advertises it will take, it meant 512 MiB live at
+     * once: the file and a sealed copy of it. Measured rather than guessed, and
+     * on a phone that is not a spike but the end of the process.
+     *
+     * So above a threshold the bodies are dropped and only their offsets kept,
+     * and a wanted chunk is sealed again from the file still in hand. Sealing
+     * is deterministic, so the second answer is the first one. It costs the
+     * sealing twice for the chunks the server actually asks for, and takes the
+     * peak from twice the file to the file plus one chunk.
+     *
+     * Below the threshold nothing is dropped, because almost every file is a
+     * note and re-sealing a note to save a few kilobytes is a worse trade.
+     */
+    private async planUpload(entry: IndexEntry, path: string): Promise<UploadPlan> {
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
-        const parts = [...chunkBytes(bytes, sizesFor(bytes.length, isText), isText)].map((c) => c.bytes);
-        const sealed = await sealChunks(this.opts.keys, parts);
+        const pieces = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)];
+        const sealed = await sealChunks(
+            this.opts.keys,
+            pieces.map((c) => c.bytes)
+        );
+
         entry.chunks = sealed.map((c) => c.name);
         entry.hash = contentId(entry.chunks);
         entry.size = bytes.length;
-        return sealed;
+        const names = entry.chunks;
+
+        if (bytes.length <= KEEP_SEALED_BELOW) {
+            const byName = new Map(sealed.map((c) => [c.name, c.bytes]));
+            return {
+                names,
+                bodyOf: async (name) => {
+                    const body = byName.get(name);
+                    if (!body) throw new Error(`no sealed body for ${name} of ${path}`);
+                    return body;
+                },
+            };
+        }
+
+        // Offsets only. `sealed` goes out of scope with this function, and what
+        // survives is a few dozen numbers.
+        const spanOf = new Map<string, { start: number; end: number }>();
+        for (let i = 0; i < sealed.length; i++) {
+            const piece = pieces[i]!;
+            spanOf.set(sealed[i]!.name, { start: piece.offset, end: piece.offset + piece.bytes.length });
+        }
+        const keys = this.opts.keys;
+        return {
+            names,
+            bodyOf: async (name) => {
+                const span = spanOf.get(name);
+                if (!span) throw new Error(`no chunk named ${name} in ${path}`);
+                const again = await sealChunks(keys, [bytes.subarray(span.start, span.end)]);
+                return again[0]!.bytes;
+            },
+        };
     }
 
     private async putFolder(path: string): Promise<number> {
         const result = await this.opts.transport.put(
             await this.sealedPath(path),
             { size: 0, ctime: 0, mtime: 0, folder: true },
-            []
+            [],
+            noBodies
         );
         return result.uid;
     }
@@ -692,7 +779,8 @@ export class Engine {
         const result = await this.opts.transport.put(
             await this.sealedPath(path),
             { size: 0, ctime: 0, mtime: this.now(), deleted: true },
-            []
+            [],
+            noBodies
         );
         return result.uid;
     }
@@ -946,4 +1034,24 @@ function add(a: SyncReport, b: SyncReport): SyncReport {
  */
 function fingerprintOf(entry: IndexEntry | undefined): string {
     return entry ? `${entry.mtime}:${entry.size}` : "gone";
+}
+
+/**
+ * Below this, a file's sealed chunks are kept rather than made twice.
+ *
+ * Almost every file is a note, and re-sealing a note to save a few kilobytes is
+ * a worse trade than the memory. Above it a file is an attachment, and the
+ * memory is the thing that matters.
+ */
+const KEEP_SEALED_BELOW = 8 * 1024 * 1024;
+
+/** What an upload needs: every chunk's name, and a way to get one's bytes. */
+interface UploadPlan {
+    readonly names: string[];
+    readonly bodyOf: (name: string) => Promise<Uint8Array>;
+}
+
+/** For a put that carries no bodies at all: a folder, or a deletion. */
+async function noBodies(name: string): Promise<Uint8Array> {
+    throw new Error(`this put has no bodies, and the server asked for ${name}`);
 }

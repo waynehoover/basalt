@@ -242,7 +242,7 @@ describe("put, against a server that answers oddly", () => {
             { name: "b".repeat(64), bytes: new Uint8Array([2]) },
             { name: "c".repeat(64), bytes: new Uint8Array([3]) },
         ];
-        const put = t.put("p", { size: 3, ctime: 0, mtime: 0 }, chunks);
+        const put = t.put("p", { size: 3, ctime: 0, mtime: 0 }, chunks.map((c) => c.name), async (n) => chunks.find((c) => c.name === n)!.bytes);
         await settle();
         // Asked for out of order, and only two of the three.
         socket.reply({ res: "want", chunks: ["c".repeat(64), "a".repeat(64)] });
@@ -255,9 +255,7 @@ describe("put, against a server that answers oddly", () => {
 
     it("refuses to invent a body the server asked for", async () => {
         const { t, socket } = await helloed(0);
-        const put = t.put("p", { size: 1, ctime: 0, mtime: 0 }, [
-            { name: "a".repeat(64), bytes: new Uint8Array([1]) },
-        ]);
+        const put = t.put("p", { size: 1, ctime: 0, mtime: 0 }, ["a".repeat(64)], async () => new Uint8Array([1]));
         await settle();
         socket.reply({ res: "want", chunks: ["z".repeat(64)] });
         await expect(put).rejects.toMatchObject({ code: "badchunk" });
@@ -265,9 +263,7 @@ describe("put, against a server that answers oddly", () => {
 
     it("reports have as no upload at all", async () => {
         const { t, socket } = await helloed(0);
-        const put = t.put("p", { size: 1, ctime: 0, mtime: 0 }, [
-            { name: "a".repeat(64), bytes: new Uint8Array([1]) },
-        ]);
+        const put = t.put("p", { size: 1, ctime: 0, mtime: 0 }, ["a".repeat(64)], async () => new Uint8Array([1]));
         await settle();
         socket.reply({ res: "have", uid: 9 });
         expect(await put).toEqual({ uid: 9, uploaded: 0, bytes: 0 });
@@ -276,7 +272,7 @@ describe("put, against a server that answers oddly", () => {
 
     it("refuses a reply that is neither want nor have", async () => {
         const { t, socket } = await helloed(0);
-        const put = t.put("p", { size: 0, ctime: 0, mtime: 0 }, []);
+        const put = t.put("p", { size: 0, ctime: 0, mtime: 0 }, [], async () => new Uint8Array(0));
         await settle();
         socket.reply({ res: "chunks", uid: 1, size: 0, chunks: [] });
         await expect(put).rejects.toBeInstanceOf(ProtocolError);
@@ -284,13 +280,13 @@ describe("put, against a server that answers oddly", () => {
 
     it("carries prev only when there is a rename", async () => {
         const { t, socket } = await helloed(0);
-        void t.put("new", { size: 0, ctime: 0, mtime: 0 }, []).catch(() => {});
+        void t.put("new", { size: 0, ctime: 0, mtime: 0 }, [], async () => new Uint8Array(0)).catch(() => {});
         await settle();
         expect(socket.sentText.at(-1)?.["meta"]).not.toHaveProperty("prev");
 
         socket.reply({ res: "have", uid: 1 });
         await settle();
-        void t.put("new", { size: 0, ctime: 0, mtime: 0, prev: "old" }, []).catch(() => {});
+        void t.put("new", { size: 0, ctime: 0, mtime: 0, prev: "old" }, [], async () => new Uint8Array(0)).catch(() => {});
         await settle();
         expect(socket.sentText.at(-1)?.["meta"]).toMatchObject({ prev: "old" });
     });
@@ -667,7 +663,7 @@ describe("a download against what the server said it would store", () => {
 });
 
 /** An engine wired to a fake socket, connected, with limits of the test's choosing. */
-async function engineOnFakeSocket(limits: { maxChunks?: number; perFileMax?: number }) {
+async function engineOnFakeSocket(limits: { maxChunks?: number; perFileMax?: number; chunkMax?: number }) {
     const { Engine } = await import("./engine.ts");
     const { deriveKeys } = await import("./crypto.ts");
     const { MemoryIndexStore, MemoryVault } = await import("./vault.ts");
@@ -677,8 +673,9 @@ async function engineOnFakeSocket(limits: { maxChunks?: number; perFileMax?: num
     socket.open();
     await connecting;
 
+    const vault = new MemoryVault();
     const engine = new Engine({
-        vault: new MemoryVault(),
+        vault,
         store: new MemoryIndexStore(),
         keys: await deriveKeys(new Uint8Array(20).fill(1)),
         transport: t,
@@ -693,11 +690,53 @@ async function engineOnFakeSocket(limits: { maxChunks?: number; perFileMax?: num
         proto: 1,
         cursor: 0,
         perFileMax: limits.perFileMax ?? 1 << 28,
-        chunkMax: 1 << 20,
+        chunkMax: limits.chunkMax ?? 1 << 20,
         maxChunks: limits.maxChunks ?? 100,
     });
     await settle();
     socket.reply({ op: "caught-up", cursor: 0 });
     await started;
-    return { engine, socket, t };
+    return { engine, socket, t, vault };
 }
+
+/**
+ * A server may advertise a smaller chunk ceiling than this client's own idea of
+ * one, and the client has to cut to it. `sizesFor` took the parameter and the
+ * engine never passed it, so a smaller ceiling was ignored and every chunk at
+ * the boundary was refused, permanently, for any file that did not compress.
+ */
+describe("cutting to the ceiling the server advertised", () => {
+    it("sends no body larger than the server said it would take", async () => {
+        const ceiling = 64 * 1024;
+        const { engine, socket, vault } = await engineOnFakeSocket({ chunkMax: ceiling });
+
+        const bytes = new Uint8Array(1024 * 1024);
+        for (let at = 0; at < bytes.length; at += 65536) {
+            crypto.getRandomValues(bytes.subarray(at, Math.min(at + 65536, bytes.length)));
+        }
+        await vault.write("clip.raw", bytes, { mtime: 1000, ctime: 1000 });
+
+        const syncing = engine.sync();
+        // Sealing a megabyte takes real time, so this waits for the put rather
+        // than for one turn of the event loop.
+        for (let i = 0; i < 200 && !socket.sentText.some((m) => m["op"] === "put"); i++) {
+            await new Promise((r) => setTimeout(r, 10));
+        }
+
+        // The put names its chunks; the server asks for all of them.
+        const put = socket.sentText.find((m) => m["op"] === "put");
+        expect(put, `nothing was put: ${JSON.stringify(socket.sentText.map((m) => m["op"]))}`).toBeDefined();
+        const names = put!["chunks"] as string[];
+        expect(names.length, "a 1 MiB file was not cut to a 64 KiB ceiling").toBeGreaterThan(8);
+
+        socket.reply({ res: "want", chunks: names });
+        await settle();
+        socket.reply({ res: "ack", uid: 1 });
+        await syncing.catch(() => undefined);
+
+        const worst = Math.max(...socket.sentBinary.map((b) => b.length));
+        expect(worst, `the largest body sent was ${worst} against a ceiling of ${ceiling}`).toBeLessThanOrEqual(
+            ceiling
+        );
+    });
+});

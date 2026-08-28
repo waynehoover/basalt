@@ -535,7 +535,21 @@ export class Transport {
     async put(
         path: string,
         meta: PutMeta,
-        chunks: readonly SealedChunk[]
+        names: readonly string[],
+        /**
+         * The sealed bytes of one chunk, asked for only if the server wants it.
+         *
+         * A callback rather than the bodies themselves, because a put used to
+         * take every sealed chunk of a file at once and a 256 MiB attachment,
+         * which is the size the server advertises it will take, meant 512 MiB
+         * live: the file and a sealed copy of it. Measured, not guessed. On a
+         * phone that is not a spike, it is the end of the process.
+         *
+         * The caller decides what that costs it. A small file keeps its bodies
+         * and this is a map lookup; a large one keeps offsets and seals the
+         * chunk again, which is deterministic and so gives the same bytes.
+         */
+        bodyOf: (name: string) => Promise<Uint8Array>
     ): Promise<{ uid: number; uploaded: number; bytes: number }> {
         const reply = await this.request({
             op: "put",
@@ -548,7 +562,7 @@ export class Transport {
                 deleted: meta.deleted ?? false,
                 ...(meta.prev ? { prev: meta.prev } : {}),
             },
-            chunks: chunks.map((c) => c.name),
+            chunks: [...names],
         });
 
         if (reply["res"] === "have") {
@@ -559,17 +573,17 @@ export class Transport {
         }
 
         const wanted = stringsOf(reply["chunks"]);
-        const byName = new Map(chunks.map((c) => [c.name, c.bytes]));
+        const offered = new Set(names);
         let bytes = 0;
 
         // The reply names what to send. Sending anything else, or sending them in
         // another order, is caught by the server, which hashes each body and
         // matches it against what it asked for.
         for (const name of wanted) {
-            const body = byName.get(name);
-            if (!body) {
+            if (!offered.has(name)) {
                 throw new ProtocolError("badchunk", `server asked for ${name}, which this put does not contain`);
             }
+            const body = await bodyOf(name);
             this.sendBody(body);
             bytes += body.length;
         }

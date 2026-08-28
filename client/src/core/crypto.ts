@@ -48,6 +48,16 @@ const NONCE_LENGTH = 12;
 /** AES-GCM authentication tag length in bits. */
 const TAG_BITS = 128;
 
+/**
+ * What sealing adds to a chunk: a nonce, an authentication tag, and the one
+ * byte saying whether the payload was deflated.
+ *
+ * Exported because the chunker has to reserve it. A chunk cut to exactly the
+ * server's ceiling seals to more than the ceiling, and the server refuses it,
+ * for ever, and the file it belongs to never syncs.
+ */
+export const SEAL_OVERHEAD = NONCE_LENGTH + TAG_BITS / 8 + 1;
+
 /** Root secret length in bytes. */
 export const SECRET_LENGTH = 20;
 

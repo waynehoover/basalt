@@ -875,3 +875,169 @@ async function entryCount(d: Device): Promise<number> {
     const state = await d.store.load();
     return state ? Object.keys(state.entries).length : 0;
 }
+
+describe("what a large attachment costs to send", () => {
+    /**
+     * A put used to take every sealed chunk of a file at once, so a 256 MiB
+     * attachment, which is the size the server advertises it will take, meant
+     * 512 MiB live: the file and a sealed copy of it. Measured rather than
+     * guessed, and on a phone that is not a spike but the end of the process.
+     *
+     * The names still have to be known before the put is sent, so the file is
+     * chunked and sealed in full either way. What changed is whether the sealed
+     * bytes are then kept. Above a threshold they are dropped and a wanted
+     * chunk is sealed again from the file, which is deterministic and so gives
+     * the same bytes.
+     *
+     * This counts how many sealed bodies are alive when the server asks for one
+     * rather than trying to read the heap, because the heap is the runtime's
+     * business and the count is the property.
+     */
+    it("does not hold a sealed copy of the whole file", async () => {
+        await fresh();
+        const said: string[] = [];
+        const a = await device("a", (m: string, ...r: unknown[]) => said.push(m + " " + r.map(String).join(" ")));
+
+        // Incompressible, so the sealed bytes are the size of the file rather
+        // than of a run-length encoding of it.
+        const big = new Uint8Array(12 * 1024 * 1024);
+        for (let at = 0; at < big.length; at += 65536) {
+            crypto.getRandomValues(big.subarray(at, Math.min(at + 65536, big.length)));
+        }
+        await a.vault.write("attachment.bin", big, { mtime: 1000, ctime: 1000 });
+
+        const report = await a.engine.sync();
+        expect(report.uploaded, said.join(" | ")).toBe(1);
+        expect(report.chunksSent, "a 12 MiB attachment came out as one chunk").toBeGreaterThan(1);
+
+        // And it arrives intact, which is the thing re-sealing could break: the
+        // second seal has to be byte for byte the first, or the server refuses
+        // the body against the name it asked for.
+        const b = await device("b");
+        await b.settle(6);
+        const got = await b.vault.read("attachment.bin");
+        expect(got.length).toBe(big.length);
+        expect(Buffer.from(got).equals(Buffer.from(big)), "the attachment came back different").toBe(true);
+    }, 300_000);
+
+    /** A note keeps its sealed chunks, because re-sealing one saves nothing. */
+    it("still sends a small file without sealing it twice", async () => {
+        await fresh();
+        const a = await device("a");
+        await a.vault.edit("note.md", "a note, which is what almost every file is\n");
+        // One pass, because Device.settle returns the last of several and the
+        // last one is by construction the one with nothing left to do.
+        const report = await a.engine.sync();
+        expect(report.uploaded).toBe(1);
+
+        const b = await device("b");
+        await b.settle(4);
+        expect(b.vault.text("note.md")).toBe("a note, which is what almost every file is\n");
+    }, 300_000);
+});
+
+/**
+ * Large files, of both kinds, through the real server.
+ *
+ * The chunk-size bug that made a max-size chunk exceed the ceiling only bit on
+ * data that does not compress, and every large-file test in this project used
+ * data that did. These use both: bytes from the random source, which is what a
+ * photo or a video is, and prose, which is what a long note is.
+ */
+describe("large files", () => {
+    /** Incompressible, in pieces because getRandomValues has a cap. */
+    const noise = (bytes: number): Uint8Array => {
+        const out = new Uint8Array(bytes);
+        for (let at = 0; at < out.length; at += 65536) {
+            crypto.getRandomValues(out.subarray(at, Math.min(at + 65536, out.length)));
+        }
+        return out;
+    };
+
+    /** Prose, which compresses, and is what a long note actually is. */
+    const prose = (bytes: number): string => {
+        const words = "the quick brown fox jumps over a lazy dog while nobody watches".split(" ");
+        let out = "";
+        let i = 0;
+        while (out.length < bytes) {
+            out += words[i++ % words.length] + (i % 12 === 0 ? "\n" : " ");
+        }
+        return out.slice(0, bytes);
+    };
+
+    it("carries an attachment that does not compress", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        const bytes = noise(9 * 1024 * 1024);
+        await a.vault.write("photo.raw", bytes, { mtime: 1000, ctime: 1000 });
+
+        const sent = await a.engine.sync();
+        expect(sent.uploaded, `report was ${JSON.stringify(sent)}`).toBe(1);
+        expect(sent.chunksSent, "9 MiB arrived as one chunk").toBeGreaterThan(4);
+
+        await convergeBoth(a, b, 6);
+        const got = await b.vault.read("photo.raw");
+        expect(got.length).toBe(bytes.length);
+        expect(Buffer.from(got).equals(Buffer.from(bytes)), "the attachment came back different").toBe(true);
+    }, 300_000);
+
+    it("carries a note far larger than a note usually is", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        const text = prose(6 * 1024 * 1024);
+        await a.vault.edit("long.md", text);
+
+        const sent = await a.engine.sync();
+        expect(sent.uploaded, `report was ${JSON.stringify(sent)}`).toBe(1);
+
+        await convergeBoth(a, b, 8);
+        expect(b.vault.text("long.md")?.length).toBe(text.length);
+        expect(b.vault.text("long.md")).toBe(text);
+    }, 300_000);
+
+    /**
+     * The reason for chunking at all. An edit in the middle of a large file
+     * should cost a chunk, not the file.
+     */
+    it("sends a chunk rather than the file when a large note changes", async () => {
+        await fresh();
+        const a = await device("a");
+        const text = prose(4 * 1024 * 1024);
+        await a.vault.edit("long.md", text);
+        await a.settle();
+
+        const middle = Math.floor(text.length / 2);
+        await a.vault.edit("long.md", text.slice(0, middle) + "an inserted sentence. " + text.slice(middle), 2_000_000);
+        const again = await a.engine.sync();
+
+        expect(again.uploaded).toBe(1);
+        expect(
+            again.bytesSent,
+            `an edit to a 4 MiB note cost ${again.bytesSent} bytes across ${again.chunksSent} chunks`
+        ).toBeLessThan(64 * 1024);
+    }, 300_000);
+
+    /** An attachment edited in the middle is the same claim, without deflate. */
+    it("sends a chunk rather than the file when a large attachment changes", async () => {
+        await fresh();
+        const a = await device("a");
+        const bytes = noise(8 * 1024 * 1024);
+        await a.vault.write("clip.raw", bytes, { mtime: 1000, ctime: 1000 });
+        await a.settle();
+
+        const edited = bytes.slice();
+        edited.set(noise(1024), Math.floor(edited.length / 2));
+        await a.vault.write("clip.raw", edited, { mtime: 2000, ctime: 1000 });
+        const again = await a.engine.sync();
+
+        expect(again.uploaded).toBe(1);
+        expect(
+            again.bytesSent,
+            `changing 1 KiB of an 8 MiB attachment cost ${again.bytesSent} bytes`
+        ).toBeLessThan(4 * 1024 * 1024);
+    }, 300_000);
+});
