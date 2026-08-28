@@ -293,11 +293,25 @@ async function cmdDeleted(args: Args, io: Console): Promise<number> {
             io.out("Nothing has been deleted from this vault.");
             return 0;
         }
+        let lost = 0;
         for (const v of gone.notes) {
-            io.out(`${when(v.mtime)}  ${v.device.padEnd(12)}  ${v.path}`);
+            // Said per note rather than assumed for all of them. A purge keeps
+            // only the newest version per path, which for a deleted note is the
+            // deletion, so its content can be gone while it is still listed.
+            const state = v.restorable === 0 ? "  (content purged)" : "";
+            if (v.restorable === 0) lost++;
+            io.out(`${when(v.mtime)}  ${v.device.padEnd(12)}  ${v.path}${state}`);
         }
         io.out("");
-        io.out(`${gone.notes.length} deleted, all still recoverable. basalt restore PATH brings one back.`);
+        const recoverable = gone.notes.length - lost;
+        if (lost === 0) {
+            io.out(`${recoverable} deleted, all still recoverable. basalt restore PATH brings one back.`);
+        } else {
+            io.out(
+                `${gone.notes.length} deleted. ${recoverable} can be restored; ` +
+                    `${lost} had their history purged and cannot be.`
+            );
+        }
         // Never a short list that looks complete. Somebody reading one and not
         // finding their note concludes it is gone.
         if (gone.more) io.out("There are older deletions than these. --limit N shows more.");

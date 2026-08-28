@@ -401,3 +401,44 @@ describe("recovery is read only", () => {
         );
     }, 300_000);
 });
+
+describe("after the history has been purged", () => {
+    /**
+     * Purge keeps only the newest version per path. For a deleted note that is
+     * the deletion record, so the note stays in the list and its content is
+     * gone. The list used to print "all still recoverable" over it, which told
+     * somebody their note was safe when it was not.
+     */
+    it("says which notes can no longer be brought back", async () => {
+        const dir = await paired();
+        await write(dir, "kept.md", "still here\n");
+        await write(dir, "purged.md", "about to be unrecoverable\n");
+        await cli("sync", "--dir", dir);
+        await rm(join(dir, "purged.md"));
+        await cli("sync", "--dir", dir);
+
+        const before = await cli("deleted", "--dir", dir, "--json");
+        expect((before.json()["deleted"] as { restorable: number }[])[0]!.restorable).toBeGreaterThan(0);
+
+        // Purge needs the data directory to itself, which is what the
+        // exclusive lock is for, so the server steps aside for it.
+        await server.whileStopped(async () => {
+            await server.cli("purge", "-vault", "default");
+        });
+
+        const after = await cli("deleted", "--dir", dir, "--json");
+        const notes = after.json()["deleted"] as { path: string; restorable: number }[];
+        expect(notes.map((n) => n.path)).toEqual(["purged.md"]);
+        expect(notes[0]!.restorable, "the content survived a purge, which it should not have").toBe(0);
+
+        const human = await cli("deleted", "--dir", dir);
+        expect(human.stdout).toMatch(/content purged/);
+        expect(human.stdout, "it still claimed everything was recoverable").not.toMatch(/all still recoverable/);
+
+        // And trying anyway fails plainly rather than writing an empty file.
+        const attempt = await cli("restore", "purged.md", "--dir", dir);
+        expect(attempt.code).toBe(1);
+        expect(attempt.all).toMatch(/no version of purged\.md with any content/);
+        await expect(read(dir, "purged.md")).rejects.toThrow();
+    }, 300_000);
+});

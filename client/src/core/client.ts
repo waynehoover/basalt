@@ -224,9 +224,14 @@ export class Client {
      */
     async deleted(limit?: number): Promise<DeletedList> {
         const answer = await this.serial(() => this.transport.deleted(limit));
-        const notes: Version[] = [];
+        const notes: Deletion[] = [];
         for (const e of answer.entries) {
-            notes.push(this.asVersion(e, await openPath(this.opts.keys, e.path)));
+            notes.push({
+                ...this.asVersion(e, await openPath(this.opts.keys, e.path)),
+                // Zero means purge has taken every version that had content.
+                // The note is still listed, and there is nothing to bring back.
+                restorable: e.restorable ?? 0,
+            });
         }
         return { notes, more: answer.more };
     }
@@ -303,8 +308,21 @@ export class Client {
  * gone.
  */
 export interface DeletedList {
-    readonly notes: Version[];
+    readonly notes: Deletion[];
     readonly more: boolean;
+}
+
+/**
+ * A deleted note, and whether anything survives to bring it back.
+ *
+ * The two are separate facts. Purge keeps only the newest version per path, and
+ * for a deleted note that is the deletion record, so a note can be listed here
+ * with its content gone. Saying "all still recoverable" over this list without
+ * looking tells somebody their note is safe when it is not.
+ */
+export interface Deletion extends Version {
+    /** The newest version with content, or 0 when there is none left. */
+    readonly restorable: number;
 }
 
 /** One version of one note, as recovery talks about it. */

@@ -38,6 +38,11 @@ export const PROTO = 1;
 export const REQUEST_TIMEOUT_MS = 60_000;
 
 /** An entry as it arrives from the server. Paths and chunk names are sealed. */
+export interface WireDeletion extends WireEntry {
+    /** The newest version with content, or 0 when purge has taken them all. */
+    readonly restorable: number;
+}
+
 export interface WireEntry {
     readonly uid: number;
     readonly path: string;
@@ -618,7 +623,7 @@ export class Transport {
      * a deletion behind at the old path, and a recovery list that is mostly
      * phantom deletions of files that still exist is one nobody reads.
      */
-    async deleted(limit?: number): Promise<{ entries: WireEntry[]; more: boolean }> {
+    async deleted(limit?: number): Promise<{ entries: WireDeletion[]; more: boolean }> {
         const reply = await this.request({ op: "deleted", ...(limit !== undefined ? { limit } : {}) });
         if (reply["res"] !== "deleted") {
             throw new ProtocolError("protostate", `expected deleted, got ${JSON.stringify(reply)}`);
@@ -626,7 +631,10 @@ export class Transport {
         // `more` says the server cut the list short. Dropping it would hand
         // somebody a short list that looks complete, and the note they are
         // looking for is exactly the one that might be missing from it.
-        return { entries: entriesOf(reply["entries"], "deleted"), more: reply["more"] === true };
+        return {
+            entries: entriesOf(reply["entries"], "deleted") as WireDeletion[],
+            more: reply["more"] === true,
+        };
     }
 
     /**

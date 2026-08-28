@@ -327,3 +327,46 @@ func TestDeletedIsBoundedAndSaysWhenItWasCut(t *testing.T) {
 		t.Fatalf("got %d deletions with more=%v, want 12 and false", len(page.Entries), page.More)
 	}
 }
+
+// Purge keeps only the newest version per path. For a deleted note that is the
+// deletion record, so after a purge the note is still in the deleted list and
+// there is nothing left to restore it from.
+//
+// Saying so is the point. A client that prints "all still recoverable" over
+// this list without looking, which one did, tells somebody their note is safe
+// when it is gone.
+func TestDeletedSaysWhetherThereIsAnythingLeftToRestore(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	content := cl.put("note.md", "the only version")
+	cl.remove("note.md")
+
+	var before wire.Deleted
+	cl.sendJSON(wire.In{Op: "deleted"})
+	cl.recvInto("deleted", &before)
+	if len(before.Entries) != 1 {
+		t.Fatalf("expected one deletion, got %d", len(before.Entries))
+	}
+	if before.Entries[0].RestorableUID != content {
+		t.Fatalf("restorable is %d, want the content version %d",
+			before.Entries[0].RestorableUID, content)
+	}
+
+	// Now the history goes.
+	if _, err := r.st.Purge(testVault, 0); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	var after wire.Deleted
+	cl.sendJSON(wire.In{Op: "deleted"})
+	cl.recvInto("deleted", &after)
+	if len(after.Entries) != 1 {
+		t.Fatalf("the deletion should still be listed, got %d", len(after.Entries))
+	}
+	if after.Entries[0].RestorableUID != 0 {
+		t.Fatalf("restorable is %d after a purge, and nothing survives to restore from",
+			after.Entries[0].RestorableUID)
+	}
+}

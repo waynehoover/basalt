@@ -97,10 +97,10 @@ export class TestServer {
         throw new Error(`server would not start after four attempts: ${last?.message}`);
     }
 
-    private async startOnce(): Promise<void> {
+    private async startOnce(fixedPort?: number): Promise<void> {
         const binary = await serverBinary();
         if (!this.dataDir) this.dataDir = await mkdtemp(join(tmpdir(), "basalt-data-"));
-        this.port = await freePort();
+        this.port = fixedPort ?? (await freePort());
         this.stderr.length = 0;
         this.proc = spawn(binary, ["serve", "-data", this.dataDir, "-addr", `127.0.0.1:${this.port}`], {
             stdio: ["ignore", "pipe", "pipe"],
@@ -124,6 +124,25 @@ export class TestServer {
             }
         }
         this.token = (await readFile(join(this.dataDir, "auth-token"), "utf8")).trim();
+    }
+
+    /**
+     * Stops the server, runs something that needs the directory to itself, and
+     * starts again on the same port.
+     *
+     * `purge` and `backup` take the data directory's exclusive lock, so they
+     * cannot run against a live server, which is the whole point of the lock.
+     * The port is kept because a client's stored config names it, and a test
+     * that had to re-pair afterwards would be testing the re-pairing.
+     */
+    async whileStopped(fn: () => Promise<void>): Promise<void> {
+        const port = this.port;
+        await this.stop();
+        try {
+            await fn();
+        } finally {
+            await this.startOnce(port);
+        }
     }
 
     async stop(): Promise<void> {

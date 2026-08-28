@@ -262,8 +262,14 @@ type History struct {
 // deletions of files that still exist under another name, and a recovery list
 // that is mostly noise is one nobody reads.
 type Deleted struct {
-	Res     string        `json:"res"` // "deleted"
-	Entries []store.Entry `json:"entries"`
+	Res string `json:"res"` // "deleted"
+	// Each entry carries `restorable`: the uid of the newest version with
+	// content in it, or zero. Purge keeps only the newest version per path, and
+	// for a deleted note that is the deletion record, so a note can be listed
+	// here with nothing left to restore it from. A client that says "all still
+	// recoverable" over this list without looking is telling somebody their
+	// note is safe when it is not.
+	Entries []store.Deletion `json:"entries"`
 	// More says the list was cut short. A vault accumulates deletions for as
 	// long as it exists, so the answer is bounded; saying nothing about it
 	// would hand somebody a short list that looks complete, and the note they

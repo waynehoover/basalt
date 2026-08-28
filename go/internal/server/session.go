@@ -723,7 +723,7 @@ func (s *Session) handleDeleted(m wire.In) error {
 		s.srv.log.Error("deleted", "vault", s.vaultID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("could not list deletions"))
 	}
-	return s.writeJSON(wire.Deleted{Res: "deleted", Entries: nonNil(entries), More: more})
+	return s.writeJSON(wire.Deleted{Res: "deleted", Entries: nonNilDeletions(entries), More: more})
 }
 
 // nonNil keeps an empty result an empty array rather than JSON null.
@@ -734,6 +734,13 @@ func (s *Session) handleDeleted(m wire.In) error {
 func nonNil(entries []store.Entry) []store.Entry {
 	if entries == nil {
 		return []store.Entry{}
+	}
+	return entries
+}
+
+func nonNilDeletions(entries []store.Deletion) []store.Deletion {
+	if entries == nil {
+		return []store.Deletion{}
 	}
 	return entries
 }

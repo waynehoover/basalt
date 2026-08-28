@@ -218,7 +218,7 @@ func TestEntriesLeaveTheStoreWithAnArrayNotNull(t *testing.T) {
 		t.Fatalf("deleted: %v", err)
 	}
 	for _, e := range del {
-		check("deleted entry", e)
+		check("deleted entry", e.Entry)
 	}
 }
 

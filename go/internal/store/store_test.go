@@ -1161,3 +1161,88 @@ func TestADeletionIsStillListedWhenThePathWasReusedAfterARename(t *testing.T) {
 		t.Fatalf("a real deletion was hidden by an old rename: %v", got)
 	}
 }
+
+// The fault verify could not see.
+//
+// Its query joined entries to their chunk rows, so an entry whose chunk rows are
+// gone had nothing to join to and was never examined. An entry declaring a size
+// with no chunks behind it is a note that reads as empty rather than as an
+// error, and `basalt verify` called the vault clean.
+func TestVerifyNoticesAnEntryWhoseChunksAreGone(t *testing.T) {
+	h := newTestStore(t)
+	e := h.file(t, "note.md", "the content of a note")
+	h.file(t, "fine.md", "still intact")
+
+	// Exactly what a botched migration or a bad row delete leaves behind. The
+	// bodies are still on disk; nothing points at them any more.
+	if _, err := h.db.Exec(`DELETE FROM entry_chunks WHERE vault_id = 'v1' AND uid = ?`, e.UID); err != nil {
+		t.Fatalf("detach chunks: %v", err)
+	}
+
+	faults, _, err := h.Verify(false)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if len(faults) != 1 {
+		t.Fatalf("verify found %d faults, want 1: %v", len(faults), faults)
+	}
+	if faults[0].Reason != "nochunks" || faults[0].Path != "note.md" {
+		t.Fatalf("verify reported %v, want nochunks for note.md", faults[0])
+	}
+}
+
+// The other half of the biconditional: content attached to something that
+// should have none is a folder or a deletion carrying bytes nobody will read.
+func TestVerifyNoticesChunksOnSomethingThatShouldHaveNone(t *testing.T) {
+	h := newTestStore(t)
+	e := h.file(t, "note.md", "content")
+	if _, err := h.db.Exec(
+		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path)
+		 VALUES ('v1', ?, 'folder', 0, 1, 1, 1, 0, 'test', '')`, e.UID+1000); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+	if _, err := h.db.Exec(
+		`INSERT INTO entry_chunks (vault_id, uid, ord, name) VALUES ('v1', ?, 0, ?)`,
+		e.UID+1000, e.Chunks[0]); err != nil {
+		t.Fatalf("attach chunk to folder: %v", err)
+	}
+
+	faults, _, err := h.Verify(false)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	found := false
+	for _, f := range faults {
+		if f.Reason == "straychunks" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("verify did not notice chunks on a folder: %v", faults)
+	}
+}
+
+// And a healthy vault is still reported healthy, so the new checks are not
+// simply refusing everything.
+func TestVerifyIsQuietOnAHealthyVault(t *testing.T) {
+	h := newTestStore(t)
+	h.file(t, "note.md", "content", "more content")
+	h.file(t, "empty.md")
+	if _, err := h.AppendEntry("v1", Entry{Path: "gone.md", Deleted: true, MTime: 3}); err != nil {
+		t.Fatalf("seed deletion: %v", err)
+	}
+	if _, err := h.AppendEntry("v1", Entry{Path: "dir", Folder: true, MTime: 4}); err != nil {
+		t.Fatalf("seed folder: %v", err)
+	}
+
+	faults, checked, err := h.Verify(true)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if len(faults) != 0 {
+		t.Fatalf("a healthy vault reported %d faults: %v", len(faults), faults)
+	}
+	if checked == 0 {
+		t.Fatal("verify checked nothing and called it clean")
+	}
+}

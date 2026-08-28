@@ -661,9 +661,20 @@ class RecoverModal extends Modal {
         }
 
         for (const version of deleted.notes) {
+            const when = new Date(version.mtime).toLocaleString();
+            if (version.restorable === 0) {
+                // Listed, and honestly. A purge keeps only the newest version
+                // per path, which for a deleted note is the deletion itself, so
+                // this one is a record of something with nothing left behind
+                // it. Offering a button that could only fail would be worse.
+                new Setting(contentEl)
+                    .setName(version.path)
+                    .setDesc(`Deleted ${when}. Its history has been purged, so there is nothing to restore.`);
+                continue;
+            }
             new Setting(contentEl)
                 .setName(version.path)
-                .setDesc(`Deleted ${new Date(version.mtime).toLocaleString()}, last written on ${version.device}`)
+                .setDesc(`Deleted ${when}, last written on ${version.device}`)
                 .addButton((b) =>
                     b
                         .setButtonText("Restore")

@@ -580,10 +580,27 @@ func (s *Store) HistoryForPath(vaultID, path string, beforeUID int64, limit int)
 // looking for is the worst version of it.
 const DeletedMax = 1000
 
+// Deletion is a deleted path, and whether anything survives to restore it from.
+//
+// The two are separate facts and used to be conflated. Purge keeps only the
+// newest version per path, which for a deleted note is the deletion record, so
+// after a purge the note is still listed and its content is gone. A client
+// saying "all still recoverable" over that list, which one did, is telling
+// somebody their note is safe when it is not.
+type Deletion struct {
+	Entry
+	// RestorableUID is the newest version of this path with content in it, or
+	// zero when purge has taken them all.
+	RestorableUID int64 `json:"restorable"`
+}
+
 // Deleted returns paths whose newest version is a deletion, newest first, and
 // whether there were more than it returned.
-func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Entry, bool, error) {
-	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path
+func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Deletion, bool, error) {
+	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path,
+	             COALESCE((SELECT MAX(r.uid) FROM entries r
+	                        WHERE r.vault_id = e.vault_id AND r.path = e.path
+	                          AND r.deleted = 0 AND r.folder = 0 AND r.uid < e.uid), 0)
 	        FROM entries e
 	        JOIN (SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path) latest
 	          ON e.path = latest.path AND e.uid = latest.uid
@@ -605,14 +622,39 @@ func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Entr
 	// guess from a full page.
 	q += ` ORDER BY e.uid DESC LIMIT ?`
 
-	entries, err := s.manyEntries(vaultID, q, vaultID, vaultID, limit+1)
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return nil, false, err
 	}
-	if len(entries) > limit {
-		return entries[:limit], true, nil
+	defer tx.Rollback()
+
+	rows, err := tx.Query(q, vaultID, vaultID, limit+1)
+	if err != nil {
+		return nil, false, err
 	}
-	return entries, false, nil
+	defer rows.Close()
+
+	out := []Deletion{}
+	for rows.Next() {
+		var d Deletion
+		var prev sql.NullString
+		if err := rows.Scan(&d.UID, &d.Path, &d.Size, &d.CTime, &d.MTime,
+			&d.Folder, &d.Deleted, &d.Device, &prev, &d.RestorableUID); err != nil {
+			return nil, false, err
+		}
+		d.Prev = prev.String
+		// A deletion carries no bodies of its own, and the field is an array on
+		// the wire for the same reason every other entry list is.
+		d.Chunks = []string{}
+		out = append(out, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(out) > limit {
+		return out[:limit], true, nil
+	}
+	return out, false, nil
 }
 
 func (s *Store) manyEntries(vaultID, query string, args ...any) ([]Entry, error) {
@@ -908,12 +950,16 @@ type Fault struct {
 	VaultID string
 	UID     int64
 	Path    string
-	Chunk   string
-	Reason  string // "missing" or "corrupt"
-	Detail  string
+	// Chunk is empty for a fault about the entry itself rather than a body.
+	Chunk  string
+	Reason string // "missing", "corrupt", "nochunks" or "straychunks"
+	Detail string
 }
 
 func (f Fault) String() string {
+	if f.Chunk == "" {
+		return fmt.Sprintf("vault %s uid %d: %s (%s)", f.VaultID, f.UID, f.Reason, f.Detail)
+	}
 	return fmt.Sprintf("vault %s uid %d chunk %s: %s (%s)",
 		f.VaultID, f.UID, f.Chunk, f.Reason, f.Detail)
 }
@@ -965,7 +1011,58 @@ func (s *Store) Verify(deep bool) ([]Fault, int, error) {
 			}
 		}
 	}
-	return faults, checked, rows.Err()
+	if err := rows.Err(); err != nil {
+		return faults, checked, err
+	}
+
+	entryFaults, err := s.verifyEntries()
+	return append(faults, entryFaults...), checked, err
+}
+
+// verifyEntries checks the entries themselves, rather than the bodies they name.
+//
+// The loop above joins entries to their chunk rows, so an entry whose chunk rows
+// are gone is not examined at all: it has nothing to join to. That is the worst
+// thing this tool could miss. An entry declaring a size with no chunks behind it
+// is a note that reads as empty rather than as an error, which is the failure
+// this whole project is arranged against, and `verify` reported the vault clean.
+//
+// Both directions are checked, because the invariant is a biconditional and the
+// opposite fault, chunks attached to something that should have none, means a
+// folder or a deletion carrying content nobody will ever read.
+func (s *Store) verifyEntries() ([]Fault, error) {
+	rows, err := s.db.Query(
+		`SELECT e.vault_id, e.uid, e.path, e.size, e.folder, e.deleted,
+		        (SELECT COUNT(*) FROM entry_chunks c WHERE c.vault_id = e.vault_id AND c.uid = e.uid)
+		   FROM entries e
+		  ORDER BY e.vault_id, e.uid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var faults []Fault
+	for rows.Next() {
+		var f Fault
+		var size int64
+		var folder, deleted bool
+		var chunkCount int
+		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &size, &folder, &deleted, &chunkCount); err != nil {
+			return faults, err
+		}
+		wantsChunks := size > 0 && !folder && !deleted
+		switch {
+		case wantsChunks && chunkCount == 0:
+			f.Reason = "nochunks"
+			f.Detail = fmt.Sprintf("declares %d bytes and names no chunks, so it would read as empty", size)
+			faults = append(faults, f)
+		case !wantsChunks && chunkCount > 0:
+			f.Reason = "straychunks"
+			f.Detail = fmt.Sprintf("names %d chunks but should have none", chunkCount)
+			faults = append(faults, f)
+		}
+	}
+	return faults, rows.Err()
 }
 
 // PrunedVault names a vault removed by PruneEmptyVaults.
