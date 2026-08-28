@@ -15,7 +15,7 @@
  * below: `Client` is one connection, and `runForever` is the loop.
  */
 
-import { Engine, type SyncReport } from "./engine.ts";
+import { Engine, type SyncOptions, type SyncReport } from "./engine.ts";
 import { Backoff, ProtocolError, Transport, type ServerLimits, type SocketLike } from "./transport.ts";
 import type { IndexStore, Vault } from "./vault.ts";
 import type { VaultKeys } from "./crypto.ts";
@@ -111,12 +111,12 @@ export class Client {
      * would tell every successful sync that it had done no work. That was a real
      * bug, caught by the first end-to-end test that read the output.
      */
-    async settle(maxPasses = 8): Promise<SyncReport> {
-        let pass = await this.engine.sync();
+    async settle(opts: SyncOptions = {}, maxPasses = 8): Promise<SyncReport> {
+        let pass = await this.engine.sync(opts);
         let total = pass;
         for (let i = 0; i < maxPasses && didSomething(pass); i++) {
             await sleep(60);
-            pass = await this.engine.sync();
+            pass = await this.engine.sync(opts);
             total = accumulate(total, pass);
         }
         return total;
@@ -152,9 +152,9 @@ export class Client {
      * Failures are logged rather than thrown, because the caller is an event
      * handler and there is nothing useful for it to do with an exception.
      */
-    async sync(): Promise<SyncReport | undefined> {
+    async sync(opts: SyncOptions = {}): Promise<SyncReport | undefined> {
         try {
-            return await this.engine.sync();
+            return await this.engine.sync(opts);
         } catch (err) {
             this.opts.log?.("sync failed", (err as Error).message);
             return undefined;

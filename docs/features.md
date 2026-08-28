@@ -154,12 +154,12 @@ match on the way in.
 | Local index with one remembered fingerprint per file | **Built** |
 | Content cache, so an unchanged vault costs one stat per file | **Built** |
 | Filesystem adapter | **Built** |
-| Obsidian Vault API adapter | **Partial**, written and untested |
-| Obsidian plugin shell | **Written**, and never loaded in Obsidian |
+| Obsidian Vault API adapter | **Built**, against a fake of Obsidian's own interface |
+| Obsidian plugin shell | **Built**, and never loaded in Obsidian |
 | Reconnect with backoff and jitter | **Built** |
 | Headless CLI | **Built** |
 | Pairing | **Built**, one string carrying the address, the token and the secret |
-| Status bar, and one modal that is not a settings tab | **Written**, untested |
+| Status bar, and one modal that is not a settings tab | **Built** |
 
 ## Security and privacy
 
@@ -210,9 +210,14 @@ Stated plainly, because a features list that only lists features is marketing.
 - **No mobile.** Never run on iOS or Android. The crypto was built from WebCrypto
   primitives specifically so it could be, and that is not the same as having
   tried.
-- **The plugin has never been loaded in Obsidian.** It builds, it bundles to a
-  file that requires nothing but `obsidian`, and its default export is a class
-  extending `Plugin`. None of that is the same as running.
+- **The plugin has never been loaded in Obsidian.** What has happened: the
+  built `dist/plugin/main.js` is loaded in a test, handed a stand-in for
+  Obsidian, and two copies of it pair and sync a note through a real server. The
+  stand-in implements `DataAdapter` against the real declarations, and the one
+  behaviour that matters, `normalizePath`, was read out of the shipped
+  `obsidian.asar` rather than assumed. That found four bugs, one of which made a
+  note vanish from the listing without a word (`docs/client-design.md`). None of
+  it is the same as running in Obsidian, which is next.
 - **No recovery interface.** The server keeps every version and every deletion
   and exposes none of it: there is no `history` or `restore` operation on the
   wire, so a deleted note is safe and not yet reachable.

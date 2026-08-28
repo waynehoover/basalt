@@ -21,7 +21,7 @@
  * which is as close as it gets until it runs in a vault.
  */
 
-import { Modal, Notice, Plugin, Setting, type TAbstractFile } from "obsidian";
+import { Modal, Notice, Plugin, Setting, type TAbstractFile, type TextComponent } from "obsidian";
 
 import { Client, runForever, summarise, type ClientOptions } from "../core/client.ts";
 import { deriveKeys, generateSecret } from "../core/crypto.ts";
@@ -49,7 +49,7 @@ export default class BasaltPlugin extends Plugin {
     private state: State = { kind: "unpaired" };
     private statusEl: HTMLElement | undefined;
     private running = false;
-    private nudgeTimer: number | undefined;
+    private nudgeTimer: ReturnType<typeof setTimeout> | undefined;
 
     override async onload(): Promise<void> {
         this.statusEl = this.addStatusBarItem();
@@ -92,7 +92,7 @@ export default class BasaltPlugin extends Plugin {
 
     override onunload(): void {
         this.running = false;
-        if (this.nudgeTimer !== undefined) window.clearTimeout(this.nudgeTimer);
+        if (this.nudgeTimer !== undefined) clearTimeout(this.nudgeTimer);
         this.client?.close();
     }
 
@@ -107,45 +107,81 @@ export default class BasaltPlugin extends Plugin {
         this.setState({ kind: "connecting" });
 
         void (async () => {
-            await runForever(await this.clientOptions(config), {
-                onClient: (client) => {
-                    this.client = client;
-                },
-                onSynced: (report) => {
-                    this.setState({ kind: "synced", summary: summarise(report), at: Date.now() });
-                    this.announce(report);
-                },
-                onDisconnected: (cause, retryIn) => {
-                    this.setState({ kind: "offline", why: cause.message, retryAt: Date.now() + retryIn });
-                },
-                onUnreachable: (cause, retryIn) => {
-                    this.setState({ kind: "offline", why: cause.message, retryAt: Date.now() + retryIn });
-                },
-                onFatal: (cause) => {
-                    // A refusal that would be repeated word for word forever: a
-                    // bad token, or a cursor the server says is impossible.
-                    // Retrying is a loop that never ends and never says why.
-                    this.setState({ kind: "stopped", why: cause.message });
-                    new Notice(`Basalt has stopped: ${cause.message}`, 0);
-                },
-                keepGoing: () => this.running,
-            });
+            // Anything thrown while assembling the client lands here, and this
+            // is the only place it can be seen. Without the catch below it
+            // becomes an unhandled rejection and the plugin simply never syncs,
+            // with a status bar still saying "connecting".
+            try {
+                await this.runLoop(config);
+            } catch (err) {
+                this.setState({ kind: "stopped", why: (err as Error).message });
+                new Notice(`Basalt has stopped: ${(err as Error).message}`, 0);
+            }
             this.running = false;
         })();
     }
 
+    private async runLoop(config: DeviceConfig): Promise<void> {
+        await runForever(await this.clientOptions(config), {
+            onClient: (client) => {
+                this.client = client;
+            },
+            onSynced: (report) => {
+                this.setState({ kind: "synced", summary: summarise(report), at: Date.now() });
+                this.announce(report);
+            },
+            onDisconnected: (cause, retryIn) => {
+                this.setState({ kind: "offline", why: cause.message, retryAt: Date.now() + retryIn });
+            },
+            onUnreachable: (cause, retryIn) => {
+                this.setState({ kind: "offline", why: cause.message, retryAt: Date.now() + retryIn });
+            },
+            onFatal: (cause) => {
+                // A refusal that would be repeated word for word forever: a
+                // bad token, or a cursor the server says is impossible.
+                // Retrying is a loop that never ends and never says why.
+                this.setState({ kind: "stopped", why: cause.message });
+                new Notice(`Basalt has stopped: ${cause.message}`, 0);
+            },
+            keepGoing: () => this.running,
+        });
+    }
+
     private async clientOptions(config: DeviceConfig): Promise<ClientOptions> {
+        const configDir = this.app.vault.configDir;
         return {
-            vault: new ObsidianVault(this.app.vault.adapter),
-            // Inside the plugin's own folder, under `.obsidian`, which is in the
-            // never-sync list. An index that synced would sync to itself.
-            store: new ObsidianIndexStore(this.app.vault.adapter, `${this.manifest.dir}/index.json`),
+            vault: new ObsidianVault(this.app.vault.adapter, configDir),
+            store: new ObsidianIndexStore(this.app.vault.adapter, this.indexPath(configDir)),
             keys: await deriveKeys(config.secret),
             url: config.url,
             token: config.token,
             vaultId: config.vaultId,
             device: config.device,
         };
+    }
+
+    /**
+     * Where the index goes: inside this plugin's own folder.
+     *
+     * That folder is under Obsidian's config directory, which never syncs, and
+     * an index that synced would sync to itself and be overwritten by every
+     * other device in turn.
+     *
+     * `manifest.dir` is optional in the API. Interpolating it without looking
+     * produces the literal path "undefined/index.json" at the vault root, which
+     * is a perfectly ordinary folder as far as the never-sync list is concerned.
+     * So it is checked, and a path outside the config directory stops the plugin
+     * rather than being used.
+     */
+    private indexPath(configDir: string): string {
+        const dir = this.manifest.dir ?? `${configDir}/plugins/${this.manifest.id}`;
+        if (dir !== configDir && !dir.startsWith(`${configDir}/`)) {
+            throw new Error(
+                `refusing to run: this plugin is installed at ${dir}, which is outside ${configDir}, ` +
+                    `so its index would sync to every other device`
+            );
+        }
+        return `${dir}/index.json`;
     }
 
     /**
@@ -157,8 +193,12 @@ export default class BasaltPlugin extends Plugin {
      */
     private nudge(): void {
         if (!this.client) return;
-        if (this.nudgeTimer !== undefined) window.clearTimeout(this.nudgeTimer);
-        this.nudgeTimer = window.setTimeout(() => {
+        if (this.nudgeTimer !== undefined) clearTimeout(this.nudgeTimer);
+        // Plain setTimeout rather than window's. Obsidian runs in a renderer
+        // where both exist, and the plain one also exists everywhere this can be
+        // tested, which is the difference between a tested nudge and an
+        // untested one.
+        this.nudgeTimer = setTimeout(() => {
             this.nudgeTimer = undefined;
             void this.client?.sync().then((report) => {
                 if (report) {
@@ -180,7 +220,11 @@ export default class BasaltPlugin extends Plugin {
             new Notice("Basalt: not connected. It will sync as soon as it reconnects.");
             return;
         }
-        const report = await this.client.settle();
+        // The write debounce is off for this one. It exists so that somebody
+        // typing does not cause a push per keystroke, and the person who just
+        // chose "sync now" has said otherwise. Reporting "up to date" while
+        // their last paragraph sits unsent is the status rule 7 forbids.
+        const report = await this.client.settle({ coalesceWrites: false });
         this.setState({ kind: "synced", summary: summarise(report), at: Date.now() });
         new Notice(`Basalt: ${summarise(report)}`);
         this.announce(report);
@@ -390,12 +434,16 @@ class BasaltModal extends Modal {
             text: "This vault is not paired yet. If another device already has the vault, paste the string it gave you.",
         });
 
-        let pairingString = "";
-        let device = "";
+        // The fields are read when a button is pressed rather than tracked
+        // through input events. One less thing between what was typed and what
+        // is used, and it is what makes this reachable from a test.
+        let deviceField: TextComponent | undefined;
+        let pairingField: TextComponent | undefined;
+        const device = () => deviceField?.getValue() ?? "";
 
         new Setting(contentEl).setName("Device name").addText((t) => {
             t.setPlaceholder("laptop");
-            t.inputEl.addEventListener("input", () => (device = t.getValue()));
+            deviceField = t;
         });
 
         new Setting(contentEl)
@@ -403,7 +451,7 @@ class BasaltModal extends Modal {
             .setDesc("From Basalt on a device that already has this vault.")
             .addText((t) => {
                 t.setPlaceholder("basalt1_...");
-                t.inputEl.addEventListener("input", () => (pairingString = t.getValue()));
+                pairingField = t;
             });
 
         new Setting(contentEl).addButton((b) =>
@@ -412,7 +460,7 @@ class BasaltModal extends Modal {
                 .setCta()
                 .onClick(async () => {
                     try {
-                        await this.plugin.pair(pairingString, device);
+                        await this.plugin.pair(pairingField?.getValue() ?? "", device());
                         new Notice("Paired. Basalt is syncing.");
                         this.render();
                     } catch (err) {
@@ -426,19 +474,19 @@ class BasaltModal extends Modal {
             text: "Only for the first device. The server prints its token the first time it runs.",
         });
 
-        let url = "";
-        let token = "";
+        let urlField: TextComponent | undefined;
+        let tokenField: TextComponent | undefined;
         new Setting(contentEl).setName("Server").addText((t) => {
             t.setPlaceholder("wss://laptop.tailnet.ts.net");
-            t.inputEl.addEventListener("input", () => (url = t.getValue()));
+            urlField = t;
         });
         new Setting(contentEl).setName("Token").addText((t) => {
-            t.inputEl.addEventListener("input", () => (token = t.getValue()));
+            tokenField = t;
         });
         new Setting(contentEl).addButton((b) =>
             b.setButtonText("Start a new vault").onClick(async () => {
                 try {
-                    await this.plugin.pairFirst(url, token, device);
+                    await this.plugin.pairFirst(urlField?.getValue() ?? "", tokenField?.getValue() ?? "", device());
                     new Notice("Paired. Use the pairing string to add your other devices.");
                     this.render();
                 } catch (err) {

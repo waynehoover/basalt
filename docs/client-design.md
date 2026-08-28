@@ -423,3 +423,80 @@ What remains is the engine, which is policy and belongs in `core`, and two
 adapters behind one interface: list, read, write, remove, rename, and watch. The
 headless client is then not a second client. It is the same one with a different
 adapter, which is exactly what Obsidian concluded.
+
+# What running the plugin without Obsidian turned up
+
+`main.ts` and `obsidian/vault.ts` were written and then not tested, because the
+`obsidian` npm package is type declarations with no runtime: `"main": ""`.
+Obsidian supplies the implementation when it loads a plugin, so the plugin's own
+code could be compiled and never executed.
+
+That is a reason it is hard to test, not a reason it is fine untested. The
+arrangement now is:
+
+- `src/obsidian/fake.ts` implements `DataAdapter`, and is declared
+  `implements DataAdapter` against the real declarations, so the compiler
+  rejects a method whose shape has drifted.
+- `src/obsidian/stub.ts` is the runtime `obsidian` module: `Plugin`, `Modal`,
+  `Setting`, `Notice`, an app and a vault.
+- `vitest.config.ts` aliases `obsidian` to the stub **for tests only**.
+  `tsconfig.json` has no such alias, so `tsc` still checks every call against
+  `obsidian.d.ts`, and `esbuild.config.mjs` still marks it external so the
+  shipped plugin gets Obsidian's own. Types from the declarations, behaviour
+  from the stub.
+- `src/build.test.ts` loads the built `dist/plugin/main.js`, hands it the stub,
+  and pairs two of them against a real Go server. That tests the artifact rather
+  than the source.
+
+It found four bugs, none of which a unit test of the source would have shown.
+
+## normalizePath is not a formatting function
+
+Read out of `Obsidian.app/Contents/Resources/obsidian.asar`, where it is three
+minified functions:
+
+```js
+Nl(e) = Dl(Bl(e)).normalize("NFC")
+Bl(e) = e.replace(/([\\/])+/g, "/").replace(/(^\/+|\/+$)/g, "") || "/"
+Dl(e) = e.replace(/ | /g, " ")
+```
+
+Two of those steps change *which file you are talking about*. A non-breaking
+space (U+00A0) or a narrow no-break space (U+202F) becomes an ordinary space,
+and the result is NFC-normalized, which matters because macOS hands out
+filenames in NFD.
+
+The first version of the adapter called it on paths that had just come back from
+`adapter.list`, and skipped anything whose `stat` then returned null. A note with
+a non-breaking space in its name **disappeared from the listing entirely**. It
+would never have synced and nothing would have said so, which is the exact shape
+of failure this project exists to refuse.
+
+The adapter now keeps one keyspace: everything the engine sees is normalized, and
+where the adapter's own name for a file differs, that mapping is kept so reads
+and writes still land on the real file.
+
+## The config folder is not always `.obsidian`
+
+`Vault.configDir` is documented as "typically `.obsidian` but it could be
+different". The never-sync list hardcoded the usual name, so a vault with a
+custom config folder would have uploaded the plugin's own folder, and that folder
+holds `data.json`, and `data.json` holds the root secret.
+
+The real name is now passed to `ObsidianVault` and there is no default, because a
+default would be right almost always and catastrophic the rest of the time.
+
+## `manifest.dir` is optional
+
+`PluginManifest.dir` is `string | undefined`. Interpolating it produces the
+literal path `undefined/index.json` at the vault root, which the never-sync list
+has no reason to skip. The index would have synced, to itself, and every device
+would have overwritten every other device's idea of what had been synced.
+
+## Sync now did not mean now
+
+The write debounce is Obsidian's, and it is right for a client that keeps
+running. It also applied to the "Sync now" command, so a person who saved a
+paragraph and immediately chose Sync now was told "up to date" while it sat
+unsent. `Engine.sync` now takes a per-pass override and the command turns the
+debounce off, on the grounds that the person has already said now.

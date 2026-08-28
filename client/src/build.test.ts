@@ -15,7 +15,11 @@
 import { execFile } from "node:child_process";
 import { readFile, rm } from "node:fs/promises";
 import { promisify } from "node:util";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+
+import { TestServer, cleanupBinary, serverBinary } from "./core/test-server.ts";
+import * as stub from "./obsidian/stub.ts";
+import type { Plugin as StubPlugin } from "./obsidian/stub.ts";
 
 const run = promisify(execFile);
 const CLI = "dist/basalt.mjs";
@@ -46,6 +50,19 @@ describe("the plugin bundle", () => {
         expect(plugin).not.toMatch(/node:(fs|path|os|crypto|child_process|util)/);
         expect(plugin).not.toMatch(/\bJsonIndexStore\b/);
         expect(plugin).not.toMatch(/\bNodeVault\b/);
+    });
+
+    /**
+     * The stub and the fake exist so the plugin can be tested at all. They must
+     * never ship: a bundle carrying its own `DataAdapter` would be a plugin that
+     * could quietly talk to the wrong one.
+     */
+    it("carries none of the scaffolding that made it testable", () => {
+        expect(plugin).not.toMatch(/FakeAdapter/);
+        expect(plugin).not.toMatch(/class FakeEl/);
+        expect(plugin).not.toMatch(/resetStub/);
+        // And the real module is still expected to come from outside.
+        expect(plugin).toMatch(/require\("obsidian"\)/);
     });
 
     it("brings its dependencies with it", () => {
@@ -95,3 +112,113 @@ describe("the headless bundle", () => {
         await expect(run("node", [CLI, "--nonsense"])).rejects.toMatchObject({ code: 2 });
     });
 });
+
+/**
+ * The bundle, actually run.
+ *
+ * Everything else in this project tests source. This loads the file that would
+ * be copied into a vault, hands it the stub in place of Obsidian, and pairs two
+ * of them against a real server. It is as close to installing the plugin as it
+ * is possible to get without Obsidian.
+ *
+ * It has caught the class of thing only a bundle can get wrong: an entry point
+ * that exports the wrong shape, a dependency that did not survive bundling, a
+ * top-level statement that throws on load. None of those are visible in a test
+ * that imports the source.
+ */
+describe("the plugin bundle, loaded and run", () => {
+    let server: TestServer;
+
+    beforeAll(async () => {
+        await serverBinary();
+    }, 180_000);
+
+    afterEach(async () => {
+        if (server) await server.cleanup();
+    });
+
+    afterAll(async () => {
+        await cleanupBinary();
+    });
+
+    /**
+     * Evaluates the CommonJS bundle with a `require` that only knows `obsidian`.
+     *
+     * Anything else it asks for is an error rather than a silent resolution, so
+     * a dependency that failed to bundle shows up here as a name instead of as a
+     * mystery in somebody's vault.
+     */
+    function loadBundle(): new (app: unknown, manifest: unknown) => StubPlugin & {
+        onload(): Promise<void>;
+        onunload(): void;
+        pairFirst(url: string, token: string, device: string): Promise<string>;
+        pair(pairing: string, device: string): Promise<void>;
+        invite(): string | undefined;
+        currentState: { kind: string };
+    } {
+        const mod: { exports: Record<string, unknown> } = { exports: {} };
+        const factory = new Function("require", "module", "exports", plugin);
+        factory(
+            (name: string) => {
+                if (name === "obsidian") return stub;
+                throw new Error(`the bundle asked for ${name}, which will not be there`);
+            },
+            mod,
+            mod.exports
+        );
+        const exported = mod.exports["default"];
+        if (typeof exported !== "function") {
+            throw new Error(`the bundle's default export is ${typeof exported}, and Obsidian needs a class`);
+        }
+        return exported as never;
+    }
+
+    it("exports something Obsidian can construct", () => {
+        const Built = loadBundle();
+        const app = new stub.App();
+        const instance = new Built(app, { id: "basalt", dir: ".obsidian/plugins/basalt" });
+        expect(instance).toBeInstanceOf(stub.Plugin);
+    });
+
+    it("pairs two vaults and syncs a note between them", async () => {
+        server = new TestServer();
+        await server.start();
+        stub.resetStub();
+        const Built = loadBundle();
+
+        const appA = new stub.App();
+        const a = new Built(appA, { id: "basalt", dir: ".obsidian/plugins/basalt" });
+        const appB = new stub.App();
+        const b = new Built(appB, { id: "basalt", dir: ".obsidian/plugins/basalt" });
+
+        try {
+            await a.onload();
+            await b.onload();
+            appA.vault.adapter.seed("From the bundle.md", "# Built\n\nThis came out of dist.\n");
+
+            const pairing = await a.pairFirst(server.wsUrl, server.token, "laptop");
+            await until(() => a.currentState.kind === "synced");
+
+            await b.pair(pairing, "desktop");
+            await until(() => appB.vault.adapter.text("From the bundle.md") !== undefined, 25_000);
+
+            expect(appB.vault.adapter.text("From the bundle.md")).toBe("# Built\n\nThis came out of dist.\n");
+            // And its own state stayed out of the vault it was syncing.
+            expect(appB.vault.adapter.filePaths().filter((p) => !p.startsWith(".obsidian/"))).toEqual([
+                "From the bundle.md",
+            ]);
+        } finally {
+            a.onunload();
+            b.onunload();
+        }
+    }, 300_000);
+});
+
+async function until(cond: () => boolean, ms = 20_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+        if (cond()) return;
+        await new Promise((r) => setTimeout(r, 25));
+    }
+    throw new Error("timed out");
+}

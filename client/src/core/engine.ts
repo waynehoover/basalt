@@ -97,6 +97,18 @@ export interface EngineOptions {
     readonly coalesceWrites?: boolean;
 }
 
+/** Overrides for a single pass. */
+export interface SyncOptions {
+    /**
+     * Whether to hold back a file written moments ago, just for this pass.
+     *
+     * Defaults to whatever the engine was built with. A person choosing "sync
+     * now" turns it off: they have said now, and reporting "up to date" while
+     * the line they just typed sits unsent is the exact status rule 7 forbids.
+     */
+    readonly coalesceWrites?: boolean;
+}
+
 /**
  * What a sync did.
  *
@@ -309,17 +321,17 @@ export class Engine {
      * second pass concurrently would have two of them deciding about the same
      * file from the same index.
      */
-    async sync(): Promise<SyncReport> {
+    async sync(opts: SyncOptions = {}): Promise<SyncReport> {
         if (this.syncing) {
             this.again = true;
             return emptyReport();
         }
         this.syncing = true;
         try {
-            let report = await this.pass();
+            let report = await this.pass(opts);
             while (this.again) {
                 this.again = false;
-                const next = await this.pass();
+                const next = await this.pass(opts);
                 report = add(report, next);
             }
             return report;
@@ -328,9 +340,10 @@ export class Engine {
         }
     }
 
-    private async pass(): Promise<SyncReport> {
+    private async pass(opts: SyncOptions = {}): Promise<SyncReport> {
         const report = emptyReport();
         const now = this.now();
+        const coalesce = opts.coalesceWrites ?? this.coalesce;
 
         // 1. What the filesystem says. The index's cache means an unchanged file
         //    costs one stat, so a full pass over a large vault is affordable and
@@ -356,7 +369,7 @@ export class Engine {
                 continue;
             }
             try {
-                await this.reconcile(path, onDisk.get(path), report, now);
+                await this.reconcile(path, onDisk.get(path), report, now, coalesce);
                 this.retries.delete(path);
             } catch (err) {
                 this.recordFailure(path, err, report);
@@ -381,7 +394,8 @@ export class Engine {
         path: string,
         stat: { folder: boolean; mtime: number; ctime: number; size: number } | undefined,
         report: SyncReport,
-        now: number
+        now: number,
+        coalesce: boolean
     ): Promise<void> {
         const entry = this.entryFor(path);
         const remote = this.remote.get(path);
@@ -399,7 +413,7 @@ export class Engine {
         const action = decide({ local, remote, index: entry, mergeable: this.mergeable(path) });
 
         if (
-            this.coalesce &&
+            coalesce &&
             action.kind !== "nothing" &&
             local &&
             !stat?.folder &&

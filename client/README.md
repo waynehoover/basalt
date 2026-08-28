@@ -118,3 +118,34 @@ else: the reconnect loop, the settle loop and the report arithmetic are in
 What is checked, in `src/build.test.ts`, is that the plugin bundle needs nothing
 but `obsidian` and contains no `node:` import. That is the regression that would
 otherwise compile, pass every test, and fail only on a phone.
+
+### How the plugin is tested without Obsidian
+
+The `obsidian` package is type declarations with no runtime (`"main": ""`), so
+`main.ts` and `obsidian/vault.ts` could be compiled and never executed.
+
+- `src/obsidian/fake.ts` implements `DataAdapter`, declared against the real
+  declarations so the compiler catches drift. Its `normalizePath` was read out
+  of the shipped `obsidian.asar`, not assumed.
+- `src/obsidian/stub.ts` is the runtime `obsidian` module.
+- `vitest.config.ts` aliases `obsidian` to the stub **for tests only**.
+  `tsconfig.json` does not, so `tsc` checks against the genuine declarations;
+  `esbuild.config.mjs` marks it external, so the shipped plugin gets Obsidian's.
+- `src/build.test.ts` loads the built `dist/plugin/main.js`, hands it the stub,
+  and pairs two of them against a real Go server.
+
+Eighteen deliberate breakages of the plugin and its adapter are all caught. What
+this cannot tell you is whether Obsidian calls these methods when the plugin
+expects, or draws what it builds. That needs Obsidian.
+
+### Installing it into a vault
+
+```
+bun run build
+cp -r dist/plugin /path/to/vault/.obsidian/plugins/basalt
+```
+
+Then enable it in Obsidian's community plugins list. Note that the root secret
+lives in `.obsidian/plugins/basalt/data.json` in the clear, which is the same
+exposure as the headless client's `config.json` and is inherent: the device has
+to be able to decrypt the vault without asking anybody.
