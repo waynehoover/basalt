@@ -58,15 +58,44 @@ version and a mismatch is refused, not negotiated.
 `proto` or `crypto` it does not implement, with `{res:"err", code:"proto"}`,
 rather than trying to interoperate.
 
+`ready` carries every ceiling the server enforces, and it arrives before any
+catch-up, so a client knows all of them before its first `put` rather than
+discovering one by being rejected. Its `cursor` is what the *server* holds.
+
+A client whose cursor is **ahead** of the server's is refused with
+`{res:"err", code:"cursor"}`. It means the server has lost history the client
+already applied: restored from an old backup, or pointed at the wrong vault.
+Continuing would have the server reissue those uids for different content, and
+the two would diverge with both sides reporting success. A refusal needs a human
+and is reversible; silent divergence is neither.
+
 ## Catch-up
 
 The server sends everything after `cursor` as ordered batches, then `ready`.
 
 ```
+<- {res:"ready", ...}
 <- {op:"batch", from:120, to:139, entries:[...]}
 <- {op:"batch", from:140, to:151, entries:[...]}
 <- {op:"caught-up", cursor:151}
 ```
+
+`batch` is the only message that ever carries entries. A live change is a batch
+of one, with `from` and `to` both set to its uid, so catch-up and live delivery
+are the same shape. A client with one code path for "apply these entries, then
+set the cursor to `to`" cannot have a bug in the live path that the catch-up
+path does not also have.
+
+A device receives its **own** committed write as a batch with `entries: []`. It
+gets the cursor advance without the payload, so there is nothing to compare and
+no way to mistake its own file for a remote one. Skipping the device entirely
+instead would leave its cursor one behind for every file it pushes, and the next
+peer's change would then look like a gap.
+
+Batches leave the server in uid order, always, including under simultaneous
+pushes from several devices. That is what makes the continuity check worth
+having: a gap a client sees is a real one, never an artefact of two commits
+racing. An assertion that cries wolf gets switched off.
 
 Entries within a batch are uid-ascending, and `from`/`to` let the client assert
 continuity. A client that sees a gap asks again from its own cursor instead of
@@ -109,8 +138,18 @@ one chunk instead of shifting every chunk after it.
   what makes the name safe to use as a filename. Uppercase is refused rather
   than normalised, because two spellings of one hash are two bodies on disk and
   a dedup miss that presents as unexplained upload volume.
-- `{res:"have"}` with no `chunks` means the server already holds every chunk and
-  the entry is recorded; nothing more is sent.
+- `{res:"have", uid}` means the server already held every chunk, so nothing was
+  uploaded and the entry is recorded. It carries the uid for the same reason
+  `ack` does. `have` and `ack` are different outcomes and both are named.
+- Uploaded bodies are matched to the names in `want` by **hashing the body**,
+  not by their position in the stream. A chunk name is the hash of its body, so
+  the server can check rather than trust: a client that reorders, repeats or
+  skips a frame is caught at the moment it happens instead of storing one body
+  under another's name.
+- A reply arriving before the one you asked for is normal. Another device can
+  commit at any moment, so a batch can land between any request and its
+  response, and every client has to demultiplex on `op` before matching a `res`
+  to the request in flight.
 - The ack carries the assigned uid and is withheld until every chunk and the
   entry are durable. "Acked" means stored.
 - `prev` is the previous path on a rename, so a rename is one operation rather
@@ -123,13 +162,24 @@ one chunk instead of shifting every chunk after it.
 
 ```
 -> {op:"get", uid}
-<- {res:"chunks", chunks:[h1,h2,h3], size}
+<- {res:"chunks", uid, size, chunks:[h1,h2,h3]}
 -> {op:"fetch", chunks:[h2]}          only what this device lacks
 <- binary frame for h2
 ```
 
 A device that already holds `h1` and `h3` from another version of the file never
 downloads them again.
+
+A `fetch` naming any chunk the server lacks sends **no** bodies at all and
+returns `nochunk`. Failing halfway through leaves a client unable to tell which
+of the frames it received. Bodies are verified against their names on the way
+out too, so a chunk that rotted on disk is reported rather than shipped to a
+device that would fail to decrypt it for reasons it cannot diagnose.
+
+A `get` for a uid that does not exist is `nouid`; one for a folder or a deletion
+is `nocontent`. They are separate because a deleted file and a corrupt cursor
+need different responses, and because an empty chunk list already means
+something else: a real, zero-byte note.
 
 ## Deleting
 
@@ -150,9 +200,31 @@ no key for any of it.
 ## Errors
 
 ```
-<- {res:"err", code:"proto"|"auth"|"badname"|"toolarge"|"nospace", msg}
+<- {res:"err", code, msg}
 ```
 
 `code` is for the client, `msg` is for the human. Every rejection has one of
 each, because an error a device cannot act on and a person cannot read is how a
 silent failure starts.
+
+The session **continues** after `badentry`, `badname`, `toolarge`, `nospace`,
+`nouid`, `nocontent` and `nochunk`: these reject one request. It **ends** after
+`proto`, `auth`, `cursor`, `busy`, `protostate` and `badchunk`, either because
+the connection should never have been opened or because the two ends no longer
+agree how many frames are outstanding and carrying on would mean guessing.
+
+| code | meaning |
+|---|---|
+| `proto` | unsupported `proto` or `crypto` |
+| `auth` | bad token or vault, never saying which |
+| `cursor` | the client is ahead of the server; see the handshake |
+| `busy` | the vault's device limit |
+| `protostate` | a message that does not belong in the current state |
+| `badentry` | a structurally invalid put |
+| `badname` | a path the server cannot store |
+| `badchunk` | a body that does not hash to the name it was asked for |
+| `toolarge` | above an advertised ceiling |
+| `nospace` | refused for want of disk |
+| `nouid` | no such entry |
+| `nocontent` | the entry is a folder or a deletion |
+| `nochunk` | the server does not hold that chunk |

@@ -1,0 +1,196 @@
+// Package server speaks the Basalt protocol over a WebSocket.
+//
+// It owns session state and message dispatch. Durability lives in the store and
+// the chunk layer below it; this package's whole contribution to "do not lose a
+// note" is ordering: bodies before entries, entries before acks, and catch-up
+// before live changes.
+package server
+
+import (
+	"crypto/subtle"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/waynehoover/basalt/internal/store"
+	"github.com/waynehoover/basalt/internal/wire"
+)
+
+const (
+	// DefaultMaxPeers caps simultaneous devices on one vault.
+	//
+	// Deliberately small. Basalt targets one person's devices: fan-out is
+	// O(peers) per commit and every connection holds a send queue and a read
+	// buffer. Refusing past the limit is honest; degrading quietly is not.
+	DefaultMaxPeers = 8
+
+	// ReadLimit bounds one incoming frame.
+	//
+	// The binding case is not a chunk body, which is capped at store.ChunkMax.
+	// It is the JSON of a put: store.MaxChunksPerEntry names at 67 bytes each is
+	// about 4.4 MB for the largest legal file. Eight is comfortably above that
+	// and still bounds a hostile peer at maxPeers * 8 MB.
+	ReadLimit = 8 << 20
+
+	// WriteWait bounds one frame write, so a peer that stops reading is
+	// detected rather than pinning a goroutine forever.
+	WriteWait = 30 * time.Second
+
+	// IdleTimeout closes a session that says nothing at all. Clients that want
+	// to sit connected send a ping.
+	IdleTimeout = 5 * time.Minute
+
+	// SendQueueDepth is buffered frames per peer before it is dropped as too
+	// slow. Sized for a burst of fan-out, not for a catch-up: catch-up runs on
+	// the session's own goroutine and blocks rather than buffering.
+	SendQueueDepth = 256
+
+	// CatchupBufferMax bounds live changes held while a session drains its
+	// backlog. A session that cannot finish catch-up before this many commits
+	// land is dropped and recovers on reconnect, which costs it nothing: the
+	// entries table plus the uid cursor is the durable queue.
+	CatchupBufferMax = 4096
+
+	// BatchSize is entries per catch-up batch. Small enough that a client sees
+	// progress and can assert continuity often, large enough that a big vault
+	// is not thousands of frames.
+	BatchSize = 200
+)
+
+// Authenticator decides whether a token may use a vault.
+//
+// It returns an error so the reason can be logged, but the reason never reaches
+// the wire: every failure is reported to the client as CodeAuth, because
+// distinguishing "no such vault" from "wrong token" tells an attacker which
+// half to keep guessing.
+type Authenticator func(vaultID, token string) error
+
+// StaticTokens authenticates against a fixed vault-to-token map.
+//
+// This is the whole of authentication until pairing exists. The comparison is
+// constant time: a token check that returns early on the first wrong byte leaks
+// the token one byte at a time to anyone who can measure it.
+func StaticTokens(tokens map[string]string) Authenticator {
+	// Copy, so a later mutation of the caller's map cannot change who has
+	// access without anything in the log saying so.
+	byVault := make(map[string]string, len(tokens))
+	for v, t := range tokens {
+		byVault[v] = t
+	}
+	return func(vaultID, token string) error {
+		want, ok := byVault[vaultID]
+		if !ok {
+			// Still do a comparison, against a value that cannot match, so an
+			// unknown vault and a wrong token take the same time.
+			subtle.ConstantTimeCompare([]byte(token), []byte(token))
+			return fmt.Errorf("no such vault %q", vaultID)
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(want)) != 1 {
+			return errors.New("token mismatch")
+		}
+		return nil
+	}
+}
+
+// Server is the protocol handler. One per process; sessions are per connection.
+type Server struct {
+	st   *store.Store
+	hub  *Hub
+	auth Authenticator
+	log  *slog.Logger
+
+	maxPeers int
+	// now is injectable so tests do not have to sleep to reach a timeout.
+	now func() time.Time
+
+	// batchSize is BatchSize unless a test lowers it. Lowering it is how the
+	// catch-up path can be made to span many frames without seeding a vault
+	// large enough to do it honestly.
+	batchSize int
+
+	// afterReplayBatch and afterReplay run at known points inside the handshake,
+	// and are nil in every non-test build.
+	//
+	// They exist because the orders that matter most in this package are
+	// "backlog first, live changes after" and "join the fan-out before reading
+	// the backlog, not after", and both are about a window a few microseconds
+	// wide. A test that tried to hit either by timing would be a test that
+	// passes when the machine is busy.
+	//
+	// afterReplayBatch runs once per catch-up batch, so a test can interrupt the
+	// middle of a replay. afterReplay runs after the last batch and before the
+	// buffered live changes are released, which is the window in which an entry
+	// is in neither the backlog nor the flush unless the session joined the
+	// fan-out first.
+	afterReplayBatch func(n int)
+	afterReplay      func()
+
+	// afterAppend runs between assigning a uid and announcing it, and is nil in
+	// every non-test build.
+	//
+	// It exists because the window commitMu closes cannot otherwise be observed:
+	// AppendEntry ends in an fsync, so the goroutine that gets the lower uid has
+	// only a log line and a channel send left to do while the next one still has
+	// a whole durable commit ahead of it. The reorder is real and the lock is
+	// what rules it out, but no amount of concurrency reliably produces it, and
+	// an invariant that holds only because a disk is slow is not one to rely on.
+	afterAppend func(uid int64)
+
+	// commitMu makes appending an entry and announcing it one step.
+	//
+	// Without it two devices can commit uid 5 and uid 6 and reach the hub in
+	// the opposite order, because AppendEntry releases the store's write lock
+	// before the fan-out runs. A peer would then receive [6,6] before [5,5] and
+	// its continuity check would fire on a vault that is perfectly healthy,
+	// which is worse than not checking: an assertion that cries wolf gets
+	// switched off. Live batches leave here in uid order, so a gap a client
+	// sees is always real.
+	//
+	// The cost is that commits to *any* vault serialise. That is already true
+	// one layer down, where the store holds a single write mutex for the same
+	// ordering reason, so this adds a fan-out of a few non-blocking channel
+	// sends to a section that was serial anyway.
+	commitMu sync.Mutex
+}
+
+func New(st *store.Store, auth Authenticator, log *slog.Logger) *Server {
+	return NewWithLimit(st, auth, log, DefaultMaxPeers)
+}
+
+func NewWithLimit(st *store.Store, auth Authenticator, log *slog.Logger, maxPeers int) *Server {
+	if maxPeers <= 0 {
+		maxPeers = DefaultMaxPeers
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Server{
+		st: st, hub: NewHub(), auth: auth, log: log,
+		maxPeers: maxPeers, now: time.Now, batchSize: BatchSize,
+	}
+}
+
+// Store is the persistence this server is serving. Exposed for the command line
+// tools that verify and purge, which must go through the same code the sessions
+// do rather than opening the database a second time.
+func (s *Server) Store() *store.Store { return s.st }
+
+// Peers is the number of devices currently connected to a vault.
+func (s *Server) Peers(vaultID string) int { return s.hub.peerCount(vaultID) }
+
+// ready is the handshake reply, built from the same constants the store
+// enforces. Advertising a limit the store does not enforce, or enforcing one it
+// does not advertise, is how a client ends up retrying a put that can never
+// succeed.
+func (s *Server) ready(cursor int64) wire.Ready {
+	return wire.Ready{
+		Res:        "ready",
+		Proto:      wire.Proto,
+		Cursor:     cursor,
+		PerFileMax: store.PerFileMax,
+		ChunkMax:   s.st.Chunks().Max(),
+		MaxChunks:  store.MaxChunksPerEntry,
+	}
+}
