@@ -170,8 +170,13 @@ describe("one device", () => {
 
         expect(second.uploaded).toBe(1);
         expect(second.chunksSent).toBeLessThanOrEqual(3);
-        expect(second.bytesSent).toBeLessThan(4096);
-        expect(first.bytesSent).toBeGreaterThan(15_000);
+        // The ratio rather than two absolute figures. What the design claims is
+        // that an edit costs a fraction of the file, and that claim should not
+        // have to be restated every time a chunk size changes.
+        expect(
+            second.bytesSent * 8,
+            `the first sync sent ${first.bytesSent} bytes and one edit cost ${second.bytesSent}`
+        ).toBeLessThan(first.bytesSent);
     }, 120_000);
 
     it("sends nothing for a second file with the same content", async () => {

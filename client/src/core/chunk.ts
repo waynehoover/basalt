@@ -69,15 +69,63 @@ export interface ChunkSizes {
 }
 
 /**
- * Text: 128 B / 256 B / 1 KiB, as LiveSync uses.
+ * Text: 512 B / 1 KiB / 4 KiB.
+ *
+ * Four times LiveSync's, which is where these started, and the change was
+ * measured rather than reasoned. The cost that dominates is not the chunk
+ * bodies, it is their names: a put carries every chunk name of the file, 64
+ * characters each, whether anything changed or not. At a 256-byte average a
+ * 14 KiB note is forty chunks, so the name list alone is 2.5 KiB and an edit
+ * costs more in names than in content.
+ *
+ * Measured over this project's own markdown and source, 80 files, 1155 KiB:
+ *
+ *     average   chunks/file   first sync   one edit   chunk rows
+ *         256          40.4          85%     3030 B         3230
+ *        1024          10.4          52%     1732 B          832
+ *        4096           3.3          40%     2538 B          260
+ *
+ * 256 is worse than 1024 on every column. 4 KiB is cheaper again on a first
+ * sync and dearer on every edit after it, and edits are the case that repeats,
+ * so 1 KiB is the middle that wins.
  *
  * The minimum matters more than it looks. Without it a run of low-entropy
  * content can fire the boundary test repeatedly and produce a chunk every few
- * bytes, and per-chunk overhead is 28 bytes of sealing plus 64 characters of
- * name on the wire. At a 128-byte floor the overhead is bounded at roughly a
- * quarter; without one it is unbounded.
+ * bytes, and per-chunk overhead is 29 bytes of sealing plus 64 characters of
+ * name. A floor bounds that; without one it is unbounded.
  */
-export const TEXT_SIZES: ChunkSizes = { min: 128, avg: 256, max: 1024 };
+export const TEXT_SIZES: ChunkSizes = { min: 512, avg: 1024, max: 4096 };
+
+/** A chunk name on the wire: 64 hex characters of SHA-256. */
+export const NAME_BYTES = 64;
+
+/** The band the average is kept inside, whatever the arithmetic says. */
+const TEXT_AVG_MIN = TEXT_SIZES.avg;
+const TEXT_AVG_MAX = 64 * 1024;
+
+/**
+ * Chunk sizes for a text file, scaled to how big it is.
+ *
+ * A put carries every chunk name of the file, so sending an edit costs roughly
+ * one chunk body plus sixty-four bytes for each chunk the file has:
+ *
+ *     cost(c) ~ c + NAME_BYTES * size / c
+ *
+ * which is least at `c = sqrt(NAME_BYTES * size)`. One fixed size cannot be
+ * right for both a 2 KiB note and a 2 MiB one, and 1 KiB chunks for the latter
+ * make it two thousand chunks whose names alone are 128 KiB, so an edit to it
+ * costs more in names than the note contains.
+ *
+ * Clamped at both ends. Below the floor the per-chunk overhead of twenty-nine
+ * bytes of sealing starts to matter more than the name list; above the ceiling
+ * the chunks are large enough that an edit stops being cheap, which is the
+ * whole point of chunking.
+ */
+export function textSizesFor(size: number): ChunkSizes {
+    const ideal = Math.sqrt(NAME_BYTES * Math.max(size, 1));
+    const avg = Math.min(TEXT_AVG_MAX, Math.max(TEXT_AVG_MIN, Math.round(ideal / 512) * 512));
+    return { min: Math.max(TEXT_SIZES.min, avg / 2), avg, max: avg * 4 };
+}
 
 /**
  * Binary: 128 KiB / 256 KiB / 1 MiB.
@@ -121,7 +169,7 @@ export const TEXT_AS_BINARY_ABOVE = 4 * 1024 * 1024;
  */
 export function sizesFor(size: number, isText: boolean, serverChunkMax: number = BINARY_SIZES.max): ChunkSizes {
     if (!Number.isFinite(serverChunkMax) || serverChunkMax <= 0) serverChunkMax = BINARY_SIZES.max;
-    const base = isText && size < TEXT_AS_BINARY_ABOVE ? TEXT_SIZES : BINARY_SIZES;
+    const base = isText && size < TEXT_AS_BINARY_ABOVE ? textSizesFor(size) : BINARY_SIZES;
 
     // The ceiling is on the *sealed* chunk, and sealing adds a nonce, a tag and
     // a marker byte. A cut made at exactly the ceiling therefore produces a

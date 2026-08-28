@@ -21,7 +21,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { chunkBytes, sizesFor, type ChunkSizes } from "./chunk.ts";
+import { chunkBytes, sizesFor, type ChunkSizes, NAME_BYTES } from "./chunk.ts";
 import { deriveKeys, sealChunks } from "./crypto.ts";
 
 const enc = new TextEncoder();
@@ -113,11 +113,17 @@ describe("what an edit costs", () => {
             // doing its job.
             expect(changed, `${size} byte note changed ${changed} of ${total} chunks`).toBeLessThanOrEqual(3);
 
-            // And in bytes, against sending the file.
-            const ratio = edited.length / bytes;
-            expect(ratio, `${size} byte note: only ${ratio.toFixed(0)}x better than whole-file`).toBeGreaterThan(
-                size / 8192
-            );
+            // And in bytes, against sending the file. The name list counts:
+            // a put carries every chunk name whether it changed or not, and at
+            // small chunk sizes that list is most of what an edit costs. An
+            // assertion on bodies alone rewarded making chunks smaller until
+            // the names outweighed them, which is exactly what had happened.
+            const onWire = bytes + total * NAME_BYTES;
+            const ratio = edited.length / onWire;
+            expect(
+                ratio,
+                `${size} byte note: ${onWire} bytes on the wire, ${ratio.toFixed(0)}x better than whole-file`
+            ).toBeGreaterThan(8);
         }
     });
 
@@ -128,12 +134,12 @@ describe("what an edit costs", () => {
         for (const size of [32 * 1024, 128 * 1024, 512 * 1024]) {
             const original = note(size);
             const edited = insertLine(original);
-            const { bytes } = await bytesOnWire(original, edited, sizesFor(size, true), true);
-            ratios.push(edited.length / bytes);
+            const { bytes, total } = await bytesOnWire(original, edited, sizesFor(size, true), true);
+            ratios.push(edited.length / (bytes + total * NAME_BYTES));
         }
-        expect(ratios[0]!).toBeLessThan(ratios[1]!);
-        expect(ratios[1]!).toBeLessThan(ratios[2]!);
-        expect(ratios[2]!).toBeGreaterThan(50);
+        expect(ratios[0]!, `ratios were ${ratios.map((r) => r.toFixed(0)).join(", ")}`).toBeLessThan(ratios[1]!);
+        expect(ratios[1]!, `ratios were ${ratios.map((r) => r.toFixed(0)).join(", ")}`).toBeLessThan(ratios[2]!);
+        expect(ratios[2]!).toBeGreaterThan(20);
     });
 
     it("sends nothing at all for a file that did not change", async () => {

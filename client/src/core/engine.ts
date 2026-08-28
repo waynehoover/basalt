@@ -75,6 +75,20 @@ export function contentId(chunkNames: readonly string[]): string {
     return chunkNames.length === 0 ? "-empty-" : chunkNames.join(",");
 }
 
+/**
+ * The chunk names back out of a content id.
+ *
+ * The id is the names joined, so this is not a lookup, it is punctuation. It
+ * matters because a batch already carries the chunk list of every entry in it,
+ * so a device that keeps the id keeps the list, and asking the server for it
+ * again is a round trip spent learning something already known.
+ *
+ * A chunk name is hex, so the comma can never appear inside one.
+ */
+export function chunkNamesOf(id: string): string[] {
+    return id === "" || id === "-empty-" ? [] : id.split(",");
+}
+
 export interface EngineOptions {
     readonly vault: Vault;
     readonly store: IndexStore;
@@ -785,16 +799,28 @@ export class Engine {
         return result.uid;
     }
 
+    /**
+     * Downloads one version, in one round trip.
+     *
+     * It used to take three: ask the server for the chunk list, fetch the
+     * bodies, then ask for the same chunk list again to fill the cache. Both
+     * questions were already answered. A batch carries the chunk list of every
+     * entry in it, and `remote.hash` *is* that list, so the only thing the
+     * server still has to be asked for is the bodies.
+     *
+     * On a fast link that was invisible. At four hundred milliseconds it was
+     * two thirds of the time a download took.
+     */
     private async download(path: string, entry: IndexEntry, remote: RemoteState): Promise<void> {
-        const content = await this.contentOf(remote.uid);
+        const chunks = chunkNamesOf(remote.hash);
+        const content = await this.contentOf(remote.uid, chunks);
         await this.opts.vault.write(path, content, { mtime: remote.mtime, ctime: remote.mtime });
         const stat = { folder: false, mtime: remote.mtime, ctime: remote.mtime, size: content.length };
         observe(entry, stat);
-        // The chunk list is the server's, so the cache can be filled without
-        // re-chunking what was just reassembled.
-        const meta = await this.opts.transport.get(remote.uid);
-        entry.chunks = meta.chunks;
-        entry.hash = contentId(meta.chunks);
+        // The chunk list is the server's, so the cache is filled without
+        // re-chunking what was just reassembled, and without asking again.
+        entry.chunks = chunks;
+        entry.hash = contentId(chunks);
         entry.size = content.length;
         synced(entry, entry.hash, entry.chunks, remote.uid, this.now());
     }
@@ -806,8 +832,12 @@ export class Engine {
      * its content and writing it back, and there is no reason for a second copy
      * of the reassembly to exist for that.
      */
-    async contentOf(uid: number): Promise<Uint8Array> {
-        const meta = await this.opts.transport.get(uid);
+    async contentOf(uid: number, known?: readonly string[]): Promise<Uint8Array> {
+        // `known` is what a caller already has. A download does: the batch that
+        // announced the version carried its chunk list, so asking for it again
+        // is a round trip spent learning something already known. A restore
+        // works from a uid alone and has to ask.
+        const meta = known !== undefined ? { chunks: known } : await this.opts.transport.get(uid);
         if (meta.chunks.length === 0) return new Uint8Array(0);
 
         // Held to what the server itself advertised. Both of these are the

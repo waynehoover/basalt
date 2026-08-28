@@ -144,7 +144,9 @@ match on the way in.
 | Notes and attachments of any type | **Built** |
 | Folder structure | **Built** |
 | Content-defined chunking, so only changed regions travel | **Built** |
-| Per-chunk deduplication across files and versions | **Built** |
+| Chunk size scaled to the file, so a long note is not a thousand chunks | **Built** |
+| Per-chunk deduplication across versions of a file | **Built**, and this is where the value is |
+| The same across different files | **Built**, and worth about nothing on distinct notes |
 | Compression before encryption | **Built** |
 | Renames as one operation rather than a delete and an add | **Built** |
 | Deletions as records, so a deleted note is recoverable | **Built**, and reachable |

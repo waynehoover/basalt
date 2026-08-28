@@ -247,7 +247,12 @@ describe("a file, all the way there and back", () => {
             let text = "";
             for (let i = 0; i < 4000; i++) text += `Paragraph ${i} with a reasonable number of words in it.\n\n`;
             const put = await c.write("notes/long.md", text);
-            expect(put.chunks.length).toBeGreaterThan(100);
+            // Many chunks, not a specific number: the count depends on the size
+            // the chunker picks for a file this big, and that scales with the
+            // file rather than being one constant for a note and a novel.
+            expect(put.chunks.length, `a ${text.length} byte note became ${put.chunks.length} chunks`).toBeGreaterThan(
+                10
+            );
 
             expect(dec.decode(await c.read(put.uid))).toBe(text);
             expect(await fresh.cli("verify", "-deep")).toMatch(/0 faults/);
@@ -352,8 +357,13 @@ describe("deduplication, which is the point", () => {
             // The measurement that justifies the whole design, taken through a
             // real server rather than in a benchmark.
             expect(second.uploaded).toBeLessThanOrEqual(3);
-            expect(second.bytes).toBeLessThan(4096);
-            expect(first.bytes).toBeGreaterThan(20_000);
+            // The ratio, not two absolute figures: the claim is that an edit
+            // costs a fraction of the file, and it should survive a change to
+            // the chunk sizes rather than having to be restated.
+            expect(
+                second.bytes * 8,
+                `the first sync sent ${first.bytes} bytes and one edit cost ${second.bytes}`
+            ).toBeLessThan(first.bytes);
 
             expect(dec.decode(await c.read(second.uid))).toBe(edited);
             c.close();

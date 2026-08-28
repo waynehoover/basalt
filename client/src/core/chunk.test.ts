@@ -9,6 +9,7 @@ import {
     chunkStream,
     looksLikeText,
     sizesFor,
+    textSizesFor,
     type Chunk,
     type ChunkSizes,
 } from "./chunk.ts";
@@ -373,7 +374,9 @@ describe("choosing sizes", () => {
         // A very large text file is data, not prose, and chunking it at 256
         // bytes would produce tens of thousands of chunks.
         expect(sizesFor(TEXT_AS_BINARY_ABOVE, true)).toEqual(reserved(BINARY_SIZES));
-        expect(sizesFor(TEXT_AS_BINARY_ABOVE - 1, true)).toEqual(reserved(TEXT_SIZES));
+        // Just under the threshold it is still text, and text sizes now scale
+        // with the file rather than being one number for a note and a novel.
+        expect(sizesFor(TEXT_AS_BINARY_ABOVE - 1, true)).toEqual(reserved(textSizesFor(TEXT_AS_BINARY_ABOVE - 1)));
     });
 
     it("clamps to what the server said it would accept", () => {

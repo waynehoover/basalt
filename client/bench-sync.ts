@@ -57,11 +57,29 @@ function pathFor(kind: string, i: number, ext: string): string {
 
 const sizeFor = (i: number, min: number, max: number) => min + ((i * 7919) % (max - min + 1));
 
+/**
+ * Prose that compresses and does not repeat itself between files.
+ *
+ * The first version cycled a dozen words, so every note was nearly every other
+ * note and cross-file deduplication looked like it was saving eighty per cent.
+ * It was measuring the generator. On genuinely distinct notes it saves nothing
+ * at all, which is the honest number and the one worth reporting.
+ */
 function prose(bytes: number, seed: number): string {
-    const words = "the quick brown fox jumps over a lazy dog while nobody is watching it".split(" ");
-    let out = "";
-    let i = seed;
-    while (out.length < bytes) out += words[i++ % words.length] + (i % 11 === 0 ? "\n" : " ");
+    const vocabulary = Array.from({ length: 5000 }, (_, i) => `w${i.toString(36)}${"aeiou"[i % 5]}`);
+    const pool = new Uint32Array(4096);
+    let at = pool.length;
+    const next = (): number => {
+        if (at >= pool.length) {
+            crypto.getRandomValues(pool);
+            at = 0;
+        }
+        return pool[at++]!;
+    };
+    let out = `# Note ${seed}\n\n`;
+    while (out.length < bytes) {
+        out += vocabulary[next() % vocabulary.length]! + (next() % 12 === 0 ? "\n" : " ");
+    }
     return out.slice(0, bytes);
 }
 
