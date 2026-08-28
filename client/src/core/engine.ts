@@ -58,7 +58,7 @@ import {
     type RemoteState,
 } from "./index-state.ts";
 import type { ServerLimits, Transport, WireEntry } from "./transport.ts";
-import type { IndexStore, Vault } from "./vault.ts";
+import { parents, type IndexStore, type Vault } from "./vault.ts";
 
 /**
  * The identity of a file's content, as both sides can compute it.
@@ -187,6 +187,15 @@ export class Engine {
      * off until the application restarted, and nothing said so.
      */
     private readonly skipped = new Map<string, { why: string; fingerprint: string }>();
+
+    /**
+     * Paths a file is standing in the way of, as of the last pass.
+     *
+     * Not written off, only noted: the condition belongs to the vault rather
+     * than to the path, and it stops holding by itself when somebody renames
+     * the file. Kept only so that the same complaint is not logged every pass.
+     */
+    private blocked = new Set<string>();
     /** Sealed path to plaintext, so a path is unsealed once per session. */
     private readonly unsealed = new Map<string, string>();
 
@@ -363,6 +372,16 @@ export class Engine {
             observe(entry, stat);
         }
 
+        // Paths that are files, so a path whose parent is one can be spotted
+        // before anything tries to create a folder there. A real filesystem
+        // answers ENOTDIR, which is not a condition that improves with retrying,
+        // and the retry is where this used to spend the rest of the session.
+        const filePaths = new Set<string>();
+        for (const [path, stat] of onDisk) {
+            if (!stat.folder) filePaths.add(path);
+        }
+        const nowBlocked = new Set<string>();
+
         // 2. Every path either side knows about.
         const paths = new Set<string>([...onDisk.keys(), ...this.entries.keys(), ...this.remote.keys()]);
 
@@ -378,6 +397,26 @@ export class Engine {
                 this.skipped.delete(path);
                 this.log("skipped file changed, trying again", path);
             }
+            const blockedBy = parents(path).find((ancestor) => filePaths.has(ancestor));
+            if (blockedBy !== undefined && !onDisk.has(path)) {
+                // Something upstream is a file where this path needs a folder.
+                // Nothing can be written here until somebody renames one of
+                // them, and a real filesystem answers ENOTDIR, which does not
+                // improve with retrying.
+                //
+                // Worked out fresh every pass rather than remembered. There is
+                // no local file here to notice a change in, so a remembered
+                // refusal would have nothing to clear it: the first version of
+                // this kept the path written off after the blocker was renamed
+                // away, and the note never arrived.
+                nowBlocked.add(path);
+                if (!this.blocked.has(path)) {
+                    this.log("cannot be both", path, `${blockedBy} is a file here and a folder elsewhere`);
+                }
+                report.skipped++;
+                continue;
+            }
+
             const retry = this.retries.get(path);
             if (retry && retry.at > now) {
                 report.retrying++;
@@ -390,6 +429,10 @@ export class Engine {
                 this.recordFailure(path, err, report);
             }
         }
+
+        // Replaced rather than added to, so a path stops being blocked the
+        // moment the file in its way is gone.
+        this.blocked = nowBlocked;
 
         this.prune(onDisk);
         await this.save();
@@ -498,6 +541,25 @@ export class Engine {
                 entry.folder = true;
                 if (remote) synced(entry, "", [], remote.uid, this.now());
                 report.foldersCreated++;
+                return;
+
+            case "clash":
+                // Written off rather than retried. Trying again cannot help
+                // while both devices disagree about what this path is, and the
+                // alternative was one direction retrying an impossible mkdir
+                // for ever while the other silently ignored the file.
+                //
+                // Neither side is touched. Renaming somebody's file to admit a
+                // folder is a larger intervention than telling them the two
+                // disagree, and only they know which they meant. The skip
+                // clears by itself once the file changes, which renaming it
+                // does.
+                this.skipped.set(path, {
+                    why: `${action.why}. Rename one of them, and it will sync.`,
+                    fingerprint: fingerprintOf(entry),
+                });
+                report.skipped++;
+                this.log("cannot be both", path, action.why);
                 return;
 
 

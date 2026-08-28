@@ -133,7 +133,21 @@ export type Action =
     | { readonly kind: "deleteRemote"; readonly why: string }
     | { readonly kind: "createLocalFolder"; readonly why: string }
     /** Local is gone and the server has content that must not be lost. */
-    | { readonly kind: "restoreLocal"; readonly why: string };
+    | { readonly kind: "restoreLocal"; readonly why: string }
+    /**
+     * One path, a file on one device and a folder on another.
+     *
+     * Reachable with any extensionless name: somebody has a note called
+     * `notes`, somebody else makes a folder called `notes`. Both cannot exist,
+     * and neither device may quietly destroy what it has to make room.
+     *
+     * Reported rather than resolved, and that is the decision. Renaming
+     * somebody's file to admit a folder is a larger intervention than saying
+     * the two disagree, and the person can see which of them they meant.
+     * Before this existed, one direction retried an impossible mkdir for ever
+     * and the other silently ignored the file.
+     */
+    | { readonly kind: "clash"; readonly why: string };
 
 export interface DecideInput {
     /** Absent when the file is not on disk. */
@@ -243,10 +257,22 @@ function decideFolder(local: LocalState | undefined, remote: RemoteState | undef
             // yet. The files carry the truth.
             return { kind: "nothing", why: "folder deleted elsewhere; its files decide" };
         }
+        if (!remote.folder) {
+            // A folder here and a file of the same name there. This used to
+            // fall through to "folder exists on both sides", so the file was
+            // never downloaded and nothing said why.
+            return { kind: "clash", why: "a folder here and a file of the same name on another device" };
+        }
         return { kind: "nothing", why: "folder exists on both sides" };
     }
     // Not a folder locally.
     if (remote?.folder && !remote.deleted) {
+        if (local !== undefined) {
+            // A file here and a folder of the same name there. This used to
+            // return createLocalFolder, which a real filesystem refuses, so the
+            // device retried an impossible mkdir for ever.
+            return { kind: "clash", why: "a file here and a folder of the same name on another device" };
+        }
         return { kind: "createLocalFolder", why: "folder exists on the server and not here" };
     }
     return { kind: "nothing", why: "folder absent on both sides" };
