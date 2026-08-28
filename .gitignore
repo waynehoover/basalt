@@ -1,0 +1,9 @@
+# Build output
+/basalt
+/go/basalt
+
+# Local server state
+*.db
+*.db-wal
+*.db-shm
+/chunks/

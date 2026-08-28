@@ -34,6 +34,15 @@ vault reports "Fully synced" having uploaded nothing.
 `put` with a reason. Obsidian validates on download only, so a file containing
 `:` uploads happily and can never come back down, on any device, forever.
 
+Paths reach the server encrypted, so this rule splits in two. The *name* check
+is the client's, applied to the plaintext before encryption, because the server
+holds no key and cannot see a `:`. The server validates what it can see:
+structure, bounds, and the internal consistency of the entry, including that a
+file declaring a size names at least one chunk. That last one matters because an
+entry with a size and no chunks is byte-identical on the wire to an empty file,
+so a lost chunk list would present to every device as the note having been
+emptied.
+
 **Namespace by string, version the protocol.** `basalt/aes-gcm+siv/1`, not an
 integer shared with other implementations. The handshake carries a protocol
 version and a mismatch is refused, not negotiated.
@@ -63,6 +72,14 @@ Entries within a batch are uid-ascending, and `from`/`to` let the client assert
 continuity. A client that sees a gap asks again from its own cursor instead of
 silently advancing past it.
 
+`from` and `to` are a *covered range*, not the first and last uid present. Every
+entry that exists with `from <= uid <= to` is in the batch, and a client that has
+applied everything up to `from - 1` may set its cursor to `to`. The distinction
+matters because history can be purged, so the uid sequence has holes; if
+`from`/`to` meant "the uids in this batch", every hole would read as a lost file.
+The continuity check is therefore `from == cursor + 1`, which a purge cannot
+break and a genuine gap cannot satisfy.
+
 Live changes that arrive mid-catch-up are held by the server and released in
 order once the backlog is on the wire. Dropping them instead would satisfy
 ordering while losing a file.
@@ -81,7 +98,17 @@ one chunk instead of shifting every chunk after it.
 ```
 
 - `chunks` are hashes of the *encrypted* chunks, so the server dedups without
-  learning anything.
+  learning anything. A chunk hash is the lowercase hex SHA-256 of the encrypted
+  chunk bytes, exactly 64 characters, one spelling only.
+
+  Naming the function is what lets the server verify what it stores: it
+  recomputes the hash on the way in and on the way out, so a body that does not
+  match its name is refused rather than filed under a name it does not have, and
+  bit rot surfaces as an error naming the chunk rather than as ciphertext a
+  device cannot decrypt for reasons it cannot diagnose. The fixed width is also
+  what makes the name safe to use as a filename. Uppercase is refused rather
+  than normalised, because two spellings of one hash are two bodies on disk and
+  a dedup miss that presents as unexplained upload volume.
 - `{res:"have"}` with no `chunks` means the server already holds every chunk and
   the entry is recorded; nothing more is sent.
 - The ack carries the assigned uid and is withheld until every chunk and the
