@@ -43,14 +43,14 @@ entry with a size and no chunks is byte-identical on the wire to an empty file,
 so a lost chunk list would present to every device as the note having been
 emptied.
 
-**Namespace by string, version the protocol.** `basalt/aes-gcm+siv/1`, not an
+**Namespace by string, version the protocol.** `basalt/hkdf-aes-gcm/1`, not an
 integer shared with other implementations. The handshake carries a protocol
 version and a mismatch is refused, not negotiated.
 
 ## Handshake
 
 ```
--> {op:"hello", proto:1, vault, token, device, crypto:"basalt/aes-gcm+siv/1", cursor}
+-> {op:"hello", proto:1, vault, token, device, crypto:"basalt/hkdf-aes-gcm/1", cursor}
 <- {res:"ready", cursor, perFileMax, chunkMax}
 ```
 
@@ -206,12 +206,60 @@ A deletion is an entry with `deleted:true`, not the absence of one. That record
 is what makes the file recoverable and what stops a vault of deleted files from
 looking like an empty vault.
 
+## Crypto
+
+`crypto:"basalt/hkdf-aes-gcm/1"` names this, and a mismatch is refused rather
+than negotiated.
+
+One root secret is generated on the first device and never leaves it. Everything
+else is derived, so there is one thing to write down and one thing to lose:
+
+```
+S                                       root secret, 160 bits
+K_auth    = HKDF(S, "basalt/auth/1")    the server stores only H(K_auth)
+K_path    = HKDF(S, "basalt/path/1")
+K_content = HKDF(S, "basalt/content/1")
+K_nonce   = HKDF(S, "basalt/nonce/1")
+```
+
+Paths and chunks are both sealed with the same construction, under different
+keys. The nonce is synthetic, derived from the plaintext, which is what makes
+the result deterministic:
+
+```
+nonce(p)  = HMAC-SHA-256(K_nonce, p)[:12]
+seal(K,p) = nonce(p) || AES-GCM-256(K, nonce(p), p)
+```
+
+Determinism is not a stylistic choice, it is load-bearing twice over. Equal paths
+must produce equal ciphertext or the server cannot tell two versions of a file
+apart. Equal chunks must produce equal ciphertext or dedup does nothing: chunk
+names are hashes of the *encrypted* chunk, so a random nonce per chunk would give
+every upload a fresh name, and content-defined chunking would cut at exactly the
+right boundaries and then send everything anyway. That failure is completely
+silent, which is why it is written down here.
+
+AES-GCM with a synthetic nonce is the deterministic-AEAD construction that
+AES-GCM-SIV packages up. It is spelled out from HMAC and AES-GCM rather than
+named as GCM-SIV because WebCrypto's AES modes are fixed by specification at CBC,
+CTR, GCM and KW, with no SIV, and the client runs in a webview on at least one
+platform. A protocol that names a primitive its own client cannot provide is a
+protocol nobody can implement.
+
+The usual nonce-reuse hazard does not arise: a nonce repeats only for identical
+plaintext under the same key, which is precisely the equality the design is
+asking for, and distinct plaintexts get distinct nonces.
+
 ## What the server can see
 
 Sizes, timestamps, chunk counts, the number of files, and which encrypted path
 changed when. Paths are deterministically encrypted, so the server can tell that
-two entries concern the same file without knowing its name. This is a deliberate
-trade: determinism is what makes dedup and equality work.
+two entries concern the same file without knowing its name.
+
+It can also tell when two chunks are byte-identical, within a file, across
+versions and across files. That is not a leak being tolerated, it is the
+mechanism dedup is made of: asking the server to store one copy of a repeated
+chunk is asking it to recognise the repeat.
 
 The server cannot see file contents, file names, or folder structure, and holds
 no key for any of it.

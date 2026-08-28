@@ -112,3 +112,212 @@ provider   6 members                pure crypto interface
 
 The provider boundary is so clean it can be tested with no app present at all,
 which is the property to aim for with every part of Basalt's client.
+
+---
+
+# What reading the two artifacts actually showed
+
+The notes above were written from an earlier reading. This section records what
+was found when both sources were read properly: Obsidian 1.13.7's `app.js`
+extracted from its asar and run through prettier, and LiveSync 1.0.21 with its
+two supporting libraries, `livesync-commonlib` and `octagonal-wheels`.
+
+Everything here is cited to a line or a file, because the point of writing it
+down is that neither artifact will answer these questions again without the same
+day's work.
+
+## The merge defect, verified rather than inferred
+
+`docs/philosophy.md` claims Obsidian's merge discards the flags that say which
+hunks failed. Here it is, whole, at `app.js:118574` after formatting:
+
+```js
+function bZ(e, t, n) {                 // (base, mine, theirs)
+  var i = new mL(),                    // diff_match_patch
+    r = i.diff_main(e, t, !0, 0);
+  r.length > 2 && (i.diff_cleanupSemantic(r), i.diff_cleanupEfficiency(r));
+  var o = i.patch_make(e, r);
+  return i.patch_apply(o, n)[0];       // <- the flags array is index 1
+}
+```
+
+Confirmed. One detail the philosophy doc does not mention and should: the diff is
+passed through `diff_cleanupSemantic` and `diff_cleanupEfficiency` when it has
+more than two edits. Those improve how a merge reads to a human; Basalt should
+do the same, because dropping them would make our merges worse in a way that
+has nothing to do with the flag bug we are fixing.
+
+## When Obsidian merges at all
+
+The guard, at `obsidian-sync-engine.js:1471` in the extracted region:
+
+```js
+if (p.initial || v.folder || p.folder || p.deleted ||
+    "md" !== Fl(d) || p.hash === v.synchash) return [3, 54];   // skip merging
+```
+
+So a three-way merge is attempted only for a **markdown** file that is not a
+folder, not deleted, not part of an initial sync, and whose server hash differs
+from the remembered `synchash`. Everything else is last-writer-wins by mtime.
+
+That last clause is the useful one: `p.hash === v.synchash` means "the server
+has not moved since we last agreed", so there is nothing to merge and the local
+edit simply wins. One field, one comparison, and it decides the whole question.
+
+Its conflict branch (`conflictAction === "conflict"`) does something worth
+copying and one thing worth not:
+
+- The conflict copy is named `<name> (Conflicted copy <device> <timestamp>)`,
+  the timestamp being `toLocaleString("sv")` with `[:\- ]` stripped to 12
+  characters, and the device name sanitised. `vault.getAvailablePath` is used so
+  a second conflict does not overwrite the first. All of that is right.
+- The conflict copy receives the **local** content and the original file is
+  overwritten with the **server** content. That is a defensible choice, but it
+  means the file you are looking at changes under you and your version moves to
+  a file you have not opened. Basalt keeps the local content in place and puts
+  the incoming version in the conflict copy, so the file you are editing is
+  never rewritten by a sync you did not ask for.
+
+## LiveSync's chunker, in full
+
+`livesync-commonlib/src/string_and_binary/chunks.ts:493`,
+`splitPiecesRabinKarp`. This is content-defined chunking as actually shipped:
+
+| | |
+|---|---|
+| Rolling hash | Rabin-Karp, `PRIME = 31`, 32-bit wrapping via `Math.imul` |
+| Window | 48 bytes |
+| Boundary test | `(hash >>> 0) % avgChunkSize === 1` |
+| Text sizes | min 128 B, avg 256 B, max 1 KiB |
+| Binary sizes | min 256 KiB, avg 1 MiB, max 4 MiB |
+| Absolute floor on max | 30 KiB, because a 48-byte window needs room to find a boundary |
+
+Two adaptive rules sit on top, and both exist to stop the chunk count exploding:
+
+- Text mode is abandoned entirely for files of 4 MiB or more, because per-chunk
+  overhead at 256 bytes a chunk stops being worth it.
+- Below that, the text chunk unit grows in steps of 32 bytes until the estimated
+  chunk count falls under `MAX_CHUNK_COUNT = 500`.
+
+The boundary probability comment in the source is worth restating because it is
+the property the whole design rests on: the chance of the hash matching is
+inversely proportional to the average chunk size, so aiming for 256 bytes means
+roughly a 1-in-256 chance per byte, and chunk sizes come out exponentially
+distributed around the average without anything having to track position.
+
+**UTF-8 safety.** A boundary is rejected if the *next* byte is a continuation
+byte (`(buffer[pos + 1] & 0xc0) === 0x80`), so a chunk never splits a multi-byte
+character. Their unit test for it is about a U+FEFF landing at the start of an
+internal chunk, which suggests it was found the hard way.
+
+**What it does that we should not.** It reads the entire file into memory with
+`new Uint8Array(await dataSrc.arrayBuffer())` before chunking. For a vault of
+notes that is fine and for a vault with video attachments it is not. The
+algorithm is inherently streamable, since the window is 48 bytes, so Basalt
+should stream it. That is a real difference, not a stylistic one.
+
+**The older binary path**, `splitPieces2`, is worth knowing about even though it
+is superseded, because it contains a good idea: split binaries on a delimiter
+that recurs structurally in the format. Null by default, `/` for PDF, `,` for
+JSON. And it derives the minimum chunk size by clamping the file size to
+[100 KB, 100 MB] and dividing by 12.5 until under 10, giving a power of ten. It
+is arbitrary but it is tuned, and the shape of the tuning is informative.
+
+## Eden, which is a good idea we are refusing
+
+Settings `maxChunksInEden`, `maxTotalLengthInEden`, `maxAgeInEden`. Chunks are
+"incubated" inside the document itself and only "graduate to independent chunks"
+once they exceed a count, a total size, or an age.
+
+The problem it solves is real: a note edited fifty times a day generates fifty
+chunk documents, most of which are dead within the hour. Keeping the churn
+inline until it settles avoids that.
+
+Basalt does not need it, and the reason is worth stating so nobody adds it
+later. Eden exists because LiveSync stores each chunk as a separate CouchDB
+document, so a chunk has a document's cost. Basalt stores a chunk as a file in a
+content-addressed directory, and its cost is an inode and a `Purge` away. The
+optimisation is a response to a constraint we do not have.
+
+## The crypto, which settles an open question
+
+This is the most useful thing in either source, because it answers a question
+`docs/protocol.md` had answered wrongly.
+
+`octagonal-wheels/src/encryption/hkdf.ts`:
+
+```
+passphrase --PBKDF2(SHA-256, 310_000 iterations, 32-byte salt)--> master key
+master key --HKDF(SHA-256, 32-byte salt)--> AES-GCM-256 key
+envelope: | iv(12) | hkdfSalt(32) | ciphertext+tag(16) |, base64, prefix "%="
+```
+
+Everything in that chain is WebCrypto-native. **Nothing uses AES-GCM-SIV**,
+which matters because Basalt's handshake declares
+`basalt/aes-gcm+siv/1` and WebCrypto's AES algorithm list is fixed by
+specification at CBC, CTR, GCM and KW. There is no SIV mode, and this machine's
+Node and OpenSSL report no `-siv` cipher either. Basalt declared a primitive its
+own client platform cannot provide.
+
+The PBKDF2 cost is memoised (`memoWithMap(10, ...)`) and it has to be: 310,000
+iterations is a visible pause on a phone. Derive once per passphrase, cache the
+key, never derive per file.
+
+### Deterministic paths, and the trap in copying it
+
+`octagonal-wheels/src/encryption/obfuscatePathV2.ts` derives an HMAC key by
+HKDF and then hashes the path:
+
+```
+key  = HKDF(passphrase, salt) -> HMAC-SHA-256 key
+path = "%/\\" + base64url(HMAC(key, plaintextPath))
+```
+
+Deterministic, which is what dedup and equality need. But the file's own comment
+says it plainly: *"it cannot be used to decrypt the path back to its original
+form."* It is one-way.
+
+LiveSync can afford that because the real filename is also stored inside the
+encrypted document, so the obfuscated path is only a lookup key. Basalt's
+protocol has no such second copy: an entry's `path` is the only place the name
+appears, and a device receiving an entry for a file it has never seen must
+recover the name from it to write the file to disk.
+
+So copying `obfuscatePathV2` directly would produce a vault that syncs
+filenames nobody can read. The requirement is deterministic **and reversible**.
+
+### What Basalt should do instead
+
+One construction, used with two different keys, and it is buildable from
+WebCrypto alone:
+
+```
+S                                  root secret, generated on device 1
+K_auth    = HKDF(S, "basalt/auth/1")        the server stores only H(K_auth)
+K_path    = HKDF(S, "basalt/path/1")
+K_content = HKDF(S, "basalt/content/1")
+K_nonce   = HKDF(S, "basalt/nonce/1")
+
+nonce(p)  = HMAC-SHA-256(K_nonce, p)[:12]           synthetic, so deterministic
+seal(K,p) = nonce(p) || AES-GCM(K, nonce(p), p)     reversible, deterministic
+```
+
+This is the synthetic-IV idea that GCM-SIV packages up, assembled from the two
+primitives WebCrypto does provide. Same plaintext always gives the same
+ciphertext, so paths compare equal and chunks deduplicate; different plaintexts
+get different nonces, so the nonce-reuse hazard that makes GCM fragile does not
+arise.
+
+**And it turns out content encryption must be deterministic too.** Basalt's
+protocol says a chunk name is the hash of the *encrypted* chunk, so that the
+server can deduplicate without learning anything. If chunk encryption used a
+random salt per chunk, as LiveSync's does, the same plaintext would encrypt
+differently every time, every name would be new, and dedup would silently do
+nothing at all. Content-defined chunking would still cut at the same boundaries
+and every chunk would still be uploaded. That is a whole feature failing quietly,
+which is this project's least favourite kind of bug, and reading the two sources
+side by side is what surfaced it.
+
+The honest cost, which belongs in the protocol's disclosure section: the server
+can see when two chunks are byte-identical, within and across files. That is not
+a leak we tolerate, it is the mechanism we asked for.

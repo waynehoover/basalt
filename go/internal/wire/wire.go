@@ -22,7 +22,7 @@ const Proto = 1
 // Crypto names the client-side scheme. It is a string rather than an integer
 // because an integer shared with other implementations means two projects
 // eventually disagree about what version 2 was.
-const Crypto = "basalt/aes-gcm+siv/1"
+const Crypto = "basalt/hkdf-aes-gcm/1"
 
 // Error codes. `code` is for the client to act on, `msg` is for a human to
 // read; docs/protocol.md requires both, because an error a device cannot act on

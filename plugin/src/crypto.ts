@@ -1,0 +1,357 @@
+/**
+ * Deterministic authenticated encryption, and the key schedule above it.
+ *
+ * This module has no reference to Obsidian, to the transport, or to any state.
+ * docs/client-design.md notes that the cleanest boundary in Obsidian's own
+ * engine is its encryption provider, testable with no app present at all; this
+ * is the equivalent here, and everything in it can be exercised with WebCrypto
+ * and nothing else.
+ *
+ * ## Why the sealing is deterministic
+ *
+ * Every other encryption layer you will read randomises its nonce, and for good
+ * reason: reusing an AES-GCM nonce under one key is catastrophic. This one does
+ * not, and the reason is load-bearing twice over.
+ *
+ * Paths must compare equal, or the server cannot tell two versions of one file
+ * apart, and it holds no key with which to work it out.
+ *
+ * Chunks must compare equal, or deduplication silently does nothing. A chunk's
+ * name is the hash of its *ciphertext*, so a random nonce would give every
+ * upload a fresh name; content-defined chunking would still cut at exactly the
+ * right boundaries and the client would then send every chunk anyway, for ever,
+ * reporting success throughout. LiveSync randomises its per-chunk salt and can
+ * afford to because it deduplicates on the plaintext hash instead. Basalt
+ * deduplicates on the wire, so the determinism has to be in the cipher.
+ *
+ * The nonce is therefore synthetic: HMAC of the plaintext under a separate key.
+ * This is the construction AES-GCM-SIV packages up, spelled out from the two
+ * primitives WebCrypto actually provides, because WebCrypto's AES modes are
+ * fixed by specification at CBC, CTR, GCM and KW and the client runs in a
+ * webview on mobile.
+ *
+ * The nonce-reuse hazard does not arise: a nonce repeats only for identical
+ * plaintext under the same key, which is exactly the equality being asked for,
+ * and distinct plaintexts get distinct nonces from the HMAC.
+ *
+ * What this concedes, and it belongs stated rather than buried: the server can
+ * see that two chunks are byte-identical. That is not a leak being tolerated,
+ * it is what dedup is made of.
+ */
+
+/** The crypto suite named in the handshake. A mismatch is refused, not negotiated. */
+export const CRYPTO_SUITE = "basalt/hkdf-aes-gcm/1";
+
+/**
+ * PBKDF2 iterations for turning a human passphrase into a root secret.
+ *
+ * 310,000 is OWASP's recommendation for PBKDF2-HMAC-SHA256 and is what LiveSync
+ * uses. It is a visible pause on a phone, which is why deriveKeys is called once
+ * per passphrase and its result held, never called per file.
+ */
+export const PBKDF2_ITERATIONS = 310_000;
+
+/** AES-GCM nonce length in bytes. 96 bits is the size the mode is built for. */
+const NONCE_LENGTH = 12;
+
+/** AES-GCM authentication tag length in bits. */
+const TAG_BITS = 128;
+
+/** Root secret length in bytes. */
+export const SECRET_LENGTH = 20;
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+/**
+ * HKDF info strings. Each key gets its own, so that a value sealed for one
+ * purpose can never be mistaken for one sealed for another, and so that
+ * compromise of the auth half says nothing about the content half.
+ *
+ * These strings are part of the wire format: changing one changes every key
+ * derived from every existing passphrase. They are versioned for that reason.
+ */
+const INFO = {
+    auth: "basalt/auth/1",
+    path: "basalt/path/1",
+    content: "basalt/content/1",
+    nonce: "basalt/nonce/1",
+} as const;
+
+/**
+ * The keys derived from one root secret.
+ *
+ * `auth` is raw bytes because it goes on the wire; the others are CryptoKeys
+ * because they must not. WebCrypto is asked for non-extractable keys, so the
+ * content key cannot be read back out of this object even by our own code,
+ * which is one fewer way for it to end up somewhere it should not be.
+ */
+export interface VaultKeys {
+    /** Sent to the server, which stores only a hash of it. */
+    readonly auth: Uint8Array;
+    /** Seals paths. Deterministic, and reversible: a device must recover the name. */
+    readonly path: CryptoKey;
+    /** Seals chunk bodies. */
+    readonly content: CryptoKey;
+    /** Derives synthetic nonces. Never seals anything itself. */
+    readonly nonce: CryptoKey;
+}
+
+function subtle(): SubtleCrypto {
+    const c = globalThis.crypto;
+    if (!c?.subtle) {
+        // Not a condition to work around. Without WebCrypto there is no way to
+        // read the vault, and pretending otherwise would write plaintext.
+        throw new Error("WebCrypto is unavailable, so this vault cannot be opened");
+    }
+    return c.subtle;
+}
+
+/** A fresh root secret. This is the one thing the user has to keep. */
+export function generateSecret(): Uint8Array {
+    return globalThis.crypto.getRandomValues(new Uint8Array(SECRET_LENGTH));
+}
+
+/**
+ * Derives every key from a root secret.
+ *
+ * The secret is used as HKDF input keying material directly, with no PBKDF2,
+ * because it is 160 random bits rather than something a human chose. PBKDF2's
+ * job is to make guessing expensive, and there is nothing here to guess.
+ * `deriveKeysFromPassphrase` is the entry point for the case where a human did
+ * choose it.
+ *
+ * Salt is empty and deliberately so. HKDF's salt defends against related-input
+ * attacks on low-entropy material; with a uniformly random secret the info
+ * string is doing the domain separation and a salt would be one more value to
+ * transport, store and lose.
+ */
+export async function deriveKeys(secret: Uint8Array): Promise<VaultKeys> {
+    if (secret.length < 16) {
+        // A short secret is a bug somewhere upstream, and silently accepting it
+        // would produce a vault that looks encrypted and is not.
+        throw new Error(`root secret is ${secret.length} bytes, need at least 16`);
+    }
+    const s = subtle();
+    const ikm = await s.importKey("raw", toBuffer(secret), "HKDF", false, ["deriveKey", "deriveBits"]);
+
+    const hkdf = (info: string) => ({
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: new Uint8Array(0),
+        info: enc.encode(info),
+    });
+
+    const [auth, path, content, nonce] = await Promise.all([
+        s.deriveBits(hkdf(INFO.auth), ikm, 256),
+        s.deriveKey(hkdf(INFO.path), ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
+        s.deriveKey(hkdf(INFO.content), ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
+        s.deriveKey(hkdf(INFO.nonce), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+    ]);
+
+    return { auth: new Uint8Array(auth), path, content, nonce };
+}
+
+/**
+ * Derives keys from a human-chosen passphrase.
+ *
+ * PBKDF2 first, because a passphrase is guessable and the iteration count is
+ * what makes guessing cost something. The salt must be stored: without it the
+ * same passphrase derives different keys and the vault is unreadable. It is not
+ * secret, only necessary.
+ */
+export async function deriveKeysFromPassphrase(passphrase: string, salt: Uint8Array): Promise<VaultKeys> {
+    if (salt.length < 16) {
+        throw new Error(`PBKDF2 salt is ${salt.length} bytes, need at least 16`);
+    }
+    const s = subtle();
+    const material = await s.importKey("raw", toBuffer(enc.encode(passphrase)), "PBKDF2", false, ["deriveBits"]);
+    const root = await s.deriveBits(
+        { name: "PBKDF2", salt: toBuffer(salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+        material,
+        SECRET_LENGTH * 8
+    );
+    return deriveKeys(new Uint8Array(root));
+}
+
+/**
+ * Seals bytes: deterministic, authenticated, reversible.
+ *
+ * Output is `nonce(12) || ciphertext || tag(16)`, so the overhead is 28 bytes
+ * flat. The nonce is prepended rather than recomputed on open, because opening
+ * would need the plaintext to recompute it and the plaintext is what it is
+ * trying to produce.
+ */
+export async function seal(key: CryptoKey, nonceKey: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+    const s = subtle();
+    const nonce = await syntheticNonce(nonceKey, plaintext);
+    const sealed = await s.encrypt(
+        { name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS },
+        key,
+        toBuffer(plaintext)
+    );
+    const out = new Uint8Array(NONCE_LENGTH + sealed.byteLength);
+    out.set(nonce, 0);
+    out.set(new Uint8Array(sealed), NONCE_LENGTH);
+    return out;
+}
+
+/**
+ * Opens what seal produced.
+ *
+ * A failure here is never recovered from and never retried. AES-GCM refusing to
+ * authenticate means the bytes are not what was sealed, and the only honest
+ * responses are to say so and to leave the file alone. Returning partial or
+ * empty content would write that emptiness into the vault.
+ */
+export async function open(key: CryptoKey, sealed: Uint8Array): Promise<Uint8Array> {
+    if (sealed.length < NONCE_LENGTH + TAG_BITS / 8) {
+        throw new Error(`sealed value is ${sealed.length} bytes, too short to contain a nonce and a tag`);
+    }
+    const s = subtle();
+    const nonce = sealed.subarray(0, NONCE_LENGTH);
+    const body = sealed.subarray(NONCE_LENGTH);
+    try {
+        const plain = await s.decrypt({ name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS }, key, toBuffer(body));
+        return new Uint8Array(plain);
+    } catch (cause) {
+        throw new Error("sealed value failed authentication, so it is not what was stored", { cause });
+    }
+}
+
+/**
+ * The synthetic nonce: HMAC of the plaintext, truncated.
+ *
+ * Truncating a 256-bit MAC to 96 bits is what the nonce length allows. The
+ * collision risk that matters is two *different* plaintexts landing on the same
+ * nonce under the same key, which needs about 2^48 distinct chunks before it is
+ * worth thinking about, and a vault is many orders of magnitude away from that.
+ */
+async function syntheticNonce(nonceKey: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+    const mac = await subtle().sign("HMAC", nonceKey, toBuffer(plaintext));
+    return new Uint8Array(mac, 0, NONCE_LENGTH);
+}
+
+/**
+ * Seals a path and encodes it for the wire.
+ *
+ * base64url, because the result travels in JSON and is used as a database key.
+ * The one-way HMAC that LiveSync uses for paths would be smaller and is not an
+ * option: a device receiving an entry for a file it has never seen has to
+ * recover the name to write it to disk, and LiveSync only gets away with it
+ * because it keeps a second copy of the name inside the encrypted document.
+ */
+export async function sealPath(keys: VaultKeys, path: string): Promise<string> {
+    return base64urlEncode(await seal(keys.path, keys.nonce, enc.encode(path)));
+}
+
+export async function openPath(keys: VaultKeys, sealedPath: string): Promise<string> {
+    const plain = await open(keys.path, base64urlDecode(sealedPath));
+    return dec.decode(plain);
+}
+
+/** Seals a chunk body. The result goes on the wire as a binary frame. */
+export async function sealChunk(keys: VaultKeys, chunk: Uint8Array): Promise<Uint8Array> {
+    return seal(keys.content, keys.nonce, chunk);
+}
+
+export async function openChunk(keys: VaultKeys, sealed: Uint8Array): Promise<Uint8Array> {
+    return open(keys.content, sealed);
+}
+
+/**
+ * A chunk's name: the lowercase hex SHA-256 of its sealed bytes.
+ *
+ * Must agree with the server's `chunks.Name` exactly. The server recomputes this
+ * from the body it receives and refuses a mismatch, so a disagreement here is
+ * caught on the first upload rather than becoming a corrupt vault.
+ */
+export async function chunkName(sealedChunk: Uint8Array): Promise<string> {
+    const digest = await subtle().digest("SHA-256", toBuffer(sealedChunk));
+    return hex(new Uint8Array(digest));
+}
+
+/** The auth token as it goes on the wire. */
+export function authToken(keys: VaultKeys): string {
+    return base64urlEncode(keys.auth);
+}
+
+/* ---------------------------------------------------------------- *
+ * Encoding
+ * ---------------------------------------------------------------- */
+
+/**
+ * Copies a view's bytes into a standalone ArrayBuffer.
+ *
+ * WebCrypto accepts a BufferSource, but a Uint8Array that is a *view* into a
+ * larger buffer has caused real bugs in this shape of code: passing the view
+ * where the whole buffer is read hands over neighbouring data. Copying is cheap
+ * at chunk sizes and removes the question.
+ */
+function toBuffer(view: Uint8Array): ArrayBuffer {
+    return view.slice().buffer as ArrayBuffer;
+}
+
+export function hex(bytes: Uint8Array): string {
+    let out = "";
+    for (const b of bytes) out += b.toString(16).padStart(2, "0");
+    return out;
+}
+
+const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+/**
+ * base64url without padding, implemented rather than borrowed.
+ *
+ * `btoa` works on a string of char codes and needs a conversion that is easy to
+ * get wrong for bytes above 0x7f, and Node's Buffer is not available in a
+ * webview. Sixteen lines removes a platform difference from the one code path
+ * where an encoding bug would corrupt every path in the vault.
+ */
+export function base64urlEncode(bytes: Uint8Array): string {
+    let out = "";
+    for (let i = 0; i < bytes.length; i += 3) {
+        const b0 = bytes[i]!;
+        const b1 = i + 1 < bytes.length ? bytes[i + 1]! : undefined;
+        const b2 = i + 2 < bytes.length ? bytes[i + 2]! : undefined;
+        out += B64URL[b0 >> 2]!;
+        out += B64URL[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)]!;
+        if (b1 === undefined) break;
+        out += B64URL[((b1 & 0x0f) << 2) | ((b2 ?? 0) >> 6)]!;
+        if (b2 === undefined) break;
+        out += B64URL[b2 & 0x3f]!;
+    }
+    return out;
+}
+
+const B64URL_INDEX = (() => {
+    const m = new Int16Array(128).fill(-1);
+    for (let i = 0; i < B64URL.length; i++) m[B64URL.charCodeAt(i)] = i;
+    return m;
+})();
+
+export function base64urlDecode(s: string): Uint8Array {
+    const n = s.length;
+    const out = new Uint8Array(Math.floor((n * 3) / 4));
+    let o = 0;
+    let acc = 0;
+    let bits = 0;
+    for (let i = 0; i < n; i++) {
+        const code = s.charCodeAt(i);
+        const v = code < 128 ? B64URL_INDEX[code]! : -1;
+        if (v < 0) {
+            // Not silently skipped. A stray character means the value was
+            // mangled in transit or storage, and decoding around it would
+            // produce plausible bytes that fail authentication later, further
+            // from the cause.
+            throw new Error(`invalid base64url character ${JSON.stringify(s[i])} at position ${i}`);
+        }
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (acc >> bits) & 0xff;
+        }
+    }
+    return out.subarray(0, o);
+}
