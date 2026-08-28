@@ -279,6 +279,19 @@ A device sends `claim` on every hello, because a vault that has been claimed
 ignores it and a device therefore never has to work out whether it is the first.
 The first-run token is kept in a device's config only until it has been spent.
 
+## Which clients may connect
+
+The websocket library verifies the `Origin` header and refuses a cross-origin
+handshake. A Go or Node client sends none and is always allowed. A browser
+client always sends one, and an Obsidian plugin is a browser client: desktop is
+`app://obsidian.md`, verified from a running app, and the two mobile origins are
+Capacitor's documented defaults and have never been checked against a device.
+
+A refused handshake logs the origin it refused and the `-allow-origin` flag that
+would admit it, because the only thing that knows a client's origin is the
+client, and this exact gap once meant no plugin could connect at all while every
+test passed.
+
 ## Crypto
 
 `crypto:"basalt/hkdf-aes-gcm/1"` names this, and a mismatch is refused rather

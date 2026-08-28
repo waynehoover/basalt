@@ -162,6 +162,9 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
 	addr := fs.String("addr", ":3003", "listen address")
+	var allowOrigin stringList
+	fs.Var(&allowOrigin, "allow-origin",
+		"additional browser origin allowed to connect, repeatable (see the log line a refused client produces)")
 	vault := fs.String("vault", "default", "the one vault this server serves")
 	verbose := fs.Bool("v", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
@@ -222,7 +225,7 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		// Built in internal/server so that it can be tested. What is in there
 		// and not here is the list of browser origins allowed to connect, which
 		// nothing caught until the plugin was loaded into a real vault.
-		Handler:           server.HTTPHandler(srv, log),
+		Handler:           server.HTTPHandler(srv, log, allowOrigin...),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: these are long-lived websockets.
 	}
@@ -574,4 +577,22 @@ func humanBytes(n int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f PiB", v)
+}
+
+// stringList is a repeatable string flag.
+//
+// Used for -allow-origin, because a browser client that is not on the built-in
+// list cannot connect and the only thing that knows its origin is the client.
+// Obsidian's mobile origins are in that list and have never been checked
+// against a device, so somebody is going to need this before I do.
+type stringList []string
+
+func (l *stringList) String() string { return strings.Join(*l, ",") }
+
+func (l *stringList) Set(v string) error {
+	if v == "" {
+		return errors.New("an origin cannot be empty")
+	}
+	*l = append(*l, v)
+	return nil
 }

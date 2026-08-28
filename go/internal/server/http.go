@@ -42,7 +42,8 @@ var AllowedOrigins = []string{
 // It lives here rather than in main so that it can be tested. The origin list
 // above is the reason that matters: it is the kind of thing that is invisible
 // until somebody runs the real client, and it should not be invisible twice.
-func HTTPHandler(srv *Server, log *slog.Logger) http.Handler {
+func HTTPHandler(srv *Server, log *slog.Logger, extraOrigins ...string) http.Handler {
+	origins := append(append([]string{}, AllowedOrigins...), extraOrigins...)
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -59,10 +60,20 @@ func HTTPHandler(srv *Server, log *slog.Logger) http.Handler {
 			// Compression off: bodies are ciphertext and do not compress, so
 			// the CPU would buy nothing.
 			CompressionMode: websocket.CompressionDisabled,
-			OriginPatterns:  AllowedOrigins,
+			OriginPatterns:  origins,
 		})
 		if err != nil {
-			log.Warn("websocket accept", "remote", r.RemoteAddr, "err", err)
+			// The origin is named, and so is the flag that would allow it. This
+			// is how a client that cannot connect says why: the desktop plugin's
+			// origin was missing once and the only evidence was this line, and
+			// the mobile ones here have never been checked against a device.
+			if origin := r.Header.Get("Origin"); origin != "" {
+				log.Warn("websocket accept refused",
+					"remote", r.RemoteAddr, "origin", origin, "err", err,
+					"hint", "if this is your own client, restart with -allow-origin "+origin)
+			} else {
+				log.Warn("websocket accept", "remote", r.RemoteAddr, "err", err)
+			}
 			return
 		}
 		srv.Handle(r.Context(), conn, r.RemoteAddr)

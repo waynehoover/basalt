@@ -246,9 +246,17 @@ Stated plainly, because a features list that only lists features is marketing.
   in the real app, and the plugin makes one per file per pass. That is the first
   thing to measure when it loads, and the fix if it is slow is already obvious:
   `Vault.getFiles()` returns Obsidian's own index with stats already in it.
-- **No mobile.** Never run on iOS or Android. The crypto was built from WebCrypto
-  primitives specifically so it could be, and that is not the same as having
-  tried.
+- **No mobile.** Never run on iOS or Android. What is known rather than hoped:
+  the plugin bundle needs nothing from its host that a webview lacks, no
+  desktop-only Obsidian API is used, and the deletion path already falls back
+  from the system trash to the vault's own. What is unknown is everything else,
+  and two things are known to be wrong or missing. Obsidian mobile has no status
+  bar, so `addStatusBarItem` returns an element nothing displays and the
+  plugin's only ongoing feedback is invisible there; the modal and its notices
+  still work. And the mobile entries in the server's origin allow-list are
+  Capacitor's documented defaults, never checked against a device: if they are
+  wrong the phone cannot connect, so the server now names the refused origin and
+  the `-allow-origin` flag that would admit it.
 - **The plugin has run in Obsidian once, by hand.** A 316 file, 27 MB vault
   synced to a headless second device and back: byte identical, a real merge, a
   real conflict copy, deletions to the macOS Trash. It found two more bugs,

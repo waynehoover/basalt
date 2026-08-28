@@ -92,3 +92,41 @@ func testLogger() *slog.Logger {
 	}
 	return slog.New(slog.NewTextHandler(out, nil))
 }
+
+// An origin the built-in list does not know can be allowed without a rebuild.
+//
+// Obsidian's mobile origins are in that list on the strength of Capacitor's
+// documented defaults and have never been checked against a device. If they are
+// wrong, a phone fails to connect and the only thing that knows the right
+// answer is the phone. The log line names the origin and the flag.
+func TestAnOriginCanBeAllowedFromTheCommandLine(t *testing.T) {
+	const odd = "capacitor://something-else"
+	if err := dialWithOrigin(t, odd); err == nil {
+		t.Fatal("an origin nobody allowed was accepted")
+	}
+
+	r := newRig(t)
+	hs := httptest.NewServer(HTTPHandler(r.srv, testLogger(), odd))
+	t.Cleanup(hs.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	header := http.Header{}
+	header.Set("Origin", odd)
+	conn, _, err := websocket.Dial(ctx, "ws"+hs.URL[len("http"):], &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("an allowed origin was still refused: %v", err)
+	}
+	conn.Close(websocket.StatusNormalClosure, "")
+
+	// And allowing one does not allow everything else.
+	hs2 := httptest.NewServer(HTTPHandler(r.srv, testLogger(), odd))
+	t.Cleanup(hs2.Close)
+	header2 := http.Header{}
+	header2.Set("Origin", "https://evil.example.com")
+	if _, _, err := websocket.Dial(ctx, "ws"+hs2.URL[len("http"):], &websocket.DialOptions{
+		HTTPHeader: header2,
+	}); err == nil {
+		t.Fatal("allowing one origin allowed every other")
+	}
+}
