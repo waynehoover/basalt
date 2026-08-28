@@ -12,7 +12,7 @@ where theirs is better. This is the list on its own terms.
 
 ## The unusual ones
 
-Five things Basalt does that its two predecessors do not. If there is a reason to
+Six things Basalt does that its two predecessors do not. If there is a reason to
 use this rather than either, it is these.
 
 ### 1. A merge that refuses rather than mangling
@@ -69,7 +69,30 @@ Measured against whole-file sync:
 Chunks are compressed before they are encrypted, which takes a full first sync of
 a vault's text from 108% of its plaintext to 67%.
 
-### 5. A backup that is a directory, and a server that checks itself
+### 5. One engine, a plugin and a command line
+
+**Partly built.** The sync engine, the crypto, the chunker and the merge are
+platform-free; Obsidian's Vault API and the filesystem are two adapters behind
+one small interface. The headless client is not a second client, it is the same
+one with a different adapter, so a bug fixed in one is fixed in both.
+
+Obsidian ships a headless client too, and reading it is what settled that this
+is the right shape rather than a guess (`docs/client-design.md`). Theirs is
+proprietary and requires a subscription. This one is a 145 KB file that needs no
+npm install:
+
+```
+basalt init --server wss://laptop.tailnet.ts.net --token TOKEN
+basalt pair basalt1_AW_gf1nhnyhf86NO...      # on the next device
+basalt sync                                   # or sync --watch
+basalt status
+```
+
+Pairing is one string carrying the address, the token and the root secret, with
+a checksum on it, so a paste that lost its last line is refused rather than
+becoming a subtly wrong key.
+
+### 6. A backup that is a directory, and a server that checks itself
 
 **Built.** `basalt backup -to DIR` produces a directory that *is* a data
 directory: restoring is copying it back. Incremental, because chunks are named by
@@ -100,7 +123,7 @@ match on the way in.
 | Catch-up from a cursor after being offline | **Built** |
 | Write coalescing, scaled by file size | **Built** |
 | Per-file retry with backoff, kept apart from permanent refusals | **Built** |
-| Watching the vault for changes rather than polling | **Designed** |
+| Watching the vault for changes rather than polling | **Built** on the filesystem |
 
 ## The server
 
@@ -128,8 +151,9 @@ match on the way in.
 | Filesystem adapter | **Built** |
 | Obsidian Vault API adapter | **Partial**, written and untested |
 | Obsidian plugin shell | **Designed** |
-| Headless CLI | **Designed** |
-| Pairing | **Designed** |
+| Reconnect with backoff and jitter | **Built** |
+| Headless CLI | **Built** |
+| Pairing | **Built**, one string carrying the address, the token and the secret |
 | Status and actions in Obsidian's settings pane | **Designed** |
 
 ## Security and privacy
@@ -174,14 +198,15 @@ These are decisions with reasoning in `docs/philosophy.md`, not gaps.
 
 Stated plainly, because a features list that only lists features is marketing.
 
-- **Nothing has synced a note between two real Obsidian vaults.** Two engines
-  converge through a real server in tests, with vaults held in memory. The
-  Obsidian adapter is the piece no test has run.
+- **Nothing has synced a note between two real Obsidian vaults.** Two
+  directories on a disk sync through a real server, driven through the real
+  CLI, and two engines converge in memory. What no test has run is the Obsidian
+  adapter, because it needs Obsidian.
 - **No mobile.** Never run on iOS or Android. The crypto was built from WebCrypto
   primitives specifically so it could be, and that is not the same as having
   tried.
-- **No pairing.** The design is settled and written down; the flow is not built,
-  so setting up a device today means handling a token by hand.
+- **No plugin.** The headless client runs; the Obsidian plugin has an adapter
+  and no shell around it, so there is nothing to install in Obsidian yet.
 - **No recovery interface.** The server keeps every version and every deletion
   and exposes none of it: there is no `history` or `restore` operation on the
   wire, so a deleted note is safe and not yet reachable.

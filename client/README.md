@@ -54,3 +54,43 @@ that does not.
 
 Nothing here has synced a real note between two real devices. The engine and the
 two adapters are what stands between it and that.
+
+## The headless client
+
+Built from the same `src/core` as the plugin, with `src/node/vault.ts` in place
+of Obsidian's API. `bun run build` produces `dist/basalt.mjs`, a single file with
+nothing to install alongside it.
+
+```
+basalt init --server wss://host --token TOKEN   # the first device
+basalt pair basalt1_...                          # every other device
+basalt sync                                      # once, and exit
+basalt sync --watch                              # and keep going
+basalt status
+basalt unlink                                    # forget the pairing, keep the notes
+```
+
+`--dir` chooses the vault and defaults to the current directory. `--json` on any
+command gives machine-readable output. `basalt invite` reprints the pairing
+string for another device.
+
+State lives in `.basalt/` inside the vault, which is in the never-sync list:
+`config.json` (0600, holds the root secret) and `index.json`.
+
+### What the shells are for
+
+`cli.ts` takes an argv and two output functions and returns an exit code, so
+`cli.test.ts` drives the whole client against a real server with real
+directories and no subprocess. `bin.ts` is the six lines that connect that to a
+terminal, and is the only part of the headless client no test covers.
+
+The plugin shell will be the same arrangement: assemble a vault, an index store,
+a transport and an engine, and own nothing else. Any sync decision that appears
+in a shell is in the wrong file.
+
+### Exit codes
+
+`0` worked. `1` failed, or finished with files that can never sync, or could not
+reach the server. `2` the command line was wrong. A sync that skipped a file for
+good exits non-zero on purpose: a broken vault that exits zero is a broken vault
+nobody hears about.

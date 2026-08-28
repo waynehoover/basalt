@@ -128,6 +128,16 @@ export interface TransportOptions {
     readonly onBatch: (batch: Batch) => void | Promise<void>;
     /** Called once when the backlog is drained. */
     readonly onCaughtUp?: (cursor: number) => void;
+    /**
+     * Called once when the connection has ended, for any reason.
+     *
+     * This class deliberately does not reconnect: a client that keeps running
+     * wants backoff and a client that syncs once and exits wants to fail, and
+     * that is a decision for whoever is running it. `Backoff` below is here for
+     * the first kind. `fatal` on the error says whether trying again could ever
+     * help.
+     */
+    readonly onClosed?: (cause: Error) => void;
     readonly log?: (message: string, ...rest: unknown[]) => void;
     /** Injectable for tests. Defaults to the platform's WebSocket. */
     readonly socketFactory?: (url: string) => SocketLike;
@@ -232,6 +242,12 @@ export class Transport {
             this.socket?.close();
         } catch {
             // Already gone. Nothing to do and nothing worth reporting.
+        }
+        try {
+            this.opts.onClosed?.(cause);
+        } catch {
+            // A listener that throws does not get to leave the transport in a
+            // half-closed state; it is already closed by this point.
         }
     }
 

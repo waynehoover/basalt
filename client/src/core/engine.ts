@@ -57,7 +57,7 @@ import {
     type LocalState,
     type RemoteState,
 } from "./index-state.ts";
-import type { Transport, WireEntry } from "./transport.ts";
+import type { ServerLimits, Transport, WireEntry } from "./transport.ts";
 import type { IndexStore, Vault } from "./vault.ts";
 
 /**
@@ -87,6 +87,14 @@ export interface EngineOptions {
     readonly log?: (message: string, ...rest: unknown[]) => void;
     /** Whether a path may be three-way merged. Defaults to text extensions. */
     readonly mergeable?: (path: string) => boolean;
+    /**
+     * Whether to hold back a file that was written moments ago.
+     *
+     * On by default, which is right for a client that keeps running. A one-shot
+     * sync turns it off: deferring to a next pass that will never happen would
+     * mean exiting successfully having skipped the file the user just saved.
+     */
+    readonly coalesceWrites?: boolean;
 }
 
 /**
@@ -106,6 +114,15 @@ export interface SyncReport {
     restored: number;
     foldersCreated: number;
     unchanged: number;
+    /**
+     * Files held back by the write debounce, which will go on the next pass.
+     *
+     * Its own counter rather than folded into `unchanged`, because rule 7 of
+     * docs/philosophy.md is that a status collapsing cases it should distinguish
+     * is not a status. "unchanged" for a file the user saved four seconds ago is
+     * the exact lie that rule is about.
+     */
+    waiting: number;
     /** Files that failed and will be tried again. */
     retrying: number;
     /** Files that can never work and will not be tried again. */
@@ -126,6 +143,7 @@ function emptyReport(): SyncReport {
         restored: 0,
         foldersCreated: 0,
         unchanged: 0,
+        waiting: 0,
         retrying: 0,
         skipped: 0,
         chunksSent: 0,
@@ -171,6 +189,10 @@ export class Engine {
         return (this.opts.mergeable ?? looksLikeText)(path);
     }
 
+    private get coalesce(): boolean {
+        return this.opts.coalesceWrites ?? true;
+    }
+
     /** What this device knows, for a status line that describes the vault. */
     status(): {
         cursor: number;
@@ -199,7 +221,7 @@ export class Engine {
      * work and would re-download the whole vault, and the server would refuse a
      * cursor it never issued, which is the case that catches a restored backup.
      */
-    async start(): Promise<void> {
+    async start(): Promise<ServerLimits> {
         if (this.started) throw new Error("already started");
         this.started = true;
 
@@ -223,6 +245,7 @@ export class Engine {
             cursor: this.cursor,
         });
         this.log("connected", limits);
+        return limits;
     }
 
     /**
@@ -375,11 +398,20 @@ export class Engine {
 
         const action = decide({ local, remote, index: entry, mergeable: this.mergeable(path) });
 
-        if (action.kind !== "nothing" && local && !stat?.folder && !readyToSyncAgain(entry, now)) {
+        if (
+            this.coalesce &&
+            action.kind !== "nothing" &&
+            local &&
+            !stat?.folder &&
+            !readyToSyncAgain(entry, now)
+        ) {
             // Written very recently. Obsidian's size-scaled debounce: somebody
             // typing generates a save every few seconds, and acting on each one
             // costs more than waiting does.
-            report.unchanged++;
+            //
+            // Turned off by a client that syncs once and exits, where there is no
+            // next pass to defer to and the person asking has just said "now".
+            report.waiting++;
             return;
         }
 

@@ -8,7 +8,7 @@
  * question about *whether* to is answered a layer up.
  */
 
-import { constants } from "node:fs";
+import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
 import { access, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
@@ -140,6 +140,56 @@ export class NodeVault implements Vault {
         } catch {
             return false;
         }
+    }
+
+    /**
+     * Reports changes under the vault, coalesced.
+     *
+     * What this is and is not: it decides *when to look*, never *what changed*.
+     * The scan is what decides, and it re-reads the vault from scratch, so a
+     * missed event costs latency and never correctness. That is the reason this
+     * can be built on recursive `fs.watch` at all, which is documented as
+     * best-effort and is not available on every platform.
+     *
+     * Coalesced on a short timer because saving one file in an editor produces
+     * several events, and because a folder copied into the vault produces one
+     * per file. Without it the engine would start a pass per event and spend the
+     * copy re-scanning.
+     */
+    watch(onChange: (path: string) => void): () => void {
+        let timer: NodeJS.Timeout | undefined;
+        let last = "";
+        let watcher: FSWatcher | undefined;
+
+        try {
+            watcher = fsWatch(this.root, { recursive: true, persistent: true }, (_event, filename) => {
+                if (!filename) return;
+                const path = filename.toString().split(sep).join("/");
+                // The state folder changes on every single pass, because that is
+                // where the index is written. Watching it would mean each pass
+                // scheduled the next one, forever.
+                if (path.split("/").some((part) => this.ignore.has(part))) return;
+                if (path.endsWith(".basalt-tmp")) return;
+                last = path;
+                if (timer) clearTimeout(timer);
+                timer = setTimeout(() => {
+                    timer = undefined;
+                    onChange(last);
+                }, 150);
+            });
+            watcher.on("error", () => {
+                // A watch that fails is a vault that gets scanned on a timer
+                // instead. Slower to notice, and no less correct.
+            });
+        } catch {
+            // Recursive watching is not available everywhere. The caller polls.
+            return () => {};
+        }
+
+        return () => {
+            if (timer) clearTimeout(timer);
+            watcher?.close();
+        };
     }
 }
 
