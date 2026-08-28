@@ -197,11 +197,16 @@ export class Plugin extends Component {
  * Modal and Setting
  * ---------------------------------------------------------------- */
 
+/** Every Modal built, newest last, so a test can read what it rendered. */
+export const modals: Modal[] = [];
+
 export class Modal {
     readonly contentEl = new FakeEl("div", "modal-content");
     isOpen = false;
 
-    constructor(public app: App) {}
+    constructor(public app: App) {
+        modals.push(this);
+    }
 
     open(): void {
         this.isOpen = true;
@@ -332,4 +337,5 @@ export const built: Setting[] = [];
 export function resetStub(): void {
     notices.length = 0;
     built.length = 0;
+    modals.length = 0;
 }

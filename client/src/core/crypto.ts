@@ -111,7 +111,13 @@ function subtle(): SubtleCrypto {
 
 /** A fresh root secret. This is the one thing the user has to keep. */
 export function generateSecret(): Uint8Array {
-    return globalThis.crypto.getRandomValues(new Uint8Array(SECRET_LENGTH));
+    const c = globalThis.crypto;
+    if (!c?.getRandomValues) {
+        // Same reasoning as `subtle` above, and more urgent: a secret from a
+        // weak source is worse than no secret, because it looks like one.
+        throw new Error("no secure random source is available, so a vault cannot be created here");
+    }
+    return c.getRandomValues(new Uint8Array(SECRET_LENGTH));
 }
 
 /**

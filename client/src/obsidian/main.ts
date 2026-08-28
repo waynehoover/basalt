@@ -404,13 +404,31 @@ class BasaltModal extends Modal {
 
         const pairing = this.plugin.invite();
         if (pairing) {
+            // Where the string goes when there is no clipboard to put it in.
+            const shown = contentEl.createEl("p", { cls: "basalt-pairing" });
+
             new Setting(contentEl)
                 .setName("Add another device")
                 .setDesc("Anyone who has this string has this vault. Treat it like the passphrase it contains.")
                 .addButton((b) =>
                     b.setButtonText("Copy pairing string").onClick(async () => {
-                        await navigator.clipboard.writeText(pairing);
-                        new Notice("Copied. Paste it into Basalt on the other device.");
+                        // Not every place this runs has a clipboard: mobile
+                        // webviews and pages outside a secure context do not.
+                        // A button that silently does nothing is worse than one
+                        // that shows you the thing to copy by hand.
+                        const clipboard = (
+                            globalThis as {
+                                navigator?: { clipboard?: { writeText(text: string): Promise<void> } };
+                            }
+                        ).navigator?.clipboard;
+                        try {
+                            if (!clipboard) throw new Error("no clipboard here");
+                            await clipboard.writeText(pairing);
+                            new Notice("Copied. Paste it into Basalt on the other device.");
+                        } catch {
+                            shown.setText(pairing);
+                            new Notice("This device has no clipboard. The string is shown above, to copy by hand.");
+                        }
                     })
                 );
         }

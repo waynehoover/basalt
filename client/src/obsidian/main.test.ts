@@ -20,7 +20,7 @@ import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
-import { App, Plugin as StubPlugin, built, notices, resetStub } from "./stub.ts";
+import { App, Plugin as StubPlugin, built, modals, notices, resetStub } from "./stub.ts";
 import BasaltPlugin from "./main.ts";
 
 beforeAll(async () => {
@@ -482,6 +482,30 @@ describe("the modal, which is not a settings tab", () => {
         expect(second.plugin.paired).toBe(true);
         expect(second.plugin.deviceName).toBe("desktop");
         await synced(second.plugin);
+    }, 300_000);
+
+    /**
+     * Not every place this runs has a clipboard: mobile webviews and anything
+     * outside a secure context do not. A copy button that silently does nothing
+     * is how somebody concludes the pairing string cannot be got at.
+     */
+    it("shows the pairing string when there is no clipboard to copy it to", async () => {
+        await fresh();
+        const { plugin } = await load();
+        const pairing = await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+
+        built.length = 0;
+        notices.length = 0;
+        plugin.ribbonIcons[0]!.callback();
+        const copy = built.find((s) => s.name === "Add another device")!.buttons[0]!;
+        await copy.click();
+
+        // Node has no navigator.clipboard, which is the case being tested.
+        expect(notices.map((n) => n.message).join(" ")).toMatch(/no clipboard/);
+        // And the whole string is on screen instead, so it can still be copied
+        // by hand. Truncating it would be the same as not showing it.
+        expect(modals.at(-1)!.contentEl.allText()).toContain(pairing);
     }, 300_000);
 
     it("shows what is happening once it is paired", async () => {
