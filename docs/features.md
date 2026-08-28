@@ -207,6 +207,12 @@ Stated plainly, because a features list that only lists features is marketing.
   directories on a disk sync through a real server, driven through the real
   CLI, and two engines converge in memory. What no test has run is the Obsidian
   adapter, because it needs Obsidian.
+- **The cost of a scan in real Obsidian is unmeasured.** The walk itself is
+  linear and cheap: 26ms for 16,000 files against an in-memory adapter, 1.6
+  microseconds each. What is unknown is what `DataAdapter.stat` costs per call
+  in the real app, and the plugin makes one per file per pass. That is the first
+  thing to measure when it loads, and the fix if it is slow is already obvious:
+  `Vault.getFiles()` returns Obsidian's own index with stats already in it.
 - **No mobile.** Never run on iOS or Android. The crypto was built from WebCrypto
   primitives specifically so it could be, and that is not the same as having
   tried.

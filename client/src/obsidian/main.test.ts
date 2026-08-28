@@ -110,6 +110,24 @@ describe("loading", () => {
     });
 
     /**
+     * Obsidian's own documentation: "If you do not wish to receive create events
+     * on vault load, register your event handler inside
+     * Workspace.onLayoutReady". Registering earlier means opening a vault fires
+     * a create for every file in it.
+     */
+    it("waits for the layout before listening for file events", async () => {
+        const app = new App();
+        app.workspace.layoutReady = false;
+        const plugin = makePlugin(app);
+        loaded.push(plugin);
+        await plugin.onload();
+
+        expect(app.vault.handlerCount(), "listening before the layout was ready").toBe(0);
+        app.workspace.finishLayout();
+        expect(app.vault.handlerCount()).toBe(4);
+    });
+
+    /**
      * Rule 2, and the incident behind it: code that read a config, fell back to
      * an empty result on error and wrote that back disabled every plugin on a
      * device. Here the fallback would be worse: an unreadable config read as

@@ -99,8 +99,32 @@ export class FakeVault {
     }
 }
 
+/**
+ * Just enough workspace.
+ *
+ * `onLayoutReady` runs its callback immediately when the layout is already up,
+ * and queues it otherwise. Both are modelled, because a plugin that only worked
+ * in one of the two cases would pass a test that only exercised the other.
+ */
+export class FakeWorkspace {
+    layoutReady = true;
+    private readonly waiting: (() => void)[] = [];
+
+    onLayoutReady(callback: () => void): void {
+        if (this.layoutReady) callback();
+        else this.waiting.push(callback);
+    }
+
+    /** Obsidian finishing its startup. */
+    finishLayout(): void {
+        this.layoutReady = true;
+        while (this.waiting.length) this.waiting.shift()!();
+    }
+}
+
 export class App {
     readonly vault = new FakeVault();
+    readonly workspace = new FakeWorkspace();
 }
 
 /* ---------------------------------------------------------------- *

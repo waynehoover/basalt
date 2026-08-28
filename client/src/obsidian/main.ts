@@ -70,10 +70,20 @@ export default class BasaltPlugin extends Plugin {
         // platform gives, they work on mobile, and they say when to look rather
         // than what changed: the scan is what decides, and it re-reads the vault
         // every time, so a missed event costs latency and never correctness.
-        this.registerEvent(this.app.vault.on("create", () => this.nudge()));
-        this.registerEvent(this.app.vault.on("modify", () => this.nudge()));
-        this.registerEvent(this.app.vault.on("delete", () => this.nudge()));
-        this.registerEvent(this.app.vault.on("rename", (_file: TAbstractFile, _oldPath: string) => this.nudge()));
+        //
+        // Registered inside onLayoutReady because Obsidian's own docs say to:
+        // "If you do not wish to receive create events on vault load, register
+        // your event handler inside Workspace.onLayoutReady". Otherwise opening
+        // a vault fires a create for every file in it. The coalescing below
+        // would collapse them into one sync, so this is about not doing
+        // thousands of pointless things rather than about correctness. The
+        // callback runs immediately if the layout is already up.
+        this.app.workspace.onLayoutReady(() => {
+            this.registerEvent(this.app.vault.on("create", () => this.nudge()));
+            this.registerEvent(this.app.vault.on("modify", () => this.nudge()));
+            this.registerEvent(this.app.vault.on("delete", () => this.nudge()));
+            this.registerEvent(this.app.vault.on("rename", (_f: TAbstractFile, _old: string) => this.nudge()));
+        });
 
         try {
             this.config = await this.readConfig();
