@@ -462,11 +462,54 @@ describe("unlinking", () => {
         await plugin.pairFirst(server.wsUrl, server.token, "laptop");
         await synced(plugin);
 
+        expect(app.vault.adapter.filePaths()).toContain(".obsidian/plugins/basalt/index.json");
+
         await plugin.unlink();
         expect(plugin.paired).toBe(false);
         expect(plugin.savedData).toBe(null);
         expect(status(plugin)).toBe("Basalt: not paired");
         expect(app.vault.adapter.text("keep.md")).toBe("still here");
+
+        // The index goes too. It records what this device believes it has
+        // already synced, and left behind it would be read as fact by the next
+        // pairing, possibly against a different server entirely.
+        expect(app.vault.adapter.filePaths()).not.toContain(".obsidian/plugins/basalt/index.json");
+    }, 300_000);
+
+    /**
+     * Unlinking and pairing again has to be a genuinely fresh start.
+     *
+     * This is the failure the stale index would cause: a cursor and a set of
+     * entries from the old pairing, read as the truth about a server that has
+     * never seen this device, so notes that were never uploaded are treated as
+     * already sent.
+     */
+    it("starts clean when paired again afterwards", async () => {
+        await fresh();
+        const { plugin, app } = await load();
+        app.vault.adapter.seed("note.md", "the only note");
+        await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+        await synced(plugin);
+        await plugin.unlink();
+
+        // A different server, which has never heard of this device.
+        const second = new TestServer();
+        await second.start();
+        try {
+            await plugin.pairFirst(second.wsUrl, second.token, "laptop-again");
+            await synced(plugin);
+            await plugin.syncNow();
+
+            // The note must have been uploaded to the new server, not assumed
+            // to be there already.
+            const elsewhere = await load();
+            await elsewhere.plugin.pair(plugin.invite()!, "other");
+            await synced(elsewhere.plugin);
+            await until("the note to arrive", () => elsewhere.app.vault.adapter.text("note.md") !== undefined);
+            expect(elsewhere.app.vault.adapter.text("note.md")).toBe("the only note");
+        } finally {
+            await second.cleanup();
+        }
     }, 300_000);
 });
 

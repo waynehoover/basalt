@@ -307,13 +307,26 @@ export default class BasaltPlugin extends Plugin {
         return this.config ? formatPairing(this.config) : undefined;
     }
 
-    /** Forgets the pairing. Every note stays where it is, on both ends. */
+    /**
+     * Forgets the pairing. Every note stays where it is, on both ends.
+     *
+     * The index goes with it, and that is not tidiness. It records what this
+     * device believes it has already synced. Left behind, the next pairing
+     * starts from it: a cursor into a server that may be a different server, and
+     * entries claiming files are up to date when nothing has been checked. The
+     * device would skip uploading notes it had never sent.
+     */
     async unlink(): Promise<void> {
         this.running = false;
         this.client?.close();
         this.client = undefined;
         this.config = undefined;
         await this.saveData(null);
+
+        const index = this.indexPath(this.app.vault.configDir);
+        if (await this.app.vault.adapter.exists(index)) {
+            await this.app.vault.adapter.remove(index);
+        }
         this.setState({ kind: "unpaired" });
     }
 

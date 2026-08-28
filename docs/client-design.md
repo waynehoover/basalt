@@ -500,3 +500,53 @@ running. It also applied to the "Sync now" command, so a person who saved a
 paragraph and immediately chose Sync now was told "up to date" while it sat
 unsent. `Engine.sync` now takes a per-pass override and the command turns the
 debounce off, on the grounds that the person has already said now.
+
+# What loading it into a real vault turned up
+
+Installed into a 316 file, 27 MB Obsidian vault, paired against a real server,
+with the headless client as the second device. Everything above this section was
+found without Obsidian. These needed it.
+
+## The server refused every browser client
+
+The first connection attempt failed, and the server said why:
+
+```
+request Origin "obsidian.md" is not authorized for Host "127.0.0.1:18500"
+```
+
+`coder/websocket` verifies the Origin header by default and refuses a
+cross-origin handshake. A Go client sends no Origin. A browser client always
+does, and an Obsidian plugin is a browser client, running at `app://obsidian.md`.
+
+So no plugin could ever have connected, and nothing in the test suite could have
+noticed, because every client in it was Go or Node. The fix is an explicit
+allow-list in `internal/server/http.go`, with the handler moved out of `main.go`
+so that it can be tested at all.
+
+Origin checking stays on for everything else. A page in somebody's browser could
+not authenticate anyway, because the token travels in `hello` rather than being
+attached automatically the way a cookie would be, but refusing at the handshake
+is cheaper than relying on that.
+
+## Unlinking left the index behind
+
+`unlink` cleared the pairing and not the index. The index records what the device
+believes it has already synced, so the next pairing would read a cursor and a set
+of entries as fact, possibly against an entirely different server, and skip
+uploading notes it had never sent.
+
+## What the live run confirmed
+
+- 316 files and 27 MB uploaded from the plugin, and the headless client pulled
+  them down byte for byte identical: `diff -r` reports nothing.
+- The server stores those 27 MB in 4.6 MB. Chunk deduplication and compression,
+  measured on somebody's actual vault rather than on generated data.
+- A note edited in Obsidian and on the CLI at the same time, in different
+  paragraphs, merged with both edits present on both devices.
+- The same note rewritten on both sides at once produced a conflict copy, with
+  both versions present on both devices and the vaults identical afterwards.
+- A deletion arriving from the other device went to the macOS Trash, verified by
+  finding the file there, rather than being destroyed.
+- The plugin's own state stayed in `.obsidian/plugins/basalt/`, and nothing
+  called `undefined` appeared at the vault root.

@@ -155,7 +155,7 @@ match on the way in.
 | Content cache, so an unchanged vault costs one stat per file | **Built** |
 | Filesystem adapter | **Built** |
 | Obsidian Vault API adapter | **Built**, against a fake of Obsidian's own interface |
-| Obsidian plugin shell | **Built**, and never loaded in Obsidian |
+| Obsidian plugin shell | **Built**, and run once in a real vault |
 | Reconnect with backoff and jitter | **Built** |
 | Headless CLI | **Built** |
 | Pairing | **Built**, one string carrying the address, the token and the secret |
@@ -216,14 +216,12 @@ Stated plainly, because a features list that only lists features is marketing.
 - **No mobile.** Never run on iOS or Android. The crypto was built from WebCrypto
   primitives specifically so it could be, and that is not the same as having
   tried.
-- **The plugin has never been loaded in Obsidian.** What has happened: the
-  built `dist/plugin/main.js` is loaded in a test, handed a stand-in for
-  Obsidian, and two copies of it pair and sync a note through a real server. The
-  stand-in implements `DataAdapter` against the real declarations, and the one
-  behaviour that matters, `normalizePath`, was read out of the shipped
-  `obsidian.asar` rather than assumed. That found four bugs, one of which made a
-  note vanish from the listing without a word (`docs/client-design.md`). None of
-  it is the same as running in Obsidian, which is next.
+- **The plugin has run in Obsidian once, by hand.** A 316 file, 27 MB vault
+  synced to a headless second device and back: byte identical, a real merge, a
+  real conflict copy, deletions to the macOS Trash. It found two more bugs,
+  including a server that refused every browser client and so had never let a
+  plugin connect at all (`docs/client-design.md`). What it has not had is
+  ordinary use over days, or a second real device, or a phone.
 - **No recovery interface.** The server keeps every version and every deletion
   and exposes none of it: there is no `history` or `restore` operation on the
   wire, so a deleted note is safe and not yet reachable.

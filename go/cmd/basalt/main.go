@@ -20,8 +20,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/coder/websocket"
-
 	"github.com/waynehoover/basalt/internal/chunks"
 	"github.com/waynehoover/basalt/internal/dirlock"
 	"github.com/waynehoover/basalt/internal/server"
@@ -165,31 +163,12 @@ func cmdServe(args []string) error {
 	// reports itself as fully synced.
 	srv := server.New(st, server.StaticTokens(map[string]string{*vault: token}), log)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "ok")
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-			http.Error(w, "basalt speaks websocket only", http.StatusUpgradeRequired)
-			return
-		}
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-			// Compression off: bodies are ciphertext and do not compress, so
-			// the CPU would buy nothing.
-			CompressionMode: websocket.CompressionDisabled,
-		})
-		if err != nil {
-			log.Warn("websocket accept", "remote", r.RemoteAddr, "err", err)
-			return
-		}
-		srv.Handle(r.Context(), conn, r.RemoteAddr)
-	})
-
 	hs := &http.Server{
-		Addr:              *addr,
-		Handler:           mux,
+		Addr: *addr,
+		// Built in internal/server so that it can be tested. What is in there
+		// and not here is the list of browser origins allowed to connect, which
+		// nothing caught until the plugin was loaded into a real vault.
+		Handler:           server.HTTPHandler(srv, log),
 		ReadHeaderTimeout: 10 * time.Second,
 		// No WriteTimeout: these are long-lived websockets.
 	}
