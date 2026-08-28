@@ -1,0 +1,42 @@
+# Basalt on a homelab.
+#
+# No TLS here on purpose: no key material lives in this binary. Put
+# `tailscale serve`, Caddy or a tunnel in front, and leave this published only
+# where that can reach it.
+
+services:
+  basalt:
+    build:
+      context: .
+      args:
+        VERSION: "0.1.0"
+    image: basalt:0.1.0
+    container_name: basalt
+    restart: unless-stopped
+
+    # 127.0.0.1 rather than every interface. Something in front terminates TLS
+    # and reaches this; nothing else should be able to.
+    ports:
+      - "127.0.0.1:3003:3003"
+
+    volumes:
+      - basalt-data:/data
+
+    # The image already drops to 65532. These say the rest of it out loud, so a
+    # compose file somebody copies keeps the properties the image was built for.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    # The token to pair the first device is in here, once:
+    #   docker compose logs basalt | grep '#'
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  basalt-data:

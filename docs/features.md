@@ -191,6 +191,8 @@ match on the way in.
 | Scanning from Obsidian's own index, not one stat per file | **Built** |
 | A hardened systemd unit, printed with real paths | **Built** |
 | Static binaries for linux and macOS, and a plugin folder | **Built** |
+| An 11 MB container image with no shell in it | **Built** |
+| `stats`, saying what is stored and what a purge would drop | **Built** |
 | Reconnect with backoff and jitter | **Built** |
 | Headless CLI | **Built** |
 | Pairing | **Built**, one string carrying the address and the secret |
@@ -205,7 +207,6 @@ match on the way in.
 | Deterministic sealing, so dedup works without the server holding a key | **Built** |
 | Paths sealed and reversible, so a device can recover a filename | **Built** |
 | Server stores no key material and terminates no TLS | **Built** |
-| PBKDF2 at 310,000 iterations for a passphrase-derived vault | **Written**, and nothing calls it |
 | One secret: the auth key is derived from the root secret | **Built** |
 | One-time bootstrap token, so a vault is claimed rather than assumed | **Built** |
 | Server storing only a hash of the auth key | **Built** |
@@ -231,6 +232,7 @@ These are decisions with reasoning in `docs/philosophy.md`, not gaps.
 | Syncing plugins, themes or settings | One device can disable every plugin on another |
 | Syncing hidden and config files | Same reason |
 | A settings screen | Every option multiplies a state space nobody tested |
+| A passphrase as a second way into a vault | One secret, or it is not one secret |
 | A web UI on the server | Anything it could show you, it would have to read |
 | Filters by file type or size | A status that describes a filter is not a status |
 | Silent conflict resolution | Keep both, always |

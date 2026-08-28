@@ -2,10 +2,63 @@
 
 One binary on a machine that stays on, and a plugin on each device.
 
-## The server
+## Docker
 
-`scripts/release.sh` builds static binaries for linux/amd64, linux/arm64 and
-both macOS architectures. They need nothing on the machine they land on: pure-Go
+The image is a single static binary on an empty filesystem: 11 MB, no shell, no
+package manager, nothing to update. Pure-Go SQLite is what makes
+`CGO_ENABLED=0` work and `CGO_ENABLED=0` is what makes `scratch` possible.
+
+```
+docker compose up -d
+docker compose logs basalt | grep '#'
+```
+
+That last line is the token for pairing the first device. It is a bootstrap: the
+first device claims the vault with it and it stops working afterwards.
+
+`compose.yaml` publishes to `127.0.0.1:3003` rather than to every interface,
+because there is no TLS in this binary and something in front should be the only
+thing that can reach it. It also runs read-only with every capability dropped,
+which is checked rather than assumed: the server starts and stays healthy under
+`--read-only --cap-drop ALL --security-opt no-new-privileges`.
+
+The healthcheck runs `basalt health` from inside the image, because there is no
+curl in there to write one with and adding a base image to get one would undo
+the point.
+
+Maintenance goes through the same binary:
+
+```
+docker exec basalt /basalt stats
+docker exec basalt /basalt verify -deep
+docker exec basalt /basalt backup -data /data -to /data/backup
+```
+
+Purge needs the directory to itself, so the server steps aside:
+
+```
+docker compose stop basalt
+docker run --rm -v basalt_basalt-data:/data basalt:0.1.0 purge -data /data -grace 0
+docker compose start basalt
+```
+
+### Volumes and who owns them
+
+A named volume works with nothing else done: Docker initialises it from the
+image, and the image ships `/data` owned by the unprivileged user the server
+runs as. A bind mount does not, because the host directory's ownership wins:
+
+```
+sudo chown -R 65532:65532 /srv/basalt
+```
+
+That was found by running the image rather than by reading it. Without the
+ownership the server cannot write its lock file and the container exits.
+
+## Without Docker: the server
+
+If you would rather not run a container, `scripts/release.sh` builds static
+binaries for linux/amd64, linux/arm64 and both macOS architectures. They need nothing on the machine they land on: pure-Go
 SQLite is what makes `CGO_ENABLED=0` work, and that is the whole reason to
 insist on it.
 
@@ -102,6 +155,16 @@ Add it and restart:
 ```
 basalt serve -data /var/lib/basalt -allow-origin capacitor://localhost
 ```
+
+## What is in there
+
+```
+basalt stats
+```
+
+Files, folders, deletions still recoverable, versions in all, and how many of
+those versions are history a purge would drop. Separate numbers rather than a
+total, because a total does not tell you whether a purge would help.
 
 ## Version
 

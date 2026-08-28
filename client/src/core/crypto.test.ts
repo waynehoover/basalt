@@ -1,13 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
     CRYPTO_SUITE,
-    PBKDF2_ITERATIONS,
     authToken,
     base64urlDecode,
     base64urlEncode,
     chunkName,
     deriveKeys,
-    deriveKeysFromPassphrase,
     generateSecret,
     hex,
     open,
@@ -64,26 +62,6 @@ describe("the key schedule", () => {
         // Silently accepting a short secret produces a vault that looks
         // encrypted and is not.
         await expect(deriveKeys(new Uint8Array(8))).rejects.toThrow(/at least 16/);
-    });
-
-    it("derives reproducibly from a passphrase and its salt", async () => {
-        const salt = new Uint8Array(16).fill(7);
-        const a = await deriveKeysFromPassphrase("correct horse battery staple", salt);
-        const b = await deriveKeysFromPassphrase("correct horse battery staple", salt);
-        expect(hex(a.auth)).toBe(hex(b.auth));
-
-        // The salt is not secret but it is necessary: lose it and the same
-        // passphrase opens nothing.
-        const other = await deriveKeysFromPassphrase("correct horse battery staple", new Uint8Array(16).fill(8));
-        expect(hex(other.auth)).not.toBe(hex(a.auth));
-    });
-
-    it("keeps the PBKDF2 cost where guessing stays expensive", () => {
-        // A policy assertion, not a behavioural one: lowering the count breaks
-        // nothing observable, and a passphrase-derived vault becomes cheap to
-        // attack. 310,000 is OWASP's figure for PBKDF2-HMAC-SHA256. Making it a
-        // test means lowering it has to be deliberate.
-        expect(PBKDF2_ITERATIONS).toBeGreaterThanOrEqual(310_000);
     });
 
     it("names a suite the server also names", () => {

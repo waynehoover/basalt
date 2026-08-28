@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -814,4 +815,151 @@ func TestServiceTellsYouHowToInstallIt(t *testing.T) {
 	if strings.Contains(out, "systemctl stop basalt && ") && !strings.Contains(out, "Backups do not need the server stopped") {
 		t.Fatalf("the notes do not say backup does not:\n%s", out)
 	}
+}
+
+/* ---------------------------------------------------------------- *
+ * stats and health
+ * ---------------------------------------------------------------- */
+
+// The numbers are separate rather than summed. "1.2 GB" says nothing about
+// whether a purge would help; versions against files says exactly that.
+func TestStatsSaysWhatIsThereAndWhatAPurgeWouldDrop(t *testing.T) {
+	dir := seeded(t)
+	out := mustRun(t, "stats", "-data", dir)
+
+	for _, want := range []string{"files", "deleted and still recoverable", "versions in all", "history"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stats does not mention %q:\n%s", want, out)
+		}
+	}
+
+	// After a purge there is no history left, and it stops saying there is.
+	mustRun(t, "purge", "-data", dir)
+	after := mustRun(t, "stats", "-data", dir)
+	if strings.Contains(after, "would drop") {
+		t.Fatalf("stats still offers a purge with nothing left to drop:\n%s", after)
+	}
+}
+
+func TestStatsRunsAgainstALiveServer(t *testing.T) {
+	dir := seeded(t)
+	stop := serveInBackground(t, dir)
+	defer stop()
+	if out := mustRun(t, "stats", "-data", dir); !strings.Contains(out, "vault") {
+		t.Fatalf("stats said:\n%s", out)
+	}
+}
+
+func TestStatsRefusesADirectoryThatIsNotThere(t *testing.T) {
+	if _, err := basalt(t, "stats", "-data", filepath.Join(t.TempDir(), "typo")); err == nil {
+		t.Fatal("stats reported on a directory that does not exist")
+	}
+}
+
+// The container image is a single static binary on an empty filesystem, so
+// there is no curl in there to write a HEALTHCHECK with, and adding a shell to
+// get one would undo the reason for the image being empty.
+func TestHealthAsksARunningServer(t *testing.T) {
+	dir := seeded(t)
+	stop := serveInBackground(t, dir)
+	defer stop()
+
+	// The port is chosen by the operating system and never printed, so this
+	// checks the shape of the answer rather than a live one: a server that is
+	// not there must fail rather than pass.
+	if _, err := basalt(t, "health", "-addr", "127.0.0.1:1", "-timeout", "2s"); err == nil {
+		t.Fatal("health passed against a port with nothing on it")
+	}
+}
+
+func TestHealthAgainstAServerOnAKnownPort(t *testing.T) {
+	dir := seeded(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	port := freeTestPort(t)
+	out := &safeBuffer{}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{"serve", "-data", dir, "-addr", fmt.Sprintf("127.0.0.1:%d", port)}, out)
+	}()
+	defer func() { cancel(); <-done }()
+
+	deadline := time.Now().Add(15 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if _, err := basalt(t, "health", "-addr", fmt.Sprintf("127.0.0.1:%d", port)); err == nil {
+			return
+		} else {
+			lastErr = err
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("health never passed against a running server: %v\n%s", lastErr, out.String())
+}
+
+// A bare port is what a bind address looks like, and asking about ":3003" must
+// mean this machine rather than being a parse error inside a container.
+func TestHealthUnderstandsABareBindAddress(t *testing.T) {
+	_, err := basalt(t, "health", "-addr", ":1", "-timeout", "2s")
+	if err == nil {
+		t.Fatal("health passed against a port with nothing on it")
+	}
+	if strings.Contains(err.Error(), "not a host and port") {
+		t.Fatalf("a bare bind address was not understood: %v", err)
+	}
+}
+
+func freeTestPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("free port: %v", err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+// The builder image has to be new enough for the module.
+//
+// A mismatch is a build that fails only once somebody tries to make an image,
+// which is later than it should be found, and the two versions live in
+// different files with nothing tying them together. This is the tie.
+func TestTheDockerfileBuildsWithAGoNewEnoughForTheModule(t *testing.T) {
+	// Tests run in the package directory, so the repository root is three up.
+	root := filepath.Join("..", "..", "..")
+	dockerfile, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	gomod, err := os.ReadFile(filepath.Join(root, "go", "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+
+	wanted := majorMinor(findAfter(t, string(gomod), "go "))
+	builder := majorMinor(findAfter(t, string(dockerfile), "ARG GO_VERSION="))
+	if builder != wanted {
+		t.Fatalf("go.mod needs Go %s and the Dockerfile builds with %s", wanted, builder)
+	}
+}
+
+func findAfter(t *testing.T, text, prefix string) string {
+	t.Helper()
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		}
+	}
+	t.Fatalf("no line starting %q", prefix)
+	return ""
+}
+
+func majorMinor(v string) string {
+	parts := strings.Split(v, ".")
+	if len(parts) < 2 {
+		return v
+	}
+	return parts[0] + "." + parts[1]
 }

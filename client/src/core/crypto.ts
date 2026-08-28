@@ -42,15 +42,6 @@
 /** The crypto suite named in the handshake. A mismatch is refused, not negotiated. */
 export const CRYPTO_SUITE = "basalt/hkdf-aes-gcm/1";
 
-/**
- * PBKDF2 iterations for turning a human passphrase into a root secret.
- *
- * 310,000 is OWASP's recommendation for PBKDF2-HMAC-SHA256 and is what LiveSync
- * uses. It is a visible pause on a phone, which is why deriveKeys is called once
- * per passphrase and its result held, never called per file.
- */
-export const PBKDF2_ITERATIONS = 310_000;
-
 /** AES-GCM nonce length in bytes. 96 bits is the size the mode is built for. */
 const NONCE_LENGTH = 12;
 
@@ -71,7 +62,7 @@ const dec = new TextDecoder();
  * compromise of the auth half says nothing about the content half.
  *
  * These strings are part of the wire format: changing one changes every key
- * derived from every existing passphrase. They are versioned for that reason.
+ * derived from every existing secret. They are versioned for that reason.
  */
 const INFO = {
     auth: "basalt/auth/1",
@@ -123,10 +114,10 @@ export function generateSecret(): Uint8Array {
 /**
  * Derives every key from a root secret.
  *
- * The secret is used as HKDF input keying material directly, with no PBKDF2,
- * because it is 160 random bits rather than something a human chose. PBKDF2's
+ * The secret is used as HKDF input keying material directly, with no password
+ * stretching, because it is 160 random bits rather than something a human
+ * chose. A stretching function's
  * job is to make guessing expensive, and there is nothing here to guess.
- * `deriveKeysFromPassphrase` is the entry point for the case where a human did
  * choose it.
  *
  * Salt is empty and deliberately so. HKDF's salt defends against related-input
@@ -160,27 +151,6 @@ export async function deriveKeys(secret: Uint8Array): Promise<VaultKeys> {
     return { auth: new Uint8Array(auth), path, content, nonce };
 }
 
-/**
- * Derives keys from a human-chosen passphrase.
- *
- * PBKDF2 first, because a passphrase is guessable and the iteration count is
- * what makes guessing cost something. The salt must be stored: without it the
- * same passphrase derives different keys and the vault is unreadable. It is not
- * secret, only necessary.
- */
-export async function deriveKeysFromPassphrase(passphrase: string, salt: Uint8Array): Promise<VaultKeys> {
-    if (salt.length < 16) {
-        throw new Error(`PBKDF2 salt is ${salt.length} bytes, need at least 16`);
-    }
-    const s = subtle();
-    const material = await s.importKey("raw", toBuffer(enc.encode(passphrase)), "PBKDF2", false, ["deriveBits"]);
-    const root = await s.deriveBits(
-        { name: "PBKDF2", salt: toBuffer(salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
-        material,
-        SECRET_LENGTH * 8
-    );
-    return deriveKeys(new Uint8Array(root));
-}
 
 /**
  * Seals bytes: deterministic, authenticated, reversible.

@@ -64,11 +64,15 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 			return cmdBackup(rest, out)
 		case "service":
 			return cmdService(rest, out)
+		case "health":
+			return cmdHealth(rest, out)
+		case "stats":
+			return cmdStats(rest, out)
 		case "version":
 			fmt.Fprintf(out, "basalt %s %s/%s %s\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
 			return nil
 		default:
-			return fmt.Errorf("unknown command %q (try serve, backup, verify, purge, service, version)", cmd)
+			return fmt.Errorf("unknown command %q (try serve, backup, verify, purge, stats, service, health, version)", cmd)
 		}
 	}
 	return cmdServe(ctx, args, out)
