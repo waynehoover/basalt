@@ -202,6 +202,7 @@ CREATE INDEX IF NOT EXISTS entry_chunks_by_name ON entry_chunks(vault_id, name);
 type Store struct {
 	db     *sql.DB
 	chunks *chunks.Store
+	dbPath string
 
 	// writeMu serialises writes.
 	//
@@ -213,6 +214,15 @@ type Store struct {
 	// and therefore cannot be one transaction. The chunk sweep takes the same
 	// lock, which is what makes that pair atomic with respect to deletion.
 	writeMu sync.Mutex
+
+	// duringBackup runs once per chunk reference while a backup copies bodies,
+	// and is nil in every non-test build.
+	//
+	// It exists because the order inside Backup is the whole correctness
+	// argument, and the window it protects is a few microseconds wide. A test
+	// that tried to commit inside it by timing would be a test that passes when
+	// the machine is busy.
+	duringBackup func()
 }
 
 // Open uses SyncFull. Use OpenWithSync only to trade durability for speed in a
@@ -243,7 +253,7 @@ func OpenWithSync(dbPath, chunkDir string, mode SyncMode) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	return &Store{db: db, chunks: cs}, nil
+	return &Store{db: db, chunks: cs, dbPath: dbPath}, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

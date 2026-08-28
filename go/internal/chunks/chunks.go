@@ -381,6 +381,31 @@ func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time
 	return deleted, spared, err
 }
 
+// CountBodies counts the chunk files this store holds, across every vault.
+//
+// It exists so a backup can report how many bodies are either side of it. A
+// backup is expected to hold fewer, because it holds what committed entries
+// reference and the source may also hold bodies from a push that has not
+// committed; reporting both numbers is what turns that from a discrepancy into
+// an explanation.
+func (s *Store) CountBodies() (int, error) {
+	n := 0
+	err := filepath.WalkDir(s.dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || strings.HasPrefix(d.Name(), tmpPrefix) {
+			return nil
+		}
+		n++
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	return n, err
+}
+
 func syncDir(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
