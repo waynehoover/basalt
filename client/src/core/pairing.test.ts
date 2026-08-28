@@ -5,7 +5,6 @@ import { PAIRING_PREFIX, formatPairing, parsePairing, type Pairing } from "./pai
 
 const sample = (over: Partial<Pairing> = {}): Pairing => ({
     url: "ws://laptop.tail1234.ts.net:8384",
-    token: "kP3xQ7mR9tW2vY5zA8bC1dE4fG6hJ0kL",
     secret: new Uint8Array(SECRET_LENGTH).map((_, i) => (i * 37) & 0xff),
     vaultId: "default",
     ...over,
@@ -16,7 +15,6 @@ describe("round tripping", () => {
         const p = sample();
         const back = parsePairing(formatPairing(p));
         expect(back.url).toBe(p.url);
-        expect(back.token).toBe(p.token);
         expect(back.vaultId).toBe(p.vaultId);
         expect([...back.secret]).toEqual([...p.secret]);
     });
@@ -33,7 +31,7 @@ describe("round tripping", () => {
 
     it("survives the whitespace a paste brings with it", () => {
         const s = formatPairing(sample());
-        expect(parsePairing(`  ${s}\n`).token).toBe(sample().token);
+        expect(parsePairing(`  ${s}\n`).url).toBe(sample().url);
     });
 
     it("carries fields that are not ASCII", () => {
@@ -43,7 +41,7 @@ describe("round tripping", () => {
 
     it("is one word, so it survives being sent in a message", () => {
         const s = formatPairing(sample());
-        expect(s).toMatch(/^basalt1_[A-Za-z0-9_-]+$/);
+        expect(s).toMatch(/^basalt2_[A-Za-z0-9_-]+$/);
     });
 });
 
@@ -55,10 +53,19 @@ describe("round tripping", () => {
  * and decrypt nothing anyone else wrote. The vault would appear to be syncing.
  */
 describe("refusing a string it cannot read completely", () => {
+    /**
+     * Version 1 carried a server token alongside the root secret. Somebody will
+     * have one written down, so it is named rather than lumped in with rubbish.
+     */
+    it("says what to do about a version 1 string", () => {
+        expect(() => parsePairing("basalt1_AAAAAAAA")).toThrow(/version 1 pairing string/);
+        expect(() => parsePairing("basalt1_AAAAAAAA")).toThrow(/basalt invite/);
+    });
+
     it("refuses something that is not a pairing string at all", () => {
-        expect(() => parsePairing("hello")).toThrow(/should start with basalt1_/);
-        expect(() => parsePairing("")).toThrow(/should start with basalt1_/);
-        expect(() => parsePairing("basalt2_abcd")).toThrow(/should start with basalt1_/);
+        expect(() => parsePairing("hello")).toThrow(/should start with basalt2_/);
+        expect(() => parsePairing("")).toThrow(/should start with basalt2_/);
+
     });
 
     it("refuses one that lost its end", () => {
@@ -102,11 +109,11 @@ describe("refusing a string it cannot read completely", () => {
 
     it("refuses a version it does not understand", () => {
         const raw = base64urlDecode(formatPairing(sample()).slice(PAIRING_PREFIX.length));
-        raw[0] = 2;
+        raw[0] = 3;
         // Recompute the checksum, so it is the version that is refused rather
         // than the damage.
         const fixed = reChecksum(raw);
-        expect(() => parsePairing(PAIRING_PREFIX + base64urlEncode(fixed))).toThrow(/version 2/);
+        expect(() => parsePairing(PAIRING_PREFIX + base64urlEncode(fixed))).toThrow(/version 3/);
     });
 
     it("refuses a length that points past the end", () => {
@@ -130,7 +137,7 @@ describe("refusing to make a string it could not read back", () => {
     });
 
     it("refuses a field too long for its length byte", () => {
-        expect(() => formatPairing(sample({ token: "x".repeat(256) }))).toThrow(/too long/);
+        expect(() => formatPairing(sample({ url: "x".repeat(256) }))).toThrow(/too long/);
     });
 });
 

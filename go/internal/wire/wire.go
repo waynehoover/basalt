@@ -96,6 +96,11 @@ type In struct {
 	Device string `json:"device"`
 	Crypto string `json:"crypto"`
 	Cursor int64  `json:"cursor"`
+	// Claim is the auth key this device wants the vault bound to, sent only
+	// while pairing the first device to an unclaimed vault. Ignored once a
+	// vault has been claimed, so a device sending it every time costs nothing
+	// and a device that never sends it can still be the first.
+	Claim string `json:"claim,omitempty"`
 
 	// put
 	Path   string   `json:"path"`

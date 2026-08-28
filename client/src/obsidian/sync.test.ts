@@ -14,7 +14,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "../core/client.ts";
-import { deriveKeys, type VaultKeys } from "../core/crypto.ts";
+import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
 import { FakeAdapter } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
@@ -46,7 +46,7 @@ class Device {
             store: new ObsidianIndexStore(this.adapter, ".obsidian/plugins/basalt/index.json"),
             keys,
             url: server.wsUrl,
-            token: server.token,
+            ...server.credentials(authToken(keys)),
             vaultId: "default",
             device: this.name,
             timeoutMs: 20_000,

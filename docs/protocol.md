@@ -249,6 +249,36 @@ the vault, and the ordinary sync uploads it as a new version. That leaves the
 server with one way to change a vault, the one that is already tested to death,
 and the client had to download the content regardless.
 
+## Authentication
+
+One secret. The auth key is a branch of the same HKDF schedule that produces the
+content and path keys, so holding the vault's root secret is what it means to
+have the vault. There is no second credential to keep, and a pairing string
+carries the address and the secret and nothing else.
+
+`hello` sends `token`, and may send `claim`.
+
+| Vault state | What opens it | What `claim` does |
+|---|---|---|
+| unclaimed | the server's first-run token | binds the vault to the offered auth key |
+| claimed | the auth key, checked against a stored hash | ignored |
+
+The server stores only `sha256` of the auth key, hex encoded, per vault. It
+never needs the key: it checks one that is offered. A server holding the
+credential could write to the vault it exists only to keep, and a stolen disk
+already yields every byte of ciphertext without also handing over the ability to
+add to it.
+
+Claiming is one-time and there is no way to undo it over the wire. A second
+device offering its own key to a claimed vault is refused, or the first device
+would be locked out of its own notes. Trust on first connection would be simpler
+and would mean whoever reached the port first owned the vault, which is why the
+bootstrap token exists at all.
+
+A device sends `claim` on every hello, because a vault that has been claimed
+ignores it and a device therefore never has to work out whether it is the first.
+The first-run token is kept in a device's config only until it has been spent.
+
 ## Crypto
 
 `crypto:"basalt/hkdf-aes-gcm/1"` names this, and a mismatch is refused rather

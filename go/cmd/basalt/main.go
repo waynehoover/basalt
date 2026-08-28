@@ -208,7 +208,14 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	// Exactly one vault is authorised. A typo in the vault name then fails
 	// authentication instead of quietly creating a second, empty vault that
 	// reports itself as fully synced.
-	srv := server.New(st, server.StaticTokens(map[string]string{*vault: token}), log)
+	// One secret. The token printed on first run is a bootstrap: the first
+	// device authenticates with it and, in the same breath, tells the server
+	// which auth key the vault belongs to from then on. After that the
+	// bootstrap opens nothing, and the only credential is one derived from the
+	// root secret that also produces the content and path keys.
+	srv := server.New(st, server.DerivedAuth(st, token, func() int64 {
+		return time.Now().UnixMilli()
+	}), log)
 
 	hs := &http.Server{
 		Addr: *addr,

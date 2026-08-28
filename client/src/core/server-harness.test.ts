@@ -17,95 +17,53 @@
  * by breaking the transport and watching it fail.
  */
 
-import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { chunkBytes, looksLikeText, sizesFor } from "./chunk.ts";
-import { deriveKeys, openChunk, sealChunks, sealPath, openPath, type VaultKeys } from "./crypto.ts";
-import { ProtocolError, Transport, urlForHost, type Batch } from "./transport.ts";
+import { authToken, deriveKeys, openChunk, sealChunks, sealPath, openPath, type VaultKeys } from "./crypto.ts";
+import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
+import { ProtocolError, Transport, type Batch } from "./transport.ts";
+
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 
 const run = promisify(execFile);
-const GO_DIR = new URL("../../../go", import.meta.url).pathname;
+
+/**
+ * The keys every client in this file shares, derived once.
+ *
+ * One vault, one root secret, and the auth key is a branch of the same schedule,
+ * so every device that has the secret authenticates with the same key.
+ */
+let sharedKeys: VaultKeys | undefined;
+async function vaultKeys(): Promise<VaultKeys> {
+    sharedKeys ??= await deriveKeys(SECRET);
+    return sharedKeys;
+}
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-let binary: string;
-let buildDir: string;
-
+// Built once for the whole suite by vitest.global-setup.ts. This file used to
+// build its own copy into its own temporary directory, which is a third `go
+// build` of the same package racing the others.
 beforeAll(async () => {
-    buildDir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
-    binary = join(buildDir, "basalt");
-    // Built rather than assumed present: a test that silently skips because it
-    // could not find the server is a test that reports success for having done
-    // nothing.
-    await run("go", ["build", "-o", binary, "./cmd/basalt"], {
-        cwd: GO_DIR,
-        env: { ...process.env, CGO_ENABLED: "0" },
-    });
+    await serverBinary();
 }, 180_000);
 
 afterAll(async () => {
-    if (buildDir) await rm(buildDir, { recursive: true, force: true });
+    await cleanupBinary();
 });
 
-/** A running server on its own port, with its own data directory. */
-class Server {
-    private proc: ChildProcess | undefined;
-    dataDir = "";
-    port = 0;
-    token = "";
-    readonly stderr: string[] = [];
-
-    async start(): Promise<void> {
-        this.dataDir = await mkdtemp(join(tmpdir(), "basalt-data-"));
-        this.port = 34000 + Math.floor(Math.random() * 1000);
-        this.proc = spawn(binary, ["serve", "-data", this.dataDir, "-addr", `127.0.0.1:${this.port}`], {
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-        this.proc.stderr?.on("data", (b: Buffer) => this.stderr.push(b.toString()));
-
-        // Wait for it to answer, rather than sleeping and hoping.
-        const deadline = Date.now() + 20_000;
-        for (;;) {
-            if (Date.now() > deadline) throw new Error(`server did not start: ${this.stderr.join("")}`);
-            try {
-                const res = await fetch(`http://127.0.0.1:${this.port}/health`);
-                if (res.ok) break;
-            } catch {
-                await new Promise((r) => setTimeout(r, 50));
-            }
-        }
-        this.token = (await readFile(join(this.dataDir, "auth-token"), "utf8")).trim();
-    }
-
-    async stop(): Promise<void> {
-        if (this.proc && this.proc.exitCode === null) {
-            const ended = new Promise<void>((resolve) => this.proc!.once("exit", () => resolve()));
-            this.proc.kill("SIGTERM");
-            await Promise.race([ended, new Promise((r) => setTimeout(r, 5000))]);
-        }
-        this.proc = undefined;
-    }
-
-    async cleanup(): Promise<void> {
-        await this.stop();
-        if (this.dataDir) await rm(this.dataDir, { recursive: true, force: true });
-    }
-
-    /** Runs a maintenance subcommand against this server's data directory. */
-    async cli(...args: string[]): Promise<string> {
-        const { stdout } = await run(binary, [...args, "-data", this.dataDir]);
-        return stdout;
-    }
-
-    get url(): string {
-        return urlForHost(`127.0.0.1:${this.port}`);
-    }
-}
+/**
+ * The server, from `test-server.ts`.
+ *
+ * This file used to carry its own copy of that class, which drifted: the copy
+ * kept picking a random port out of a thousand while the shared one had moved
+ * to asking the operating system for a free one, so this file's tests failed
+ * every so often and blamed whichever one was running.
+ */
+const Server = TestServer;
+type Server = TestServer;
 
 /** A client: keys, a transport, and the batches it has been given. */
 class Client {
@@ -120,7 +78,7 @@ class Client {
     ) {}
 
     async connect(server: Server, cursor = 0) {
-        this.transport = new Transport(server.url, {
+        this.transport = new Transport(server.wsUrl, {
             onBatch: (b) => {
                 this.batches.push(b);
                 for (const e of b.entries) this.entries.set(e.uid, e);
@@ -133,9 +91,9 @@ class Client {
         await this.transport.connect();
         return this.transport.hello({
             vault: "default",
-            token: server.token,
             device: this.device,
             cursor,
+            ...server.credentials(authToken(this.keys)),
         });
     }
 
@@ -227,7 +185,7 @@ describe("the handshake, against the real server", () => {
     });
 
     it("is refused with the wrong token", async () => {
-        const t = new Transport(server.url, { onBatch: () => {}, timeoutMs: 10_000 });
+        const t = new Transport(server.wsUrl, { onBatch: () => {}, timeoutMs: 10_000 });
         await t.connect();
         await expect(
             t.hello({ vault: "default", token: "not-the-token", device: "impostor", cursor: 0 })
@@ -236,10 +194,10 @@ describe("the handshake, against the real server", () => {
     });
 
     it("is refused for the wrong vault, indistinguishably", async () => {
-        const t = new Transport(server.url, { onBatch: () => {}, timeoutMs: 10_000 });
+        const t = new Transport(server.wsUrl, { onBatch: () => {}, timeoutMs: 10_000 });
         await t.connect();
         await expect(
-            t.hello({ vault: "someone-elses", token: server.token, device: "a", cursor: 0 })
+            t.hello({ vault: "someone-elses", token: authToken(await vaultKeys()), device: "a", cursor: 0 })
         ).rejects.toMatchObject({ code: "auth" });
         t.close();
     });
@@ -247,10 +205,10 @@ describe("the handshake, against the real server", () => {
     it("is refused when this device claims a cursor the server never issued", async () => {
         // The server has lost history this device already applied, so continuing
         // would have it reissue those uids for other files.
-        const t = new Transport(server.url, { onBatch: () => {}, timeoutMs: 10_000 });
+        const t = new Transport(server.wsUrl, { onBatch: () => {}, timeoutMs: 10_000 });
         await t.connect();
         await expect(
-            t.hello({ vault: "default", token: server.token, device: "a", cursor: 999_999 })
+            t.hello({ ...server.credentials(authToken(await vaultKeys())), vault: "default", device: "a", cursor: 999_999 })
         ).rejects.toMatchObject({ code: "cursor" });
         t.close();
     });

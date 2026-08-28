@@ -223,17 +223,23 @@ describe("pairing", () => {
         app.vault.adapter.seed("note.md", "# Hello\n");
 
         const pairing = await plugin.pairFirst(server.wsUrl, server.token, "laptop");
-        expect(pairing).toMatch(/^basalt1_/);
+        expect(pairing).toMatch(/^basalt2_/);
         await synced(plugin);
 
         expect(plugin.paired).toBe(true);
         expect(plugin.deviceName).toBe("laptop");
         expect(status(plugin)).toBe("Basalt: 1 sent");
         // Saved in a form that survives the JSON round trip Obsidian does.
+        // No token: the vault has one secret, and what authenticates is derived
+        // from it. The server's first-run token is kept only until the vault has
+        // been claimed with it, and by now it has.
+        await until("the spent bootstrap to be dropped", () => {
+            const saved = plugin.savedData as Record<string, unknown> | null;
+            return saved !== null && saved["bootstrap"] === undefined;
+        });
         expect(Object.keys(plugin.savedData as object).sort()).toEqual([
             "device",
             "secret",
-            "token",
             "url",
             "vaultId",
         ]);
@@ -290,7 +296,7 @@ describe("pairing", () => {
     it("refuses a pairing string that was mangled", async () => {
         const { plugin } = await load();
         await expect(plugin.pair("basalt1_notreally", "d")).rejects.toThrow();
-        await expect(plugin.pair("hello", "d")).rejects.toThrow(/basalt1_/);
+        await expect(plugin.pair("hello", "d")).rejects.toThrow(/basalt2_/);
         expect(plugin.paired).toBe(false);
         expect(plugin.savedData).toBe(null);
     });
@@ -704,7 +710,7 @@ describe("the modal, which is not a settings tab", () => {
         notices.length = 0;
         await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
 
-        expect(notices.map((n) => n.message).join(" ")).toMatch(/basalt1_/);
+        expect(notices.map((n) => n.message).join(" ")).toMatch(/basalt2_/);
         expect(plugin.paired).toBe(false);
     });
 });

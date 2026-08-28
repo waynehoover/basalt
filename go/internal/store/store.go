@@ -160,7 +160,12 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS vaults (
   vault_id   TEXT    PRIMARY KEY,
   next_uid   INTEGER NOT NULL DEFAULT 1,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  -- Hex SHA-256 of the device auth key, or empty before a device has claimed
+  -- the vault. The key itself is never stored: a server holding one could
+  -- write to the vault it is meant only to keep, and a stolen disk already
+  -- yields every byte of ciphertext without also handing over the credential.
+  auth_hash  TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS entries (
@@ -249,6 +254,10 @@ func OpenWithSync(dbPath, chunkDir string, mode SyncMode) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating: %w", err)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
@@ -269,6 +278,14 @@ func (s *Store) EnsureVault(vaultID string, now int64) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.ensureVaultLocked(vaultID, now)
+}
+
+// ensureVaultLocked is EnsureVault for a caller already holding writeMu.
+func (s *Store) ensureVaultLocked(vaultID string, now int64) error {
+	if vaultID == "" {
+		return fmt.Errorf("%w: empty vault id", ErrBadEntry)
+	}
 	_, err := s.db.Exec(
 		`INSERT INTO vaults (vault_id, next_uid, created_at) VALUES (?, 1, ?)
 		 ON CONFLICT(vault_id) DO NOTHING`, vaultID, now)
@@ -1170,4 +1187,93 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// migrate brings an older database up to the current schema.
+//
+// CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so a
+// column added to the schema above never reaches a database made before it.
+// Additive only, and each step is idempotent, because the alternative is a
+// server that starts fine on a fresh directory and fails on the one that has
+// somebody's notes in it.
+func migrate(db *sql.DB) error {
+	// Nothing to migrate before the table exists; the schema will create it.
+	var tables int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'vaults'`).Scan(&tables); err != nil {
+		return err
+	}
+	if tables == 0 {
+		return nil
+	}
+
+	has, err := hasColumn(db, "vaults", "auth_hash")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.Exec(`ALTER TABLE vaults ADD COLUMN auth_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func hasColumn(db *sql.DB, table, column string) (bool, error) {
+	rows, err := db.Query(`SELECT name FROM pragma_table_info(?)`, table)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+/* ---------------------------------------------------------------- *
+ * Who may write to a vault
+ * ---------------------------------------------------------------- */
+
+// AuthHash returns the hex SHA-256 of the vault's auth key, or empty when no
+// device has claimed it yet.
+func (s *Store) AuthHash(vaultID string) (string, error) {
+	var hash string
+	err := s.db.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return hash, err
+}
+
+// ClaimVault records the auth key hash for a vault that has none, and reports
+// whether this call is the one that did it.
+//
+// The write is conditional in SQL rather than checked and then written, so two
+// devices arriving at once cannot both believe they claimed it. The loser is
+// told no and can decide what that means; silently accepting the second would
+// hand the vault to whichever connection happened to finish last.
+func (s *Store) ClaimVault(vaultID, hash string, now int64) (bool, error) {
+	if hash == "" {
+		return false, errors.New("refusing to claim a vault with an empty auth hash")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if err := s.ensureVaultLocked(vaultID, now); err != nil {
+		return false, err
+	}
+	res, err := s.db.Exec(
+		`UPDATE vaults SET auth_hash = ? WHERE vault_id = ? AND auth_hash = ''`, hash, vaultID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }

@@ -7,7 +7,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -65,7 +67,18 @@ const (
 // the wire: every failure is reported to the client as CodeAuth, because
 // distinguishing "no such vault" from "wrong token" tells an attacker which
 // half to keep guessing.
-type Authenticator func(vaultID, token string) error
+// Credentials are what a device offers at hello.
+//
+// Token is what it is authenticating with. Claim is the auth key it wants the
+// vault to be bound to from now on, sent only while pairing the first device,
+// and ignored once a vault has been claimed.
+type Credentials struct {
+	VaultID string
+	Token   string
+	Claim   string
+}
+
+type Authenticator func(c Credentials) error
 
 // StaticTokens authenticates against a fixed vault-to-token map.
 //
@@ -79,7 +92,8 @@ func StaticTokens(tokens map[string]string) Authenticator {
 	for v, t := range tokens {
 		byVault[v] = t
 	}
-	return func(vaultID, token string) error {
+	return func(c Credentials) error {
+		vaultID, token := c.VaultID, c.Token
 		want, ok := byVault[vaultID]
 		if !ok {
 			// Still do a comparison, against a value that cannot match, so an
@@ -192,5 +206,71 @@ func (s *Server) ready(cursor int64) wire.Ready {
 		PerFileMax: store.PerFileMax,
 		ChunkMax:   s.st.Chunks().Max(),
 		MaxChunks:  store.MaxChunksPerEntry,
+	}
+}
+
+/* ---------------------------------------------------------------- *
+ * One secret
+ * ---------------------------------------------------------------- */
+
+// DerivedAuth authenticates against a key the client derives from the vault's
+// root secret, with a one-time bootstrap token for the very first device.
+//
+// The point is that there is one secret rather than two. Before this, a vault
+// had a root secret that the devices shared and a server token that had nothing
+// to do with it, and a pairing string had to carry both. The auth key is now
+// another branch of the same HKDF schedule that produces the content and path
+// keys, so holding the root secret is what it means to have the vault.
+//
+// The server stores only sha256 of that key. It never needs the key itself: it
+// checks an offered one, and a server that held the credential could write to
+// the vault it exists only to keep. A stolen disk already yields every byte of
+// ciphertext; it should not also yield the ability to add to it.
+//
+// The bootstrap token is how a vault gets claimed in the first place. The
+// server prints one on first run, the first device authenticates with it and
+// sends the auth key it wants the vault bound to, and from then on the
+// bootstrap opens nothing. Trust on first connection would be simpler and would
+// mean whoever reached the port first owned the vault.
+func DerivedAuth(st *store.Store, bootstrap string, now func() int64) Authenticator {
+	return func(c Credentials) error {
+		hash, err := st.AuthHash(c.VaultID)
+		if err != nil {
+			return fmt.Errorf("reading the vault's auth hash: %w", err)
+		}
+
+		if hash != "" {
+			// Constant time, and over the hashes rather than the keys, so the
+			// comparison is a fixed 32 bytes whatever was offered.
+			offered := sha256.Sum256([]byte(c.Token))
+			want, decodeErr := hex.DecodeString(hash)
+			if decodeErr != nil {
+				return fmt.Errorf("vault %q has an unreadable auth hash", c.VaultID)
+			}
+			if subtle.ConstantTimeCompare(offered[:], want) != 1 {
+				return errors.New("auth key mismatch")
+			}
+			return nil
+		}
+
+		// Unclaimed. The bootstrap token is the only thing that opens it, and
+		// only in exchange for the key that replaces it.
+		if subtle.ConstantTimeCompare([]byte(c.Token), []byte(bootstrap)) != 1 {
+			return errors.New("bootstrap token mismatch")
+		}
+		if c.Claim == "" {
+			return errors.New("this vault has not been claimed, and no auth key was offered to claim it with")
+		}
+		claimed := sha256.Sum256([]byte(c.Claim))
+		ok, err := st.ClaimVault(c.VaultID, hex.EncodeToString(claimed[:]), now())
+		if err != nil {
+			return fmt.Errorf("claiming vault %q: %w", c.VaultID, err)
+		}
+		if !ok {
+			// Another device claimed it between the read and the write. Its key
+			// is the vault's key now, and this one is not it.
+			return errors.New("the vault was claimed by another device a moment ago")
+		}
+		return nil
 	}
 }

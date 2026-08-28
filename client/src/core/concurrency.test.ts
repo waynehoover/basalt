@@ -12,7 +12,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "./client.ts";
-import { deriveKeys, type VaultKeys } from "./crypto.ts";
+import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
@@ -43,7 +43,7 @@ async function ready(): Promise<{ client: Client; vault: MemoryVault }> {
         store: new MemoryIndexStore(),
         keys,
         url: server.wsUrl,
-        token: server.token,
+        ...server.credentials(authToken(keys)),
         vaultId: "default",
         device: "a",
         timeoutMs: 20_000,

@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "../core/client.ts";
-import { deriveKeys, type VaultKeys } from "../core/crypto.ts";
+import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
 import { JsonIndexStore, NodeVault } from "./vault.ts";
 
@@ -43,7 +43,7 @@ async function device(name: string): Promise<{ c: Client; dir: string }> {
         store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
         keys,
         url: server.wsUrl,
-        token: server.token,
+        ...server.credentials(authToken(keys)),
         vaultId: "default",
         device: name,
         timeoutMs: 20_000,

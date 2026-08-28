@@ -34,6 +34,8 @@ export interface ClientOptions {
     /** WebSocket URL of the server. */
     readonly url: string;
     readonly token: string;
+    /** The auth key to bind the vault to, if it has not been claimed yet. */
+    readonly claim?: string;
     readonly vaultId: string;
     readonly device: string;
     readonly timeoutMs?: number;
@@ -78,6 +80,7 @@ export class Client {
             device: opts.device,
             vaultId: opts.vaultId,
             token: opts.token,
+            ...(opts.claim !== undefined ? { claim: opts.claim } : {}),
             ...(opts.coalesceWrites !== undefined ? { coalesceWrites: opts.coalesceWrites } : {}),
             ...(opts.log !== undefined ? { log: opts.log } : {}),
         });

@@ -283,7 +283,7 @@ func (s *Session) handleHello(m wire.In) error {
 	if m.Cursor < 0 {
 		return s.fatal(wire.CodeProtoState, fmt.Errorf("negative cursor %d", m.Cursor))
 	}
-	if err := s.srv.auth(m.Vault, m.Token); err != nil {
+	if err := s.srv.auth(Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim}); err != nil {
 		// Logged in full, reported as one word. Telling a caller whether the
 		// vault or the token was wrong tells them which half to keep guessing.
 		s.srv.log.Warn("auth failed", "remote", s.remote, "vault", m.Vault, "err", err)

@@ -38,18 +38,31 @@
 import { SECRET_LENGTH, base64urlDecode, base64urlEncode } from "./crypto.ts";
 
 /** Marks the string as ours, and says which layout follows. */
-export const PAIRING_PREFIX = "basalt1_";
+export const PAIRING_PREFIX = "basalt2_";
 
-const VERSION = 1;
+/**
+ * Version 2 dropped the server token.
+ *
+ * A vault used to have two secrets: a root secret the devices shared, and a
+ * server token that had nothing to do with it, and a pairing string had to
+ * carry both. The auth key is now another branch of the same HKDF schedule that
+ * produces the content and path keys, so the root secret is the whole of it.
+ *
+ * The prefix carries the version as well as the length byte, so a version 1
+ * string pasted into this is refused by the prefix check with something to say
+ * rather than by the checksum with nothing.
+ */
+const VERSION = 2;
 const CHECKSUM_BYTES = 4;
 
 /** Everything a device needs to join a vault. */
 export interface Pairing {
     /** WebSocket URL of the server, without the path. */
     readonly url: string;
-    /** The token the server will accept. */
-    readonly token: string;
-    /** The vault's root secret, from which every key is derived. */
+    /**
+     * The vault's root secret, from which every key is derived, including the
+     * one that authenticates to the server. Anyone holding this has the vault.
+     */
     readonly secret: Uint8Array;
     /** Which vault on that server. */
     readonly vaultId: string;
@@ -63,7 +76,7 @@ export function formatPairing(p: Pairing): string {
     if (p.secret.length !== SECRET_LENGTH) {
         throw new Error(`a root secret is ${SECRET_LENGTH} bytes, not ${p.secret.length}`);
     }
-    const parts = [enc.encode(p.token), enc.encode(p.url), enc.encode(p.vaultId)];
+    const parts = [enc.encode(p.url), enc.encode(p.vaultId)];
     for (const part of parts) {
         // One byte of length per field. A url or a vault id longer than this is
         // not a case worth a wider format; it is a case worth an error.
@@ -97,6 +110,16 @@ export function formatPairing(p: Pairing): string {
  */
 export function parsePairing(input: string): Pairing {
     const text = input.trim();
+    if (text.startsWith("basalt1_")) {
+        // Named rather than lumped in with rubbish, because somebody will have
+        // one written down. The vault it belongs to needs re-pairing: the
+        // server no longer takes the token in it, and the root secret in it is
+        // in a layout this cannot read.
+        throw new Error(
+            "this is a version 1 pairing string, from before the server token was folded into the root secret. " +
+                "Run basalt invite on a device that is already paired to get a current one."
+        );
+    }
     if (!text.startsWith(PAIRING_PREFIX)) {
         throw new Error(`not a pairing string: it should start with ${PAIRING_PREFIX}`);
     }
@@ -107,7 +130,7 @@ export function parsePairing(input: string): Pairing {
     } catch {
         throw new Error("this pairing string is damaged: it is not valid base64url");
     }
-    if (raw.length < 1 + SECRET_LENGTH + 3 + CHECKSUM_BYTES) {
+    if (raw.length < 1 + SECRET_LENGTH + 2 + CHECKSUM_BYTES) {
         throw new Error("this pairing string is too short to be complete");
     }
 
@@ -138,13 +161,12 @@ export function parsePairing(input: string): Pairing {
         return value;
     };
 
-    const token = field("token");
     const url = field("server address");
     const vaultId = field("vault name");
     if (at !== body.length) throw new Error("this pairing string has more in it than it should");
-    if (token === "" || url === "" || vaultId === "") throw new Error("this pairing string has an empty field");
+    if (url === "" || vaultId === "") throw new Error("this pairing string has an empty field");
 
-    return { url, token, secret, vaultId };
+    return { url, secret, vaultId };
 }
 
 /**
@@ -181,16 +203,25 @@ function checksum(body: Uint8Array): Uint8Array {
  */
 export interface DeviceConfig extends Pairing {
     readonly device: string;
+    /**
+     * The server's first-run token, kept only until this device has claimed the
+     * vault with it.
+     *
+     * Absent on every device but the first, and absent on that one too once the
+     * claim has gone through. What authenticates after that is derived from the
+     * root secret, so there is nothing else to keep.
+     */
+    readonly bootstrap?: string;
 }
 
 /** The stored form, which is JSON on both platforms. */
 export function encodeConfig(config: DeviceConfig): Record<string, string> {
     return {
         url: config.url,
-        token: config.token,
         vaultId: config.vaultId,
         device: config.device,
         secret: base64urlEncode(config.secret),
+        ...(config.bootstrap ? { bootstrap: config.bootstrap } : {}),
     };
 }
 
@@ -214,7 +245,14 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     if (secret.length !== SECRET_LENGTH) {
         throw new Error(`${where} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH}`);
     }
-    return { url: str("url"), token: str("token"), vaultId: str("vaultId"), device: str("device"), secret };
+    const bootstrap = record["bootstrap"];
+    return {
+        url: str("url"),
+        vaultId: str("vaultId"),
+        device: str("device"),
+        secret,
+        ...(typeof bootstrap === "string" && bootstrap !== "" ? { bootstrap } : {}),
+    };
 }
 
 /**

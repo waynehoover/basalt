@@ -460,7 +460,20 @@ export class Transport {
      * the *server* holds, so the difference says how far behind this device is
      * without anything having remembered a verdict from last time.
      */
-    async hello(args: { vault: string; token: string; device: string; cursor: number }): Promise<ServerLimits> {
+    async hello(args: {
+        vault: string;
+        token: string;
+        device: string;
+        cursor: number;
+        /**
+         * The auth key this device wants the vault bound to.
+         *
+         * Sent every time and meaningful only once: the server ignores it for a
+         * vault that has already been claimed. Sending it unconditionally means
+         * a device never has to know whether it is the first one.
+         */
+        claim?: string;
+    }): Promise<ServerLimits> {
         this.cursor = args.cursor;
         const reply = await this.request({
             op: "hello",
@@ -470,6 +483,7 @@ export class Transport {
             token: args.token,
             device: args.device,
             cursor: args.cursor,
+            ...(args.claim !== undefined ? { claim: args.claim } : {}),
         });
         if (reply["res"] !== "ready") {
             throw new ProtocolError("protostate", `expected ready, got ${JSON.stringify(reply)}`);

@@ -112,9 +112,11 @@ basalt sync                                   # or sync --watch
 basalt status
 ```
 
-Pairing is one string carrying the address, the token and the root secret, with
-a checksum on it, so a paste that lost its last line is refused rather than
-becoming a subtly wrong key.
+Pairing is one string carrying the address and the root secret, with a checksum
+on it, so a paste that lost its last line is refused rather than becoming a
+subtly wrong key. There is no separate server token in it: the key that
+authenticates is derived from the same secret that decrypts, so a vault has one
+secret and eighty characters is the whole of it.
 
 That the core really is platform-free is checked rather than asserted: the
 plugin bundle is built and read, and a test fails if a single `node:` import has
@@ -183,7 +185,7 @@ match on the way in.
 | Obsidian plugin shell | **Built**, and run once in a real vault |
 | Reconnect with backoff and jitter | **Built** |
 | Headless CLI | **Built** |
-| Pairing | **Built**, one string carrying the address, the token and the secret |
+| Pairing | **Built**, one string carrying the address and the secret |
 | Status bar, and one modal that is not a settings tab | **Built** |
 
 ## Security and privacy
@@ -196,8 +198,9 @@ match on the way in.
 | Paths sealed and reversible, so a device can recover a filename | **Built** |
 | Server stores no key material and terminates no TLS | **Built** |
 | PBKDF2 at 310,000 iterations for a passphrase-derived vault | **Written**, and nothing calls it |
-| Authentication by token, compared in constant time | **Built** |
-| Server storing only a hash of the auth key | **Designed** |
+| One secret: the auth key is derived from the root secret | **Built** |
+| One-time bootstrap token, so a vault is claimed rather than assumed | **Built** |
+| Server storing only a hash of the auth key | **Built** |
 
 ### What the server can see
 

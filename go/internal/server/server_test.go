@@ -9,32 +9,32 @@ func TestStaticTokensCopiesTheMapItWasGiven(t *testing.T) {
 	tokens := map[string]string{"v1": "secret"}
 	auth := StaticTokens(tokens)
 
-	if err := auth("v1", "secret"); err != nil {
+	if err := auth(Credentials{VaultID: "v1", Token: "secret"}); err != nil {
 		t.Fatalf("correct token refused: %v", err)
 	}
 	tokens["v1"] = "changed"
 	tokens["v2"] = "also-secret"
 
-	if err := auth("v1", "secret"); err != nil {
+	if err := auth(Credentials{VaultID: "v1", Token: "secret"}); err != nil {
 		t.Fatalf("the original token stopped working after the caller's map changed: %v", err)
 	}
-	if err := auth("v1", "changed"); err == nil {
+	if err := auth(Credentials{VaultID: "v1", Token: "changed"}); err == nil {
 		t.Fatal("a token added to the caller's map after the fact was accepted")
 	}
-	if err := auth("v2", "also-secret"); err == nil {
+	if err := auth(Credentials{VaultID: "v2", Token: "also-secret"}); err == nil {
 		t.Fatal("a vault added to the caller's map after the fact was accepted")
 	}
 }
 
 func TestStaticTokensRefusesWrongTokenAndUnknownVault(t *testing.T) {
 	auth := StaticTokens(map[string]string{"v1": "secret"})
-	if err := auth("v1", "wrong"); err == nil {
+	if err := auth(Credentials{VaultID: "v1", Token: "wrong"}); err == nil {
 		t.Fatal("wrong token accepted")
 	}
-	if err := auth("nope", "secret"); err == nil {
+	if err := auth(Credentials{VaultID: "nope", Token: "secret"}); err == nil {
 		t.Fatal("unknown vault accepted")
 	}
-	if err := auth("v1", ""); err == nil {
+	if err := auth(Credentials{VaultID: "v1", Token: ""}); err == nil {
 		t.Fatal("empty token accepted")
 	}
 }

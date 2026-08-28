@@ -14,7 +14,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Engine, contentId, type SyncReport } from "./engine.ts";
-import { deriveKeys, type VaultKeys } from "./crypto.ts";
+import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
 import { Transport } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
@@ -63,7 +63,7 @@ class Device {
             transport: this.transport,
             device: this.name,
             vaultId: "default",
-            token: server.token,
+            ...server.credentials(authToken(keys)),
             // A clock the test advances, so the size-scaled write debounce does
             // not decide when a sync may happen.
             now: () => (this.clock += 60_000),

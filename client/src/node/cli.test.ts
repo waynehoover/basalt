@@ -156,7 +156,7 @@ describe("pairing a vault", () => {
 
         const nonsense = await cli("pair", "have-a-nice-day", "--dir", c);
         expect(nonsense.code).toBe(1);
-        expect(nonsense.all).toMatch(/basalt1_/);
+        expect(nonsense.all).toMatch(/basalt2_/);
 
         // And nothing was written, so a failed pair leaves no half-configured vault.
         await expect(read(c, ".basalt/config.json")).rejects.toThrow();
@@ -451,4 +451,90 @@ describe("server addresses", () => {
         expect(() => normaliseUrl("ftp://host")).toThrow(/ws:\/\/ or wss:\/\//);
         expect(() => normaliseUrl("   ")).toThrow(/not a server address/);
     });
+});
+
+describe("one secret", () => {
+    /**
+     * A vault used to have two: a root secret the devices shared, and a server
+     * token that had nothing to do with it. The auth key is now another branch
+     * of the same HKDF schedule that produces the content and path keys, so
+     * holding the root secret is what it means to have the vault.
+     */
+    it("spends the server's first-run token and then forgets it", async () => {
+        await fresh();
+        const a = await vaultDir("a");
+        await cli("init", "--dir", a, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
+
+        // Kept until it has been used, because until then it is the only thing
+        // that opens an unclaimed vault.
+        const before = JSON.parse(await read(a, ".basalt/config.json")) as Record<string, string>;
+        expect(before["bootstrap"]).toBe(server.token);
+
+        await write(a, "note.md", "claimed\n");
+        expect((await cli("sync", "--dir", a, "--json")).code).toBe(0);
+
+        // Spent. Keeping it is keeping a second secret that opens nothing.
+        const after = JSON.parse(await read(a, ".basalt/config.json")) as Record<string, string>;
+        expect(after["bootstrap"]).toBeUndefined();
+        expect(Object.keys(after).sort()).toEqual(["device", "secret", "url", "vaultId"]);
+
+        // And the vault still syncs, on a credential derived from the secret.
+        await write(a, "again.md", "still working\n");
+        expect((await cli("sync", "--dir", a, "--json")).json()["uploaded"]).toBe(1);
+    }, 300_000);
+
+    it("has no token in the pairing string at all", async () => {
+        await fresh();
+        const a = await vaultDir("a");
+        await cli("init", "--dir", a, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
+        await write(a, "note.md", "x\n");
+        await cli("sync", "--dir", a);
+
+        const pairing = (await cli("invite", "--dir", a, "--json")).json()["pairing"] as string;
+        // The bootstrap is not in it, and neither is anything else that a
+        // second device would need beyond the secret and the address.
+        expect(pairing).not.toContain(server.token);
+        expect(Buffer.from(pairing.slice("basalt2_".length), "base64url").toString("latin1")).not.toContain(
+            server.token
+        );
+
+        const b = await vaultDir("b");
+        await cli("pair", pairing, "--dir", b, "--device", "b");
+        const config = JSON.parse(await read(b, ".basalt/config.json")) as Record<string, string>;
+        expect(config["bootstrap"], "a second device was handed a bootstrap it must not have").toBeUndefined();
+
+        // And it syncs, because the secret it was given derives the credential.
+        await cli("sync", "--dir", b);
+        expect(await read(b, "note.md")).toBe("x\n");
+    }, 300_000);
+
+    /**
+     * Once a vault is claimed the printed token opens nothing. Otherwise it
+     * would stay a working credential for the life of the server, which is
+     * exactly the second secret this removes.
+     */
+    it("stops accepting the first-run token once the vault is claimed", async () => {
+        await fresh();
+        const a = await vaultDir("a");
+        await cli("init", "--dir", a, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
+        await cli("sync", "--dir", a);
+
+        // Somebody else with the printed token and a secret of their own.
+        const intruder = await vaultDir("intruder");
+        await cli(
+            "init",
+            "--dir",
+            intruder,
+            "--server",
+            server.wsUrl,
+            "--token",
+            server.token,
+            "--device",
+            "intruder",
+            "--json"
+        );
+        const attempt = await cli("sync", "--dir", intruder);
+        expect(attempt.code, `the spent bootstrap still worked: ${attempt.all}`).toBe(1);
+        expect(attempt.all).toMatch(/auth|not authorised/i);
+    }, 300_000);
 });

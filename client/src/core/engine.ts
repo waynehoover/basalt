@@ -83,6 +83,8 @@ export interface EngineOptions {
     readonly device: string;
     readonly vaultId: string;
     readonly token: string;
+    /** The auth key to bind the vault to, if it has not been claimed yet. */
+    readonly claim?: string;
     readonly now?: () => number;
     readonly log?: (message: string, ...rest: unknown[]) => void;
     /** Whether a path may be three-way merged. Defaults to text extensions. */
@@ -272,6 +274,7 @@ export class Engine {
             token: this.opts.token,
             device: this.opts.device,
             cursor: this.cursor,
+            ...(this.opts.claim !== undefined ? { claim: this.opts.claim } : {}),
         });
         this.log("connected", limits);
         return limits;

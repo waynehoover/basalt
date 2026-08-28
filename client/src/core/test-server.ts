@@ -145,6 +145,23 @@ export class TestServer {
         }
     }
 
+    /**
+     * What a client should authenticate with.
+     *
+     * The first device to connect uses the token the server printed on its
+     * first run, and offers the auth key the vault should belong to from then
+     * on. Every device after that uses the key. This mirrors what the shells
+     * do, and a harness that handed out the bootstrap for ever would be testing
+     * a server that does not exist.
+     */
+    credentials(derivedAuthKey: string): { token: string; claim: string } {
+        const token = this.claimed ? derivedAuthKey : this.token;
+        this.claimed = true;
+        return { token, claim: derivedAuthKey };
+    }
+
+    private claimed = false;
+
     async stop(): Promise<void> {
         if (this.proc && this.proc.exitCode === null) {
             const ended = new Promise<void>((resolve) => this.proc!.once("exit", () => resolve()));

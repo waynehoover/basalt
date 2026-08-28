@@ -24,7 +24,7 @@
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 
-import { deriveKeys, generateSecret } from "../core/crypto.ts";
+import { authToken, deriveKeys, generateSecret } from "../core/crypto.ts";
 import { Client, runForever, type ClientOptions } from "../core/client.ts";
 import type { SyncReport } from "../core/engine.ts";
 import { formatPairing, normaliseUrl, parsePairing } from "../core/pairing.ts";
@@ -41,7 +41,7 @@ export interface Console {
 
 export const USAGE = `basalt: self-hosted sync for Obsidian
 
-  basalt init --server URL --token TOKEN    pair this vault as the first device
+  basalt init --server URL --token TOKEN    claim a new vault, with the server's first-run token
   basalt pair PAIRING-STRING                pair this vault with an existing one
   basalt invite                             print the string another device needs
   basalt sync                               sync once and exit
@@ -128,10 +128,13 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
 
     const config: Config = {
         url: normaliseUrl(args.server),
-        token: args.token,
         vaultId: args.vaultId,
         device: args.device,
         secret: generateSecret(),
+        // The server's first-run token, kept only until this device has claimed
+        // the vault with it. What authenticates afterwards is derived from the
+        // secret above, so there is nothing else to hold on to.
+        bootstrap: args.token,
     };
     await saveConfig(args.dir, config);
 
@@ -419,16 +422,31 @@ async function cmdUnlink(args: Args, io: Console): Promise<number> {
 async function open(config: Config, args: Args, io?: Console): Promise<Client> {
     const client = new Client(await clientOptions(config, args, io));
     await client.connect();
+
+    // The connection succeeded, so if a bootstrap was used the vault is claimed
+    // and the token is spent. Kept any longer it is a second secret sitting in
+    // a file for no reason, and one that no longer opens anything.
+    if (config.bootstrap) {
+        const { bootstrap: _spent, ...rest } = config;
+        await saveConfig(args.dir, rest);
+    }
     return client;
 }
 
 async function clientOptions(config: Config, args: Args, io?: Console): Promise<ClientOptions> {
+    const keys = await deriveKeys(config.secret);
+    const derived = authToken(keys);
     return {
         vault: new NodeVault(args.dir),
         store: new JsonIndexStore(indexPath(args.dir)),
-        keys: await deriveKeys(config.secret),
+        keys,
         url: config.url,
-        token: config.token,
+        // The bootstrap while there is one, and what the root secret derives
+        // once the vault has been claimed. `claim` goes every time and is
+        // ignored by a server that already knows its answer, so a device never
+        // has to work out whether it is the first.
+        token: config.bootstrap ?? derived,
+        claim: derived,
         vaultId: config.vaultId,
         device: config.device,
         timeoutMs: args.timeout,

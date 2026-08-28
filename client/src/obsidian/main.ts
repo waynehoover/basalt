@@ -31,7 +31,7 @@ import {
     type DeletedList,
     type Version,
 } from "../core/client.ts";
-import { deriveKeys, generateSecret } from "../core/crypto.ts";
+import { authToken, deriveKeys, generateSecret } from "../core/crypto.ts";
 import type { SyncReport } from "../core/engine.ts";
 import {
     decodeConfig,
@@ -159,6 +159,10 @@ export default class BasaltPlugin extends Plugin {
         await runForever(await this.clientOptions(config), {
             onClient: (client) => {
                 this.client = client;
+                // A connection means a bootstrap, if there was one, has been
+                // spent. Keeping it is keeping a second secret that no longer
+                // opens anything.
+                if (client && this.config?.bootstrap) void this.forgetBootstrap();
             },
             onSynced: (report) => {
                 this.setState({ kind: "synced", summary: summarise(report), at: Date.now() });
@@ -181,14 +185,29 @@ export default class BasaltPlugin extends Plugin {
         });
     }
 
+    /** Drops the spent first-run token from the saved settings. */
+    private async forgetBootstrap(): Promise<void> {
+        if (!this.config?.bootstrap) return;
+        const { bootstrap: _spent, ...rest } = this.config;
+        this.config = rest;
+        await this.saveData(encodeConfig(rest));
+    }
+
     private async clientOptions(config: DeviceConfig): Promise<ClientOptions> {
         const configDir = this.app.vault.configDir;
+        const keys = await deriveKeys(config.secret);
+        const derived = authToken(keys);
         return {
             vault: new ObsidianVault(this.app.vault.adapter, configDir),
             store: new ObsidianIndexStore(this.app.vault.adapter, this.indexPath(configDir)),
-            keys: await deriveKeys(config.secret),
+            keys,
             url: config.url,
-            token: config.token,
+            // The bootstrap while there is one, and what the root secret
+            // derives once the vault has been claimed. `claim` goes every time
+            // and a server that already knows its answer ignores it, so a
+            // device never has to work out whether it is the first.
+            token: config.bootstrap ?? derived,
+            claim: derived,
             vaultId: config.vaultId,
             device: config.device,
         };
@@ -314,12 +333,12 @@ export default class BasaltPlugin extends Plugin {
         if (this.config) throw new Error("this vault is already paired");
         const config: DeviceConfig = {
             url: normaliseUrl(url),
-            token: token.trim(),
             vaultId: "default",
             device: device.trim() || "obsidian",
             secret: generateSecret(),
+            bootstrap: token.trim(),
         };
-        if (config.token === "") throw new Error("the server's token is needed");
+        if (config.bootstrap === "") throw new Error("the server's token is needed");
         await this.saveData(encodeConfig(config));
         this.config = config;
         this.start();
@@ -561,7 +580,7 @@ class BasaltModal extends Modal {
             .setName("Pairing string")
             .setDesc("From Basalt on a device that already has this vault.")
             .addText((t) => {
-                t.setPlaceholder("basalt1_...");
+                t.setPlaceholder("basalt2_...");
                 pairingField = t;
             });
 
