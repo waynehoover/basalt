@@ -154,6 +154,9 @@ match on the way in.
 | Catch-up from a cursor after being offline | **Built** |
 | Write coalescing, scaled by file size | **Built** |
 | Per-file retry with backoff, kept apart from permanent refusals | **Built** |
+| A written-off file tried again once it changes | **Built** |
+| One path that is a file here and a folder there, refused and explained | **Built** |
+| Fetched chunks checked against the name they were asked for | **Built** |
 | Watching the vault for changes rather than polling | **Built** on the filesystem |
 
 ## The server
@@ -164,6 +167,8 @@ match on the way in.
 | SQLite for entries, content-addressed files for bodies | **Built** |
 | Full version history, append-only | **Built** |
 | `verify`, including a deep pass that re-reads every byte | **Built** |
+| `verify` checking the entries too, not only the bodies they name | **Built** |
+| Refusing a `-data` path that is not already a data directory | **Built** |
 | `purge` to drop history, with a grace window for in-flight uploads | **Built** |
 | `backup`, incremental and self-verifying | **Built** |
 | Directory locks, so maintenance cannot race a running server | **Built** |

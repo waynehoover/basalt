@@ -475,6 +475,7 @@ export function accumulate(total: SyncReport, pass: SyncReport): SyncReport {
         waiting: pass.waiting,
         retrying: pass.retrying,
         skipped: pass.skipped,
+        blocked: pass.blocked,
     };
 }
 
@@ -508,6 +509,7 @@ export function summarise(r: SyncReport): string {
     add(r.restored, "restored");
     add(r.retrying, "retrying");
     add(r.skipped, "stuck");
+    add(r.blocked, "in the way");
     return bits.length === 0 ? "up to date" : bits.join(", ");
 }
 

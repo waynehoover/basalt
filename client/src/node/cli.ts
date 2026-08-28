@@ -480,6 +480,7 @@ function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): 
     say(r.waiting, "waiting for a write to settle");
     say(r.retrying, "failed, will try again");
     say(r.skipped, "cannot sync and will not be retried");
+    say(r.blocked, "waiting on a name that is a file here and a folder elsewhere");
 
     if (lines.length === 0) {
         io.out("Nothing to do. Everything here matches the server.");

@@ -109,7 +109,7 @@ describe("a path that is a file here and a folder there", () => {
         expect(reportA.retrying, `A: ${JSON.stringify(reportA)}`).toBe(0);
         expect(reportB.retrying, `B: ${JSON.stringify(reportB)}`).toBe(0);
         expect(
-            reportA.skipped + reportB.skipped,
+            reportA.skipped + reportA.blocked + reportB.skipped + reportB.blocked,
             `neither device reported the disagreement: A ${JSON.stringify(reportA)} B ${JSON.stringify(reportB)}`
         ).toBeGreaterThan(0);
     }, 300_000);
@@ -147,12 +147,13 @@ describe("a path that is a file here and a folder there", () => {
         expect((await stat(join(a.dir, "notes"))).isDirectory()).toBe(true);
         // B is the one that cannot have both, and it says so rather than
         // passing over the folder in silence, which is what it used to do.
-        // Two: the path itself, and the note inside the folder that cannot be
-        // written while a file of that name is in the way.
+        // Counted apart, because they are different things to be told. One
+        // path can never work until somebody renames something, and one is
+        // simply waiting on a name that is in the way.
         expect(
-            reportB.skipped,
+            { skipped: reportB.skipped, blocked: reportB.blocked },
             `B passed it over: ${JSON.stringify(reportB)} (A: ${JSON.stringify(reportA)})`
-        ).toBe(2);
+        ).toEqual({ skipped: 1, blocked: 1 });
     }, 300_000);
 
     /** And once somebody renames one of them, it syncs like anything else. */
@@ -183,6 +184,10 @@ describe("a path that is a file here and a folder there", () => {
         const held = await contents(a.dir);
         expect(held, `A holds ${held}`).toContain("notes/inside.md");
         expect(held, `A holds ${held}`).toContain("a file, not a folder");
-        expect((await a.c.settle()).skipped, "still refusing after the rename").toBe(0);
+        const settled = await a.c.settle();
+        expect(
+            { skipped: settled.skipped, blocked: settled.blocked },
+            "still refusing after the rename"
+        ).toEqual({ skipped: 0, blocked: 0 });
     }, 300_000);
 });

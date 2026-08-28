@@ -635,3 +635,69 @@ describe("recovery answers from a server that answers badly", () => {
         expect(await asked).toEqual({ entries: [], more: false });
     });
 });
+
+/**
+ * A device is told at hello what the server will store. Nothing used to hold
+ * the server to it on the way back: a chunk list is a number the server
+ * chooses, and a device that fetches and buffers however many are named runs
+ * out of memory on a corrupt row as readily as on a hostile one.
+ */
+describe("a download against what the server said it would store", () => {
+    it("refuses a version naming more chunks than the server stores", async () => {
+        const { engine, socket } = await engineOnFakeSocket({ maxChunks: 4 });
+        const asked = engine.contentOf(1);
+        await settle();
+        socket.reply({ res: "chunks", uid: 1, size: 10, chunks: Array.from({ length: 5 }, (_, i) => `${i}`.repeat(64)) });
+        await expect(asked).rejects.toThrow(/stores at most 4/);
+    });
+
+    it("accepts one within the limit", async () => {
+        const { engine, socket } = await engineOnFakeSocket({ maxChunks: 4 });
+        const body = new Uint8Array([1, 2, 3]);
+        const name = await chunkName(body);
+        const asked = engine.contentOf(1);
+        await settle();
+        socket.reply({ res: "chunks", uid: 1, size: 3, chunks: [name] });
+        await settle();
+        socket.body(body);
+        // It gets as far as decrypting, which is where a body that is not a
+        // sealed chunk fails. That is past the bound, which is the point.
+        await expect(asked).rejects.not.toThrow(/stores at most/);
+    });
+});
+
+/** An engine wired to a fake socket, connected, with limits of the test's choosing. */
+async function engineOnFakeSocket(limits: { maxChunks?: number; perFileMax?: number }) {
+    const { Engine } = await import("./engine.ts");
+    const { deriveKeys } = await import("./crypto.ts");
+    const { MemoryIndexStore, MemoryVault } = await import("./vault.ts");
+    const socket = new FakeSocket();
+    const t = new Transport("ws://test", { onBatch: () => {}, socketFactory: () => socket, timeoutMs: 2000 });
+    const connecting = t.connect();
+    socket.open();
+    await connecting;
+
+    const engine = new Engine({
+        vault: new MemoryVault(),
+        store: new MemoryIndexStore(),
+        keys: await deriveKeys(new Uint8Array(20).fill(1)),
+        transport: t,
+        device: "d",
+        vaultId: "v",
+        token: "t",
+    });
+    const started = engine.start();
+    await settle();
+    socket.reply({
+        res: "ready",
+        proto: 1,
+        cursor: 0,
+        perFileMax: limits.perFileMax ?? 1 << 28,
+        chunkMax: 1 << 20,
+        maxChunks: limits.maxChunks ?? 100,
+    });
+    await settle();
+    socket.reply({ op: "caught-up", cursor: 0 });
+    await started;
+    return { engine, socket, t };
+}

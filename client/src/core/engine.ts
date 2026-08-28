@@ -141,6 +141,15 @@ export interface SyncReport {
     retrying: number;
     /** Files that can never work and will not be tried again. */
     skipped: number;
+    /**
+     * Paths a file is standing in the way of.
+     *
+     * Its own counter rather than folded into `skipped`, whose label says a file
+     * will not be tried again. These are tried every pass and cannot succeed
+     * until somebody renames one of the two things that disagree, which is a
+     * different thing to tell a person and rule 7 says to tell them apart.
+     */
+    blocked: number;
     /** Chunk bodies actually sent, and their size. The measure that matters. */
     chunksSent: number;
     bytesSent: number;
@@ -160,6 +169,7 @@ function emptyReport(): SyncReport {
         waiting: 0,
         retrying: 0,
         skipped: 0,
+        blocked: 0,
         chunksSent: 0,
         bytesSent: 0,
     };
@@ -198,6 +208,18 @@ export class Engine {
      * the file. Kept only so that the same complaint is not logged every pass.
      */
     private blocked = new Set<string>();
+
+    /**
+     * What the server said it would accept, kept so a download can be held to
+     * it.
+     *
+     * The limits arrive at hello and were previously logged and dropped. They
+     * bound what this device sends; nothing bounded what it would take. A chunk
+     * list is a number the server chooses, and a device that fetches and buffers
+     * however many are named runs out of memory on a corrupt row as readily as
+     * on a hostile one.
+     */
+    private limits: ServerLimits | undefined;
     /** Sealed path to plaintext, so a path is unsealed once per session. */
     private readonly unsealed = new Map<string, string>();
 
@@ -276,6 +298,7 @@ export class Engine {
             cursor: this.cursor,
             ...(this.opts.claim !== undefined ? { claim: this.opts.claim } : {}),
         });
+        this.limits = limits;
         this.log("connected", limits);
         return limits;
     }
@@ -416,7 +439,7 @@ export class Engine {
                 if (!this.blocked.has(path)) {
                     this.log("cannot be both", path, `${blockedBy} is a file here and a folder elsewhere`);
                 }
-                report.skipped++;
+                report.blocked++;
                 continue;
             }
 
@@ -698,10 +721,31 @@ export class Engine {
     async contentOf(uid: number): Promise<Uint8Array> {
         const meta = await this.opts.transport.get(uid);
         if (meta.chunks.length === 0) return new Uint8Array(0);
+
+        // Held to what the server itself advertised. Both of these are the
+        // server's own numbers, so refusing past them is not a policy of this
+        // client's, it is declining to be told two different things.
+        const maxChunks = this.limits?.maxChunks ?? 0;
+        if (maxChunks > 0 && meta.chunks.length > maxChunks) {
+            throw new Error(
+                `version ${uid} names ${meta.chunks.length} chunks, and this server said it stores at most ${maxChunks}`
+            );
+        }
+
         const bodies = await this.opts.transport.fetch(meta.chunks);
         const opened: Uint8Array[] = [];
-        for (const body of bodies) opened.push(await openChunk(this.opts.keys, body));
-        const total = opened.reduce((n, b) => n + b.length, 0);
+        let total = 0;
+        const perFileMax = this.limits?.perFileMax ?? 0;
+        for (const body of bodies) {
+            const part = await openChunk(this.opts.keys, body);
+            total += part.length;
+            if (perFileMax > 0 && total > perFileMax) {
+                throw new Error(
+                    `version ${uid} is over ${total} bytes, and this server said it stores at most ${perFileMax}`
+                );
+            }
+            opened.push(part);
+        }
         const out = new Uint8Array(total);
         let at = 0;
         for (const b of opened) {
