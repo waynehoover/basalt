@@ -34,6 +34,8 @@ Early. See `docs/` for the design this is being built to:
 
 - `docs/running.md`, putting it on a server and on your devices, Docker included
 - `docs/features.md`, everything it does, marked built, partial or designed
+- `docs/tradeoffs.md`, the design decisions and what each one costs
+- `docs/benchmark.md`, speed and correctness, measured together
 - `docs/philosophy.md` — what it refuses to do, and why
 - `docs/protocol.md` — the wire protocol, and the seven defects it exists to avoid
 - `docs/backup.md`, on the two kinds of backup and which one saves you from what
