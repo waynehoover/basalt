@@ -55,7 +55,34 @@ const (
 	// times the plaintext, and Obsidian's own paths are bounded by the
 	// filesystem, so this has room to spare while still being a bound.
 	MaxPathLen = 4096
+
+	// ChunkOverheadMax bounds what encryption adds to one chunk: a nonce, an
+	// authentication tag, and any framing. AES-GCM-SIV needs 12 plus 16, so
+	// this is an order of magnitude of headroom, which is deliberate: it is the
+	// slack a future scheme, or padding to obscure sizes, would need. Anything
+	// wanting more than this is a protocol version, not a bigger constant.
+	ChunkOverheadMax = 256
 )
+
+// CiphertextBudget is the most stored ciphertext an entry may reference, given
+// the plaintext size it declares and how many chunks it splits into.
+//
+// A client chunks size bytes of plaintext into n pieces and encrypts each, so
+// the honest total is size + n*overhead and this is an upper bound on it.
+//
+// It exists because size and chunk count were bounded independently, and their
+// product was the real ceiling: an entry declaring one byte could reference
+// 65536 chunks of a megabyte each, and neither bound was violated. Every other
+// unbounded case in this package is closed with a comment saying why; this one
+// was the exception.
+//
+// The comparison is per *reference*, not per distinct body. A file with two
+// identical blocks counts that ciphertext twice, because its declared size
+// counts the plaintext twice, and the two numbers have to be about the same
+// thing to be comparable.
+func CiphertextBudget(size int64, n int) int64 {
+	return size + int64(n)*ChunkOverheadMax
+}
 
 var (
 	// ErrUnknownVault is a write against a vault id with no row. Callers must
@@ -74,6 +101,10 @@ var (
 	// docs/protocol.md: validate at put, with a reason, rather than discovering
 	// it on download when it is too late to refuse.
 	ErrBadEntry = errors.New("invalid entry")
+
+	// ErrOverBudget is an entry referencing more ciphertext than its declared
+	// plaintext size can account for. See CiphertextBudget.
+	ErrOverBudget = errors.New("entry references more ciphertext than its declared size allows")
 )
 
 // Entry is one version of one file.
@@ -97,8 +128,12 @@ type Entry struct {
 	Prev string `json:"prev,omitempty"`
 
 	// Chunks names the encrypted chunks of this version, in order. Empty for a
-	// folder, a deletion, and a zero-byte file.
-	Chunks []string `json:"chunks,omitempty"`
+	// folder, a deletion, and a zero-byte file, and empty rather than absent:
+	// there is no omitempty here, and the read paths fill in an empty slice, so
+	// the field is always an array on the wire. A nil slice marshals to JSON
+	// null, and a client that iterates it crashes on exactly the entries it is
+	// meant to handle without noticing.
+	Chunks []string `json:"chunks"`
 }
 
 // HasBody reports whether this entry is expected to have chunk bodies behind it.
@@ -278,12 +313,24 @@ func (e Entry) Validate() error {
 		return nil
 	}
 
-	// A file with content must say where the content is. Without this an entry
-	// with no chunks reads exactly like an empty file, so a push that lost its
-	// chunk list would present as the note having been emptied. That is the
-	// silent failure this whole layer exists to refuse.
+	// A file has chunks if and only if it has content.
+	//
+	// The forward half: an entry with a size and no chunks reads exactly like an
+	// empty file, so a push that lost its chunk list would present as the note
+	// having been emptied. That is the silent failure this whole layer exists to
+	// refuse.
 	if e.Size > 0 && len(e.Chunks) == 0 {
 		return fmt.Errorf("%w: size %d with no chunks", ErrBadEntry, e.Size)
+	}
+	// The reverse half: a zero-byte file carries no chunks. Both shapes were
+	// legal, which made an empty note two different things on the wire and a
+	// trap for whoever writes the client. Encrypting empty plaintext does
+	// produce a chunk's worth of ciphertext, so a client has to special case
+	// this either way; the biconditional at least means the server can check
+	// the relationship completely, and an empty note costs no body.
+	if e.Size == 0 && len(e.Chunks) > 0 {
+		return fmt.Errorf("%w: zero-byte file carries %d chunks; an empty file has none",
+			ErrBadEntry, len(e.Chunks))
 	}
 	return nil
 }
@@ -307,10 +354,24 @@ func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
 	// that checked earlier would be racing the chunk sweep; holding the lock
 	// across the check and the commit is what makes "committed implies
 	// serveable" true rather than likely.
+	//
+	// The same stat yields each body's size, and the total is checked against
+	// what the declared plaintext size can account for. This is the
+	// authoritative check: the session bounds uploads as they arrive so a
+	// hostile client cannot write the disk full before being refused, but that
+	// pre-check can be bypassed by referencing chunks the server already holds,
+	// and this one cannot be bypassed at all.
+	var stored int64
 	for i, n := range e.Chunks {
-		if !s.chunks.Has(vaultID, n) {
+		size, ok := s.chunks.Size(vaultID, n)
+		if !ok {
 			return 0, fmt.Errorf("%w: chunk %d of %d: %s", ErrChunkMissing, i+1, len(e.Chunks), n)
 		}
+		stored += size
+	}
+	if budget := CiphertextBudget(e.Size, len(e.Chunks)); stored > budget {
+		return 0, fmt.Errorf("%w: %d chunks holding %d bytes for a declared size of %d, budget %d",
+			ErrOverBudget, len(e.Chunks), stored, e.Size, budget)
 	}
 
 	tx, err := s.db.Begin()
@@ -536,7 +597,9 @@ func attachChunks(tx *sql.Tx, vaultID string, entries []Entry) error {
 		if e.UID > hi {
 			hi = e.UID
 		}
-		entries[i].Chunks = nil
+		// Empty, not nil: see Entry.Chunks. Every entry leaving this package
+		// carries an array, even when it carries no chunks.
+		entries[i].Chunks = []string{}
 	}
 
 	rows, err := tx.Query(

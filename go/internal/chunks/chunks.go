@@ -153,11 +153,25 @@ func (s *Store) Path(vaultID, name string) (string, error) {
 // fails loudly. Rule 2 says absent and unreadable are different states, and the
 // place that distinction has to survive is Put and Get, which return errors.
 func (s *Store) Has(vaultID, name string) bool {
+	_, ok := s.Size(vaultID, name)
+	return ok
+}
+
+// Size is Has plus the stored size, from the same stat.
+//
+// The size matters because an entry declares a plaintext size and references
+// chunks of ciphertext, and nothing else in the system relates the two. A
+// caller checking presence is already paying for the stat, so it may as well
+// learn what it is admitting.
+func (s *Store) Size(vaultID, name string) (int64, bool) {
 	if !ValidName(name) {
-		return false
+		return 0, false
 	}
 	st, err := os.Stat(s.path(vaultID, name))
-	return err == nil && st.Mode().IsRegular()
+	if err != nil || !st.Mode().IsRegular() {
+		return 0, false
+	}
+	return st.Size(), true
 }
 
 // Missing returns the subset of names this vault does not hold, in the order

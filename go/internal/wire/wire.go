@@ -104,10 +104,6 @@ type In struct {
 
 	// get
 	UID int64 `json:"uid"`
-
-	// history, deleted
-	Before          int64 `json:"before"`
-	SuppressRenames bool  `json:"suppressRenames"`
 }
 
 // PutMeta is the metadata of one version. It is nested rather than flat so that

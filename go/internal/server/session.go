@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
@@ -498,6 +499,23 @@ func (s *Session) handlePut(m wire.In) error {
 		return s.reject(wire.CodeBadChunk, err)
 	}
 
+	// What this entry may reference in total, and what it already accounts for.
+	//
+	// The store re-checks this at commit and is the authority; the point of
+	// doing it here too is that the commit happens *after* the upload, so
+	// relying on it alone would let a client write the disk full and only then
+	// be told no. Refusing before the want list goes out costs nothing.
+	budget := store.CiphertextBudget(e.Size, len(e.Chunks))
+	held, err := s.heldBytes(e.Chunks, missing)
+	if err != nil {
+		return s.reject(wire.CodeInternal, err)
+	}
+	if held > budget {
+		return s.reject(wire.CodeToolarge, fmt.Errorf(
+			"the chunks named already hold %d bytes for a declared size of %d, budget %d",
+			held, e.Size, budget))
+	}
+
 	if len(missing) == 0 {
 		uid, err := s.commit(e)
 		if err != nil {
@@ -509,7 +527,7 @@ func (s *Session) handlePut(m wire.In) error {
 	if err := s.writeJSON(wire.Want{Res: "want", Chunks: missing}); err != nil {
 		return err
 	}
-	if err := s.readBodies(missing); err != nil {
+	if err := s.readBodies(missing, budget-held); err != nil {
 		return err
 	}
 
@@ -521,7 +539,32 @@ func (s *Session) handlePut(m wire.In) error {
 	return s.writeJSON(wire.Ack{Res: "ack", UID: uid})
 }
 
-// readBodies reads one binary frame per wanted chunk and stores each.
+// heldBytes totals what this entry's already-present chunks occupy, counting a
+// repeated chunk once per reference because the declared size counts its
+// plaintext once per reference too.
+func (s *Session) heldBytes(all, missing []string) (int64, error) {
+	absent := make(map[string]struct{}, len(missing))
+	for _, n := range missing {
+		absent[n] = struct{}{}
+	}
+	var held int64
+	for _, n := range all {
+		if _, gone := absent[n]; gone {
+			continue
+		}
+		size, ok := s.srv.st.Chunks().Size(s.vaultID, n)
+		if !ok {
+			// Present a moment ago, when Missing looked. The sweep can do this;
+			// the commit will refuse and the client retries.
+			continue
+		}
+		held += size
+	}
+	return held, nil
+}
+
+// readBodies reads one binary frame per wanted chunk and stores each, refusing
+// once the uploads pass what the entry's declared size can account for.
 //
 // Frames are matched to names by hashing the body, not by position. That is
 // only possible because a chunk name *is* the hash of its body, and it is
@@ -531,12 +574,13 @@ func (s *Session) handlePut(m wire.In) error {
 // Every failure in here ends the session. Mid-stream there is no way to tell
 // the client "skip that one and carry on" without both ends agreeing how many
 // frames remain, and guessing is how two ends desync silently.
-func (s *Session) readBodies(want []string) error {
+func (s *Session) readBodies(want []string, allowance int64) error {
 	outstanding := make(map[string]struct{}, len(want))
 	for _, n := range want {
 		outstanding[n] = struct{}{}
 	}
 
+	var uploaded int64
 	for len(outstanding) > 0 {
 		typ, body, err := s.readMsg()
 		if err != nil {
@@ -558,16 +602,38 @@ func (s *Session) readBodies(want []string) error {
 				"received a %d byte body hashing to %s, which was not among the %d chunks still wanted",
 				len(body), name, len(outstanding)))
 		}
+		// Checked before the write, not after. The point of the bound is that
+		// the bytes never reach the disk.
+		uploaded += int64(len(body))
+		if uploaded > allowance {
+			return s.fatal(wire.CodeToolarge, fmt.Errorf(
+				"uploads reached %d bytes with %d chunks still wanted, and this entry's "+
+					"declared size allows %d",
+				uploaded, len(outstanding), allowance))
+		}
 		if err := s.srv.st.Chunks().Put(s.vaultID, name, body); err != nil {
-			code := wire.CodeInternal
-			if errors.Is(err, chunks.ErrTooLarge) {
-				code = wire.CodeToolarge
-			}
-			return s.fatal(code, err)
+			return s.fatal(putErrorCode(err), err)
 		}
 		delete(outstanding, name)
 	}
 	return nil
+}
+
+// putErrorCode classifies a failure to store a body.
+//
+// It is a function rather than an inline switch so the classification can be
+// tested directly: a full disk is not something a test can arrange, and before
+// this it arrived as an unexplained internal fault while `nospace` sat in the
+// protocol's code list and was never sent by anything.
+func putErrorCode(err error) string {
+	switch {
+	case errors.Is(err, chunks.ErrTooLarge):
+		return wire.CodeToolarge
+	case errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT):
+		return wire.CodeNoSpace
+	default:
+		return wire.CodeInternal
+	}
 }
 
 // commit appends the entry and fans it out, as one step.
@@ -596,6 +662,8 @@ func (s *Session) commit(e store.Entry) (int64, error) {
 			// A body was swept between the upload and the commit. Loud, and the
 			// client re-uploads; see chunks.DefaultGrace for why this is rare.
 			code = wire.CodeNoChunk
+		case errors.Is(err, store.ErrOverBudget):
+			code = wire.CodeToolarge
 		}
 		return 0, s.fatal(code, err)
 	}

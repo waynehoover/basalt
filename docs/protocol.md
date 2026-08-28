@@ -138,6 +138,25 @@ one chunk instead of shifting every chunk after it.
   what makes the name safe to use as a filename. Uppercase is refused rather
   than normalised, because two spellings of one hash are two bodies on disk and
   a dedup miss that presents as unexplained upload volume.
+- The chunks an entry references must be consistent with the `size` it declares.
+  The server accepts at most `size + 256*len(chunks)` bytes of stored ciphertext
+  for one entry, counting a repeated chunk once per reference because `size`
+  counts its plaintext once per reference too. Over that is `toolarge`.
+
+  This exists because `size` and `len(chunks)` were bounded independently, and
+  their product was the real ceiling: an entry declaring one byte could
+  reference 65536 chunks of a megabyte each without violating either bound. The
+  bound is enforced twice, as uploads arrive so the bytes never reach the disk,
+  and again at commit so referencing chunks the server already holds cannot slip
+  past it.
+- A file has chunks **if and only if** it has content. A zero-byte note carries
+  none, and so do folders and deletions. Encrypting empty plaintext does produce
+  ciphertext, so a client has to special case an empty file either way; fixing
+  the shape means the server can check the relationship completely instead of
+  accepting two different things for one state.
+- `chunks` is always an array, never absent and never `null`, on every entry in
+  every direction. A client iterating it must not have to guard the cases it
+  should be able to ignore.
 - `{res:"have", uid}` means the server already held every chunk, so nothing was
   uploaded and the entry is recorded. It carries the uid for the same reason
   `ack` does. `have` and `ack` are different outcomes and both are named.
@@ -223,8 +242,8 @@ agree how many frames are outstanding and carrying on would mean guessing.
 | `badentry` | a structurally invalid put |
 | `badname` | a path the server cannot store |
 | `badchunk` | a body that does not hash to the name it was asked for |
-| `toolarge` | above an advertised ceiling |
-| `nospace` | refused for want of disk |
+| `toolarge` | above an advertised ceiling, or more ciphertext than the declared size allows |
+| `nospace` | refused for want of disk, or an exceeded quota |
 | `nouid` | no such entry |
 | `nocontent` | the entry is a folder or a deletion |
 | `nochunk` | the server does not hold that chunk |

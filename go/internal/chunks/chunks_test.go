@@ -453,3 +453,42 @@ func TestSweepCountsALiveRecentChunkAsLiveNotSpared(t *testing.T) {
 		t.Fatalf("deleted %d, spared %d; want 0 and 0", deleted, spared)
 	}
 }
+
+// Size and Has must agree, and neither may treat a directory as a chunk. Has is
+// defined in terms of Size, so the risk is that Size loosens what counts.
+func TestSizeAndHasAgree(t *testing.T) {
+	s := newTestStore(t)
+	body := []byte("some ciphertext")
+	name := Name(body)
+
+	if size, ok := s.Size("v1", name); ok || size != 0 {
+		t.Fatalf("Size reported %d, %v before the chunk existed", size, ok)
+	}
+	if err := s.Put("v1", name, body); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	size, ok := s.Size("v1", name)
+	if !ok || size != int64(len(body)) {
+		t.Fatalf("Size = %d, %v; want %d, true", size, ok, len(body))
+	}
+	if !s.Has("v1", name) {
+		t.Fatal("Has disagrees with Size")
+	}
+
+	// A directory where a chunk should be is not a chunk. Without the regular
+	// file check its size would be reported as a body's.
+	other := Name([]byte("never uploaded"))
+	p, err := s.Path("v1", other)
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	if err := os.MkdirAll(p, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if size, ok := s.Size("v1", other); ok {
+		t.Fatalf("a directory was reported as a chunk of %d bytes", size)
+	}
+	if s.Has("v1", other) {
+		t.Fatal("Has accepted a directory")
+	}
+}

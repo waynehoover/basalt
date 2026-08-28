@@ -183,6 +183,21 @@ func (c *client) pump() []byte {
 	return nil
 }
 
+// recvRaw returns the next text frame exactly as it came off the wire, without
+// demultiplexing. Used where the test is about the JSON itself, since decoding
+// into a struct is what hides the difference between [] and null.
+func (c *client) recvRaw() string {
+	c.t.Helper()
+	typ, data, err := c.read()
+	if err != nil {
+		c.t.Fatalf("%s: read: %v", c.name, err)
+	}
+	if typ != websocket.MessageText {
+		c.t.Fatalf("%s: expected a text frame, got binary (%d bytes)", c.name, len(data))
+	}
+	return string(data)
+}
+
 // recvFrame returns the next reply, queueing any batches that arrive first.
 func (c *client) recvFrame() []byte {
 	c.t.Helper()

@@ -1,8 +1,14 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"syscall"
 	"testing"
+
+	"github.com/coder/websocket"
 
 	"github.com/waynehoover/basalt/internal/chunks"
 	"github.com/waynehoover/basalt/internal/store"
@@ -694,5 +700,255 @@ func TestUnknownOpIsAnsweredRatherThanIgnored(t *testing.T) {
 	cl.sendJSON(wire.In{Op: "ping"})
 	if m := cl.recv(); m["res"] != "pong" {
 		t.Fatalf("session unusable after an unknown op: %v", m)
+	}
+}
+
+/* ---------------------------------------------------------------- *
+ * The ciphertext budget
+ * ---------------------------------------------------------------- */
+
+// A client declaring one byte and then uploading megabytes must be stopped
+// while it is uploading, not after. The store refuses the commit either way,
+// but by then the bytes are on the disk this bound exists to protect.
+func TestUploadsAreCutOffOnceTheyPassTheDeclaredSize(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	bodies := make([]string, 4)
+	names := make([]string, 4)
+	for i := range bodies {
+		b := make([]byte, 64<<10) // 64 KiB each
+		b[0] = byte(i)
+		bodies[i] = string(b)
+		names[i] = chunks.Name(b)
+	}
+
+	cl.sendJSON(wire.In{Op: "put", Path: "lie.md", Chunks: names,
+		Meta: wire.PutMeta{Size: 1, MTime: 5}})
+	var want wire.Want
+	cl.recvInto("want", &want)
+	for _, b := range bodies {
+		// The server stops reading part way through, so a write can fail here.
+		// That is the refusal arriving, not a test failure.
+		if err := cl.conn.Write(cl.ctx, websocket.MessageBinary, []byte(b)); err != nil {
+			break
+		}
+	}
+	cl.expectErr(wire.CodeToolarge)
+
+	if st := r.mustStats(); st.Versions != 0 {
+		t.Fatalf("%d entries committed", st.Versions)
+	}
+	// At most the first body reached the disk before the bound fired.
+	stored := 0
+	for _, n := range names {
+		if r.st.Chunks().Has(testVault, n) {
+			stored++
+		}
+	}
+	if stored > 1 {
+		t.Fatalf("%d of 4 oversized bodies were written before the refusal", stored)
+	}
+}
+
+// Pointing a tiny entry at chunks the server already holds uploads nothing, so
+// only the commit can refuse it. The session has to turn that into a code the
+// client can act on rather than an internal fault.
+func TestAnEntryPointedAtAlreadyHeldChunksIsRefusedByTheBudget(t *testing.T) {
+	r := newRig(t)
+	big := make([]byte, 64<<10)
+	e := r.seed("big.md", string(big))
+
+	cl := r.dial("a")
+	cl.hello(0)
+	cl.sendJSON(wire.In{Op: "put", Path: "tiny.md", Chunks: e.Chunks,
+		Meta: wire.PutMeta{Size: 10, MTime: 5}})
+	cl.expectErr(wire.CodeToolarge)
+
+	if st := r.mustStats(); st.Files != 1 {
+		t.Fatalf("stats = %+v, want only the seeded file", st)
+	}
+	// The session survives: this rejects one request, it does not desync.
+	if uid := cl.put("fine.md", "a normal note"); uid == 0 {
+		t.Fatal("the session was unusable after a budget refusal")
+	}
+}
+
+// An honestly sized file must not be caught by the bound, or the fix is worse
+// than the hole. This is a realistic shape: 8 KiB plaintext chunks with an
+// AES-GCM nonce and tag on each.
+func TestAnHonestlySizedUploadIsNotRefused(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	const plain, n = 8192, 6
+	bodies := make([]string, n)
+	names := make([]string, n)
+	for i := range bodies {
+		b := make([]byte, plain+28)
+		b[0] = byte(i)
+		bodies[i] = string(b)
+		names[i] = chunks.Name(b)
+	}
+	cl.sendJSON(wire.In{Op: "put", Path: "real.md", Chunks: names,
+		Meta: wire.PutMeta{Size: plain * n, MTime: 5}})
+	var want wire.Want
+	cl.recvInto("want", &want)
+	for _, n := range want.Chunks {
+		cl.sendBinary([]byte(bodyFor(t, bodies, n)))
+	}
+	var ack wire.Ack
+	cl.recvInto("ack", &ack)
+	r.mustVerify()
+}
+
+/* ---------------------------------------------------------------- *
+ * Empty, never null
+ * ---------------------------------------------------------------- */
+
+// Whatever the entry, `chunks` is an array on the wire. A client that iterates
+// it must not have to guard against null on folders, deletions and empty notes,
+// which is the same hazard already closed for a batch's entry list.
+func TestEveryEntryOnTheWireCarriesAChunkArray(t *testing.T) {
+	r := newRig(t)
+	r.seed("note.md", "content")
+	if _, err := r.st.AppendEntry(testVault, store.Entry{Path: "folder", Folder: true}); err != nil {
+		t.Fatalf("folder: %v", err)
+	}
+	if _, err := r.st.AppendEntry(testVault, store.Entry{
+		Path: "note.md", Deleted: true, MTime: 2}); err != nil {
+		t.Fatalf("deletion: %v", err)
+	}
+	if _, err := r.st.AppendEntry(testVault, store.Entry{
+		Path: "empty.md", Size: 0, MTime: 3}); err != nil {
+		t.Fatalf("empty: %v", err)
+	}
+
+	cl := r.dial("a")
+	cl.sendJSON(helloMsg(testVault, testToken, "a", 0))
+	cl.recvInto("ready", nil)
+
+	// Read the raw frame, because decoding into a struct is exactly what hides
+	// the difference between [] and null.
+	raw := cl.recvRaw()
+	if !strings.Contains(raw, `"op":"batch"`) {
+		t.Fatalf("expected a batch, got %s", raw)
+	}
+	if strings.Contains(raw, `"chunks":null`) {
+		t.Fatalf("a batch entry carried a null chunk list: %s", raw)
+	}
+	if !strings.Contains(raw, `"chunks":[]`) {
+		t.Fatalf("expected at least one empty chunk array in %s", raw)
+	}
+
+	// Same on the get path, which builds its own reply rather than echoing an
+	// entry.
+	cl.recvInto("caught-up", nil)
+	cl.sendJSON(wire.In{Op: "get", UID: 4})
+	raw = cl.recvRaw()
+	if strings.Contains(raw, `"chunks":null`) {
+		t.Fatalf("get returned a null chunk list for an empty file: %s", raw)
+	}
+}
+
+// A zero-byte file has one shape, and the other is refused with a message that
+// says which. Both were legal, which made an empty note two different things.
+func TestAZeroByteFileWithChunksIsRefused(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	names, _ := chunkNames([]string{"ciphertext of nothing"})
+	cl.sendJSON(wire.In{Op: "put", Path: "empty.md", Chunks: names,
+		Meta: wire.PutMeta{Size: 0, MTime: 5}})
+	msg := cl.expectErr(wire.CodeBadEntry)
+	if !strings.Contains(msg, "an empty file has none") {
+		t.Fatalf("the refusal does not say what shape to send instead: %s", msg)
+	}
+}
+
+// A full disk has its own code. Before this it arrived as an unexplained
+// internal fault while `nospace` sat in the protocol's code list unused by
+// anything.
+//
+// The classification is tested directly because a full filesystem is not
+// something a test can arrange, and an approximation of it (an unwritable
+// directory) produces a different errno and would pin down nothing.
+func TestAFailedBodyWriteIsClassified(t *testing.T) {
+	cases := []struct {
+		why  string
+		err  error
+		want string
+	}{
+		{"a full disk", fmt.Errorf("writing chunk: %w", syscall.ENOSPC), wire.CodeNoSpace},
+		{"an exceeded quota", fmt.Errorf("writing chunk: %w", syscall.EDQUOT), wire.CodeNoSpace},
+		{"a body over the ceiling", fmt.Errorf("x: %w", chunks.ErrTooLarge), wire.CodeToolarge},
+		{"anything else", errors.New("disk on fire"), wire.CodeInternal},
+	}
+	for _, c := range cases {
+		if got := putErrorCode(c.err); got != c.want {
+			t.Errorf("%s: code = %q, want %q", c.why, got, c.want)
+		}
+	}
+}
+
+// A body that cannot be written commits nothing. The errno depends on the
+// platform, so this asserts the outcome rather than the code.
+func TestABodyThatCannotBeWrittenCommitsNothing(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	dir := r.st.Chunks().VaultDir(testVault)
+	if err := os.MkdirAll(dir, 0o500); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	names, size := chunkNames([]string{"a body that cannot be written"})
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names,
+		Meta: wire.PutMeta{Size: size, MTime: 5}})
+	var want wire.Want
+	cl.recvInto("want", &want)
+	cl.sendBinary([]byte("a body that cannot be written"))
+
+	if m := cl.recv(); m["res"] != "err" {
+		t.Fatalf("a failed write was not reported: %v", m)
+	}
+	if st := r.mustStats(); st.Versions != 0 {
+		t.Fatalf("%d entries committed despite the write failing", st.Versions)
+	}
+}
+
+// The declared size counts a repeated block once per reference, so the budget
+// must too. Four references to one body is four blocks of plaintext, whatever
+// the disk holds.
+func TestRepeatedChunksAreBudgetedPerReferenceOverTheWire(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	body := make([]byte, 4096)
+	name := chunks.Name(body)
+	// Four references, but a size that only accounts for one of them.
+	cl.sendJSON(wire.In{Op: "put", Path: "lie.md",
+		Chunks: []string{name, name, name, name},
+		Meta:   wire.PutMeta{Size: 4096, MTime: 5}})
+
+	m := cl.recv()
+	if m["res"] == "want" {
+		// The body is not held yet, so the server asks for it once. Uploading
+		// it stays inside the per-upload allowance; the commit is what refuses,
+		// because only it counts references rather than uploads.
+		cl.sendBinary(body)
+		m = cl.recv()
+	}
+	if m["res"] != "err" || m["code"] != wire.CodeToolarge {
+		t.Fatalf("four references to one body declaring one body of plaintext was accepted: %v", m)
+	}
+	if st := r.mustStats(); st.Versions != 0 {
+		t.Fatalf("%d entries committed", st.Versions)
 	}
 }
