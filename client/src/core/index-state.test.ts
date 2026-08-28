@@ -72,7 +72,6 @@ describe("the decision table", () => {
         // and choosing by mtime would discard one of them.
         const a = at(local({ hash: "mine" }), remote({ hash: "theirs" }), entry({ synchash: BASE }), false);
         expect(a.kind).toBe("conflict");
-        expect(a.kind === "conflict" && a.keepLocal).toBe(true);
     });
 
     it("does nothing when the path is absent everywhere", () => {
@@ -93,20 +92,23 @@ describe("pairing a device against a vault it already has", () => {
         expect(a.why).toMatch(/no last-synced version/);
     });
 
-    it("leaves the newer version in place", () => {
-        const newerLocal = at(
-            local({ hash: "mine", mtime: 2000 }),
-            remote({ hash: "theirs", mtime: 1000 }),
-            entry({ synchash: "" })
-        );
-        expect(newerLocal.kind === "conflict" && newerLocal.keepLocal).toBe(true);
-
-        const newerRemote = at(
-            local({ hash: "mine", mtime: 1000 }),
-            remote({ hash: "theirs", mtime: 2000 }),
-            entry({ synchash: "" })
-        );
-        expect(newerRemote.kind === "conflict" && newerRemote.keepLocal).toBe(false);
+    it("keeps the local file in place whichever clock ran ahead", () => {
+        // No field decides this, and that is the point: information-wise the
+        // choice is a coin flip, and never rewriting the file somebody has open
+        // is a better rule than preferring whichever device's clock was faster.
+        const clocks: [number, number][] = [
+            [2000, 1000],
+            [1000, 2000],
+        ];
+        for (const [lm, rm] of clocks) {
+            const a = at(
+                local({ hash: "mine", mtime: lm }),
+                remote({ hash: "theirs", mtime: rm }),
+                entry({ synchash: "" })
+            );
+            expect(a.kind).toBe("conflict");
+            expect(a).not.toHaveProperty("keepLocal");
+        }
     });
 
     it("does nothing at all for the files that are byte-identical", () => {

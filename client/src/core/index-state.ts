@@ -119,8 +119,16 @@ export type Action =
     | { readonly kind: "download"; readonly why: string }
     /** Both sides moved and the file is text: fetch the base and three-way merge. */
     | { readonly kind: "merge"; readonly why: string }
-    /** Both sides moved and no merge is possible or safe: keep both. */
-    | { readonly kind: "conflict"; readonly why: string; readonly keepLocal: boolean }
+    /**
+     * Both sides moved and no merge is possible or safe: keep both.
+     *
+     * There is no field saying which one stays in place, because the answer is
+     * always the local file. An earlier version returned the newer by mtime, and
+     * the engine ignored it: information-wise the choice is a coin flip, and
+     * "never rewrite the file somebody has open" is the better rule than "prefer
+     * whichever clock ran ahead".
+     */
+    | { readonly kind: "conflict"; readonly why: string }
     | { readonly kind: "deleteLocal"; readonly why: string }
     | { readonly kind: "deleteRemote"; readonly why: string }
     | { readonly kind: "createLocalFolder"; readonly why: string }
@@ -201,12 +209,10 @@ export function decide(input: DecideInput): Action {
 
     if (base === "") {
         // No common ancestor, and the two differ. There is no correct merge and
-        // no honest way to pick, so both are kept. The newer one stays in place.
-        const keepLocal = local.mtime >= remote.mtime;
+        // no honest way to pick, so both are kept.
         return {
             kind: "conflict",
             why: "both sides have content and there is no last-synced version to merge from",
-            keepLocal,
         };
     }
 
@@ -220,11 +226,7 @@ export function decide(input: DecideInput): Action {
 
     // Both moved since the last sync.
     if (!mergeable) {
-        return {
-            kind: "conflict",
-            why: "changed on both sides and this file cannot be merged",
-            keepLocal: true,
-        };
+        return { kind: "conflict", why: "changed on both sides and this file cannot be merged" };
     }
     return { kind: "merge", why: "changed on both sides since the last sync" };
 }
