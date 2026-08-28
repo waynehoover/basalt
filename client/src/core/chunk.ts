@@ -382,3 +382,19 @@ export function looksLikeText(path: string): boolean {
     if (dot < 0) return false;
     return TEXT_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }
+
+/**
+ * Extensions whose contents have to parse as JSON to be usable.
+ *
+ * `.canvas` is Obsidian's own, and a canvas that does not parse is one the
+ * application refuses to open. They are still merged as text, because a
+ * line-wise merge of two edits to different parts of a document is usually
+ * right; what changes is that the result is checked before it is accepted.
+ */
+const JSON_EXTENSIONS = new Set(["canvas", "json"]);
+
+export function looksLikeJson(path: string): boolean {
+    const dot = path.lastIndexOf(".");
+    if (dot < 0) return false;
+    return JSON_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+}

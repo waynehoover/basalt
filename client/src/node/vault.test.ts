@@ -165,11 +165,7 @@ describe("reading and writing", () => {
         expect(await v.exists("dir2")).toBe(false);
     });
 
-    it("removing something already gone is not an error", async () => {
-        // A deletion arriving twice, which two devices deleting the same file
-        // produces routinely.
-        await expect(new NodeVault(root).remove("never-existed.md")).resolves.toBeUndefined();
-    });
+
 });
 
 describe("paths from elsewhere", () => {
@@ -266,5 +262,69 @@ describe("the index on disk", () => {
         // No temporary left behind to be mistaken for the real thing.
         const { readdir } = await import("node:fs/promises");
         expect((await readdir(root)).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    });
+});
+
+/**
+ * A deletion arriving over the wire was somebody's decision on another device,
+ * possibly a mistaken one, and the first rule is not to lose a note.
+ *
+ * The Obsidian adapter has always trashed rather than deleted and this one did
+ * not, which is the same defect Sync Engine had reported against it as issue
+ * 232: files destroyed on one platform and trashed on another, by the same
+ * sync. Found by reading their issues rather than by anything failing here.
+ */
+describe("deleting, which must be recoverable", () => {
+    it("moves a file to the vault's trash rather than destroying it", async () => {
+        const v = new NodeVault(root);
+        await v.write("notes/gone.md", enc.encode("here for now"), { mtime: 1, ctime: 1 });
+
+        await v.remove("notes/gone.md");
+        expect(await v.exists("notes/gone.md")).toBe(false);
+        expect(dec.decode(await readFile(join(root, ".trash", "notes", "gone.md")))).toBe("here for now");
+    });
+
+    it("moves a folder too", async () => {
+        const v = new NodeVault(root);
+        await v.write("folder/inside.md", enc.encode("in there"), { mtime: 1, ctime: 1 });
+        await v.remove("folder");
+        expect(await v.exists("folder")).toBe(false);
+        expect(dec.decode(await readFile(join(root, ".trash", "folder", "inside.md")))).toBe("in there");
+    });
+
+    /**
+     * Deleting, restoring and deleting again is ordinary, and the second
+     * deletion overwriting the first would quietly discard a version somebody
+     * might want.
+     */
+    it("does not overwrite what is already in the trash", async () => {
+        const v = new NodeVault(root);
+        await v.write("note.md", enc.encode("the first one"), { mtime: 1, ctime: 1 });
+        await v.remove("note.md");
+        await v.write("note.md", enc.encode("the second one"), { mtime: 2, ctime: 1 });
+        await v.remove("note.md");
+
+        const { readdir } = await import("node:fs/promises");
+        const trashed = (await readdir(join(root, ".trash"))).sort();
+        expect(trashed.length, `the trash holds ${JSON.stringify(trashed)}`).toBe(2);
+        const contents = await Promise.all(trashed.map((f) => readFile(join(root, ".trash", f), "utf8")));
+        expect(contents.sort()).toEqual(["the first one", "the second one"]);
+    });
+
+    it("keeps the trash out of the listing, so it does not sync back", async () => {
+        // Otherwise what was deleted travels back out and undoes the deletion
+        // on every other device in turn.
+        const v = new NodeVault(root);
+        await v.write("note.md", enc.encode("x"), { mtime: 1, ctime: 1 });
+        await v.remove("note.md");
+        await v.write("kept.md", enc.encode("y"), { mtime: 1, ctime: 1 });
+        expect((await v.list()).map((f) => f.path)).toEqual(["kept.md"]);
+    });
+
+    it("removing something already gone is still not an error", async () => {
+        const v = new NodeVault(root);
+        await expect(v.remove("never-existed.md")).resolves.toBeUndefined();
+        const { readdir } = await import("node:fs/promises");
+        await expect(readdir(join(root, ".trash"))).rejects.toThrow();
     });
 });

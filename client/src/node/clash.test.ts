@@ -191,3 +191,53 @@ describe("a path that is a file here and a folder there", () => {
         ).toEqual({ skipped: 0, blocked: 0 });
     }, 300_000);
 });
+
+/**
+ * A folder moved while another device was away.
+ *
+ * Reported against Fast Note Sync as issue 257: an offline device receiving a
+ * directory move raised ENOENT from several nested deletions at once. The shape
+ * is worth having whatever the cause was there, because it is the ordinary way
+ * somebody reorganises a vault and the device that was asleep gets all of it in
+ * one batch.
+ */
+describe("a folder reorganised while a device was away", () => {
+    it("arrives whole, with nothing left behind", async () => {
+        server = new TestServer();
+        await server.start();
+        const a = await device("a");
+        const b = await device("b");
+
+        const { writeFile, mkdir, rename } = await import("node:fs/promises");
+        await mkdir(join(a.dir, "Projects", "2025", "Q1"), { recursive: true });
+        for (const name of ["one.md", "two.md", "three.md"]) {
+            await writeFile(join(a.dir, "Projects", "2025", "Q1", name), `note ${name}\n`);
+        }
+        await writeFile(join(a.dir, "Projects", "2025", "summary.md"), "the summary\n");
+        await a.c.settle();
+        await b.c.settle();
+        expect((await contents(b.dir)).includes("Projects/2025/Q1/one.md")).toBe(true);
+
+        // B goes away, and A reorganises three levels at once.
+        b.c.close();
+        await mkdir(join(a.dir, "Archive"), { recursive: true });
+        await rename(join(a.dir, "Projects", "2025"), join(a.dir, "Archive", "2025"));
+        await a.c.settle({}, 12);
+
+        // B comes back to all of it in one batch.
+        const b2 = await device("b2");
+        await b2.c.settle({}, 12);
+
+        const held = await contents(b2.dir);
+        expect(held, `B holds ${held}`).toContain("Archive/2025/Q1/one.md");
+        expect(held, `B holds ${held}`).toContain("Archive/2025/summary.md");
+        // And nothing of the old arrangement is left as a live file.
+        expect(held, `B holds ${held}`).not.toContain("Projects/2025/Q1/one.md: note one.md");
+
+        const report = await b2.c.settle();
+        expect(
+            { retrying: report.retrying, skipped: report.skipped },
+            `B is still working through it: ${JSON.stringify(report)}`
+        ).toEqual({ retrying: 0, skipped: 0 });
+    }, 300_000);
+});

@@ -41,7 +41,7 @@
  * rule 10 of docs/philosophy.md in its natural habitat.
  */
 
-import { looksLikeText, chunkBytes, sizesFor } from "./chunk.ts";
+import { looksLikeJson, looksLikeText, chunkBytes, sizesFor } from "./chunk.ts";
 import { openChunk, openPath, sealChunks, sealPath, type SealedChunk, type VaultKeys } from "./crypto.ts";
 import { conflictCopyPath, mergeText } from "./merge.ts";
 import {
@@ -855,7 +855,10 @@ export class Engine {
         const mine = dec.decode(await this.opts.vault.read(path));
         const theirs = dec.decode(await this.contentOf(remote.uid));
 
-        const outcome = mergeText(base, mine, theirs);
+        // A canvas that merged cleanly and no longer parses is a canvas
+        // Obsidian refuses to open, and the four checks inside mergeText all
+        // pass for it: nothing was lost and nothing collided.
+        const outcome = mergeText(base, mine, theirs, looksLikeJson(path) ? parsesAsJson : undefined);
         if (outcome.kind === "conflict") {
             this.log("merge refused", path, outcome.why);
             await this.conflict(path, entry, remote, report, outcome.why);
@@ -1054,4 +1057,14 @@ interface UploadPlan {
 /** For a put that carries no bodies at all: a folder, or a deletion. */
 async function noBodies(name: string): Promise<Uint8Array> {
     throw new Error(`this put has no bodies, and the server asked for ${name}`);
+}
+
+/** Whether text is still JSON, for the formats where that is what it means to be usable. */
+function parsesAsJson(text: string): boolean {
+    try {
+        JSON.parse(text);
+        return true;
+    } catch {
+        return false;
+    }
 }

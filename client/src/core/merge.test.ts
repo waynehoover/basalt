@@ -593,3 +593,81 @@ describe("which check catches what", () => {
         expect(once.kind === "merged" && once.text).toBe("# day\n\n- first\n- mine\n- theirs\n");
     });
 });
+
+/**
+ * A structured file that merged cleanly and no longer parses.
+ *
+ * Every other check in mergeText passes for this: nothing was lost, nothing
+ * collided, both directions agree. The file is simply no longer a canvas, and
+ * Obsidian refuses to open it. Reported against a neighbouring project as an
+ * overwrite risk on canvas files, and found here by reading their issues.
+ */
+describe("a merge that stops the file being what it was", () => {
+    const parsesAsJson = (t: string) => {
+        try {
+            JSON.parse(t);
+            return true;
+        } catch {
+            return false;
+        }
+    };
+
+    it("keeps a merge that is still valid", async () => {
+        const base = '{\n  "nodes": [\n    {"id": "a"}\n  ],\n  "edges": []\n}';
+        const mine = base.replace('"edges": []', '"edges": [{"id": "e1"}]');
+        const theirs = base.replace('{"id": "a"}', '{"id": "a", "text": "hello"}');
+
+        const out = mergeText(base, mine, theirs, parsesAsJson);
+        if (out.kind !== "merged") throw new Error(`refused a good merge: ${out.why}`);
+        expect(parsesAsJson(out.text)).toBe(true);
+    });
+
+    /**
+     * The shapes that would break a canvas are refused before the new check is
+     * reached, by the two-directions check, and that is worth knowing rather
+     * than assuming. Five attempts at a clean merge that produces broken JSON,
+     * all of them already conflicts:
+     *
+     *   appending while the other side deletes, two appends to one array, a
+     *   nested delete against an append, edits either side of a closing brace,
+     *   and adding and removing canvas nodes.
+     *
+     * The parse check stays as the thing that catches a sixth shape nobody has
+     * thought of, and no test isolates it, because nothing yet gets that far.
+     */
+    it("already refuses the shapes that would break a canvas", () => {
+        const shapes: [string, string, string, string][] = [
+            ["append against delete", "[\n  1,\n  2\n]", "[\n  1,\n  2,\n  3\n]", "[\n  1\n]"],
+            ["two appends", "[\n  1\n]", "[\n  1,\n  2\n]", "[\n  1,\n  3\n]"],
+            [
+                "canvas nodes added and removed",
+                '{"nodes":[\n{"id":"a"},\n{"id":"b"}\n],"edges":[]}',
+                '{"nodes":[\n{"id":"a"},\n{"id":"b"},\n{"id":"c"}\n],"edges":[]}',
+                '{"nodes":[\n{"id":"a"}\n],"edges":[]}',
+            ],
+        ];
+        for (const [name, base, mine, theirs] of shapes) {
+            const out = mergeText(base, mine, theirs, parsesAsJson);
+            if (out.kind === "merged") {
+                expect(parsesAsJson(out.text), `${name} merged into something that is not JSON`).toBe(true);
+            } else {
+                expect(out.kind, name).toBe("conflict");
+            }
+        }
+    });
+
+    /**
+     * The check is only asked of files where it means something. Prose has no
+     * such property, and refusing a merge because a note is not JSON would
+     * refuse every merge there is.
+     */
+    it("asks nothing of prose", () => {
+        const base = ["# Note", "", "First.", "", "Second."].join("\n");
+        const mine = base.replace("First.", "First, edited here.");
+        const theirs = base.replace("Second.", "Second, edited there.");
+        const out = mergeText(base, mine, theirs);
+        if (out.kind !== "merged") throw new Error(`refused a good merge: ${out.why}`);
+        expect(out.text).toContain("edited here");
+        expect(out.text).toContain("edited there");
+    });
+});

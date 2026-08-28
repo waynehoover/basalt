@@ -218,7 +218,26 @@ export type MergeOutcome =
  * the most useful thing in Obsidian's engine, because it turns a three-way merge
  * into something that needs no version history at all.
  */
-export function mergeText(base: string, mine: string, theirs: string): MergeOutcome {
+export function mergeText(
+    base: string,
+    mine: string,
+    theirs: string,
+    /**
+     * Whether the merged text is still the kind of thing it was.
+     *
+     * For prose there is nothing to ask: any arrangement of lines is a valid
+     * note. For a structured file there is, and a line-wise merge does not know
+     * it: two edits to different parts of a canvas can each apply cleanly and
+     * leave JSON that does not parse, which Obsidian then refuses to open. The
+     * four checks below all pass, because nothing was lost and nothing
+     * collided; the file is simply no longer a canvas.
+     *
+     * Reported against Sync Engine's neighbours as an overwrite risk on canvas
+     * files, and found here by reading their issues rather than by anything
+     * failing.
+     */
+    stillValid: (text: string) => boolean = () => true
+): MergeOutcome {
     if (mine === theirs) {
         return { kind: "take", text: mine, why: "both sides already agree" };
     }
@@ -302,6 +321,13 @@ export function mergeText(base: string, mine: string, theirs: string): MergeOutc
         return {
             kind: "conflict",
             why: `the merge reported success but ${describe(missing)} is not in the result`,
+        };
+    }
+
+    if (!stillValid(forward.text)) {
+        return {
+            kind: "conflict",
+            why: "both sides merged cleanly and the result is no longer a valid file of its kind",
         };
     }
 

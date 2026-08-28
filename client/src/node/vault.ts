@@ -9,8 +9,8 @@
  */
 
 import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
-import { access, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { access, cp, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
 
@@ -22,7 +22,10 @@ import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts"
  * is where one of the durability rules came from. `.basalt` is this client's own
  * bookkeeping, and syncing it would sync the index to itself.
  */
-const NEVER_SYNC = new Set([".obsidian", ".basalt", ".trash", ".git", ".DS_Store", "node_modules"]);
+/** Where a deletion arriving from another device goes, rather than away. */
+const TRASH_DIR = ".trash";
+
+const NEVER_SYNC = new Set([".obsidian", ".basalt", TRASH_DIR, ".git", ".DS_Store", "node_modules"]);
 
 export interface NodeVaultOptions {
     /** Extra top-level names to leave alone. */
@@ -125,8 +128,64 @@ export class NodeVault implements Vault {
         }
     }
 
+    /**
+     * Removes a path by moving it into the vault's trash.
+     *
+     * Not `rm`. A deletion arriving over the wire was somebody's decision on
+     * another device, possibly a mistaken one, and the first rule is not to
+     * lose a note. The Obsidian adapter has always trashed rather than deleted
+     * and this one did not, which is the same defect Sync Engine had reported
+     * against it as issue 232: files destroyed on one platform and trashed on
+     * another, by the same sync.
+     *
+     * `.trash` is in the never-sync list, so what lands there does not travel
+     * back out and undo the deletion everywhere else.
+     */
     async remove(path: string): Promise<void> {
-        await rm(this.absolute(path), { recursive: true, force: true });
+        const full = this.absolute(path);
+        try {
+            await access(full, constants.F_OK);
+        } catch {
+            // Two devices deleting the same file produces this routinely.
+            return;
+        }
+
+        const target = await this.freeTrashPath(path);
+        await mkdir(dirname(target), { recursive: true });
+        try {
+            await rename(full, target);
+            return;
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+        }
+        // The trash is on another filesystem, which happens when a vault spans
+        // mounts. Copy and then remove, so the copy exists before the original
+        // stops existing.
+        await cp(full, target, { recursive: true });
+        await rm(full, { recursive: true, force: true });
+    }
+
+    /**
+     * Where in the trash a path can go without displacing what is already there.
+     *
+     * Deleting, restoring and deleting again is ordinary, and the second
+     * deletion overwriting the first would quietly discard a version somebody
+     * might want. Numbered rather than timestamped so the order is obvious.
+     */
+    private async freeTrashPath(path: string): Promise<string> {
+        const base = join(this.root, TRASH_DIR, path);
+        const dot = basename(path).lastIndexOf(".");
+        const [stem, ext] =
+            dot <= 0 ? [base, ""] : [base.slice(0, base.length - (basename(path).length - dot)), base.slice(base.length - (basename(path).length - dot))];
+        for (let n = 0; n < 1000; n++) {
+            const candidate = n === 0 ? base : `${stem} (${n})${ext}`;
+            try {
+                await access(candidate, constants.F_OK);
+            } catch {
+                return candidate;
+            }
+        }
+        throw new Error(`the trash already holds a thousand copies of ${path}`);
     }
 
     async mkdir(path: string): Promise<void> {

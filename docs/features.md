@@ -150,6 +150,7 @@ match on the way in.
 | Deletions as records, so a deleted note is recoverable | **Built**, and reachable |
 | Three-way merge for text | **Built** |
 | Conflict copies for anything that cannot merge | **Built** |
+| A merge refused when the result stops being valid JSON | **Built** |
 | Live relay between connected devices | **Built** |
 | Catch-up from a cursor after being offline | **Built** |
 | Write coalescing, scaled by file size | **Built** |
@@ -185,7 +186,7 @@ match on the way in.
 | Local index with one remembered fingerprint per file | **Built** |
 | An index that shrinks again when notes are deleted | **Built** |
 | Content cache, so an unchanged vault costs one stat per file | **Built** |
-| Filesystem adapter | **Built** |
+| Filesystem adapter | **Built**, deletions to the vault's trash |
 | Obsidian Vault API adapter | **Built**, against a fake of Obsidian's own interface |
 | Obsidian plugin shell | **Built**, and run once in a real vault |
 | Scanning from Obsidian's own index, not one stat per file | **Built** |

@@ -794,15 +794,24 @@ describe("saying what it is working on", () => {
             if (s.kind === "syncing") seen.push(s.path);
         });
 
-        // Big enough that sealing it takes longer than the threshold.
-        const big = new Uint8Array(6 * 1024 * 1024);
-        crypto.getRandomValues(big.subarray(0, 65536));
-        for (let at = 65536; at < big.length; at += 65536) big.copyWithin(at, 0, 65536);
+        // Incompressible and large enough that sealing it reliably outlasts the
+        // threshold. A compressible file seals in a few milliseconds and the
+        // state never fires, which made an earlier version of this pass or fail
+        // depending on how loaded the machine was.
+        const big = new Uint8Array(24 * 1024 * 1024);
+        for (let at = 0; at < big.length; at += 65536) {
+            crypto.getRandomValues(big.subarray(at, Math.min(at + 65536, big.length)));
+        }
         await app.vault.adapter.writeBinary("big.bin", big.buffer as ArrayBuffer, { mtime: 5000 });
 
-        await plugin.syncNow();
+        const syncing = plugin.syncNow();
+        // Watched while it runs rather than checked afterwards, because by the
+        // time it finishes the state has moved on to the result.
+        await until("it to say what it is working on", () => seen.length > 0, 60_000);
+        await syncing;
         stop();
-        expect(seen, "nothing was said during the pass").toContain("big.bin");
+
+        expect(seen).toContain("big.bin");
         // And it ends on a result rather than stuck saying it is working.
         expect(plugin.currentState.kind).toBe("synced");
     }, 300_000);
