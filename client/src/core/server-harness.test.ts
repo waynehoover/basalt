@@ -29,7 +29,7 @@ import { deriveKeys, openChunk, sealChunks, sealPath, openPath, type VaultKeys }
 import { ProtocolError, Transport, urlForHost, type Batch } from "./transport.ts";
 
 const run = promisify(execFile);
-const GO_DIR = new URL("../../go", import.meta.url).pathname;
+const GO_DIR = new URL("../../../go", import.meta.url).pathname;
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 

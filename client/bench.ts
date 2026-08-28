@@ -17,8 +17,8 @@
 
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { BINARY_SIZES, TEXT_SIZES, chunkBytes, looksLikeText, sizesFor, type ChunkSizes } from "./src/chunk.ts";
-import { chunkName, deriveKeys, sealChunk, sealChunks } from "./src/crypto.ts";
+import { BINARY_SIZES, TEXT_SIZES, chunkBytes, looksLikeText, sizesFor, type ChunkSizes } from "./src/core/chunk.ts";
+import { chunkName, deriveKeys, sealChunk, sealChunks } from "./src/core/crypto.ts";
 
 const enc = new TextEncoder();
 const MIB = 1024 * 1024;

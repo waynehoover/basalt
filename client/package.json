@@ -1,7 +1,7 @@
 {
-  "name": "basalt-obsidian",
+  "name": "basalt-client",
   "version": "0.1.0",
-  "description": "Self-hosted sync for Obsidian",
+  "description": "Basalt: the shared sync core, the Obsidian plugin, and the headless client",
   "private": true,
   "type": "module",
   "scripts": {

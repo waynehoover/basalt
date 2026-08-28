@@ -321,3 +321,105 @@ side by side is what surfaced it.
 The honest cost, which belongs in the protocol's disclosure section: the server
 can see when two chunks are byte-identical, within and across files. That is not
 a leak we tolerate, it is the mechanism we asked for.
+
+---
+
+# Obsidian's headless client, and what it settles about structure
+
+`obsidian-headless` on npm, version 0.0.14, published by the `obsidianmd` org.
+Licensed UNLICENSED, so it was read the same way `app.js` was: for architecture
+and interoperability, and nothing is copied.
+
+It matters because it answers a question about Basalt's own structure that would
+otherwise be guesswork: does a headless client share the sync engine with the
+plugin, or is it a second implementation?
+
+## It is one engine, not two
+
+The engine's identifiers are all present in the headless bundle, in the same
+forms they take in the desktop app: `synchash`, `previouspath`, `syncingPath`,
+`fileRetry`, `skippedFiles`, `newServerFiles`, `perFileMax`,
+`deterministicEncode`. Those are not names anyone arrives at twice.
+
+So the same engine runs in both, and what changes underneath it is the platform:
+in the app it drives Obsidian's Vault API, and headless it drives the
+filesystem. That is the structure to copy, and it is the reason Basalt's
+`client/src/core` exists.
+
+One marker is absent, and it is interesting: `conflictAction` does not appear.
+The desktop engine carries it as swappable policy defaulting to `"merge"`. Read
+generously, a headless client has nobody to show a conflicted copy to.
+
+## What it is built out of
+
+| | |
+|---|---|
+| Runtime | Node 22 or newer |
+| Dependencies | `better-sqlite3`, `commander`, and nothing else |
+| Native code | prebuilt `btime` addons for five platforms |
+| Size | one 216 KB bundled file |
+
+Two things worth taking from that list.
+
+**It keeps its index in SQLite**, with a schema of four tables that is almost
+aggressively plain:
+
+```
+meta(key, value)
+local_files(path, data)
+server_files(path, data)
+pending_files(uid, path, data)
+```
+
+`data` is a JSON blob per path rather than a column per field, which means the
+entry shape can change without a migration. And `pending_files` is the inbound
+queue *persisted*: the desktop engine keeps `newServerFiles` in memory and
+rebuilds it from the server, and headless survives a restart with the work list
+intact. Basalt's index should do the same, and the reason is rule 1 wearing
+different clothes: a work list that only exists in memory is one a crash silently
+shortens.
+
+**It ships native addons to read file creation time.** Node's `stat` gives
+`birthtime` unreliably across platforms, and they cared enough about `ctime` to
+compile C for five targets. Basalt puts `ctime` on every entry too, and this is a
+warning about how much it is worth: on any platform where the value is a guess,
+so is anything decided from it. Nothing in Basalt's reconciliation reads `ctime`,
+and after seeing this, nothing should start.
+
+## Its command surface
+
+```
+login  logout
+sync-list-remote  sync-list-local  sync-create-remote
+sync-setup  sync  sync-config  sync-status  sync-unlink
+publish-*
+```
+
+Plus a `--json` flag throughout. The shape is worth keeping: a one-time sync and
+a continuous watch behind the same verb, status as its own command rather than
+noise on every other one, and machine-readable output so the thing can be driven
+from a script.
+
+Basalt's version needs less. There are no accounts, so no `login`; one vault per
+server, so no `sync-list-remote` or `sync-create-remote`; and pairing replaces
+`sync-setup`. What is left is roughly `pair`, `sync`, `status`, `unlink`, which is
+about the right size for a tool whose config is one string.
+
+## What this means for Basalt's layout
+
+```
+client/src/core/      platform-free: crypto, chunk, merge, index-state, transport
+client/src/obsidian/  the Vault API adapter and the plugin shell
+client/src/node/      the filesystem adapter and the headless CLI
+```
+
+Everything written so far is already in `core` and already platform-free: sealing
+uses WebCrypto, chunking is arithmetic, the merge is arithmetic plus
+diff-match-patch, and the transport uses the platform's `WebSocket`, which Node
+22 and every Obsidian target both provide. None of it had to be made portable;
+it simply never reached for anything that was not.
+
+What remains is the engine, which is policy and belongs in `core`, and two
+adapters behind one interface: list, read, write, remove, rename, and watch. The
+headless client is then not a second client. It is the same one with a different
+adapter, which is exactly what Obsidian concluded.
