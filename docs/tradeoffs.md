@@ -31,6 +31,23 @@ design.
 | Nonce reuse risk | 96-bit synthetic, birthday bound at 2^48 chunks | none, the nonce is a counter |
 | What the server learns | that two chunks are identical | nothing |
 
+The second row is the one that sounds best and matters least. Measured over this
+project's own markdown and source, and over generated prose that does not repeat
+itself, cross-file deduplication saves **nothing**: notes are distinct, and two
+distinct notes share no chunks. It saves a great deal on generated or duplicated
+content, which a vault mostly is not.
+
+What chunking is actually worth is the first row: the same file across its own
+versions. An edit to a long note sends the part that changed rather than the
+note, and that is the case that repeats every day.
+
+A cost that took measuring to see: a put carries every chunk name of the file,
+sixty-four characters each, changed or not. At a 256 byte average, which is
+where these sizes started, a 14 KiB note is forty chunks and an edit costs more
+in names than in content. The size now scales as the square root of the file,
+which is where `chunk + names` is least, and that alone took a first sync from
+85% of plaintext to about 50% and halved what an edit costs.
+
 The cost of our side is real. Deduplication *requires* that identical plaintext
 produce identical ciphertext, so the server can tell that two chunks match. That
 is not a leak being tolerated, it is the mechanism, and a design that refuses it
@@ -129,7 +146,9 @@ Said plainly, because a comparison that only runs one way is an advertisement.
 - **Field testing.** 351 and 2890 stars against a plugin that has run in a real
   vault once, for minutes.
 - **Backends.** They work with storage you already pay for.
-- **Merging.** Their region-aware diff3 handles the code-block case above.
+- **Merging.** Their region-aware diff3 handles the code-block case above, and
+  `node-diff3` on npm is maintained and pure JavaScript, where the library used
+  here has not been published since 2020.
 - **Reach.** They are installable from Obsidian's community list.
 - **Round trips.** Their engine overlaps requests; this one sends exactly one at
   a time, because a reply carries no request id. On a 400ms link that is most of
