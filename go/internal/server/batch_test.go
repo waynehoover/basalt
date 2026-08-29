@@ -229,3 +229,63 @@ func TestABatchIsBounded(t *testing.T) {
 	cl.sendJSON(wire.In{Op: "ping"})
 	cl.recvInto("pong", &wire.Pong{})
 }
+
+// A commit refusal is an entry's refusal, not the batch's.
+//
+// checkEntry runs before the bodies arrive, so it cannot know how much
+// ciphertext an entry will end up referencing. The budget is therefore enforced
+// again at commit, and a batch spends one allowance across every entry in it, so
+// an entry that overruns its own share is caught only there.
+//
+// This used to end the session. The entries that had already committed were
+// never acked, the client retried all of them, and the server grew a second
+// version of every note in the batch.
+func TestACommitRefusalDoesNotTakeTheBatchWithIt(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	// Three honest entries and one that declares a byte while naming a chunk
+	// the batch is paying for. Its own budget cannot cover that chunk, but the
+	// batch's summed allowance can, so the bodies all arrive.
+	big := make([]byte, 4096)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	bigName := chunks.Name(big)
+	bodies := map[string]string{bigName: string(big)}
+
+	entries := []wire.PutEntry{
+		{Path: "honest.md", Meta: wire.PutMeta{Size: 4096, MTime: 1}, Chunks: []string{bigName}},
+		{Path: "liar.md", Meta: wire.PutMeta{Size: 1, MTime: 2}, Chunks: []string{bigName}},
+	}
+	for _, name := range []string{"after-one.md", "after-two.md"} {
+		e, b := entryFor(name, "content of "+name)
+		entries = append(entries, e)
+		for k, v := range b {
+			bodies[k] = v
+		}
+	}
+
+	acks := cl.putMany(entries, bodies)
+	if len(acks.Results) != 4 {
+		t.Fatalf("%d results, want 4", len(acks.Results))
+	}
+	if acks.Results[1].Code != wire.CodeToolarge {
+		t.Fatalf("the overrunning entry came back as %+v, want %s", acks.Results[1], wire.CodeToolarge)
+	}
+	// The three honest ones, including the two that were queued behind the
+	// refusal, all committed and all said so.
+	for _, i := range []int{0, 2, 3} {
+		if acks.Results[i].UID == 0 {
+			t.Fatalf("entry %d was lost to another entry's refusal: %+v", i, acks.Results[i])
+		}
+	}
+	// A pong is the proof the session survived, and a stronger one than not
+	// seeing a hang-up.
+	cl.sendJSON(wire.In{Op: "ping"})
+	cl.recvInto("pong", &wire.Pong{})
+	if got := r.mustStats().Files; got != 3 {
+		t.Fatalf("the vault holds %d files, want 3", got)
+	}
+}

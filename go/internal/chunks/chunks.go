@@ -225,14 +225,10 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 	if int64(len(body)) > s.max {
 		return fmt.Errorf("%w: %d > %d", ErrTooLarge, len(body), s.max)
 	}
-	if got := Name(body); got != name {
-		// The client named this chunk; the bytes it sent hash to something
-		// else. Storing it under the claimed name would corrupt the vault
-		// invisibly, and storing it under the computed name would leave the
-		// entry pointing at a chunk that does not exist. Refuse both.
-		return fmt.Errorf("%w: claimed %s, computed %s", ErrCorrupt, name, got)
-	}
-
+	// The name-against-body check is place's, so that it happens on whichever
+	// goroutine is about to do the write. Storing a body under a claimed name
+	// would corrupt the vault invisibly, and storing it under the computed name
+	// would leave the entry pointing at a chunk that does not exist.
 	dir, err := s.place(vaultID, name, body)
 	if err != nil || dir == "" {
 		return err
@@ -250,6 +246,19 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 // every body durable, every name durable. It changes only how many times the
 // same directory is flushed to make that so.
 func (s *Store) place(vaultID, name string, body []byte) (string, error) {
+	// Re-hashed here rather than trusted from the caller, because in a batch the
+	// caller and the writer are different goroutines: whoever handed this over
+	// has moved on, and if the bytes ever came from a buffer that gets reused,
+	// the wrong body would be filed under a correct name and served to a device
+	// that could only report it as undecryptable.
+	//
+	// coder/websocket's Conn.Read allocates per message today (io.ReadAll), so
+	// this is closing the class rather than a live fault. One SHA-256 over data
+	// already in hand, on a server that has the cores.
+	if got := Name(body); got != name {
+		return "", fmt.Errorf("%w: claimed %s, computed %s", ErrCorrupt, name, got)
+	}
+
 	p := s.path(vaultID, name)
 	// A chunk already present is already correct: the name is a hash of the
 	// body and the body was verified on the way in. Re-writing it would be a

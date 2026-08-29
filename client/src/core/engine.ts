@@ -437,6 +437,26 @@ export class Engine {
         const now = this.now();
         const coalesce = opts.coalesceWrites ?? this.coalesce;
 
+        // Both queues empty at the end of every pass that returns. One that
+        // threw on its way out leaves them full, and carrying that into the next
+        // pass would commit those writes against a report nobody reads, so the
+        // pass that did the work would say it did none and `settle` would stop.
+        //
+        // Dropping them is safe and is the reason this is a discard rather than
+        // a flush. Nothing queued was acknowledged, so no entry was marked
+        // synced and no file was written; reconciliation sees the same
+        // divergence again and queues the same work.
+        if (this.outbox.length > 0 || this.inbox.length > 0) {
+            this.log("a pass ended early, discarding what it had queued", {
+                writes: this.outbox.length,
+                reads: this.inbox.length,
+            });
+            this.outbox = [];
+            this.outboxBytes = 0;
+            this.inbox = [];
+            this.inboxBytes = 0;
+        }
+
         // 1. What the filesystem says. The index's cache means an unchanged file
         //    costs one stat, so a full pass over a large vault is affordable and
         //    there is no need to track dirtiness separately.

@@ -701,6 +701,53 @@ describe("the guards the happy path hides", () => {
     }, 120_000);
 });
 
+/**
+ * A pass that throws on its way out leaves its queues full.
+ *
+ * Nothing in the loop can do that today: every path is inside a try that records
+ * the failure and carries on, and the only throwing steps left (listing, pruning,
+ * saving) sit outside the window where anything is queued. The guard is here
+ * because the consequence is quiet rather than loud: those writes would commit
+ * during the *next* pass and increment a report nobody reads, so the pass that
+ * did the work would report none, and `settle` would stop with edits unsent.
+ *
+ * Discarding is safe. Nothing queued was acknowledged, so no entry is marked
+ * synced, and reconciliation queues the same work again.
+ */
+describe("a pass that ended early", () => {
+    it("discards what it queued rather than committing it against the next report", async () => {
+        await fresh();
+        const a = await device("a");
+        await a.vault.write("real.md", new TextEncoder().encode("a real note"), { mtime: 1000, ctime: 1000 });
+        await a.settle();
+
+        // What a thrown pass would leave behind. If the guard goes, this commits
+        // during the next pass and its uid lands on nothing.
+        let committed = false;
+        const engine = a.engine as unknown as {
+            outbox: unknown[];
+            outboxBytes: number;
+            inbox: unknown[];
+        };
+        engine.outbox.push({
+            path: "left-over.md",
+            size: 0,
+            entry: { path: "sealed", meta: { size: 0, ctime: 0, mtime: 0, folder: true }, names: [] },
+            bodyOf: async () => new Uint8Array(0),
+            commit: () => {
+                committed = true;
+            },
+        });
+        engine.outboxBytes = 0;
+
+        const report = await a.engine.sync();
+
+        expect(committed, "a write left by a dead pass was committed by the next one").toBe(false);
+        expect(engine.outbox).toHaveLength(0);
+        expect(report.uploaded).toBe(0);
+    });
+});
+
 describe("what the index forgets", () => {
     /**
      * `entries` was pruned and `remote` was not, so a vault kept the server's

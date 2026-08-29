@@ -184,6 +184,12 @@ func (s *Session) reject(code string, cause error) error {
 	return s.writeJSON(wire.Error(code, cause.Error()))
 }
 
+// refuse writes an error frame the caller already built. The session continues,
+// exactly as it does after reject.
+func (s *Session) refuse(e *wire.Err) error {
+	return s.writeJSON(*e)
+}
+
 // fatal reports a refusal that ends the session, writing the reason first.
 func (s *Session) fatal(code string, cause error) error {
 	_ = s.writeJSON(wire.Error(code, cause.Error()))
@@ -585,11 +591,13 @@ func (s *Session) handlePutMany(m wire.In) error {
 			results[i] = wire.AckResult{Code: item.refusal.Code, Msg: item.refusal.Msg}
 			continue
 		}
-		uid, err := s.commit(item.entry)
+		uid, refusal, err := s.commit(item.entry)
 		if err != nil {
-			// commit already closed the session for anything it refuses, so
-			// there is nothing left to answer with.
 			return err
+		}
+		if refusal != nil {
+			results[i] = wire.AckResult{Code: refusal.Code, Msg: refusal.Msg}
+			continue
 		}
 		results[i] = wire.AckResult{UID: uid}
 	}
@@ -648,9 +656,12 @@ func (s *Session) handlePut(m wire.In) error {
 	}
 
 	if len(missing) == 0 {
-		uid, err := s.commit(e)
+		uid, refusal, err := s.commit(e)
 		if err != nil {
 			return err
+		}
+		if refusal != nil {
+			return s.refuse(refusal)
 		}
 		return s.writeJSON(wire.Have{Res: "have", UID: uid})
 	}
@@ -662,9 +673,12 @@ func (s *Session) handlePut(m wire.In) error {
 		return err
 	}
 
-	uid, err := s.commit(e)
+	uid, refusal, err := s.commit(e)
 	if err != nil {
 		return err
+	}
+	if refusal != nil {
+		return s.refuse(refusal)
 	}
 	// Only now is the ack truthful: every body is durable and so is the entry.
 	return s.writeJSON(wire.Ack{Res: "ack", UID: uid})
@@ -771,6 +785,24 @@ func (s *Session) readBodies(want []string, allowance int64) error {
 	return nil
 }
 
+// commitCode names the entry-level refusals AppendEntry can return. An empty
+// string means the fault is not attributable to the entry, and a session that
+// cannot commit for reasons of its own has nothing useful left to say.
+func commitCode(err error) string {
+	switch {
+	case errors.Is(err, store.ErrBadEntry):
+		return wire.CodeBadEntry
+	case errors.Is(err, store.ErrOverBudget):
+		return wire.CodeToolarge
+	case errors.Is(err, store.ErrChunkMissing):
+		// A body was swept between the upload and the commit. The client is
+		// told which entry and re-uploads; see chunks.DefaultGrace for why this
+		// is rare.
+		return wire.CodeNoChunk
+	}
+	return ""
+}
+
 // putErrorCode classifies a failure to store a body.
 //
 // It is a function rather than an inline switch so the classification can be
@@ -788,36 +820,29 @@ func putErrorCode(err error) string {
 	}
 }
 
-// commit appends the entry and fans it out, as one step.
+// commit appends an entry and returns the uid it was given.
 //
-// A failure here is reported without an ack, which is the whole contract: the
-// client's put has not returned, so it retries, and nothing claims to be stored
-// that is not.
+// A refusal the entry itself caused comes back as a *wire.Err with nothing
+// written to the socket, because the caller decides what that means. For a
+// single put it is an error frame and the session continues; for a batch it is
+// one entry's result and the other entries still commit. Killing the session
+// instead would leave a batch half committed and every entry in it unacked,
+// which is the failure batching exists to avoid.
 //
-// The fan-out happens before the caller writes its ack, so the pushing device
-// sees its own (empty) range before the reply. That is not a problem to design
-// around: a peer can commit at any moment, so a client waiting on any reply has
-// to tolerate a batch arriving first no matter what order this code uses. What
-// it does buy is that the announcement cannot be reordered by a concurrent
-// commit, because commitMu spans both halves.
-func (s *Session) commit(e store.Entry) (int64, error) {
+// Anything else has already ended the session.
+func (s *Session) commit(e store.Entry) (int64, *wire.Err, error) {
 	s.srv.commitMu.Lock()
 	defer s.srv.commitMu.Unlock()
 
 	uid, err := s.srv.st.AppendEntry(s.vaultID, e)
 	if err != nil {
-		code := wire.CodeInternal
-		switch {
-		case errors.Is(err, store.ErrBadEntry):
-			code = wire.CodeBadEntry
-		case errors.Is(err, store.ErrChunkMissing):
-			// A body was swept between the upload and the commit. Loud, and the
-			// client re-uploads; see chunks.DefaultGrace for why this is rare.
-			code = wire.CodeNoChunk
-		case errors.Is(err, store.ErrOverBudget):
-			code = wire.CodeToolarge
+		if code := commitCode(err); code != "" {
+			s.srv.log.Warn("refused at commit",
+				"vault", s.vaultID, "path", len(e.Path), "code", code, "err", err)
+			refusal := wire.Error(code, err.Error())
+			return 0, &refusal, nil
 		}
-		return 0, s.fatal(code, err)
+		return 0, nil, s.fatal(wire.CodeInternal, err)
 	}
 	e.UID = uid
 	if s.srv.afterAppend != nil {
@@ -828,7 +853,7 @@ func (s *Session) commit(e store.Entry) (int64, error) {
 		"folder", e.Folder, "deleted", e.Deleted)
 
 	s.srv.hub.broadcast(s.vaultID, e, s)
-	return uid, nil
+	return uid, nil, nil
 }
 
 /* ---------------------------------------------------------------- *

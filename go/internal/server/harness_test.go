@@ -425,6 +425,10 @@ func toStrings(t *testing.T, v any) []string {
 
 // closed reports whether the server has hung up, which is how a fatal refusal
 // is distinguished from one the session survives.
+// closed reports whether the server hung up. It must be the last thing a test
+// does with this client: it waits on a read, and cancelling a read is what
+// closes a websocket, so a session that was alive is not alive afterwards. Where
+// the question is "did this survive", send a ping and expect a pong instead.
 func (c *client) closed() bool {
 	c.t.Helper()
 	ctx, cancel := context.WithTimeout(c.ctx, 3*time.Second)

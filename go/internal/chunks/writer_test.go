@@ -172,3 +172,34 @@ func TestABatchToleratesTheSameChunkTwice(t *testing.T) {
 		t.Fatalf("the chunk came back as %q", got)
 	}
 }
+
+// The batch verifies on the goroutine that writes, not on the one that handed
+// the body over.
+//
+// Add and the write happen on different goroutines, so anything that reuses a
+// buffer between them would file the wrong bytes under a correct name. Nothing
+// does today, and the check is what keeps that true: a chunk that fails to
+// decrypt is the one fault a device cannot diagnose, because the server told it
+// the chunk arrived.
+func TestABatchVerifiesTheBodyItIsAboutToWrite(t *testing.T) {
+	s := newTestStore(t)
+
+	honest := []byte("the bytes this name is for")
+	name := Name(honest)
+	// What a reused buffer would look like from inside place: the right name,
+	// the wrong bytes.
+	if _, err := s.place("v1", name, []byte("something else entirely")); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("err = %v, want ErrCorrupt", err)
+	}
+	if s.Has("v1", name) {
+		t.Fatal("a body that did not match its name reached the disk")
+	}
+
+	if _, err := s.place("v1", name, honest); err != nil {
+		t.Fatalf("the honest body was refused: %v", err)
+	}
+	got, err := s.Get("v1", name)
+	if err != nil || string(got) != string(honest) {
+		t.Fatalf("get = %q, %v", got, err)
+	}
+}
