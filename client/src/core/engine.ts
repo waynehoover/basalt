@@ -237,6 +237,13 @@ export class Engine {
      */
     private blocked = new Set<string>();
 
+    /**
+     * Set once a vault that advertised streaming failed at it. See `streamScan`:
+     * the plugin's streaming is a URL the webview fetches, which is verified on
+     * desktop and nowhere else.
+     */
+    private cannotStream = false;
+
     /** Writes waiting to go up together, and what they will cost to hold. */
     private outbox: Queued[] = [];
     private outboxBytes = 0;
@@ -675,15 +682,36 @@ export class Engine {
         knownSize: number | undefined
     ): Promise<Scanned | undefined> {
         const vault = this.opts.vault;
-        if (!vault.readBlocks || !vault.readRange) return undefined;
+        if (!vault.readBlocks || !vault.readRange || this.cannotStream) return undefined;
         if (knownSize === undefined || knownSize <= KEEP_SEALED_BELOW) return undefined;
 
+        try {
+            return await this.streamed(entry, path, knownSize);
+        } catch (err) {
+            // A vault that offers these methods and cannot deliver. The Obsidian
+            // adapter reaches the file through a URL the webview can fetch, and
+            // that is verified on desktop and unverified anywhere else, so a
+            // failure here is read as "not on this platform" rather than as a
+            // failure of the file.
+            //
+            // Remembered, because otherwise every large file in the vault would
+            // discover it again, one at a time.
+            this.cannotStream = true;
+            this.log("streaming is not available here, reading whole files instead", path, {
+                why: (err as Error).message,
+            });
+            return undefined;
+        }
+    }
+
+    private async streamed(entry: IndexEntry, path: string, knownSize: number): Promise<Scanned> {
+        const vault = this.opts.vault;
         const isText = this.mergeable(path);
         const names: string[] = [];
         const spans: { start: number; end: number }[] = [];
         let size = 0;
 
-        for await (const piece of chunkStream(vault.readBlocks(path), this.sizesFor(knownSize, isText), isText)) {
+        for await (const piece of chunkStream(vault.readBlocks!(path), this.sizesFor(knownSize, isText), isText)) {
             const sealed = await sealChunks(this.opts.keys, [piece.bytes]);
             names.push(sealed[0]!.name);
             spans.push({ start: piece.offset, end: piece.offset + piece.bytes.length });

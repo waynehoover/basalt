@@ -65,6 +65,13 @@ A first sync of 2000 files costs 26 round trips, not 2000. Twenty edited notes
 take about a second over 400 ms of latency. `docs/benchmark.md` has the numbers
 and the machine they were measured on.
 
+### Notes first, attachments second
+Everything here is built around Markdown: the chunk sizes, the merge, the
+scanning, the round trips. Attachments sync and are not the point. Large binary
+files work and are capped at 64 MiB by default, because sending one costs the
+device memory that a note never does. If your vault is mostly video, this is the
+wrong tool and `docs/philosophy.md` says why.
+
 ### Nothing to configure
 No accounts, no subscription, no settings screen. One binary, one pairing string,
 and every question with a right answer answered once in the source.

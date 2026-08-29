@@ -125,6 +125,68 @@ export class ObsidianVault implements Vault {
      * `stat`, rather than by `instanceof`. Class identity across a plugin
      * boundary is a thing that works until a build changes.
      */
+    /**
+     * The file in blocks, without `DataAdapter` having a streaming read.
+     *
+     * `getResourcePath` returns the URL the webview already uses to show an
+     * image or play an audio note, and that URL can be fetched. The response
+     * carries a body stream, so a large attachment can be cut and named a chunk
+     * at a time instead of being handed over whole.
+     *
+     * Verified in a running Obsidian on desktop: fetch succeeds, `res.body` is
+     * a stream, and a ranged request returns the right bytes from the middle of
+     * a file rather than the first N. Mobile is Capacitor and its resource URLs
+     * are a different scheme, which nothing here has tested, so the engine
+     * treats a failure as "this platform cannot" and falls back to reading the
+     * file whole.
+     */
+    async *readBlocks(path: string, blockSize = 1024 * 1024): AsyncGenerator<Uint8Array> {
+        const res = await fetch(this.resourceUrl(path));
+        if (!res.ok || !res.body) {
+            throw new Error(`cannot stream ${path}: the vault answered ${res.status}`);
+        }
+        const reader = res.body.getReader();
+        // Re-blocked rather than passed through, because what a fetch hands back
+        // is whatever the transport felt like and the chunker should not have
+        // its memory decided by that.
+        let held = new Uint8Array(0);
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (value && value.length > 0) {
+                const merged = new Uint8Array(held.length + value.length);
+                merged.set(held, 0);
+                merged.set(value, held.length);
+                held = merged;
+            }
+            while (held.length >= blockSize) {
+                yield held.slice(0, blockSize);
+                held = held.subarray(blockSize);
+            }
+            if (done) break;
+        }
+        if (held.length > 0) yield held.slice(0);
+    }
+
+    async readRange(path: string, start: number, end: number): Promise<Uint8Array> {
+        const res = await fetch(this.resourceUrl(path), {
+            headers: { Range: `bytes=${start}-${end - 1}` },
+        });
+        if (!res.ok) throw new Error(`cannot read ${path} at ${start}: the vault answered ${res.status}`);
+        const got = new Uint8Array(await res.arrayBuffer());
+        // A handler that ignored the Range would answer with the whole file,
+        // which would then be sealed and refused for not matching its name. Said
+        // here instead, where the reason is knowable.
+        if (got.length > end - start) {
+            throw new Error(`this vault does not honour ranged reads, so ${path} cannot be streamed`);
+        }
+        return got;
+    }
+
+    /** Where the webview can fetch a file from. */
+    private resourceUrl(path: string): string {
+        return this.vault.adapter.getResourcePath(this.resolve(path));
+    }
+
     async list(): Promise<FileStat[]> {
         const out: FileStat[] = [];
         this.actualName.clear();

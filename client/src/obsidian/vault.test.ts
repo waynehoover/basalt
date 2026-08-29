@@ -11,7 +11,7 @@
  * here.
  */
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { FakeAdapter, FakeVaultIndex, asVault, normalizePath } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
@@ -397,3 +397,99 @@ class CountingAdapter {
         return this.inner.list(p);
     }
 }
+
+/**
+ * Streaming through the resource URL, which is how the plugin sends a large
+ * attachment without holding it. `DataAdapter` has no ranged or streaming read,
+ * but `getResourcePath` returns a URL the webview already fetches for images,
+ * and that response carries a body stream and honours a Range header. Verified
+ * in a running Obsidian on desktop; unverified on mobile, which is why the
+ * engine falls back rather than failing a file.
+ */
+describe("reading a file through its resource URL", () => {
+    const body = (n: number) => {
+        const out = new Uint8Array(n);
+        for (let i = 0; i < n; i++) out[i] = (i * 37 + (i >> 7)) & 0xff;
+        return out;
+    };
+
+    /** A vault whose resource URLs are served by a fetch this test controls. */
+    function streaming(bytes: Uint8Array, opts: { honourRange?: boolean; fail?: boolean } = {}) {
+        const adapter = new FakeAdapter();
+        const vault = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
+        (adapter as unknown as { getResourcePath(p: string): string }).getResourcePath = (p) => `app://test/${p}`;
+
+        globalThis.fetch = (async (_url: unknown, init?: { headers?: Record<string, string> }) => {
+            if (opts.fail) return { ok: false, status: 404, body: null };
+            const range = init?.headers?.["Range"];
+            let slice = bytes;
+            if (range && opts.honourRange !== false) {
+                const [, a, b] = /bytes=(\d+)-(\d+)/.exec(range)!;
+                slice = bytes.subarray(Number(a), Number(b) + 1);
+            }
+            return {
+                ok: true,
+                status: 200,
+                arrayBuffer: async () => slice.slice().buffer,
+                body: {
+                    getReader() {
+                        let sent = false;
+                        return {
+                            async read() {
+                                if (sent) return { done: true, value: undefined };
+                                sent = true;
+                                return { done: false, value: slice.slice() };
+                            },
+                        };
+                    },
+                },
+            };
+        }) as never;
+        return vault;
+    }
+
+    const realFetch = globalThis.fetch;
+    afterEach(() => {
+        globalThis.fetch = realFetch;
+    });
+
+    it("streams the whole file in blocks of the size asked for", async () => {
+        const bytes = body(300_000);
+        const vault = streaming(bytes);
+        const blocks: Uint8Array[] = [];
+        for await (const b of vault.readBlocks("big.bin", 64 * 1024)) blocks.push(b);
+
+        // Re-blocked, so what the chunker sees does not depend on how the
+        // transport felt like splitting the response.
+        expect(blocks.length).toBe(Math.ceil(300_000 / (64 * 1024)));
+        expect(blocks.slice(0, -1).every((b) => b.length === 64 * 1024)).toBe(true);
+
+        const joined = new Uint8Array(300_000);
+        let at = 0;
+        for (const b of blocks) {
+            joined.set(b, at);
+            at += b.length;
+        }
+        expect(joined).toEqual(bytes);
+    });
+
+    it("reads a range from the middle", async () => {
+        const bytes = body(100_000);
+        const vault = streaming(bytes);
+        expect(await vault.readRange("big.bin", 40_000, 40_200)).toEqual(bytes.subarray(40_000, 40_200));
+    });
+
+    // The failure that would otherwise be silent: a handler ignoring Range and
+    // answering with the whole file. Those bytes would be sealed and refused by
+    // the server for not matching their name, which is a fatal protocol error.
+    // Caught here, it is a platform that cannot stream.
+    it("refuses a vault that ignores the range rather than sending the wrong bytes", async () => {
+        const vault = streaming(body(100_000), { honourRange: false });
+        await expect(vault.readRange("big.bin", 40_000, 40_200)).rejects.toThrow(/ranged reads/);
+    });
+
+    it("says so when the resource cannot be fetched at all", async () => {
+        const vault = streaming(body(1000), { fail: true });
+        await expect(vault.readRange("big.bin", 0, 10)).rejects.toThrow(/404/);
+    });
+});

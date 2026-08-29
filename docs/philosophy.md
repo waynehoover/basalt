@@ -162,9 +162,39 @@ things with a right answer, and no settings screen. No web UI on the server,
 because anything it could show you, it would have to read. No merge of our own; two
 independent projects chose diff-match-patch. No silent conflict resolution.
 
+## Notes first, and what that costs attachments
+
+This is a note-taking sync tool. Somebody writing prose is the case every
+decision is made for, and it shows in the numbers: an edit to a note sends a few
+hundred bytes and costs one round trip, a vault of two thousand notes syncs in
+twenty-six, and a pass over a settled vault costs about a millisecond in the
+plugin because Obsidian already keeps the file list in memory.
+
+Attachments are supported and are not optimised for. Three reasons, all
+measured, all consequences of notes being first:
+
+- **Chunk sizes are chosen for prose.** They scale with file size, but the
+  tuning that made an edit cost 1,732 bytes instead of 3,030 was done against
+  Markdown, not against video.
+- **Sending a large file costs memory a note never does.** The chunk names all
+  go up before any body does, so the file is cut end to end before anything is
+  sent. The headless client streams it in blocks and stays flat; the plugin
+  streams it through the URL the webview would use for an image, which is
+  verified on desktop and nowhere else, and falls back to reading the file whole
+  where that does not work.
+- **Deduplication does nothing for them.** Two photographs are two photographs.
+  What chunking buys is the edit to a long note, and a binary file that changes
+  usually changes throughout.
+
+So the default file limit is 64 MiB rather than the 256 MiB the format allows,
+and `basalt serve -max-file` raises it. A vault that is mostly video is a vault
+this is the wrong tool for, and there are file syncs that are the right one.
+`docs/benchmark.md` has the numbers.
+
 ## Who this is wrong for
 
 Anyone needing a vault shared with other people, sync without running anything, a
-hosted option, or storage they already pay for.
+hosted option, storage they already pay for, or a vault that is mostly large
+binary files.
 [Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync) does all of
 that, is MIT licensed, and is a better answer.
