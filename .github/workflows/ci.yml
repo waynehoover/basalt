@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    name: server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      # Formatting is checked rather than applied, so a diff never lands as a
+      # surprise in somebody else's commit.
+      - name: gofmt
+        working-directory: go
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        working-directory: go
+        run: go vet ./...
+
+      # The store and the chunk writer are concurrent, and a data race there is
+      # the kind of fault that shows up as a lost note rather than a crash.
+      - name: test
+        working-directory: go
+        run: go test -race ./...
+
+  client:
+    name: client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The client's tests build cmd/basalt and talk to it over a real socket,
+      # so this job needs both toolchains.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: install
+        working-directory: client
+        run: bun install --frozen-lockfile
+
+      - name: typecheck
+        working-directory: client
+        run: bun run typecheck
+
+      - name: test
+        working-directory: client
+        run: bun run test
+
+      # A plugin bundle that reaches for a node: builtin compiles, passes every
+      # other test, and fails only on a phone.
+      - name: build
+        working-directory: client
+        run: bun run build
+
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the image
+        run: docker build -t basalt:ci .
+      - name: it runs
+        run: docker run --rm basalt:ci version
