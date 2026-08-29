@@ -108,6 +108,9 @@ the existing checks miss. It is line-wise, and a Markdown paragraph is one line.
 plaintext and one solid stream sends 57%. Five per cent, against a second code
 path through the most durability-critical part of the client.
 
+Basalt itself is MIT, like LiveSync and like Obsidian's own plugin API
+declarations.
+
 ## Libraries
 
 **diff-match-patch**, the merge, unmaintained since 2020 and a known risk.
