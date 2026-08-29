@@ -291,6 +291,10 @@ func (s *Session) handleHello(m wire.In) error {
 	if m.Cursor < 0 {
 		return s.fatal(wire.CodeProtoState, fmt.Errorf("negative cursor %d", m.Cursor))
 	}
+	if len(m.Device) > store.MaxDeviceLen {
+		return s.fatal(wire.CodeBadName,
+			fmt.Errorf("device name is %d bytes, limit is %d", len(m.Device), store.MaxDeviceLen))
+	}
 	if err := s.srv.auth(Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim}); err != nil {
 		// Logged in full, reported as one word. Telling a caller whether the
 		// vault or the token was wrong tells them which half to keep guessing.
@@ -606,9 +610,12 @@ func (s *Session) handlePutMany(m wire.In) error {
 
 func (s *Session) handlePut(m wire.In) error {
 	e := m.Entry()
-	if e.Device == "" {
-		e.Device = s.device
-	}
+	// The session's device, never the message's. A device name is what a person
+	// reads next to a version to work out where it came from, so a client that
+	// could put another device's name on its own write would make that answer a
+	// lie. The batched put has always taken it from the session; this one asked
+	// the client and only corrected an empty answer.
+	e.Device = s.device
 
 	// Two checks ahead of Validate, only to name the outcome: docs/protocol.md
 	// gives badname and toolarge their own codes because a client acts on them
@@ -978,6 +985,19 @@ func (s *Session) handleFetch(m wire.In) error {
 		// to decrypt it for reasons it cannot diagnose.
 		body, err := s.srv.st.Chunks().Get(s.vaultID, n)
 		if err != nil {
+			// A body that fails its own hash is not a body. Left in place it
+			// would keep satisfying the presence check, so every client would
+			// keep being told the server already holds it and none would ever
+			// send it again. Moved aside, the next put asks for it and a device
+			// that still has the note heals the vault.
+			if errors.Is(err, chunks.ErrCorrupt) {
+				s.srv.log.Error("quarantining a corrupt chunk",
+					"vault", s.vaultID, "chunk", n, "err", err)
+				if qerr := s.srv.st.Chunks().Quarantine(s.vaultID, n); qerr != nil {
+					s.srv.log.Error("could not quarantine it",
+						"vault", s.vaultID, "chunk", n, "err", qerr)
+				}
+			}
 			// Present a moment ago, unreadable now. Frames may already be on
 			// the wire, so there is no clean way to continue.
 			return s.fatal(wire.CodeNoChunk,

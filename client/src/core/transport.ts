@@ -437,7 +437,20 @@ export class Transport {
     private async onBatchFrame(frame: Reply): Promise<void> {
         const from = numberOf(frame["from"]);
         const to = numberOf(frame["to"]);
-        const entries = Array.isArray(frame["entries"]) ? (frame["entries"] as WireEntry[]) : [];
+        // Required to be present, though it may be empty. An absent or null
+        // `entries` used to be read as an empty batch, so a frame that lost the
+        // field advanced the cursor over real versions and this device never
+        // fetched them: a note missing for ever, on a client reporting success.
+        // Empty stays legal, because that is how a device gets its own writes
+        // back without the payload.
+        const raw = frame["entries"];
+        if (!Array.isArray(raw)) {
+            throw new ProtocolError(
+                "protostate",
+                `batch ${from} to ${to} carries no entries array, so an empty batch cannot be told from a lost one`
+            );
+        }
+        const entries = raw as WireEntry[];
 
         // The continuity check the batch shape exists for. From and to are a
         // covered range, not the uids present, so a purged hole in the sequence
@@ -452,6 +465,21 @@ export class Transport {
             throw new ProtocolError("protostate", `batch covers an empty range, ${from} to ${to}`);
         }
         for (const e of entries) {
+            // Checked to be a number before it is compared. An entry with no
+            // uid at all made both comparisons false and sailed through, which
+            // is the range check passing by not being performed.
+            if (typeof e?.uid !== "number" || !Number.isFinite(e.uid)) {
+                throw new ProtocolError("protostate", `batch ${from}..${to} contains an entry with no uid`);
+            }
+            if (typeof e.path !== "string" || e.path === "") {
+                throw new ProtocolError("protostate", `batch ${from}..${to} contains uid ${e.uid} with no path`);
+            }
+            if (!Array.isArray(e.chunks)) {
+                throw new ProtocolError(
+                    "protostate",
+                    `batch ${from}..${to} contains uid ${e.uid} with no chunks array`
+                );
+            }
             if (e.uid < from || e.uid > to) {
                 throw new ProtocolError("protostate", `batch ${from}..${to} contains uid ${e.uid}`);
             }

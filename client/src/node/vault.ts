@@ -9,7 +9,7 @@
  */
 
 import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
-import { access, cp, mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, open, readFile, readdir, rename, rm, stat, utimes } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
@@ -73,6 +73,9 @@ export class NodeVault implements Vault {
             }
             for (const item of items) {
                 if (this.ignore.has(item.name)) continue;
+                // A write in flight, from this client. Listing one would sync a
+                // half-written note under a name that is about to vanish.
+                if (isTemporary(item.name)) continue;
                 const path = prefix ? `${prefix}/${item.name}` : item.name;
                 const full = join(dir, item.name);
                 if (item.isDirectory()) {
@@ -116,12 +119,7 @@ export class NodeVault implements Vault {
     async write(path: string, bytes: Uint8Array, times: { mtime: number; ctime: number }): Promise<void> {
         const full = this.absolute(path);
         await mkdir(dirname(full), { recursive: true });
-        // Written to a temporary name and renamed, so a crash or a concurrent
-        // read never sees a half-written note. The same reason the server does it
-        // for chunk bodies.
-        const tmp = `${full}.basalt-tmp`;
-        await writeFile(tmp, bytes);
-        await rename(tmp, full);
+        await writeDurably(full, bytes);
         if (times.mtime > 0) {
             const seconds = times.mtime / 1000;
             await utimes(full, seconds, seconds);
@@ -228,7 +226,7 @@ export class NodeVault implements Vault {
                 // where the index is written. Watching it would mean each pass
                 // scheduled the next one, forever.
                 if (path.split("/").some((part) => this.ignore.has(part))) return;
-                if (path.endsWith(".basalt-tmp")) return;
+                if (isTemporary(path)) return;
                 last = path;
                 if (timer) clearTimeout(timer);
                 timer = setTimeout(() => {
@@ -289,10 +287,89 @@ export class JsonIndexStore implements IndexStore {
         }
     }
 
+    /**
+     * Writes the index durably, and only ever after the notes it describes.
+     *
+     * The engine writes every downloaded file in a pass and saves this once at
+     * the end, so the ordering is already right. What was missing was the
+     * durability underneath it: with neither the note nor the index fsynced, a
+     * power cut could leave the index on disk saying a note was synced while the
+     * note itself was not. On the next pass the file is missing, the index says
+     * it matched the server, and `decideMissingLocally` reads that as "the user
+     * deleted it" and propagates the deletion to every other device.
+     *
+     * That is a note lost silently, by a machine losing power at the wrong
+     * moment, and it is the exact failure the first rule exists to refuse.
+     */
     async save(state: StoredState): Promise<void> {
         await mkdir(dirname(this.file), { recursive: true });
-        const tmp = `${this.file}.tmp`;
-        await writeFile(tmp, JSON.stringify(state));
-        await rename(tmp, this.file);
+        await writeDurably(this.file, new TextEncoder().encode(JSON.stringify(state)));
+    }
+}
+
+/**
+ * Marks this client's in-progress writes. Anything matching is not a note.
+ *
+ * A vault is somebody's own directory and they can name a file whatever they
+ * like, so the suffix alone is not enough: the temp name used to be exactly
+ * `<file>.basalt-tmp`, and a real attachment sitting at that path would be
+ * overwritten by the next write of `<file>` and then renamed away. Unique names
+ * make that a coincidence rather than a certainty, and creating them
+ * exclusively makes it impossible.
+ */
+export const TEMP_MARK = ".basalt-tmp-";
+
+/** Whether a vault-relative path is one of this client's temporary files. */
+export function isTemporary(path: string): boolean {
+    return path.includes(TEMP_MARK);
+}
+
+let tempCounter = 0;
+
+/**
+ * Creates a temporary file next to its destination, and never opens one that
+ * already exists: `wx` fails rather than truncating, so a file somebody else
+ * put there is refused instead of destroyed.
+ */
+async function openTemp(full: string): Promise<{ tmp: string; handle: Awaited<ReturnType<typeof open>> }> {
+    for (let attempt = 0; attempt < 64; attempt++) {
+        const tmp = `${full}${TEMP_MARK}${(tempCounter++).toString(36)}${attempt ? `-${attempt}` : ""}`;
+        try {
+            return { tmp, handle: await open(tmp, "wx") };
+        } catch (err) {
+            if ((err as { code?: string }).code !== "EEXIST") throw err;
+        }
+    }
+    throw new Error(`could not find an unused temporary name beside ${full}`);
+}
+
+/**
+ * Writes a file so that a crash leaves either the old contents or the new.
+ *
+ * The same four steps the server uses for a chunk body, and each earns its
+ * keep. Writing in place would let a crash leave a half-written note. Renaming
+ * without fsyncing the file means the rename can be durable while the bytes are
+ * not. Renaming without fsyncing the *directory* means the bytes can be durable
+ * while the name is not.
+ *
+ * Exported for the tests, which can check the outcome of every step except the
+ * flushes themselves: whether an fsync really reached the platter is not
+ * something a process can observe, on any operating system.
+ */
+export async function writeDurably(full: string, bytes: Uint8Array): Promise<void> {
+    const { tmp, handle } = await openTemp(full);
+    try {
+        await handle.write(bytes);
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+    await rename(tmp, full);
+
+    const dir = await open(dirname(full), "r");
+    try {
+        await dir.sync();
+    } finally {
+        await dir.close();
     }
 }

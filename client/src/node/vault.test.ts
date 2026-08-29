@@ -1,9 +1,9 @@
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { JsonIndexStore, NodeVault } from "./vault.ts";
+import { JsonIndexStore, NodeVault, TEMP_MARK, isTemporary, writeDurably } from "./vault.ts";
 
 let root: string;
 
@@ -326,5 +326,80 @@ describe("deleting, which must be recoverable", () => {
         await expect(v.remove("never-existed.md")).resolves.toBeUndefined();
         const { readdir } = await import("node:fs/promises");
         await expect(readdir(join(root, ".trash"))).rejects.toThrow();
+    });
+});
+
+/**
+ * Durability, and the file beside the file.
+ *
+ * The engine writes a downloaded note and then saves an index saying it is
+ * synced. With neither fsynced, a power cut can leave the index on disk and the
+ * note not, and the next pass reads a missing file with a matching synchash as
+ * "the user deleted this" and propagates the deletion everywhere.
+ *
+ * What a test can check is every step except the flushes: whether an fsync
+ * reached the platter is not observable from a process on any OS. So these
+ * cover the outcome, the temp files, and the one hazard the old temp name
+ * carried.
+ */
+describe("writing durably", () => {
+    it("leaves the destination correct and no temporary files behind", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "basalt-durable-"));
+        try {
+            const at = join(dir, "note.md");
+            await writeDurably(at, new TextEncoder().encode("the contents"));
+            expect(await readFile(at, "utf8")).toBe("the contents");
+
+            const strays = (await readdir(dir)).filter(isTemporary);
+            expect(strays, `temporary files survived: ${strays.join(", ")}`).toEqual([]);
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    // A vault is somebody's own directory and they can name a file anything.
+    // The temp name used to be exactly `<file>.basalt-tmp`, so a real note at
+    // that path was truncated by the next write of `<file>` and then renamed
+    // out of existence: two of somebody's files destroyed by a write to a
+    // third. The property is broader than that one name, so the test is too.
+    it("touches nothing in the directory except the file it was asked to write", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "basalt-durable-"));
+        try {
+            const bystanders: Record<string, string> = {
+                "note.md.basalt-tmp": "the name this client used to use",
+                "note.md.basalt-tmp-0": "and the shape it uses now",
+                "note.md.backup": "somebody's own copy",
+                "note.md": "the old contents",
+                "other.md": "an unrelated note",
+            };
+            for (const [name, text] of Object.entries(bystanders)) {
+                await writeFile(join(dir, name), text);
+            }
+
+            await writeDurably(join(dir, "note.md"), new TextEncoder().encode("new contents"));
+
+            expect(await readFile(join(dir, "note.md"), "utf8")).toBe("new contents");
+            for (const [name, text] of Object.entries(bystanders)) {
+                if (name === "note.md") continue;
+                expect(await readFile(join(dir, name), "utf8"), `${name} was modified`).toBe(text);
+            }
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("keeps a write in flight out of the listing", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "basalt-durable-"));
+        try {
+            await writeFile(join(dir, "real.md"), "a note");
+            await writeFile(join(dir, `real.md${TEMP_MARK}7`), "half a note");
+
+            const vault = new NodeVault(dir);
+            const paths = (await vault.list()).map((s) => s.path);
+            expect(paths).toContain("real.md");
+            expect(paths.some(isTemporary)).toBe(false);
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
     });
 });

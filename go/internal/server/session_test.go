@@ -952,3 +952,59 @@ func TestRepeatedChunksAreBudgetedPerReferenceOverTheWire(t *testing.T) {
 		t.Fatalf("%d entries committed", st.Versions)
 	}
 }
+
+// A device name is what a person reads next to a version to work out where it
+// came from. A client that could write another device's name onto its own
+// entries would make that answer a lie, and one that could send an unbounded
+// name would put a copy of it on every entry it ever wrote and in every
+// broadcast frame.
+func TestAnEntryIsAlwaysAttributedToTheSessionsDevice(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("phone")
+	cl.hello(0)
+
+	names := cl.put("note.md", "some content")
+	e, ok, err := r.st.EntryByUID(testVault, names)
+	if err != nil || !ok {
+		t.Fatalf("uid %d: ok=%v err=%v", names, ok, err)
+	}
+	if e.Device != "phone" {
+		t.Fatalf("device is %q, want the session's", e.Device)
+	}
+
+	// Now a put claiming to be somebody else.
+	body := "content of a forged note"
+	cl.sendJSON(wire.In{
+		Op:     "put",
+		Path:   "forged.md",
+		Device: "laptop",
+		Meta:   wire.PutMeta{Size: int64(len(body)), MTime: 2},
+		Chunks: []string{chunks.Name([]byte(body))},
+	})
+	cl.recvInto("want", &wire.Want{})
+	cl.sendBinary([]byte(body))
+	var ack wire.Ack
+	cl.recvInto("ack", &ack)
+
+	forged, ok, err := r.st.EntryByUID(testVault, ack.UID)
+	if err != nil || !ok {
+		t.Fatalf("uid %d: ok=%v err=%v", ack.UID, ok, err)
+	}
+	if forged.Device != "phone" {
+		t.Fatalf("an entry was attributed to %q, which is not the device that wrote it", forged.Device)
+	}
+}
+
+func TestAnUnboundedDeviceNameIsRefused(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.sendJSON(wire.In{
+		Op:     "hello",
+		Proto:  wire.Proto,
+		Vault:  testVault,
+		Token:  testToken,
+		Crypto: wire.Crypto,
+		Device: strings.Repeat("d", store.MaxDeviceLen+1),
+	})
+	cl.expectErr(wire.CodeBadName)
+}

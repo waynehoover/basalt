@@ -203,3 +203,58 @@ func TestABatchVerifiesTheBodyItIsAboutToWrite(t *testing.T) {
 		t.Fatalf("get = %q, %v", got, err)
 	}
 }
+
+// Presence is a stat, so a body that rotted on disk still answers Has, and
+// Missing therefore tells every client the server already holds it. The entry
+// was acknowledged, no client will send it again, and Get fails for ever.
+// Nothing in an ordinary sync heals that unless the server can admit it needs
+// the chunk back.
+func TestACorruptBodyStopsCountingAsHeld(t *testing.T) {
+	s := newTestStore(t)
+	body := []byte("what this chunk is supposed to be")
+	name := Name(body)
+	if err := s.Put("v1", name, body); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+
+	// Rot, of the kind a disk produces and a stat cannot see.
+	if err := os.WriteFile(s.path("v1", name), []byte("not that at all, but the same name"), 0o600); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	if !s.Has("v1", name) {
+		t.Fatal("the premise is wrong: a corrupt body should still stat as present")
+	}
+	if _, err := s.Get("v1", name); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("get = %v, want ErrCorrupt", err)
+	}
+
+	if err := s.Quarantine("v1", name); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+
+	if s.Has("v1", name) {
+		t.Fatal("a quarantined body still counts as held, so no client will ever replace it")
+	}
+	missing, err := s.Missing("v1", []string{name})
+	if err != nil {
+		t.Fatalf("missing: %v", err)
+	}
+	if len(missing) != 1 || missing[0] != name {
+		t.Fatalf("missing = %v, want the chunk back on the want list", missing)
+	}
+
+	// And it is set aside rather than destroyed, so somebody can see what
+	// happened to it.
+	if _, err := os.Stat(s.path("v1", name) + corruptSuffix); err != nil {
+		t.Fatalf("the corrupt body was not kept: %v", err)
+	}
+
+	// The vault heals: a client that still holds the note sends it back.
+	if err := s.Put("v1", name, body); err != nil {
+		t.Fatalf("re-put: %v", err)
+	}
+	got, err := s.Get("v1", name)
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("get after healing = %q, %v", got, err)
+	}
+}

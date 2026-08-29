@@ -13,7 +13,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { Engine, contentId, type SyncReport } from "./engine.ts";
+import { Engine, contentId, firstFreeName, type SyncReport } from "./engine.ts";
 import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
 import { Transport } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
@@ -334,6 +334,91 @@ describe("concurrent edits, which is where notes get lost", () => {
             expect(copies.length, `${d.name} has no conflict copy`).toBeGreaterThan(0);
         }
     }, 240_000);
+});
+
+/**
+ * A conflict copy is the only surviving record of one side of a divergence, so
+ * overwriting one is the same failure the copy exists to prevent, one level up.
+ *
+ * The name carries the time only to the minute, so two conflicts on one path
+ * from one device inside the same minute produced the same name and the second
+ * write replaced the first. Two passes inside a minute is ordinary: the write
+ * debounce is measured in tens of seconds.
+ */
+describe("naming a copy beside a note", () => {
+    const none = async () => false;
+    const only = (...taken: string[]) => async (p: string) => taken.includes(p);
+
+    it("uses the name it was given when nothing is there", async () => {
+        expect(await firstFreeName("note (Conflicted copy a 202608281705).md", none)).toBe(
+            "note (Conflicted copy a 202608281705).md"
+        );
+    });
+
+    it("numbers past a name already in use rather than writing over it", async () => {
+        const base = "note (Conflicted copy a 202608281705).md";
+        expect(await firstFreeName(base, only(base))).toBe("note (Conflicted copy a 202608281705) 2.md");
+    });
+
+    it("keeps numbering while the numbered ones are taken too", async () => {
+        const base = "note (Conflicted copy a 202608281705).md";
+        const taken = only(base, "note (Conflicted copy a 202608281705) 2.md", "note (Conflicted copy a 202608281705) 3.md");
+        expect(await firstFreeName(base, taken)).toBe("note (Conflicted copy a 202608281705) 4.md");
+    });
+
+    it("keeps the extension where the name has one, and adds none where it does not", async () => {
+        expect(await firstFreeName("a/b/note.md", only("a/b/note.md"))).toBe("a/b/note 2.md");
+        // A dot in a folder name is not an extension on the file.
+        expect(await firstFreeName("a.b/note", only("a.b/note"))).toBe("a.b/note 2");
+    });
+
+    it("refuses rather than inventing a name when a thousand are taken", async () => {
+        await expect(firstFreeName("note.md", async () => true)).rejects.toThrow(/unused name/);
+    });
+});
+
+/**
+ * An extension is a claim, not a fact. A `.md` holding bytes that are not UTF-8
+ * used to decode with replacement characters, merge cleanly, and get written
+ * back with those replacements standing in for bytes neither side had touched:
+ * a file altered by a sync that reported success.
+ *
+ * The edits below are at opposite ends and do not collide, so the merge
+ * succeeds. That is the case that mattered: a merge that refuses never writes
+ * anything, and it is the clean merge that quietly rewrote the middle.
+ */
+describe("a text file that is not text", () => {
+    it("does not rewrite bytes neither side edited", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+
+        // 0xFF and 0xFE are valid nowhere in UTF-8, and are what a Latin-1 note
+        // or a mis-labelled attachment looks like.
+        const note = (head: string, tail: string) =>
+            new Uint8Array([...new TextEncoder().encode(`${head}\n`), 0xff, 0xfe, ...new TextEncoder().encode(`\n${tail}\n`)]);
+
+        await a.vault.write("note.md", note("start", "end"), { mtime: 1000, ctime: 1000 });
+        await convergeBoth(a, b);
+
+        // Opposite ends, so there is nothing to collide and the merge is clean.
+        await a.vault.write("note.md", note("START HERE", "end"), { mtime: 2000, ctime: 1000 });
+        await b.vault.write("note.md", note("start", "END HERE"), { mtime: 2000, ctime: 1000 });
+        await convergeBoth(a, b);
+
+        for (const d of [a, b]) {
+            for (const path of d.vault.paths()) {
+                const bytes = await d.vault.read(path);
+                // EF BF BD is U+FFFD, the replacement character. Its presence
+                // means bytes that were on disk were decoded away and written
+                // back as something else.
+                const rewritten = [...bytes].some(
+                    (byte, i) => byte === 0xef && bytes[i + 1] === 0xbf && bytes[i + 2] === 0xbd
+                );
+                expect(rewritten, `${d.name}:${path} came back with replacement characters`).toBe(false);
+            }
+        }
+    });
 });
 
 describe("deletions", () => {

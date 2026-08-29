@@ -789,3 +789,65 @@ describe("the timeout a fetch leaves behind", () => {
         await expect(pinging).resolves.toBeUndefined();
     });
 });
+
+/**
+ * A batch that lost its entries must not look like a batch that had none.
+ *
+ * The decoder read an absent or null `entries` as `[]`. A frame mangled by a
+ * proxy, or written by a future server with a bug, therefore passed the
+ * continuity check, applied nothing, and advanced the cursor over real
+ * versions. On reconnect the client resumed after them and never fetched them
+ * again: notes missing for ever, with the client reporting success throughout.
+ *
+ * Empty stays legal. That is how a device receives its own committed write,
+ * with the cursor advance and no payload, and refusing it would break every
+ * push this device makes.
+ */
+describe("a batch frame that cannot be trusted", () => {
+    const badFrames: { why: string; frame: Record<string, unknown> }[] = [
+        { why: "no entries field at all", frame: { op: "batch", from: 1, to: 3 } },
+        { why: "a null entries field", frame: { op: "batch", from: 1, to: 3, entries: null } },
+        { why: "entries that is not an array", frame: { op: "batch", from: 1, to: 3, entries: {} } },
+        {
+            why: "an entry with no uid, which slips past a range check",
+            frame: { op: "batch", from: 1, to: 3, entries: [{ path: "p", chunks: [] }] },
+        },
+        {
+            why: "an entry with no path",
+            frame: { op: "batch", from: 1, to: 3, entries: [{ uid: 2, chunks: [] }] },
+        },
+        {
+            why: "an entry with no chunks array",
+            frame: { op: "batch", from: 1, to: 3, entries: [{ uid: 2, path: "p" }] },
+        },
+    ];
+
+    for (const { why, frame } of badFrames) {
+        it(`refuses ${why} rather than advancing the cursor`, async () => {
+            const { t, socket, batches } = await helloed(0);
+            socket.reply(frame);
+            await settle();
+
+            expect(batches, "a malformed batch was applied").toHaveLength(0);
+            expect(socket.closed, "a batch nobody can interpret has to end the session").toBe(true);
+        });
+    }
+
+    it("still accepts an empty batch, which is how a device sees its own write", async () => {
+        const { socket, batches } = await helloed(0);
+        socket.reply({ op: "batch", from: 1, to: 1, entries: [] });
+        await settle();
+
+        expect(batches).toHaveLength(1);
+        expect(batches[0]!.entries).toEqual([]);
+        expect(socket.closed).toBe(false);
+
+        // The cursor is not readable from outside, so it is observed the way it
+        // matters: the next contiguous batch is accepted, which it could only
+        // be if the empty one advanced it to 1.
+        socket.reply({ op: "batch", from: 2, to: 2, entries: [] });
+        await settle();
+        expect(batches).toHaveLength(2);
+        expect(socket.closed).toBe(false);
+    });
+});

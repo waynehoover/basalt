@@ -421,6 +421,39 @@ func (w *Writer) Close() error {
 	return nil
 }
 
+// Quarantine moves a body that failed verification out of the way.
+//
+// Presence here is a stat, not a hash: Missing reports a chunk that exists as
+// held, so a body that rotted on disk is one the server tells every client it
+// already has. The entry referencing it was acknowledged, no client will ever
+// send it again, and Get fails for ever. Nothing in an ordinary sync could heal
+// that, because healing requires the server to admit it needs the chunk.
+//
+// So the body is renamed rather than deleted. Renamed, it stops satisfying Has,
+// the next put asks for it, and a client that still holds the note sends it
+// back. Deleted, the evidence of what went wrong would be gone too, and
+// docs/philosophy.md rule 3 is that nothing is destroyed until a verified copy
+// exists elsewhere: for a body that fails its own hash there is no copy, only a
+// name that no longer means anything.
+func (s *Store) Quarantine(vaultID, name string) error {
+	if !ValidName(name) {
+		return fmt.Errorf("%w: %q", ErrBadName, name)
+	}
+	p := s.path(vaultID, name)
+	aside := p + corruptSuffix
+	if err := os.Rename(p, aside); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil // already gone, which is the state this wanted
+		}
+		return err
+	}
+	return syncDir(filepath.Dir(p))
+}
+
+// corruptSuffix marks a body that did not match its own name. It is outside the
+// hex alphabet, so a quarantined file can never be mistaken for a chunk.
+const corruptSuffix = ".corrupt"
+
 // tmpPrefix marks in-progress writes so the sweep leaves them alone.
 const tmpPrefix = ".tmp-"
 

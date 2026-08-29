@@ -56,6 +56,15 @@ const (
 	// filesystem, so this has room to spare while still being a bound.
 	MaxPathLen = 4096
 
+	// MaxDeviceLen bounds a device name.
+	//
+	// It is a label somebody reads next to a version, nothing more, and it was
+	// unbounded: an authenticated client could send megabytes of it, and the
+	// server would store a copy on every entry that device ever wrote and put
+	// another copy in every broadcast frame. 64 bytes is more than any name
+	// anybody would type.
+	MaxDeviceLen = 64
+
 	// ChunkOverheadMax bounds what encryption adds to one chunk: a nonce, an
 	// authentication tag, and any framing. AES-GCM-SIV needs 12 plus 16, so
 	// this is an order of magnitude of headroom, which is deliberate: it is the

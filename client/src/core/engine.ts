@@ -1136,15 +1136,35 @@ export class Engine {
 
     private async merge(path: string, entry: IndexEntry, remote: RemoteState | undefined, report: SyncReport): Promise<void> {
         if (!remote) return;
-        const dec = new TextDecoder();
 
-        // The ancestor, fetched by the uid the index remembered. This is what
-        // `synchash` and `syncuid` are for: one field to identify the common
-        // ancestor and one to go and get it, with no version history on the
-        // device.
-        const base = dec.decode(await this.contentOf(entry.syncuid));
-        const mine = dec.decode(await this.opts.vault.read(path));
-        const theirs = dec.decode(await this.contentOf(remote.uid));
+        // Refusing to decode is the point. A file is classified as text by its
+        // extension, and an extension is a claim rather than a fact: a `.md`
+        // holding bytes that are not UTF-8 decodes with replacement characters,
+        // merges cleanly, and is written back with those replacements in place
+        // of bytes neither side edited. That is a file quietly altered by a sync
+        // that reported success.
+        //
+        // So the merge is attempted only on text that really is text, and
+        // anything else takes the conflict path, which keeps both versions
+        // byte-for-byte and transforms neither.
+        const dec = new TextDecoder("utf-8", { fatal: true });
+        let base: string;
+        let mine: string;
+        let theirs: string;
+        try {
+            // The ancestor, fetched by the uid the index remembered. This is
+            // what `synchash` and `syncuid` are for: one field to identify the
+            // common ancestor and one to go and get it, with no version history
+            // on the device.
+            base = dec.decode(await this.contentOf(entry.syncuid));
+            mine = dec.decode(await this.opts.vault.read(path));
+            theirs = dec.decode(await this.contentOf(remote.uid));
+        } catch {
+            const why = "one side is not valid UTF-8, so merging it would rewrite bytes nobody edited";
+            this.log("merge refused", path, why);
+            await this.conflict(path, entry, remote, report, why);
+            return;
+        }
 
         // A canvas that merged cleanly and no longer parses is a canvas
         // Obsidian refuses to open, and the four checks inside mergeText all
@@ -1172,6 +1192,24 @@ export class Engine {
     }
 
     /**
+     * A conflict copy path nothing is using yet.
+     *
+     * The name carries the device and the time to the minute, so two conflicts
+     * on one path from one device inside the same minute produced the same
+     * name, and the second write replaced the first. Two passes inside a minute
+     * is ordinary: the write debounce is measured in tens of seconds.
+     *
+     * That lost a note. A conflict copy is the only surviving record of one
+     * side of a divergence, and quietly overwriting it is the failure the
+     * conflict copy exists to prevent, one level up.
+     */
+    private freeConflictPath(path: string): Promise<string> {
+        return firstFreeName(conflictCopyPath(path, this.opts.device, new Date(this.now())), (p) =>
+            this.opts.vault.exists(p)
+        );
+    }
+
+    /**
      * Keeps both versions.
      *
      * The local file stays where it is and the incoming version takes a new
@@ -1191,7 +1229,7 @@ export class Engine {
         why: string
     ): Promise<void> {
         if (!remote) return;
-        const copyPath = conflictCopyPath(path, this.opts.device, new Date(this.now()));
+        const copyPath = await this.freeConflictPath(path);
         const incoming = await this.contentOf(remote.uid);
         await this.opts.vault.write(copyPath, incoming, { mtime: remote.mtime, ctime: remote.mtime });
 
@@ -1344,6 +1382,36 @@ const KEEP_SEALED_BELOW = 8 * 1024 * 1024;
  * See `queue`: the count bound is the server's, this one is memory.
  */
 const BATCH_BYTES = 8 * 1024 * 1024;
+
+/**
+ * `base`, or the first numbered variant of it that nothing is using.
+ *
+ * Separated out and exported because it is the part that can be wrong: the
+ * engine's use of it is one line, and the interesting cases are what happens
+ * when a name is taken, when several are, and what a name with no extension
+ * does.
+ */
+export async function firstFreeName(
+    base: string,
+    taken: (path: string) => Promise<boolean>
+): Promise<string> {
+    if (!(await taken(base))) return base;
+
+    const dot = base.lastIndexOf(".");
+    const slash = base.lastIndexOf("/");
+    const hasExt = dot > slash;
+    const stem = hasExt ? base.slice(0, dot) : base;
+    const ext = hasExt ? base.slice(dot) : "";
+
+    for (let n = 2; n < 1000; n++) {
+        const candidate = `${stem} ${n}${ext}`;
+        if (!(await taken(candidate))) return candidate;
+    }
+    // A thousand of these beside one note is not a state worth inventing a name
+    // for, and inventing one silently is how the thousand-and-first overwrites
+    // something.
+    throw new Error(`cannot find an unused name beside ${base}`);
+}
 
 /** One version waiting for company in the inbox. */
 interface Incoming {
