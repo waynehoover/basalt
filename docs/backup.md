@@ -70,7 +70,7 @@ success. Resync that device from zero.
 
 ## Scheduling
 
-A systemd timer, a launchd job, or cron. Two destinations is not paranoia — a
+A systemd timer, a launchd job, or cron. Two destinations is not paranoia: a
 backup on a disk in the same box is one power supply away from not existing.
 
 ```
@@ -89,7 +89,7 @@ disk that has been sitting untouched.
 
 Two servers on one directory is refused. `backup` and `verify` run alongside a
 live server. `purge` deletes bodies, so it takes the data lock exclusively and
-refuses while a server is up — otherwise it could sweep a body just as an entry
+refuses while a server is up. Otherwise it could sweep a body just as an entry
 referencing it commits.
 
 Refusals name the process in the way, pid included, and fail immediately. A

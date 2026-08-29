@@ -116,7 +116,7 @@ In the plugin it is one command, "Recover a deleted note".
 Restoring never overwrites: if the path is occupied the copy lands beside it
 under `(restored N)` and says so. A restored note keeps the timestamp it was
 written with, so a note from March does not sort to the top. And restoring is not
-a server operation — the client fetches the version with an ordinary `get`,
+a server operation. The client fetches the version with an ordinary `get`,
 writes it, and the ordinary sync sends it on, so the server keeps one way to
 change a vault.
 

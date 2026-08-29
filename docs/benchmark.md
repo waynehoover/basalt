@@ -11,7 +11,7 @@ real defects.
 The vault shape is theirs: many small notes, some medium, a few large, folders
 several deep. Half the large files are incompressible, because prose compresses
 and a chunk-size defect hid inside that for months. And the prose does not repeat
-itself — the first generator cycled a dozen words, so every note was nearly every
+itself. The first generator cycled a dozen words, so every note was nearly every
 other note and cross-file deduplication looked like it saved eighty per cent. It
 was measuring the generator. On distinct notes it saves nothing.
 

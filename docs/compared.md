@@ -51,7 +51,7 @@ good, both are further along, and reading them found real defects here.
 **Chunks against streaming encryption.** Sync Engine encrypts as a stream with a
 per-file salt: conventional, never holds a whole file, and cannot deduplicate.
 Basalt seals deterministically, so an edit to a 2 MiB note costs one chunk and
-the same content in two files is stored once — at the cost of holding a file plus
+the same content in two files is stored once, at the cost of holding a file plus
 one chunk in memory, and of the server learning that two chunks are identical.
 
 **Refusing a merge against merging better.** Theirs is a real diff3 that splits
@@ -87,8 +87,8 @@ included, minus the step that discards which hunks applied.
 
 **Sync Engine** contributed reporting correctness beside speed, which their
 harness does and which caught a competitor losing 98 files. Also the benchmark
-vault shape and their published 400 ms environment. Their issue 232 — `rm` where
-the platform should trash — was a live defect here too.
+vault shape and their published 400 ms environment. Their issue 232, `rm` where
+the platform should trash, was a live defect here too.
 
 **Fast Note Sync** contributed issue 257: a path that is a file on one side and a
 folder on the other, which Basalt retried forever one way and ignored the other.

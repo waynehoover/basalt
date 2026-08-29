@@ -66,7 +66,7 @@ not know what it cost.
 
 Obsidian and LiveSync both merge with diff-match-patch. Obsidian applies the
 patches and returns the text, discarding the array saying which hunks landed, so
-**hunks that do not apply are silently dropped** — rule 10 wearing a different
+**hunks that do not apply are silently dropped**: rule 10 wearing a different
 hat.
 
 Basalt uses the same library and the same construction, then diverges: if any
@@ -140,7 +140,7 @@ homelab.example.ts.net:3003#K7M2PQR4-9XBCDEFGHJKMNPQRSTVWXYZ23456789
 A setting earns a row only by surviving three questions. Can another device tell
 us? Then it travels in the pairing string. Is there a right answer? Then it is
 chosen once in the source. Is it only relevant when something specific happens?
-Then it appears in that moment — capabilities in the command palette, fixes
+Then it appears in that moment: capabilities in the command palette, fixes
 inside the error that needs them.
 
 ## Rules
@@ -156,8 +156,8 @@ inside the error that needs them.
 ## Refusals
 
 No second backend. No peer-to-peer. No teams or shared vaults. No settings for
-things with a right answer, and no settings screen. No web UI on the server —
-anything it could show you, it would have to read. No merge of our own; two
+things with a right answer, and no settings screen. No web UI on the server,
+because anything it could show you, it would have to read. No merge of our own; two
 independent projects chose diff-match-patch. No silent conflict resolution.
 
 ## Who this is wrong for

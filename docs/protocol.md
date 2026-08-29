@@ -37,7 +37,7 @@ vault reports "Fully synced" having uploaded nothing.
 
 Paths reach the server encrypted, so the rule splits: the client checks the name
 before encrypting, and the server checks structure, bounds and internal
-consistency — including that a file declaring a size names at least one chunk,
+consistency, including that a file declaring a size names at least one chunk,
 since a size with no chunks is byte-identical on the wire to an empty note.
 
 **Namespace by string, version the protocol.** `basalt/hkdf-aes-gcm/1`, not an
@@ -255,7 +255,7 @@ apart and inventing the distinction would be a lie in a recovery tool.
 `deleted` returns paths whose newest version is a deletion, newest first, renames
 suppressed, bounded at 1000. `more` says the list was cut short and a client must
 show it: a truncated list that does not say so is one somebody reads before
-concluding their note is gone. Suppression is not optional — a rename retires the
+concluding their note is gone. Suppression is not optional: a rename retires the
 old path, so without it most of the list is phantom deletions.
 
 `entries` is an array in both, never null. A client iterating null crashes on

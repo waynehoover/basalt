@@ -19,43 +19,46 @@ server   ./basalt                       prints a setup string
 device   paste it                       that is the whole setup
 ```
 
-Built for one person's devices on a private network, reached over Tailscale or a
-Cloudflare tunnel. That assumption is what lets it be small: no accounts, no
-subscription, no external database, no settings screen.
+## Features
 
-Notes are encrypted before they leave the device. The server stores ciphertext
-and encrypted paths and has no key for either.
+**One static binary.** No database, no message broker, no cgo. Drop it on a box
+or run the Docker image. Backups are one command and they verify themselves.
 
-## Why
+**Setup is one string.** No accounts, no subscription, no sign-in. The address
+and the key travel together; paste it on the next device and you are done.
 
-|  |  |
-|---|---|
-| **Editing one line of a 2 MiB note** | sends 494 B, not 2 MiB |
-| **A merge it cannot make safely** | keeps both versions instead of silently dropping an edit |
-| **A first sync of 2000 files** | 26 round trips, not 2000 |
-| **The server** | one static binary, no database, no key material |
+**Encrypted before it leaves.** Every note and every filename. The server stores
+ciphertext, holds no key, and never needs one. Not a setting you can forget to
+turn on.
 
-`docs/benchmark.md` has the measurements and the machine they were taken on.
+**Sends only what changed.** Editing one line of a 2 MiB note sends 494 bytes,
+not 2 MiB. Chunks are compressed before they are encrypted.
 
-## Backing it up
+**Fast on a slow link.** A first sync of 2000 files costs 26 round trips, not
+2000. Twenty edited notes cost 20 chunks and about a second at 400 ms.
 
-```
-basalt backup -to /mnt/usb/basalt
-```
+**It will not mangle a note.** When a merge is not provably safe it keeps both
+versions instead of silently dropping an edit. Deletions lose to edits, in both
+directions.
 
-Incremental, verified, and it runs while the server does. The copy is ciphertext,
-so keep the passphrase somewhere else. For a copy you can read without Basalt,
-back up the vault folder with whatever you already use — it is plain Markdown.
+**Nothing to configure.** No settings screen, no options nobody tested. Every
+question with a right answer is answered once, in the source.
+
+**Correctness is the point.** Full version history and recovery on the server, a
+benchmark that reports correctness beside speed, and ten durability rules that
+each came from something going wrong.
 
 ## Status
 
-Early. The headless client works; the plugin has run in a real vault once. It has
-never run on a phone.
+Early. The headless client works. The plugin has run in a real vault once, and
+never on a phone.
 
-- `docs/running.md` — server, devices, Docker
-- `docs/philosophy.md` — the ten durability rules and what it refuses to do
-- `docs/protocol.md` — the wire protocol
-- `docs/benchmark.md` — speed and correctness, measured together
-- `docs/compared.md` — Obsidian Sync, the two self-hosted plugins, what was borrowed
-- `docs/backup.md` — the two kinds of backup
-- `client/README.md` — how the plugin and the headless client share one engine
+## Docs
+
+[Running it](docs/running.md) ·
+[Philosophy](docs/philosophy.md) ·
+[Protocol](docs/protocol.md) ·
+[Benchmark](docs/benchmark.md) ·
+[Compared](docs/compared.md) ·
+[Backup](docs/backup.md) ·
+[Client](client/README.md)
