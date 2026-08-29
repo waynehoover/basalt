@@ -4,24 +4,21 @@
  *
  * ## The construction, and the defect it inherits
  *
- * Obsidian's merge, verified in the shipped bundle at `app.js:118574`:
+ * Obsidian's merge is diff-match-patch used the way its own documentation shows,
+ * verified by reading `app.js:118574` in the released application. Four steps:
+ * diff the ancestor against the local side; if the diff has more than two edits,
+ * run `diff_cleanupSemantic` and then `diff_cleanupEfficiency` over it; build
+ * patches from it with `patch_make`; apply them to the incoming side.
  *
- * ```js
- * function bZ(base, mine, theirs) {
- *   const r = dmp.diff_main(base, mine, true, 0);
- *   if (r.length > 2) { dmp.diff_cleanupSemantic(r); dmp.diff_cleanupEfficiency(r); }
- *   return dmp.patch_apply(dmp.patch_make(base, r), theirs)[0];
- * }
- * ```
+ * `patch_apply` returns `[text, appliedFlags]`, and theirs returns index 0.
+ * Discarding index 1 discards which hunks applied, so a hunk that could not be
+ * placed is dropped and the result is returned as though it had succeeded. That
+ * is a lost edit, reported as a success, which is the failure this project
+ * exists to prevent.
  *
- * `patch_apply` returns `[text, appliedFlags]`. Taking `[0]` discards which
- * hunks applied, so a hunk that could not be placed is dropped and the result is
- * returned as though it had succeeded. That is a lost edit, reported as a
- * success, which is the failure this project exists to prevent.
- *
- * Everything else about that function is right and is kept, including the two
- * cleanup passes, which make a merge read the way a human would write it.
- * Dropping them would make our merges worse in a way unrelated to the bug.
+ * Every other step is right and is kept, including the two cleanup passes, which
+ * make a merge read the way a human would write it. Dropping them would make our
+ * merges worse in a way unrelated to the bug.
  *
  * ## What this does instead
  *

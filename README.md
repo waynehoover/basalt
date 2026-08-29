@@ -14,6 +14,18 @@ accounts, no subscription, no external database, no settings screen.
 Your notes are encrypted before they leave the device. The server stores
 ciphertext and deterministically-encrypted paths, and has no key for either.
 
+## What this is not
+
+Not a product, not a service, and not something run for anyone else. It is a
+personal tool for syncing one person's own devices, and every design decision
+assumes that; `docs/philosophy.md` lists what it refuses to do as a result.
+
+It is also not an Obsidian plugin distribution, a hosted offering, or an
+alternative anyone is being sold. Where the docs compare behaviour with Obsidian
+Sync or with other plugins, that is engineering documentation for the decisions
+made here, and `docs/prior-art.md` says what was learned from each and on what
+terms.
+
 ## Backing it up
 
 ```

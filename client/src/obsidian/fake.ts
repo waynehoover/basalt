@@ -14,10 +14,10 @@
  * It is declared `implements DataAdapter`, against the real `obsidian.d.ts`, so
  * the compiler rejects a method whose shape has drifted from the real one.
  *
- * And the behaviour that matters is copied from the shipped application rather
- * than assumed. `normalizePath` below is Obsidian's own, read out of
- * `obsidian.asar`, minified names and all. It does more than the name suggests
- * and finding that out is most of why this file exists.
+ * And the behaviour that matters is determined from the shipped application
+ * rather than assumed. `normalizePath` below matches what Obsidian's does, which
+ * was found by reading `obsidian.asar`: it does more than the name suggests, and
+ * finding that out is most of why this file exists.
  *
  * ## What it still cannot tell you
  *
@@ -32,12 +32,15 @@ import type { DataAdapter, DataWriteOptions, ListedFiles, Stat, TAbstractFile, V
 /**
  * Obsidian's `normalizePath`, as it actually ships.
  *
- * Read from `Obsidian.app/Contents/Resources/obsidian.asar`, where it is three
- * minified functions:
+ * `normalizePath` is part of Obsidian's plugin API, whose declarations are
+ * published under the MIT licence. The behaviour is not, so it was determined by
+ * reading `Obsidian.app/Contents/Resources/obsidian.asar` and written out here as
+ * the four steps it performs, so that this fake and the real adapter agree:
  *
- *     Nl(e) = Dl(Bl(e)).normalize("NFC")
- *     Bl(e) = e.replace(/([\\/])+/g, "/").replace(/(^\/+|\/+$)/g, "") || "/"
- *     Dl(e) = e.replace(/ | /g, " ")
+ *   1. Collapse runs of backslash and forward slash into a single `/`.
+ *   2. Strip leading and trailing slashes; an empty result becomes `/`.
+ *   3. Replace U+00A0 and U+202F with an ordinary space.
+ *   4. Normalize to NFC.
  *
  * Two of those four steps are surprising, and both matter to a sync client.
  *

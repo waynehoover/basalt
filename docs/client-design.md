@@ -129,23 +129,20 @@ day's work.
 ## The merge defect, verified rather than inferred
 
 `docs/philosophy.md` claims Obsidian's merge discards the flags that say which
-hunks failed. Here it is, whole, at `app.js:118574` after formatting:
+hunks failed. Read at `app.js:118574`, the function takes base, mine and theirs,
+and does five things:
 
-```js
-function bZ(e, t, n) {                 // (base, mine, theirs)
-  var i = new mL(),                    // diff_match_patch
-    r = i.diff_main(e, t, !0, 0);
-  r.length > 2 && (i.diff_cleanupSemantic(r), i.diff_cleanupEfficiency(r));
-  var o = i.patch_make(e, r);
-  return i.patch_apply(o, n)[0];       // <- the flags array is index 1
-}
-```
+1. `diff_main(base, mine, true, 0)`.
+2. When that diff has more than two edits, `diff_cleanupSemantic` and then
+   `diff_cleanupEfficiency` over it.
+3. `patch_make(base, diff)`.
+4. `patch_apply(patches, theirs)`.
+5. Return index 0 of the pair that comes back. **The flags array is index 1.**
 
-Confirmed. One detail the philosophy doc does not mention and should: the diff is
-passed through `diff_cleanupSemantic` and `diff_cleanupEfficiency` when it has
-more than two edits. Those improve how a merge reads to a human; Basalt should
-do the same, because dropping them would make our merges worse in a way that
-has nothing to do with the flag bug we are fixing.
+Confirmed, then. One detail the philosophy doc does not mention and should: step
+2. Those two passes improve how a merge reads to a human, and Basalt should do
+the same, because dropping them would make our merges worse in a way that has
+nothing to do with the flag bug we are fixing.
 
 ## When Obsidian merges at all
 
@@ -452,14 +449,15 @@ It found four bugs, none of which a unit test of the source would have shown.
 
 ## normalizePath is not a formatting function
 
-Read out of `Obsidian.app/Contents/Resources/obsidian.asar`, where it is three
-minified functions:
+`normalizePath` is part of Obsidian's plugin API, and the API's type
+declarations are published under the MIT licence. The behaviour is not, so it
+was determined by reading `Obsidian.app/Contents/Resources/obsidian.asar`. It
+does four things:
 
-```js
-Nl(e) = Dl(Bl(e)).normalize("NFC")
-Bl(e) = e.replace(/([\\/])+/g, "/").replace(/(^\/+|\/+$)/g, "") || "/"
-Dl(e) = e.replace(/ | /g, " ")
-```
+1. Collapse runs of backslash and forward slash into a single `/`.
+2. Strip leading and trailing slashes; an empty result becomes `/`.
+3. Replace U+00A0 and U+202F with an ordinary space.
+4. Normalize to NFC.
 
 Two of those steps change *which file you are talking about*. A non-breaking
 space (U+00A0) or a narrow no-break space (U+202F) becomes an ordinary space,

@@ -49,8 +49,8 @@ Not a repository. Closed source, verified by reading the shipped bundle
   idea in their engine: one field per file remembering the content as of the
   last successful sync turns a three-way merge into something that needs no
   version history at all. `docs/client-design.md`.
-- **The merge construction at `app.js:118574`**, kept almost entirely, including
-  both diff-match-patch cleanup passes.
+- **The sequence of diff-match-patch calls their merge performs**, read at
+  `app.js:118574` and kept almost entirely, including both cleanup passes.
 - **The defect in it**, which is the reason this project exists. `patch_apply`
   returns `[text, appliedFlags]` and theirs takes `[0]`, so a hunk that could
   not be placed is dropped and the result returned as a success. That is a lost
@@ -119,6 +119,38 @@ without.
   cleanly here, including two devices appending to a daily note, and caught
   nothing the existing checks miss. It is line-wise, and a Markdown paragraph is
   one line. `client/src/core/merge.ts`.
+
+## On what terms
+
+Not legal advice, and no lawyer has read this. It is written down because the
+question has a factual half that can be settled by reading the documents, and
+that half is settled here.
+
+**No Obsidian code is copied.** There is no reproduction of their source,
+minified or formatted, anywhere in this repository. Two behaviours are
+reimplemented and both are described as steps rather than transcribed:
+`normalizePath`, so the test fake and the real adapter agree, and the sequence of
+diff-match-patch calls that Obsidian's merge performs, which is that library's
+own documented usage pattern and is written here as such. What is taken
+otherwise is ideas, observed behaviour and measurements, none of which copyright
+covers.
+
+**The plugin API is MIT.** `obsidianmd/obsidian-api` carries an MIT licence
+(Copyright 2022 Dynalist Inc.), which is what the type declarations this plugin
+compiles against are used under.
+
+**Obsidian's terms permit reverse engineering for this purpose.** Their Terms of
+Service, section Restrictions, clause (iii) prohibits reverse engineering
+"*except for the purpose of developing Third Party Plugins for non-commercial
+use*", and their own definition of a Third Party Plugin covers this one. That is
+why the reading was done and it is the only reason it was done.
+
+**Basalt does not speak Obsidian Sync's protocol** and never has. It is a
+separate protocol answering to `docs/protocol.md`, it does not connect to their
+service, and it is not offered to anyone.
+
+Anyone forking this to sell something should get their own advice, because the
+clauses above turn on facts about the project that a fork changes.
 
 ## Libraries relied on
 

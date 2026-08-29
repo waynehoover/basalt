@@ -9,6 +9,14 @@ here is inferred from documentation or from behaviour.
 Where Obsidian Sync is better, it says so. A comparison that finds no fault with
 the thing writing it is not a comparison.
 
+This document exists because Basalt's design decisions were made against
+Obsidian Sync's observed behaviour, and a decision whose reasoning is not written
+down is a decision nobody can revisit. It is not a sales comparison: Basalt is a
+personal tool for one person's own devices and is not offered to anyone.
+Obsidian Sync is a supported, hosted product with a company behind it, and for
+most people that is the right answer. `docs/prior-art.md` records what was
+learned here and on what terms.
+
 ## The short version
 
 | | Obsidian Sync | Basalt |
@@ -80,19 +88,14 @@ which the server can read a note, and no code path that would let it.
 This is where Basalt deliberately does more work, and it is worth being precise
 because the difference is not "ours is better", it is "ours refuses more often".
 
-Obsidian's merge, whole, at `app.js:118574`:
+Obsidian's merge, read at `app.js:118574`, is diff-match-patch used the way its
+documentation shows: diff the ancestor against the local side, run the two
+cleanup passes when the diff has more than two edits, make patches from it, and
+apply them to the incoming side.
 
-```js
-function bZ(base, mine, theirs) {
-  const r = dmp.diff_main(base, mine, true, 0);
-  if (r.length > 2) { dmp.diff_cleanupSemantic(r); dmp.diff_cleanupEfficiency(r); }
-  return dmp.patch_apply(dmp.patch_make(base, r), theirs)[0];
-}
-```
-
-`patch_apply` returns `[text, appliedFlags]`. Taking `[0]` discards which hunks
-landed, so a hunk that could not be placed is dropped and the result is returned
-as a success.
+`patch_apply` returns `[text, appliedFlags]`, and theirs returns index 0.
+Discarding index 1 discards which hunks landed, so a hunk that could not be
+placed is dropped and the result is returned as a success.
 
 Basalt uses the same construction, keeps both cleanup passes, and then adds three
 checks. Each was measured, by disabling it and seeing what broke:

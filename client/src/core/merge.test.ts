@@ -2,15 +2,28 @@ import { describe, expect, it } from "vitest";
 import { diff_match_patch } from "diff-match-patch";
 import { conflictCopyPath, mergeText, sanitiseDevice } from "./merge.ts";
 
-/** Obsidian's merge, as shipped, for comparison. Verified at app.js:118574. */
-function obsidianMerge(base: string, mine: string, theirs: string): string {
+/**
+ * diff-match-patch used the way its own documentation shows, with none of the
+ * checks this module adds. The baseline the tests below measure against.
+ *
+ * Diff the ancestor against the local side, clean the diff up when it has more
+ * than two edits, turn it into patches and apply them to the incoming side.
+ * `patch_apply` returns a pair; take the text and ignore the flags.
+ *
+ * That last step is the whole subject of this file. It is also what Obsidian
+ * ships, which was verified by reading `app.js:118574` in the released
+ * application, and it is written here as the library's own usage pattern rather
+ * than as a copy of theirs, because that is what it is: there is no other
+ * obvious way to call these four functions.
+ */
+function unguardedMerge(base: string, mine: string, theirs: string): string {
     const dmp = new diff_match_patch();
-    const r = dmp.diff_main(base, mine, true, 0);
-    if (r.length > 2) {
-        dmp.diff_cleanupSemantic(r);
-        dmp.diff_cleanupEfficiency(r);
+    const diff = dmp.diff_main(base, mine, true, 0);
+    if (diff.length > 2) {
+        dmp.diff_cleanupSemantic(diff);
+        dmp.diff_cleanupEfficiency(diff);
     }
-    return dmp.patch_apply(dmp.patch_make(base, r), theirs)[0];
+    return dmp.patch_apply(dmp.patch_make(base, diff), theirs)[0];
 }
 
 describe("the cases that need no merge", () => {
@@ -102,7 +115,7 @@ describe("refusing to merge rather than losing an edit", () => {
         // there is nowhere for the local change to go.
         const theirs = "alpha\nbravo\ndelta\n";
 
-        const obsidian = obsidianMerge(base, mine, theirs);
+        const obsidian = unguardedMerge(base, mine, theirs);
         const ours = mergeText(base, mine, theirs);
 
         if (!obsidian.includes("REWRITTEN LOCALLY")) {
@@ -237,7 +250,7 @@ describe("the splice that diff-match-patch is happy to produce", () => {
         const theirs = "# Note\n\nTheir entirely other sentence.\n";
 
         // What the library does, unaided, and what Obsidian therefore ships.
-        const spliced = obsidianMerge(base, mine, theirs);
+        const spliced = unguardedMerge(base, mine, theirs);
         expect(spliced).toBe("# Note\n\nMy completely different entirely other sentence.\n");
         // Note what that defeats: both edits *are* present, so a check for a
         // lost insertion passes. Only an overlap check catches it.
@@ -344,7 +357,7 @@ describe("the guards behind the overlap check", () => {
         }
         const theirs = theirLines.join("\n");
 
-        const obsidian = obsidianMerge(base, mine, theirs);
+        const obsidian = unguardedMerge(base, mine, theirs);
         const ours = mergeText(base, mine, theirs);
 
         if (!obsidian.includes("LOCAL REWROTE LINE FIFTEEN")) {
@@ -492,7 +505,7 @@ describe("a hunk placed in the wrong place, which reports success", () => {
         .join("\n");
 
     it("is exactly what the library does, unaided", () => {
-        const spliced = obsidianMerge(base, mine, theirs);
+        const spliced = unguardedMerge(base, mine, theirs);
         // The edit is present, so nothing looking for a lost edit would notice.
         expect(spliced).toContain("EDITED LOCALLY");
         // And it is attached to the wrong item.
