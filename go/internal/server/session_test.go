@@ -3,16 +3,15 @@ package server
 import (
 	"errors"
 	"fmt"
+	"github.com/coder/websocket"
+	"github.com/waynehoover/basalt/internal/chunks"
+	"github.com/waynehoover/basalt/internal/store"
+	"github.com/waynehoover/basalt/internal/wire"
 	"os"
 	"strings"
 	"syscall"
 	"testing"
-
-	"github.com/coder/websocket"
-
-	"github.com/waynehoover/basalt/internal/chunks"
-	"github.com/waynehoover/basalt/internal/store"
-	"github.com/waynehoover/basalt/internal/wire"
+	"time"
 )
 
 /* ---------------------------------------------------------------- *
@@ -1015,4 +1014,66 @@ func TestAnUnboundedDeviceNameIsRefused(t *testing.T) {
 		Device: strings.Repeat("d", store.MaxDeviceLen+1),
 	})
 	cl.expectErr(wire.CodeBadName)
+}
+
+// A settled vault has nothing to say, and a connection with nothing to carry
+// used to be closed for it.
+//
+// Liveness was "said something in the last five minutes", which cannot tell a
+// dead connection from a finished one. Watched against a real client: a vault
+// that had synced dropped its connection every five minutes for ever, each time
+// reconnecting and replaying the handshake to learn it was already up to date.
+// Nothing was lost and nothing said why.
+func TestASilentConnectionIsKeptRatherThanClosed(t *testing.T) {
+	r := newRig(t)
+	// Fast enough that several pings pass inside a test, which is the only way
+	// to reach this without sleeping for minutes.
+	r.srv.pingEvery = 20 * time.Millisecond
+	r.srv.pongWait = 2 * time.Second
+
+	cl := r.dial("a")
+	cl.hello(0)
+
+	// Say nothing at all for many ping intervals. The old rule would have shut
+	// this down; the new one asks the connection instead of waiting on the
+	// client's manners.
+	time.Sleep(500 * time.Millisecond)
+
+	// Still there, and still able to work.
+	names := cl.put("after-the-silence.md", "written after saying nothing for a while")
+	if names == 0 {
+		t.Fatal("the session was closed while it had nothing to say")
+	}
+	cl.sendJSON(wire.In{Op: "ping"})
+	cl.recvInto("pong", &wire.Pong{})
+}
+
+// And a connection that stops answering still has to be reaped, or a server
+// accumulates sessions that will never speak again. A laptop closing its lid
+// produces exactly that: a socket that looks open, will never answer, and will
+// never error either.
+//
+// Forced here by giving the ping no time to be answered, which is the mechanism
+// under test rather than a way of simulating a dead peer: what has to be true is
+// that an unanswered ping closes the session. A peer that really is gone is
+// caught sooner and more cheaply, by the read failing.
+func TestAConnectionThatDoesNotAnswerAPingIsReaped(t *testing.T) {
+	r := newRig(t)
+	r.srv.pingEvery = 10 * time.Millisecond
+	r.srv.pongWait = time.Nanosecond // no pong can arrive this fast
+
+	cl := r.dial("a")
+	cl.hello(0)
+	if got := r.srv.hub.peerCount(testVault); got != 1 {
+		t.Fatalf("%d peers after connecting, want 1", got)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.srv.hub.peerCount(testVault) == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("a session whose pings went unanswered was never closed")
 }

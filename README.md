@@ -4,7 +4,7 @@
 
 # Basalt
 
-> Self-hosted sync engineered for Obsidian vaults, not for files
+> Blazing fast self-hosted Obsidian sync that just works
 
 [![CI](https://github.com/waynehoover/basalt/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -14,11 +14,11 @@
 </div>
 
 **Basalt** syncs an Obsidian vault between your own devices, through a server you
-run. The chunking, the merge, the encryption and the wire protocol are all
-designed around Markdown notes in a vault one person owns, rather than around
-files in general. That is where the speed comes from: a generic file syncer
-cannot send a few hundred bytes for an edit to a long note, because it does not
-know what it is carrying.
+run. It is engineered for vaults rather than for files: the chunking, the merge,
+the encryption and the wire protocol are all designed around Markdown notes that
+one person owns. That is where the speed comes from. A generic file syncer cannot
+send a few hundred bytes for an edit to a long note, because it does not know
+what it is carrying.
 
 ```
 server   ./basalt                       prints a setup string

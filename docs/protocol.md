@@ -154,6 +154,13 @@ one chunk instead of shifting every chunk after it.
   the server can check rather than trust: a client that reorders, repeats or
   skips a frame is caught at the moment it happens instead of storing one body
   under another's name.
+- A quiet connection is kept, not closed. The server pings and expects a pong
+  rather than treating silence as death: a vault that has finished syncing has
+  nothing to say, and closing it every few minutes meant reconnecting and
+  replaying the handshake for ever to learn it was already up to date. A client
+  that answers WebSocket pings needs to do nothing else, and one that stops
+  answering is closed within a ping interval, which is what a laptop closing its
+  lid produces.
 - A reply arriving before the one you asked for is normal. Another device can
   commit at any moment, so a batch can land between any request and its
   response, and every client has to demultiplex on `op` before matching a `res`

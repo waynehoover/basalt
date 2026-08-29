@@ -65,6 +65,7 @@ func (s *Server) Handle(ctx context.Context, conn *websocket.Conn, remote string
 		dead: make(chan struct{}),
 	}
 	go sess.writeLoop()
+	go sess.keepalive()
 
 	err := sess.run()
 	if err != nil {
@@ -196,10 +197,50 @@ func (s *Session) fatal(code string, cause error) error {
 	return cause
 }
 
+// readMsg waits for the next frame, for as long as the connection lives.
+//
+// No deadline of its own. A read that timed out could not tell a connection that
+// had died from one whose vault was simply settled, and closed both. What bounds
+// this now is keepalive: a connection that stops answering pings is closed, and
+// closing it is what ends this read.
+//
+// A client that answers pings and sends nothing else holds a session open. That
+// is a slow-loris in a system built for one person's own devices behind a
+// tunnel, and MaxPeers already bounds how many of them there can be.
 func (s *Session) readMsg() (websocket.MessageType, []byte, error) {
-	ctx, cancel := context.WithTimeout(s.ctx, IdleTimeout)
-	defer cancel()
-	return s.conn.Read(ctx)
+	return s.conn.Read(s.ctx)
+}
+
+// keepalive asks a quiet connection whether it is still there.
+//
+// Runs for the life of the session. A ping that is not answered inside PongWait
+// means the far end is gone however healthy the socket looks, which is what a
+// laptop closing its lid produces: a connection that will never answer and never
+// error either.
+func (s *Session) keepalive() {
+	ticker := time.NewTicker(s.srv.pingEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-s.dead:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(s.ctx, s.srv.pongWait)
+			err := s.conn.Ping(ctx)
+			cancel()
+			if err != nil {
+				// Closing the connection ends the read this session is parked
+				// on, which ends the session. Logged at debug: a device going
+				// away is ordinary.
+				s.srv.log.Debug("connection stopped answering",
+					"remote", s.remote, "vault", s.vaultID, "err", err)
+				s.kill(nil)
+				return
+			}
+		}
+	}
 }
 
 /* ---------------------------------------------------------------- *

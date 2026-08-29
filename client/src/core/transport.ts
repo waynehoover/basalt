@@ -146,6 +146,23 @@ export class ProtocolError extends Error {
     }
 }
 
+/**
+ * The one thing a failed `wss://` connection is most often missing.
+ *
+ * A bare host in a pairing string becomes `wss://`, which is right for the
+ * tunnel or the tailnet this is meant to be reached through: a server with TLS
+ * in front of it. A server without TLS in front of it answers nothing at all,
+ * and the failure looks exactly like a wrong address or a machine that is off.
+ *
+ * Cost an hour the first time it was hit, against a server on localhost. The
+ * address is in the message already; this adds the one word that turns it into
+ * something to try.
+ */
+function plainTextHint(url: string): string {
+    if (!url.startsWith("wss://")) return "";
+    return `. If that server has no TLS in front of it, pair with ws://${url.slice("wss://".length)} instead`;
+}
+
 /** Raised when the connection went away rather than answering. */
 export class ConnectionError extends Error {
     constructor(message: string) {
@@ -282,7 +299,7 @@ export class Transport {
 
         await new Promise<void>((resolve, reject) => {
             socket.onopen = () => resolve();
-            socket.onerror = () => reject(new ConnectionError(`could not connect to ${this.url}`));
+            socket.onerror = () => reject(new ConnectionError(`could not connect to ${this.url}${plainTextHint(this.url)}`));
             socket.onclose = (ev) => reject(new ConnectionError(`connection closed before opening: ${describeClose(ev)}`));
         });
 

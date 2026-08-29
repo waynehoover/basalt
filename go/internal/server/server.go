@@ -40,9 +40,24 @@ const (
 	// detected rather than pinning a goroutine forever.
 	WriteWait = 30 * time.Second
 
-	// IdleTimeout closes a session that says nothing at all. Clients that want
-	// to sit connected send a ping.
-	IdleTimeout = 5 * time.Minute
+	// PingInterval is how often the server checks that a quiet connection is
+	// still there, by sending a WebSocket ping and waiting for the pong.
+	//
+	// Liveness used to be "said something in the last five minutes", which
+	// confuses a dead connection with a settled one. A vault that has finished
+	// syncing has nothing to say, so its connection was closed every five
+	// minutes for ever, each time reconnecting and replaying the handshake to
+	// discover it was already up to date. Nothing was lost and nothing said why.
+	//
+	// A ping asks the question directly, and asks it of the connection rather
+	// than of the client's manners: it works for a client that never sends an
+	// application message, and it notices a connection that died silently, which
+	// a laptop closing its lid does, within a minute rather than five.
+	PingInterval = 45 * time.Second
+
+	// PongWait is how long a ping may go unanswered before the connection is
+	// treated as gone.
+	PongWait = 15 * time.Second
 
 	// SendQueueDepth is buffered frames per peer before it is dropped as too
 	// slow. Sized for a burst of fan-out, not for a catch-up: catch-up runs on
@@ -126,6 +141,12 @@ type Server struct {
 	// now is injectable so tests do not have to sleep to reach a timeout.
 	now func() time.Time
 
+	// pingEvery and pongWait are the constants unless a test lowers them, which
+	// is the only way to reach the keepalive without a test that sleeps for
+	// minutes.
+	pingEvery time.Duration
+	pongWait  time.Duration
+
 	// batchSize is BatchSize unless a test lowers it. Lowering it is how the
 	// catch-up path can be made to span many frames without seeding a vault
 	// large enough to do it honestly.
@@ -190,6 +211,7 @@ func NewWithLimit(st *store.Store, auth Authenticator, log *slog.Logger, maxPeer
 	return &Server{
 		st: st, hub: NewHub(), auth: auth, log: log,
 		maxPeers: maxPeers, perFileMax: store.DefaultPerFileMax,
+		pingEvery: PingInterval, pongWait: PongWait,
 		now: time.Now, batchSize: BatchSize,
 	}
 }
