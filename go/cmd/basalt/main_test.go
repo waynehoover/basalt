@@ -963,3 +963,44 @@ func majorMinor(v string) string {
 	}
 	return parts[0] + "." + parts[1]
 }
+
+// A bind address is not an address. Binding to every interface is the normal way
+// to run this, because a phone cannot reach a server on loopback, but pasting
+// "0.0.0.0:3003" into a device asks it to connect to nothing at all and the
+// failure looks like a server that is down.
+func TestTheSetupStringNamesSomethingADeviceCanDial(t *testing.T) {
+	for _, addr := range []string{"0.0.0.0:3003", ":3003", "[::]:3003"} {
+		var out bytes.Buffer
+		printSetup(&out, addr, "default", "TOKEN", true, false)
+		got := out.String()
+
+		for _, wildcard := range []string{"0.0.0.0:3003#", "[::]:3003#", " :3003#"} {
+			if strings.Contains(got, wildcard) {
+				t.Errorf("listening on %s printed %q as something to paste:\n%s", addr, wildcard, got)
+			}
+		}
+		if !strings.Contains(got, "#TOKEN") {
+			t.Errorf("listening on %s printed no pairing string at all:\n%s", addr, got)
+		}
+	}
+}
+
+// An explicit address is left exactly as given: it is already the answer.
+func TestAnExplicitAddressIsPrintedAsGiven(t *testing.T) {
+	var out bytes.Buffer
+	printSetup(&out, "vault.example.ts.net:3003", "default", "TOKEN", false, false)
+	if !strings.Contains(out.String(), "vault.example.ts.net:3003#TOKEN") {
+		t.Errorf("an explicit address was rewritten:\n%s", out.String())
+	}
+}
+
+// -localhost exists so that trying this out on one machine needs no thought
+// about schemes: a pairing string with none becomes wss://, and a loopback
+// server has no TLS in front of it.
+func TestLocalhostPrintsAStringThatCanBePastedAsIs(t *testing.T) {
+	var out bytes.Buffer
+	printSetup(&out, "127.0.0.1:3003", "default", "TOKEN", false, true)
+	if !strings.Contains(out.String(), "ws://127.0.0.1:3003#TOKEN") {
+		t.Errorf("-localhost printed a string that needs editing before use:\n%s", out.String())
+	}
+}

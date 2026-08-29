@@ -191,6 +191,7 @@ path used to be created on the spot and the backup then succeeded, of nothing.
 | flag | default | |
 |---|---|---|
 | `-addr` | `:3003` | listen address |
+| `-localhost` | off | bind to loopback and print a `ws://` string, for trying it on one machine |
 | `-vault` | `default` | the one vault this server serves |
 | `-max-file` | 67108864 (64 MiB) | largest file to accept |
 | `-allow-origin` | none | an extra browser origin, repeatable |
@@ -214,6 +215,17 @@ One caveat if you ever lower it: a client also refuses to *download* a version
 larger than what the server advertises, so lowering the limit below a file
 already in the vault leaves that file unreachable on a new device. Raising it is
 always safe.
+
+On a wildcard bind, which is what `:3003` and `0.0.0.0:3003` both mean, the setup
+string names the addresses of this machine's interfaces rather than the bind
+address. A bind address is not an address: pasting `0.0.0.0:3003` into a device
+asks it to connect to nothing at all, and the failure looks exactly like a server
+that is down.
+
+`-localhost` is for trying this out on one machine. It binds to loopback and
+prints a string with `ws://` on the front, because a pairing string with no
+scheme becomes `wss://`, which is right behind a tunnel and wrong for a server
+with no TLS in front of it.
 
 `-allow-origin` is for a browser client whose origin is not one of the three
 built in. A refused handshake logs the origin it refused and this flag, so the

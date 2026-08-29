@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -185,9 +186,23 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	vault := fs.String("vault", "default", "the one vault this server serves")
 	maxFile := fs.Int64("max-file", store.DefaultPerFileMax,
 		"largest file to accept, in bytes; the cost is the sending device's memory, roughly seven times the file")
+	local := fs.Bool("localhost", false,
+		"bind to 127.0.0.1 and print a ws:// pairing string, for trying this out on one machine")
 	verbose := fs.Bool("v", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *local {
+		// Both halves of what a local trial needs. Binding to loopback is the
+		// obvious half; the other is that a pairing string with no scheme
+		// becomes wss://, which is right for the tunnel this is normally reached
+		// through and wrong for a server with no TLS in front of it. Printing
+		// the string a device can actually use is the point of the flag.
+		_, port, err := net.SplitHostPort(*addr)
+		if err != nil {
+			return fmt.Errorf("-addr %q is not host:port: %w", *addr, err)
+		}
+		*addr = net.JoinHostPort("127.0.0.1", port)
 	}
 
 	level := slog.LevelInfo
@@ -254,7 +269,7 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		// No WriteTimeout: these are long-lived websockets.
 	}
 
-	printSetup(out, *addr, *vault, token, fresh)
+	printSetup(out, *addr, *vault, token, fresh, *local)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -282,16 +297,61 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	}
 }
 
-func printSetup(out io.Writer, addr, vault, token string, fresh bool) {
-	host := addr
-	if strings.HasPrefix(addr, ":") {
-		host = "<this-host>" + addr
+// pairingHosts turns a listen address into addresses a device could dial.
+//
+// A wildcard bind is the normal way to run this, because a phone cannot reach a
+// server bound to loopback. But the bind address is not an address: pasting
+// "0.0.0.0:3003" into a device asks it to connect to 0.0.0.0, which is nothing
+// at all, and the failure looks like a server that is down. So the interfaces
+// are named instead, and if none can be found the placeholder says plainly that
+// a hostname is needed.
+func pairingHosts(addr string) []string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return []string{addr}
 	}
+	if host != "" && host != "0.0.0.0" && host != "::" {
+		return []string{addr}
+	}
+
+	var out []string
+	ifaces, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, a := range ifaces {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipnet.IP
+			// Loopback is not reachable from another device, and a link-local
+			// address is not reachable without its zone, which is not something
+			// to paste into a phone.
+			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.To4() == nil {
+				continue
+			}
+			out = append(out, net.JoinHostPort(ip.String(), port))
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"<this-host>:" + port}
+	}
+	return out
+}
+
+func printSetup(out io.Writer, addr, vault, token string, fresh, local bool) {
 	if fresh {
 		fmt.Fprintln(out, "A new auth token was generated for this server.")
 	}
 	fmt.Fprintf(out, "basalt %s listening on %s, serving vault %q\n", version, addr, vault)
-	fmt.Fprintf(out, "  %s#%s\n", host, token)
+	for _, host := range pairingHosts(addr) {
+		// The scheme only where it is not the usual one. A pairing string with
+		// no scheme becomes wss://, which is right behind a tunnel and wrong for
+		// a loopback server with no TLS in front of it.
+		if local {
+			host = "ws://" + host
+		}
+		fmt.Fprintf(out, "  %s#%s\n", host, token)
+	}
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "That token authenticates a device. It is not the encryption key:")
 	fmt.Fprintln(out, "the vault passphrase is generated on your first device and this")
