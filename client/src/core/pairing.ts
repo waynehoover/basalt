@@ -24,15 +24,12 @@
  * has the vault, exactly as if they were holding the passphrase, and the CLI
  * says so when it prints one.
  *
- * ## The two secrets, and why there are still two
+ * ## One secret
  *
- * The server's auth token and the vault's root secret are independent today: the
- * server generates a random token and compares against it, and knows nothing
- * about the key schedule. Folding them together, so the server stores only a
- * hash of the derived auth key and the root secret is the only secret in the
- * system, is written down in docs/features.md as designed and not built. Until
- * it is, a pairing string carries both, which is why this format is
- * length-prefixed and versioned rather than fixed.
+ * The auth key is a branch of the same HKDF schedule that produces the content
+ * and path keys, and the server stores only its hash, so the root secret is the
+ * only secret in the system and this string carries nothing else. The format
+ * stays length-prefixed and versioned because it once carried two.
  */
 
 import { SECRET_LENGTH, base64urlDecode, base64urlEncode } from "./crypto.ts";

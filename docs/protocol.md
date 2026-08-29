@@ -35,14 +35,10 @@ vault reports "Fully synced" having uploaded nothing.
 `put` with a reason. Obsidian validates on download only, so a file containing
 `:` uploads happily and can never come back down, on any device, forever.
 
-Paths reach the server encrypted, so this rule splits in two. The *name* check
-is the client's, applied to the plaintext before encryption, because the server
-holds no key and cannot see a `:`. The server validates what it can see:
-structure, bounds, and the internal consistency of the entry, including that a
-file declaring a size names at least one chunk. That last one matters because an
-entry with a size and no chunks is byte-identical on the wire to an empty file,
-so a lost chunk list would present to every device as the note having been
-emptied.
+Paths reach the server encrypted, so the rule splits: the client checks the name
+before encrypting, and the server checks structure, bounds and internal
+consistency — including that a file declaring a size names at least one chunk,
+since a size with no chunks is byte-identical on the wire to an empty note.
 
 **Namespace by string, version the protocol.** `basalt/hkdf-aes-gcm/1`, not an
 integer shared with other implementations. The handshake carries a protocol
@@ -81,34 +77,24 @@ The server sends everything after `cursor` as ordered batches, then `ready`.
 <- {op:"caught-up", cursor:151}
 ```
 
-`batch` is the only message that ever carries entries. A live change is a batch
-of one, with `from` and `to` both set to its uid, so catch-up and live delivery
-are the same shape. A client with one code path for "apply these entries, then
-set the cursor to `to`" cannot have a bug in the live path that the catch-up
-path does not also have.
+`batch` is the only message that carries entries. A live change is a batch of
+one, so catch-up and live delivery are the same shape and cannot diverge.
 
-A device receives its **own** committed write as a batch with `entries: []`. It
-gets the cursor advance without the payload, so there is nothing to compare and
-no way to mistake its own file for a remote one. Skipping the device entirely
-instead would leave its cursor one behind for every file it pushes, and the next
-peer's change would then look like a gap.
+A device receives its **own** committed write as a batch with `entries: []`: the
+cursor advance without the payload, so there is nothing to mistake for a remote
+file. Skipping it entirely would leave the cursor one behind for every push, and
+the next peer's change would look like a gap.
 
 Batches leave the server in uid order, always, including under simultaneous
-pushes from several devices. That is what makes the continuity check worth
-having: a gap a client sees is a real one, never an artefact of two commits
-racing. An assertion that cries wolf gets switched off.
+pushes. That is what makes the continuity check worth having: a gap a client sees
+is real, never two commits racing. An assertion that cries wolf gets switched
+off.
 
-Entries within a batch are uid-ascending, and `from`/`to` let the client assert
-continuity. A client that sees a gap asks again from its own cursor instead of
-silently advancing past it.
-
-`from` and `to` are a *covered range*, not the first and last uid present. Every
-entry that exists with `from <= uid <= to` is in the batch, and a client that has
-applied everything up to `from - 1` may set its cursor to `to`. The distinction
-matters because history can be purged, so the uid sequence has holes; if
-`from`/`to` meant "the uids in this batch", every hole would read as a lost file.
-The continuity check is therefore `from == cursor + 1`, which a purge cannot
-break and a genuine gap cannot satisfy.
+`from` and `to` are a *covered range*, not the first and last uid present: every
+entry with `from <= uid <= to` is in the batch. That matters because a purge
+leaves holes in the uid sequence, and under the other reading every hole would
+read as a lost file. The check is `from == cursor + 1`, which a purge cannot
+break and a real gap cannot satisfy.
 
 Live changes that arrive mid-catch-up are held by the server and released in
 order once the backlog is on the wire. Dropping them instead would satisfy
@@ -261,24 +247,20 @@ to pull it back.
 read a path and recovery does not change that: it is a key in a table.
 
 `history` returns every version of one path, newest first, deletions included,
-because a history that stops at the last version with content does not say what
-happened. `before` pages backwards: pass the oldest uid already held. An empty
-list is not an error and is not distinguishable from a purged history, because
-the server cannot tell those apart and inventing the distinction would be a lie
-in a recovery tool.
+because a history stopping at the last version with content does not say what
+happened. `before` pages backwards. An empty list is not an error and is
+indistinguishable from a purged history, because the server cannot tell those
+apart and inventing the distinction would be a lie in a recovery tool.
 
-`deleted` returns paths whose newest version is a deletion, newest first, with
-renames suppressed. It is bounded at 1000, because a vault accumulates deletions
-for as long as it exists and an unbounded answer is one frame that grows without
-limit. `more` says the list was cut short, and a client must show that: a
-truncated list that does not say so is one somebody reads before concluding
-their note is gone. Suppression is not optional: a rename retires the old
-path, so without it most of the list is phantom deletions of files that still
-exist under another name.
+`deleted` returns paths whose newest version is a deletion, newest first, renames
+suppressed, bounded at 1000. `more` says the list was cut short and a client must
+show it: a truncated list that does not say so is one somebody reads before
+concluding their note is gone. Suppression is not optional — a rename retires the
+old path, so without it most of the list is phantom deletions.
 
-`entries` is an array in both, never null, for the same reason batches carry an
-array: a client iterating null crashes on exactly the answer it exists to
-handle, and for `deleted` that is the common case.
+`entries` is an array in both, never null. A client iterating null crashes on
+exactly the answer it exists to handle, and for `deleted` that is the common
+case.
 
 ### Restoring is not an operation
 
@@ -302,21 +284,17 @@ carries the address and the secret and nothing else.
 | unclaimed | the server's first-run token | binds the vault to the offered auth key |
 | claimed | the auth key, checked against a stored hash | ignored |
 
-The server stores only `sha256` of the auth key, hex encoded, per vault. It
-never needs the key: it checks one that is offered. A server holding the
-credential could write to the vault it exists only to keep, and a stolen disk
-already yields every byte of ciphertext without also handing over the ability to
-add to it.
+The server stores only `sha256` of the auth key, per vault: it never needs the
+key, only checks one offered. A stolen disk yields ciphertext without also
+handing over the ability to add to it.
 
-Claiming is one-time and there is no way to undo it over the wire. A second
-device offering its own key to a claimed vault is refused, or the first device
-would be locked out of its own notes. Trust on first connection would be simpler
-and would mean whoever reached the port first owned the vault, which is why the
-bootstrap token exists at all.
+Claiming is one-time and cannot be undone over the wire; a second device offering
+its own key to a claimed vault is refused, or the first would be locked out of
+its own notes. Trust on first connection would mean whoever reached the port
+first owned the vault, which is why the bootstrap token exists.
 
-A device sends `claim` on every hello, because a vault that has been claimed
-ignores it and a device therefore never has to work out whether it is the first.
-The first-run token is kept in a device's config only until it has been spent.
+A device sends `claim` on every hello, so it never has to work out whether it is
+the first. The first-run token is kept only until it has been spent.
 
 ## Which clients may connect
 
@@ -326,10 +304,9 @@ client always sends one, and an Obsidian plugin is a browser client: desktop is
 `app://obsidian.md`, verified from a running app, and the two mobile origins are
 Capacitor's documented defaults and have never been checked against a device.
 
-A refused handshake logs the origin it refused and the `-allow-origin` flag that
-would admit it, because the only thing that knows a client's origin is the
-client, and this exact gap once meant no plugin could connect at all while every
-test passed.
+A refused handshake logs the origin and the `-allow-origin` flag that would admit
+it. This exact gap once meant no plugin could connect at all while every test
+passed.
 
 ## Crypto
 

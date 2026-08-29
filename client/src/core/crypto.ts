@@ -2,10 +2,9 @@
  * Deterministic authenticated encryption, and the key schedule above it.
  *
  * This module has no reference to Obsidian, to the transport, or to any state.
- * docs/client-design.md notes that the cleanest boundary in Obsidian's own
- * engine is its encryption provider, testable with no app present at all; this
- * is the equivalent here, and everything in it can be exercised with WebCrypto
- * and nothing else.
+ * The cleanest boundary in Obsidian's own engine is its encryption provider,
+ * testable with no app present at all. This is the equivalent, and everything in
+ * it can be exercised with WebCrypto and nothing else.
  *
  * ## Why the sealing is deterministic
  *
@@ -125,10 +124,9 @@ export function generateSecret(): Uint8Array {
  * Derives every key from a root secret.
  *
  * The secret is used as HKDF input keying material directly, with no password
- * stretching, because it is 160 random bits rather than something a human
- * chose. A stretching function's
- * job is to make guessing expensive, and there is nothing here to guess.
- * choose it.
+ * stretching, because it is 160 random bits rather than something a human chose.
+ * A stretching function's job is to make guessing expensive, and there is
+ * nothing here to guess.
  *
  * Salt is empty and deliberately so. HKDF's salt defends against related-input
  * attacks on low-entropy material; with a uniformly random secret the info

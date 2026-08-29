@@ -1,8 +1,8 @@
 /**
  * The local index, and the decision it exists to answer.
  *
- * docs/client-design.md calls one field the most useful thing in Obsidian's
- * engine: `synchash`, the content hash as of the last successful sync. It is the
+ * The most useful idea in Obsidian's engine is one field: `synchash`, the
+ * content hash as of the last successful sync. It is the
  * common ancestor, so a three-way merge needs no version history on the device
  * at all. Everything here is built around that.
  *

@@ -236,9 +236,9 @@ export type MergeOutcome =
  * Merges `mine` and `theirs` over their common ancestor `base`.
  *
  * `base` is the content as of the last successful sync, which the local index
- * remembers as one hash per file. docs/client-design.md: that single field is
- * the most useful thing in Obsidian's engine, because it turns a three-way merge
- * into something that needs no version history at all.
+ * remembers as one hash per file. That single field is the most useful idea in
+ * Obsidian's engine: it turns a three-way merge into something that needs no
+ * version history at all.
  */
 export function mergeText(
     base: string,

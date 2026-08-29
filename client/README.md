@@ -15,9 +15,7 @@ every Obsidian target both provide. So the headless client is not a second
 client, it is the same one with a different adapter.
 
 That structure is not a guess. Obsidian ships `obsidian-headless` and it is the
-same engine as the desktop app with the Vault API swapped out;
-`docs/client-design.md` records how that was established and what else the
-headless client is built from.
+same engine as the desktop app with the Vault API swapped out.
 
 ## Working on it
 

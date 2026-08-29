@@ -44,10 +44,8 @@ test fail, restore it.
 
 ## Prior art
 
-`docs/prior-art.md` is the full list: every project that shaped this one, what
-specifically came from each, and what was evaluated and turned down. Add to it
-when reading someone else's code changes something here. The two that come up
-most:
+`docs/compared.md` credits every project this one learned from. Add to it when
+reading someone else's code changes something here. The two that come up most:
 
 - `~/code/obionesync` — the predecessor, which piggybacks Obsidian's own engine.
   Its README and CLAUDE.md hold the verified protocol facts about Obsidian Sync.

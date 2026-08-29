@@ -3,10 +3,9 @@
  *
  * Everything platform-specific about a client is behind this interface, and
  * there is deliberately not much of it. `obsidian-headless` is the same sync
- * engine as the desktop app with the Vault API swapped for the filesystem
- * (docs/client-design.md records how that was established), so the size of this
- * interface is the size of the difference between a plugin and a headless
- * client.
+ * engine as the desktop app with the Vault API swapped for the filesystem, so
+ * the size of this interface is the size of the difference between a plugin and
+ * a headless client.
  *
  * It is narrow enough that an in-memory implementation is a real one rather than
  * a mock, which is what lets two engines converge against a real server in a

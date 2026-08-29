@@ -2,9 +2,8 @@
  * Content-defined chunking: a Rabin-Karp rolling hash decides where chunks end.
  *
  * The idea and the parameters come from LiveSync's `splitPiecesRabinKarp`, read
- * at `livesync-commonlib/src/string_and_binary/chunks.ts:493` and recorded in
- * docs/client-design.md. Two things are done differently and both are
- * deliberate; they are noted where they occur.
+ * at `livesync-commonlib/src/string_and_binary/chunks.ts:493`. Two things are
+ * done differently and both are deliberate; they are noted where they occur.
  *
  * ## Why a rolling hash rather than fixed offsets
  *

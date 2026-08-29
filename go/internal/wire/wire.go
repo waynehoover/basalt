@@ -2,9 +2,9 @@
 //
 // It holds no state, opens no connection and knows no policy, so the whole
 // vocabulary can be exercised without a server. That separation is deliberate:
-// docs/client-design.md notes that the cleanest boundary in Obsidian's engine is
-// the one between orchestration and a transport that knows no policy, and this
-// is the equivalent seam on the server side.
+// the cleanest boundary in Obsidian's engine is the one between orchestration
+// and a transport that knows no policy, and this is the equivalent seam on the
+// server side.
 //
 // Every reply names its outcome. docs/protocol.md's first design rule exists
 // because in Obsidian's protocol `{res:"ok"}` on a push means "discard the

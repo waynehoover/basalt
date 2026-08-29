@@ -7,24 +7,12 @@ server   ./basalt                       prints a setup string
 device   paste it                       that is the whole setup
 ```
 
-Basalt is built for one person's devices on a private network, reached over
-Tailscale or a Cloudflare tunnel. That assumption is what lets it be small: no
-accounts, no subscription, no external database, no settings screen.
+Built for one person's devices on a private network, reached over Tailscale or a
+Cloudflare tunnel. That assumption is what lets it be small: no accounts, no
+subscription, no external database, no settings screen.
 
-Your notes are encrypted before they leave the device. The server stores
-ciphertext and deterministically-encrypted paths, and has no key for either.
-
-## What this is not
-
-Not a product, not a service, and not something run for anyone else. It is a
-personal tool for syncing one person's own devices, and every design decision
-assumes that; `docs/philosophy.md` lists what it refuses to do as a result.
-
-It is also not an Obsidian plugin distribution, a hosted offering, or an
-alternative anyone is being sold. Where the docs compare behaviour with Obsidian
-Sync or with other plugins, that is engineering documentation for the decisions
-made here, and `docs/prior-art.md` says what was learned from each and on what
-terms.
+Notes are encrypted before they leave the device. The server stores ciphertext
+and encrypted paths and has no key for either.
 
 ## Backing it up
 
@@ -33,39 +21,20 @@ basalt backup -to /mnt/usb/basalt
 ```
 
 Incremental, verified, and it runs while the server does. The copy is ciphertext,
-so keep the passphrase somewhere other than the backup: without it the backup
-restores nothing.
-
-For a copy of your notes you can read without Basalt, back up the vault folder on
-any device with whatever you already use. It is plain Markdown. `docs/backup.md`
-explains why both kinds are worth having and what each one covers.
+so keep the passphrase somewhere else. For a copy you can read without Basalt,
+back up the vault folder with whatever you already use — it is plain Markdown.
+`docs/backup.md` covers what each kind saves you from.
 
 ## Status
 
-Early. See `docs/` for the design this is being built to:
+Early. The headless client works; the plugin has run in a real vault once. It has
+never run on a phone.
 
-- `docs/running.md`, putting it on a server and on your devices, Docker included
-- `docs/features.md`, everything it does, marked built, partial or designed
-- `docs/tradeoffs.md`, the design decisions and what each one costs
-- `docs/benchmark.md`, speed and correctness, measured together
-- `docs/philosophy.md` — what it refuses to do, and why
-- `docs/protocol.md` — the wire protocol, and the seven defects it exists to avoid
-- `docs/backup.md`, on the two kinds of backup and which one saves you from what
-- `docs/vs-obsidian-sync.md`, a side by side comparison, including where theirs wins
-- `docs/prior-art.md` — every project this one is built on, and what came from each
-- `client/README.md`, how the plugin and the headless client share one engine
-
-## Not LiveSync
-
-[Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync) is excellent,
-MIT-licensed, and does considerably more than this will: CouchDB and S3 backends,
-peer-to-peer sync, hidden-file sync, plugin sync, a bridge to other apps. Basalt
-deliberately does none of that. If you need any of it, use LiveSync.
-
-Basalt takes two things from reading it: content-defined chunking, so editing a
-large note re-uploads one chunk rather than all of them, and the conclusion that
-text merging is solved and should not be reimplemented.
-
-It is not the only debt. `docs/prior-art.md` lists every project that shaped
-this one, what specifically came from each, and the two that were evaluated and
-turned down.
+- `docs/running.md` — server, devices, Docker
+- `docs/philosophy.md` — the ten durability rules and what it refuses to do
+- `docs/protocol.md` — the wire protocol
+- `docs/benchmark.md` — speed and correctness, measured together
+- `docs/compared.md` — Obsidian Sync, the two self-hosted plugins, and what was
+  borrowed from each
+- `docs/backup.md` — the two kinds of backup
+- `client/README.md` — how the plugin and the headless client share one engine

@@ -2,9 +2,9 @@
  * The wire, and nothing above it.
  *
  * This module knows the protocol and no policy: what a `put` looks like, not
- * when to send one. docs/client-design.md singles that boundary out as the
- * cleanest thing in Obsidian's engine, where a 66-method engine collaborates
- * with a 20-method transport that decides nothing.
+ * when to send one. That boundary is the cleanest thing in Obsidian's engine,
+ * where a 66-method engine collaborates with a 20-method transport that decides
+ * nothing.
  *
  * ## Shape, taken from Obsidian's transport
  *

@@ -1,9 +1,9 @@
 /**
  * The engine: everything that decides, and nothing that knows where files live.
  *
- * Structure follows Obsidian's, which docs/client-design.md describes as an
- * orchestrator collaborating with a transport that knows no policy, a filter that
- * knows only paths, and a crypto provider with no reference to the app. That
+ * Structure follows Obsidian's: an orchestrator collaborating with a transport
+ * that knows no policy, a filter that knows only paths, and a crypto provider
+ * with no reference to the app. That
  * shape is why the same engine runs in their plugin and their headless client,
  * and it is why this one can run against a vault held in memory.
  *
