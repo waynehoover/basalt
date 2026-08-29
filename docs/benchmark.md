@@ -1,5 +1,7 @@
 # Benchmark
 
+[Docs index](index.md)
+
 `cd client && bun run bench:sync`. `BENCH_SCALE=1` for the full size,
 `BENCH_WIRE=400` for one wire.
 

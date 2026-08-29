@@ -1,5 +1,7 @@
 # Basalt client
 
+[Docs index](../docs/index.md)
+
 One sync engine, two things to run it: the Obsidian plugin and a headless client.
 
 ```

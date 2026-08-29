@@ -1,5 +1,7 @@
 # Running it
 
+[Docs index](index.md)
+
 One binary on a machine that stays on, and a plugin on each device.
 
 ## Docker

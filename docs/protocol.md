@@ -1,5 +1,7 @@
 # The Basalt wire protocol, v1
 
+[Docs index](index.md)
+
 Basalt does not speak Obsidian Sync's protocol. This document exists because
 that protocol has seven defects we hit in practice, six of which fail silently,
 and each rule below is the inversion of one of them.

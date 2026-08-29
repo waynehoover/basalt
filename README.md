@@ -55,10 +55,4 @@ never on a phone.
 
 ## Docs
 
-[Running it](docs/running.md) ·
-[Philosophy](docs/philosophy.md) ·
-[Protocol](docs/protocol.md) ·
-[Benchmark](docs/benchmark.md) ·
-[Compared](docs/compared.md) ·
-[Backup](docs/backup.md) ·
-[Client](client/README.md)
+[Read the docs](docs/index.md).

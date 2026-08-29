@@ -1,5 +1,7 @@
 # Design philosophy
 
+[Docs index](index.md)
+
 **Minimal, opinionated, fast, self-hosted.** In that order when they conflict,
 except that nothing outranks not losing a note.
 

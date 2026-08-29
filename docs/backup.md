@@ -1,5 +1,7 @@
 # Backup
 
+[Docs index](index.md)
+
 Two different things people mean by "back up my notes", and confusing them is how
 someone ends up with a directory nobody can read.
 

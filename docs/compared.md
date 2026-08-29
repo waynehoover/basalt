@@ -1,5 +1,7 @@
 # Compared, and where it came from
 
+[Docs index](index.md)
+
 Basalt was built against three other projects: Obsidian Sync, whose behaviour was
 read out of the shipped app, and two self-hosted plugins whose source is public.
 This is what differs, what was learned from each, and where theirs is better.
