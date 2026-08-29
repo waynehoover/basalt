@@ -3,7 +3,8 @@
 [Back to the project](../README.md)
 
 **[Running it](running.md)**
-Putting the server on a box, pairing your devices, and the Docker image.
+Putting the server on a box, pairing your devices, the Docker image, and every
+command and flag.
 
 **[Philosophy](philosophy.md)**
 The ten durability rules, each with the incident that produced it, and what this

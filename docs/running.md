@@ -168,6 +168,72 @@ Files, folders, deletions still recoverable, versions in all, and how many of
 those versions are history a purge would drop. Separate numbers rather than a
 total, because a total does not tell you whether a purge would help.
 
+## Commands and flags
+
+Every command takes `-data`, the directory holding the database, chunk bodies and
+the auth token. It defaults to `~/.basalt`, and only `serve` will create one:
+the others refuse a path that is not already a data directory, because a mistyped
+path used to be created on the spot and the backup then succeeded, of nothing.
+
+| | |
+|---|---|
+| `basalt serve` | run the server. The default command, so bare `basalt` is this |
+| `basalt backup -to DIR` | copy everything, verified, while the server runs |
+| `basalt verify` | check the store against itself |
+| `basalt purge` | reclaim space from unreferenced bodies |
+| `basalt stats` | what the vault holds |
+| `basalt service` | print a hardened systemd unit |
+| `basalt health` | ask a running server if it is well, for a container probe |
+| `basalt version` | what this binary is |
+
+### serve
+
+| flag | default | |
+|---|---|---|
+| `-addr` | `:3003` | listen address |
+| `-vault` | `default` | the one vault this server serves |
+| `-max-file` | 67108864 (64 MiB) | largest file to accept |
+| `-allow-origin` | none | an extra browser origin, repeatable |
+| `-v` | off | verbose logging |
+
+`-max-file` is bounded by what the sending device can hold, not by anything the
+server pays. Preparing a file to send costs roughly seven times its size in
+memory, so 64 MiB costs a device about 520 MB and 256 MiB would cost about
+1.8 GB. Raise it for a vault that really does hold video, and expect the device
+doing the sending to feel it. The ceiling is 256 MiB whatever you pass, because
+that is what the store will accept.
+
+One caveat if you ever lower it: a client also refuses to *download* a version
+larger than what the server advertises, so lowering the limit below a file
+already in the vault leaves that file unreachable on a new device. Raising it is
+always safe.
+
+`-allow-origin` is for a browser client whose origin is not one of the three
+built in. A refused handshake logs the origin it refused and this flag, so the
+answer is in the log rather than in this document.
+
+### backup, verify, purge
+
+| flag | on | |
+|---|---|---|
+| `-to DIR` | backup | where to copy to, required |
+| `-deep` | backup, verify | re-read every body and check it against its name |
+| `-grace` | purge | spare unreferenced bodies written this recently (default 1h) |
+| `-vault` | purge | which vault to purge (default `default`) |
+
+`docs/backup.md` covers what each of these saves you from and which needs the
+server stopped.
+
+### service and health
+
+| flag | on | |
+|---|---|---|
+| `-addr`, `-vault` | service | what the generated unit should use |
+| `-user` | service | user to run as, defaulting to whoever runs it |
+| `-binary` | service | path to the binary, defaulting to this one |
+| `-addr` | health | the server to ask (default `127.0.0.1:3003`) |
+| `-timeout` | health | how long to wait (default 5s) |
+
 ## Version
 
 ```
