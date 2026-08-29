@@ -4,7 +4,9 @@
 
 # Basalt
 
-**Self-hosted sync for Obsidian. One binary on your box, one string on each device.**
+**Self-hosted sync engineered for Obsidian vaults, not for files.**
+
+One binary on your box, one string on each device.
 
 [![CI](https://github.com/waynehoover/basalt/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt/actions/workflows/ci.yml)
 [![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](go/go.mod)
@@ -18,6 +20,16 @@
 server   ./basalt                       prints a setup string
 device   paste it                       that is the whole setup
 ```
+
+Both halves are built for one thing: Markdown notes in a vault one person owns.
+The chunking, the merge, the encryption and the wire protocol are all designed
+around that, rather than around files in general. It is why an edit to a long
+note costs a few hundred bytes instead of the whole file, why two devices
+editing one note usually merge cleanly and never merge wrongly, and why syncing
+a vault over a slow link costs a handful of round trips. A generic file syncer
+cannot do those things, because it does not know what it is carrying.
+
+Correctness comes first and speed second, in that order when they conflict.
 
 ## Features
 
