@@ -40,6 +40,7 @@ Early. See `docs/` for the design this is being built to:
 - `docs/protocol.md` — the wire protocol, and the seven defects it exists to avoid
 - `docs/backup.md`, on the two kinds of backup and which one saves you from what
 - `docs/vs-obsidian-sync.md`, a side by side comparison, including where theirs wins
+- `docs/prior-art.md` — every project this one is built on, and what came from each
 - `client/README.md`, how the plugin and the headless client share one engine
 
 ## Not LiveSync
@@ -52,3 +53,7 @@ deliberately does none of that. If you need any of it, use LiveSync.
 Basalt takes two things from reading it: content-defined chunking, so editing a
 large note re-uploads one chunk rather than all of them, and the conclusion that
 text merging is solved and should not be reimplemented.
+
+It is not the only debt. `docs/prior-art.md` lists every project that shaped
+this one, what specifically came from each, and the two that were evaluated and
+turned down.

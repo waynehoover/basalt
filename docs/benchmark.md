@@ -129,6 +129,54 @@ What can be said without any race at all: an edit to a large note costs one
 chunk here and costs the whole file on any backend that stores files. That
 follows from the design, and no wire changes it.
 
+## What is next, in the order it is worth doing
+
+Ranked by what the measurements above say, not by what sounds interesting.
+
+**1. Run this on Linux.** The only number here that is not honest about the
+deployment. 108 of the 2000-file upload's 167 seconds are this laptop's
+`F_FULLFSYNC`; on Linux the same chunks are about 7. Nothing else on this list
+matters until the platform it ships on has been measured end to end, and until
+it has, every upload figure in this document is a laptop's.
+
+**2. Then stop, probably.** After that the upload is within a few seconds of
+what a 2.6 MiB/s link can carry and the download already is: 64 s against a 48 s
+floor. There is no round trip left to remove and no obvious byte left to save,
+so the next honest step is to find that out rather than to keep optimising.
+
+**3. Run it on a phone.** Never done. It is last on a performance list and first
+on every other one: WebCrypto in a webview, memory pressure during a first sync,
+and a battery are all unmeasured, and any of them could make the numbers above
+irrelevant on the device most people sync to.
+
+**4. Measure their plugin on this machine.** See below. It is the only thing
+that would turn the comparison above into a comparison.
+
+### Measured and not worth doing
+
+**Solid compression on a first sync.** The idea: compress the whole first push
+as one stream rather than each chunk separately, so the dictionary spans files.
+Measured on the benchmark vault, per-chunk deflate sends 60% of the plaintext
+and one solid stream sends 57%. **It saves 5%,** and it would cost a second code
+path through the most durability-critical part of the client, break content
+addressing (a chunk of a compressed stream is not a chunk of a file), and give
+up per-edit updates for anything sent that way.
+
+An earlier estimate of this said 43%, and it was measured against the benchmark
+generator's first version, which cycled a dozen words. That is the same trap
+documented at the top of this file, walked into a second time.
+
+**Request ids, so several questions can be in flight.** Worth a great deal
+before batching and very little after: there are 26 round trips in a 2000-file
+sync to overlap. The one-in-flight rule stays, and it stays for free.
+
+**Fewer, larger chunks to cut the fsync count.** 33261 chunks is 33261 file
+flushes, and doubling the chunk size halves them. But the chunk size was already
+chosen by measurement against what an edit costs, and 1024 beat 256 on every
+axis; trading that back to save disk flushes on a first sync is optimising the
+one operation that happens once. Revisit only if step 1 shows the flushes still
+dominate on Linux, which the 4527/s figure says they will not.
+
 ## Why there is no table with their plugin measured on this machine
 
 There should be one. It needs Obsidian, a Nextcloud or WebDAV server, their

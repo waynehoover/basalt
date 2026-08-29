@@ -7,7 +7,7 @@ about design, and about the two other self-hosted projects worth comparing with:
 [Sync Engine](https://github.com/hesprs/sync-engine) and
 [Fast Note Sync](https://github.com/haierkeys/obsidian-fast-note-sync). Both are
 good, both are further along in ways named below, and reading them found real
-defects here.
+defects here. `docs/prior-art.md` credits them line by line.
 
 ---
 
