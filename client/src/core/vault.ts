@@ -36,6 +36,27 @@ export interface Vault {
     list(): Promise<FileStat[]>;
     read(path: string): Promise<Uint8Array>;
     /**
+     * The same bytes, in blocks, for a caller that does not need them at once.
+     *
+     * Optional, and the reason the engine has two paths for a large file. A
+     * vault that can stream lets one be chunked, named and sent in bounded
+     * memory; a vault that cannot has to hand over the whole thing.
+     *
+     * Obsidian's `DataAdapter` is the second kind: `readBinary` returns the
+     * whole ArrayBuffer and there is no ranged or streaming read beside it, so
+     * the plugin takes the buffered path and the headless client does not.
+     */
+    readBlocks?(path: string, blockSize?: number): AsyncIterable<Uint8Array>;
+    /**
+     * One byte range. Needed with `readBlocks` and for the same reason.
+     *
+     * The chunk names go up before any body does, so the file is read once to
+     * name it and then again for the chunks the server actually asks for.
+     * Without this the second pass would need the whole file in hand, which is
+     * the thing being avoided.
+     */
+    readRange?(path: string, start: number, end: number): Promise<Uint8Array>;
+    /**
      * Writes a file, creating any missing folders.
      *
      * `mtime` is set to the value given, because the engine's whole decision

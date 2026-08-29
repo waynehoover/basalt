@@ -403,3 +403,85 @@ describe("writing durably", () => {
         }
     });
 });
+
+/**
+ * Streaming a file, which is how a large one is sent without being held.
+ *
+ * The chunk names go up before any body does, so the file is read once to name
+ * it and again for the chunks the server asks for. Both reads have to agree
+ * with each other and with reading it whole, or a chunk would go up under a
+ * name that is not its own.
+ */
+describe("reading a file in blocks and in ranges", () => {
+    const body = (n: number) => {
+        const out = new Uint8Array(n);
+        for (let i = 0; i < n; i++) out[i] = (i * 31 + (i >> 8)) & 0xff;
+        return out;
+    };
+
+    it("streams exactly what reading it whole would give", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "basalt-stream-"));
+        try {
+            const bytes = body(700_000);
+            await writeFile(join(dir, "big.bin"), bytes);
+            const vault = new NodeVault(dir);
+
+            const blocks: Uint8Array[] = [];
+            for await (const b of vault.readBlocks("big.bin", 64 * 1024)) blocks.push(b);
+            expect(blocks.length).toBeGreaterThan(1);
+
+            const joined = new Uint8Array(blocks.reduce((n, b) => n + b.length, 0));
+            let at = 0;
+            for (const b of blocks) {
+                joined.set(b, at);
+                at += b.length;
+            }
+            expect(joined).toEqual(await vault.read("big.bin"));
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    // The block buffer is reused, so a generator yielding views rather than
+    // copies would hand out blocks that are rewritten before they are used.
+    it("gives blocks that survive the next block being read", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "basalt-stream-"));
+        try {
+            await writeFile(join(dir, "big.bin"), body(400_000));
+            const vault = new NodeVault(dir);
+
+            const held: Uint8Array[] = [];
+            for await (const b of vault.readBlocks("big.bin", 32 * 1024)) held.push(b);
+
+            const whole = await vault.read("big.bin");
+            let at = 0;
+            for (const b of held) {
+                expect(b, `block at ${at} was overwritten`).toEqual(whole.subarray(at, at + b.length));
+                at += b.length;
+            }
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("reads a range, and reports a short one rather than padding it", async () => {
+        const dir = await mkdtemp(join(tmpdir(), "basalt-stream-"));
+        try {
+            const bytes = body(10_000);
+            await writeFile(join(dir, "big.bin"), bytes);
+            const vault = new NodeVault(dir);
+
+            expect(await vault.readRange("big.bin", 1000, 3000)).toEqual(bytes.subarray(1000, 3000));
+            expect(await vault.readRange("big.bin", 0, 1)).toEqual(bytes.subarray(0, 1));
+
+            // Past the end, which is what a file shrinking mid-upload looks
+            // like. Short is the honest answer; zeroes would be bytes nobody
+            // wrote, sent under a name that is not theirs.
+            const past = await vault.readRange("big.bin", 9_000, 12_000);
+            expect(past.length).toBe(1_000);
+            expect(past).toEqual(bytes.subarray(9_000));
+        } finally {
+            await rm(dir, { recursive: true, force: true });
+        }
+    });
+});

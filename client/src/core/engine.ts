@@ -41,7 +41,7 @@
  * rule 10 of docs/philosophy.md in its natural habitat.
  */
 
-import { looksLikeJson, looksLikeText, chunkBytes, sizesFor } from "./chunk.ts";
+import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
 import { openChunk, openPath, sealChunks, sealPath, type SealedChunk, type VaultKeys } from "./crypto.ts";
 import { conflictCopyPath, mergeText } from "./merge.ts";
 import {
@@ -585,7 +585,7 @@ export class Engine {
             if (!stat.folder && needsRehash(entry, Math.ceil(stat.mtime), stat.size)) {
                 // The only place a file is read for its content, and only when
                 // the stat says it moved.
-                sealed = await this.rehash(entry, path);
+                sealed = await this.rehash(entry, path, stat.size);
             }
             local = { folder: stat.folder, mtime: entry.mtime, size: entry.size, hash: entry.hash };
         }
@@ -625,7 +625,10 @@ export class Engine {
      * Only for files small enough to hold. Above that the bodies are dropped
      * for the reason `planUpload` explains, and it does its own work.
      */
-    private async rehash(entry: IndexEntry, path: string): Promise<Scanned> {
+    private async rehash(entry: IndexEntry, path: string, knownSize?: number): Promise<Scanned> {
+        const streamed = await this.streamScan(entry, path, knownSize);
+        if (streamed) return streamed;
+
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
         const pieces = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)];
@@ -647,6 +650,50 @@ export class Engine {
         entry.hash = contentId(entry.chunks);
         entry.size = bytes.length;
         return { bytes, pieces, names: entry.chunks };
+    }
+
+    /**
+     * Names a large file without ever holding it, when the vault can stream.
+     *
+     * The buffered path holds the whole file from the moment it is read until
+     * the last chunk has gone, because a wanted chunk is sealed again from the
+     * bytes in hand. That is the whole of why a 256 MiB attachment costs most of
+     * a gigabyte: not the sending, the holding.
+     *
+     * With blocks and ranges the file is read twice from disk instead: once to
+     * cut and name it, keeping one chunk at a time, and again for the chunks the
+     * server actually asks for. Two reads of a disk against most of a gigabyte
+     * of memory is not a close trade.
+     *
+     * Returns undefined when the vault cannot do it, or when the file is small
+     * enough that holding it is cheaper than reading it twice. Obsidian's
+     * adapter is the first case: it has `readBinary` and nothing beside it.
+     */
+    private async streamScan(
+        entry: IndexEntry,
+        path: string,
+        knownSize: number | undefined
+    ): Promise<Scanned | undefined> {
+        const vault = this.opts.vault;
+        if (!vault.readBlocks || !vault.readRange) return undefined;
+        if (knownSize === undefined || knownSize <= KEEP_SEALED_BELOW) return undefined;
+
+        const isText = this.mergeable(path);
+        const names: string[] = [];
+        const spans: { start: number; end: number }[] = [];
+        let size = 0;
+
+        for await (const piece of chunkStream(vault.readBlocks(path), this.sizesFor(knownSize, isText), isText)) {
+            const sealed = await sealChunks(this.opts.keys, [piece.bytes]);
+            names.push(sealed[0]!.name);
+            spans.push({ start: piece.offset, end: piece.offset + piece.bytes.length });
+            size += piece.bytes.length;
+        }
+
+        entry.chunks = names;
+        entry.hash = contentId(names);
+        entry.size = size;
+        return { names, spans, path, size };
     }
 
     /** Chunk names without keeping the bodies. See `sealedNames`. */
@@ -966,14 +1013,40 @@ export class Engine {
         }
 
         // Offsets only, for a file too large to hold sealed. A wanted chunk is
-        // sealed again from the bytes still in hand, which is deterministic and
-        // so gives back exactly what was named.
+        // sealed again, which is deterministic and so gives back exactly what
+        // was named: either from the bytes still in hand, or by reading the
+        // range back off the disk if the file was never held at all.
+        const keys = this.opts.keys;
+        const vault = this.opts.vault;
+
+        if (scan.spans) {
+            const spanOf = new Map(scan.names.map((name, i) => [name, scan.spans[i]!]));
+            return {
+                names: scan.names,
+                bodyOf: async (name) => {
+                    const span = spanOf.get(name);
+                    if (!span) throw new Error(`no chunk named ${name} in ${path}`);
+                    const range = await vault.readRange!(scan.path, span.start, span.end);
+                    const again = await sealChunks(keys, [range]);
+                    // Checked against the name it was promised under. The file
+                    // was read to name it and is being read again to send it,
+                    // so an edit in between would otherwise put bytes on the
+                    // wire under a name that is not theirs. The server would
+                    // catch that and end the session; caught here it is one
+                    // file to try again next pass.
+                    if (again[0]!.name !== name) {
+                        throw new Error(`${path} changed while it was being sent, so it was not sent`);
+                    }
+                    return again[0]!.bytes;
+                },
+            };
+        }
+
         const spanOf = new Map<string, { start: number; end: number }>();
         for (let i = 0; i < scan.names.length; i++) {
             const piece = scan.pieces[i]!;
             spanOf.set(scan.names[i]!, { start: piece.offset, end: piece.offset + piece.bytes.length });
         }
-        const keys = this.opts.keys;
         const bytes = scan.bytes;
         return {
             names: scan.names,
@@ -1504,12 +1577,24 @@ function tooLarge(size: number, max: number): Error {
  * above that threshold the names were taken a window at a time and the bodies
  * dropped, and a wanted chunk is sealed again from `bytes`.
  */
-interface Scanned {
-    readonly bytes: Uint8Array;
-    readonly pieces: readonly { offset: number; bytes: Uint8Array }[];
-    readonly names: string[];
-    readonly sealed?: SealedChunk[];
-}
+type Scanned =
+    /** The file was read whole, because the vault could only hand it over whole. */
+    | {
+          readonly bytes: Uint8Array;
+          readonly pieces: readonly { offset: number; bytes: Uint8Array }[];
+          readonly names: string[];
+          readonly sealed?: SealedChunk[];
+          readonly spans?: undefined;
+      }
+    /** The file was streamed, and nothing of it is held but the offsets. */
+    | {
+          readonly names: string[];
+          readonly spans: readonly { start: number; end: number }[];
+          readonly path: string;
+          readonly size: number;
+          readonly bytes?: undefined;
+          readonly sealed?: undefined;
+      };
 
 /** One version waiting for company in the inbox. */
 interface Incoming {

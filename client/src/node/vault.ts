@@ -109,6 +109,48 @@ export class NodeVault implements Vault {
     }
 
     /**
+     * The file in blocks, so a large one can be chunked without being held.
+     *
+     * A megabyte at a time: large enough that the per-read cost disappears,
+     * small enough that peak memory is bounded by something other than the file.
+     */
+    async *readBlocks(path: string, blockSize = 1024 * 1024): AsyncGenerator<Uint8Array> {
+        const handle = await open(this.absolute(path), "r");
+        try {
+            const buf = new Uint8Array(blockSize);
+            for (;;) {
+                const { bytesRead } = await handle.read(buf, 0, blockSize, null);
+                if (bytesRead === 0) return;
+                // Copied rather than yielded as a view, because the buffer is
+                // reused for the next block and a consumer that kept the view
+                // would find it rewritten underneath.
+                yield buf.slice(0, bytesRead);
+            }
+        } finally {
+            await handle.close();
+        }
+    }
+
+    async readRange(path: string, start: number, end: number): Promise<Uint8Array> {
+        const handle = await open(this.absolute(path), "r");
+        try {
+            const out = new Uint8Array(end - start);
+            let at = 0;
+            while (at < out.length) {
+                const { bytesRead } = await handle.read(out, at, out.length - at, start + at);
+                if (bytesRead === 0) break;
+                at += bytesRead;
+            }
+            // Short means the file shrank since it was named. The caller checks
+            // the chunk against its name and fails this file rather than
+            // sending bytes under a name that is not theirs.
+            return at === out.length ? out : out.subarray(0, at);
+        } finally {
+            await handle.close();
+        }
+    }
+
+    /**
      * Writes a file, then sets its modification time to the one given.
      *
      * The timestamp is not decoration. The engine's decision table compares

@@ -1102,6 +1102,49 @@ describe("what a large attachment costs to send", () => {
         expect(reads).toBeGreaterThan(0);
     });
 
+    /**
+     * A streamed file and a held file must produce identical names, or the two
+     * adapters would disagree about what a file is called: the headless client
+     * streams, the plugin cannot, and a vault synced by both would store every
+     * large file twice and never recognise either copy.
+     */
+    it("names a streamed file exactly as a held one", async () => {
+        const { chunkBytes, chunkStream, sizesFor } = await import("./chunk.ts");
+        const { sealChunks } = await import("./crypto.ts");
+
+        const bytes = new Uint8Array(9 * 1024 * 1024);
+        for (let at = 0; at < bytes.length; at += 65536) {
+            crypto.getRandomValues(bytes.subarray(at, Math.min(at + 65536, bytes.length)));
+        }
+        const sizes = sizesFor(bytes.length, false);
+
+        const held = (await sealChunks(keys, [...chunkBytes(bytes, sizes, false)].map((c) => c.bytes))).map(
+            (c) => c.name
+        );
+
+        async function* blocks(size: number) {
+            for (let at = 0; at < bytes.length; at += size) {
+                yield bytes.slice(at, Math.min(at + size, bytes.length));
+            }
+        }
+
+        // Block size must not change the answer either. The chunker cuts on
+        // content, so a boundary that moved with the read size would be a
+        // rolling hash that was not rolling.
+        for (const blockSize of [4096, 64 * 1024, 1024 * 1024, bytes.length]) {
+            const streamed: string[] = [];
+            const spans: number[] = [];
+            for await (const piece of chunkStream(blocks(blockSize), sizes, false)) {
+                streamed.push((await sealChunks(keys, [piece.bytes]))[0]!.name);
+                spans.push(piece.offset);
+            }
+            expect(streamed, `block size ${blockSize}`).toEqual(held);
+            // And the offsets have to be right, because a wanted chunk is read
+            // back by range and would otherwise be different bytes.
+            expect(spans[0]).toBe(0);
+        }
+    });
+
     it("does not hold a sealed copy of the whole file", async () => {
         await fresh();
         const said: string[] = [];

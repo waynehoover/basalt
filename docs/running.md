@@ -197,12 +197,18 @@ path used to be created on the spot and the backup then succeeded, of nothing.
 | `-v` | off | verbose logging |
 
 `-max-file` is bounded by what the sending device can hold, not by anything the
-server pays. Peak memory on the sending device is about 210 MB plus 2.7 MB per
-MiB of file, so 64 MiB costs about 430 MB and the 256 MiB ceiling about 900 MB.
-The default is low because the smallest device syncing the vault sets it, and
-the plugin has never run on a phone. Raise it as far as 256 MiB for a vault that
-holds video on devices that can carry it; the ceiling holds whatever you pass,
-because that is what the store will accept.
+server pays, and the two clients differ.
+
+The headless client streams: it reads a large file in blocks to name it and in
+ranges to send it, so memory is nearly flat and a 256 MiB attachment costs it
+about 290 MB. The plugin cannot, because Obsidian's adapter hands over whole
+files and offers nothing else, so it costs about 210 MB plus 2.7 MB per MiB:
+430 MB at 64 MiB, about 900 MB at 256.
+
+The default is set for the weaker of the two and for a phone that has never been
+tested. Raise it as far as 256 MiB if the large files in your vault are only ever
+moved by the headless client. The ceiling holds whatever you pass, because that
+is what the store will accept.
 
 One caveat if you ever lower it: a client also refuses to *download* a version
 larger than what the server advertises, so lowering the limit below a file

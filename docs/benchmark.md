@@ -112,35 +112,55 @@ file is the file. `chunkStream` exists for the case where a Blob can be read in
 blocks, and nothing uses it yet.
 
 Peak resident and wall clock for a whole sync of one attachment, measured on
-this laptop:
+this laptop, with the headless client:
 
 | file | peak | time |
 |---|---|---|
-| 32 MiB | 295 MB | 0.7 s |
-| 64 MiB | 430 MB | 1.5 s |
-| 128 MiB | 666 MB | 2.9 s |
-| 256 MiB | 896 MB | 2.4 s |
+| 16 MiB | 144 MB | 0.4 s |
+| 64 MiB | 220 MB | 1.6 s |
+| 128 MiB | 229 MB | 3.3 s |
+| 256 MiB | 291 MB | 6.5 s |
 
-Roughly 210 MB plus 2.7 MB per MiB of file. It used to be far worse, and two
-things were doing it. A changed file was read, cut and sealed **twice**, once by
-the scan that decided it had changed and once by the upload that sent it; the
-scan now hands its work to the upload. And every chunk was deflated whether or
-not it could compress, which for photographs, PDFs and video is the compressor's
-worst case: all the work, an output the size of the input, nothing found, the
-answer discarded. A chunk is now probed on its first four kilobytes. Together
-those took a 64 MiB attachment from 6.8 s and 636 MB to 1.5 s and 430 MB.
+Nearly flat, and for a 256 MiB file the peak is now smaller than the file, which
+is the point: it is never held. Getting there took three things.
+
+**It was read, cut and sealed twice.** Once by the scan that decides a file has
+changed and again by the upload that sends it, with both passes' garbage live at
+once. The scan hands its work forward now.
+
+**Every chunk was deflated whether or not it could compress.** For photographs,
+PDFs and video that is a compressor's worst case: all of the work, an output the
+size of the input, nothing found, the answer discarded. A chunk is probed on its
+first four kilobytes. Over 64 MiB of incompressible data: 763 ms and 260 MB
+became 24 ms and 131 MB, with identical bytes on the wire.
+
+**The file was held from the first read until the last chunk went.** That was
+the rest of it. A vault that can hand over blocks and ranges is now read twice
+from disk instead: once to cut and name it, keeping one chunk at a time, and
+again for the chunks the server asks for. Two disk reads against most of a
+gigabyte of memory is not a close trade, and it costs about 13% more wall clock.
+
+Together, a 64 MiB attachment went from 6.8 s and 636 MB to 1.6 s and 220 MB,
+and a 256 MiB one from about 900 MB to 291 MB.
+
+**The plugin does not get the last of those**, and cannot as things stand.
+Obsidian's `DataAdapter` offers `readBinary` and nothing beside it: no ranged
+read, no stream. So the plugin holds the file and pays roughly 210 MB plus
+2.7 MB per MiB, while the headless client is flat. `getResourcePath` returns a
+URL the webview can already load, and fetching that would give a stream on both
+desktop and mobile; whether `fetch` is allowed to is not something this
+repository can answer without Obsidian running, so it is written down rather than
+assumed.
 
 For comparison, Obsidian Sync reads the whole file, encrypts it in one call and
 slices the ciphertext into 2 MiB wire frames, so it holds about twice the file.
-Neither client streams, and neither can: `DataAdapter` has no streaming read to
-offer.
 
 That curve is what sets the default file limit, rather than any cost to the
-server. A server advertises 64 MiB and a client refuses anything larger from its
-stat, before opening it: the server would refuse it too, but only after the
-client had read, chunked and sealed it, so the file just over the limit was the
-most expensive thing in the vault to prepare and produced an error its size
-already predicted. `basalt serve -max-file` raises it as far as 256 MiB.
+server, and it is set for the weakest device rather than the strongest: 64 MiB,
+because the plugin buffers and has never run on a phone. A client refuses
+anything larger from its stat, before opening it. `basalt serve -max-file` raises
+it as far as 256 MiB, which is comfortable for a vault whose large files are only
+ever moved by the headless client.
 
 ## What adding latency found
 
