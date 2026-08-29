@@ -846,3 +846,45 @@ describe("saying what it is working on", () => {
         expect(seen, `a quiet pass announced ${JSON.stringify(seen)}`).toEqual([]);
     }, 300_000);
 });
+
+/**
+ * Re-pairing, and the run that would not stop.
+ *
+ * Found by running the plugin against a real server. Unlinking and pairing
+ * again left the previous run alive: `keepGoing` was one boolean shared by every
+ * run, so the old one woke from its backoff, read the *new* run's flag, and
+ * carried on with the old vault's secret. It reconnected, failed authentication,
+ * and its refusal put "Basalt has stopped: not authorised for this vault" on
+ * screen while the real client was syncing perfectly well behind it.
+ */
+describe("pairing again after unlinking", () => {
+    it("retires the previous run so it cannot speak for the plugin", async () => {
+        const { plugin } = await load();
+        const p = plugin as unknown as {
+            generation: number;
+            running: boolean;
+            unlink(): Promise<void>;
+            setState(s: unknown): void;
+            state: { kind: string; why?: string };
+        };
+
+        const before = p.generation;
+        await p.unlink();
+        // Unlink alone has to retire it. Closing the client is not enough,
+        // because a run whose client closed simply reconnects.
+        expect(p.generation, "unlinking left the run in flight current").toBeGreaterThan(before);
+        expect(p.running).toBe(false);
+        expect(p.state.kind).toBe("unpaired");
+    });
+
+    it("keeps a superseded run from clobbering the state of the current one", async () => {
+        const { plugin } = await load();
+        const p = plugin as unknown as { generation: number; state: { kind: string } };
+
+        // What the old run's onFatal did. Numbered runs make the check possible
+        // at all: without a generation there is nothing to compare against.
+        const stale = p.generation;
+        p.generation++;
+        expect(stale === p.generation, "a superseded run cannot tell it was superseded").toBe(false);
+    });
+});

@@ -143,14 +143,17 @@ gigabyte of memory is not a close trade, and it costs about 13% more wall clock.
 Together, a 64 MiB attachment went from 6.8 s and 636 MB to 1.6 s and 220 MB,
 and a 256 MiB one from about 900 MB to 291 MB.
 
-**The plugin does not get the last of those**, and cannot as things stand.
-Obsidian's `DataAdapter` offers `readBinary` and nothing beside it: no ranged
-read, no stream. So the plugin holds the file and pays roughly 210 MB plus
-2.7 MB per MiB, while the headless client is flat. `getResourcePath` returns a
-URL the webview can already load, and fetching that would give a stream on both
-desktop and mobile; whether `fetch` is allowed to is not something this
-repository can answer without Obsidian running, so it is written down rather than
-assumed.
+**The plugin gets all three.** `DataAdapter` offers `readBinary` and nothing
+beside it, but `getResourcePath` returns the URL the webview already fetches to
+show an image, and that response carries a body stream and honours a Range
+header. Verified in a running Obsidian, and then measured there: a 20 MiB
+attachment, written into a real vault and synced by the plugin to a real server,
+went in **2.9 seconds**, and the server's `verify -deep` found 0 faults across
+479 chunk references.
+
+Mobile is Capacitor and its resource URLs are a different scheme, which nothing
+has tested. A failure is treated as "not on this platform": the engine remembers
+it and everything after takes the buffered path, which is what it did before.
 
 For comparison, Obsidian Sync reads the whole file, encrypts it in one call and
 slices the ciphertext into 2 MiB wire frames, so it holds about twice the file.

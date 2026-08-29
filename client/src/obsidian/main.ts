@@ -69,6 +69,12 @@ export default class BasaltPlugin extends Plugin {
     private statusEl: HTMLElement | undefined;
     private ribbonEl: HTMLElement | undefined;
     private running = false;
+
+    /**
+     * Which run is the current one. Bumped by every start and by unlink, so a
+     * run that has been superseded can tell, and says nothing when it has.
+     */
+    private generation = 0;
     private nudgeTimer: ReturnType<typeof setTimeout> | undefined;
 
     override async onload(): Promise<void> {
@@ -200,6 +206,14 @@ export default class BasaltPlugin extends Plugin {
         const config = this.config;
         if (!config || this.running) return;
         this.running = true;
+        // Every run is numbered, and only the newest one may speak. A single
+        // boolean was not enough: unlinking cleared it, pairing again set it,
+        // and the *previous* run woke from its backoff, read the new run's
+        // flag, and carried on with the old vault's secret. It reconnected,
+        // failed authentication, and its refusal put "Basalt has stopped: not
+        // authorised for this vault" on screen while the real client was
+        // syncing perfectly well behind it.
+        const mine = ++this.generation;
         this.setState({ kind: "connecting" });
 
         void (async () => {
@@ -208,18 +222,22 @@ export default class BasaltPlugin extends Plugin {
             // becomes an unhandled rejection and the plugin simply never syncs,
             // with a status bar still saying "connecting".
             try {
-                await this.runLoop(config);
+                await this.runLoop(config, mine);
             } catch (err) {
-                this.setState({ kind: "stopped", why: (err as Error).message });
-                new Notice(`Basalt has stopped: ${(err as Error).message}`, 0);
+                if (mine === this.generation) {
+                    this.setState({ kind: "stopped", why: (err as Error).message });
+                    new Notice(`Basalt has stopped: ${(err as Error).message}`, 0);
+                }
             }
-            this.running = false;
+            if (mine === this.generation) this.running = false;
         })();
     }
 
-    private async runLoop(config: DeviceConfig): Promise<void> {
+    private async runLoop(config: DeviceConfig, mine: number): Promise<void> {
+        const current = () => mine === this.generation;
         await runForever(await this.clientOptions(config), {
             onClient: (client) => {
+                if (!current()) return;
                 this.client = client;
                 // A connection means a bootstrap, if there was one, has been
                 // spent. Keeping it is keeping a second secret that no longer
@@ -227,23 +245,27 @@ export default class BasaltPlugin extends Plugin {
                 if (client && this.config?.bootstrap) void this.forgetBootstrap();
             },
             onSynced: (report) => {
+                if (!current()) return;
                 this.setState({ kind: "synced", summary: summarise(report), at: Date.now() });
                 this.announce(report);
             },
             onDisconnected: (cause, retryIn) => {
+                if (!current()) return;
                 this.setState({ kind: "offline", why: cause.message, retryAt: Date.now() + retryIn });
             },
             onUnreachable: (cause, retryIn) => {
+                if (!current()) return;
                 this.setState({ kind: "offline", why: cause.message, retryAt: Date.now() + retryIn });
             },
             onFatal: (cause) => {
+                if (!current()) return;
                 // A refusal that would be repeated word for word forever: a
                 // bad token, or a cursor the server says is impossible.
                 // Retrying is a loop that never ends and never says why.
                 this.setState({ kind: "stopped", why: cause.message });
                 new Notice(`Basalt has stopped: ${cause.message}`, 0);
             },
-            keepGoing: () => this.running,
+            keepGoing: () => this.running && current(),
         });
     }
 
@@ -296,6 +318,15 @@ export default class BasaltPlugin extends Plugin {
             vaultId: config.vaultId,
             device: config.device,
             onProgress: (path) => this.working(path),
+            // The engine's running commentary, which had nowhere to go.
+            //
+            // These are the lines that say why something did not sync: a file
+            // written off for good, a path that is a file here and a folder
+            // there, a retry and its reason, a platform that cannot stream. With
+            // no log they went nowhere, so a vault with one file missing looked
+            // exactly like a vault with none missing, and the only way to find
+            // out was to attach a debugger.
+            log: (message, ...rest) => console.info("Basalt:", message, ...rest),
         };
     }
 
@@ -540,6 +571,10 @@ export default class BasaltPlugin extends Plugin {
      * device would skip uploading notes it had never sent.
      */
     async unlink(): Promise<void> {
+        // Retires every run in flight. Closing the client is not enough: a run
+        // whose client is closed simply reconnects, which is the whole point of
+        // it.
+        this.generation++;
         this.running = false;
         this.client?.close();
         this.client = undefined;

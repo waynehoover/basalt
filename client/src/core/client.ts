@@ -181,7 +181,18 @@ export class Client {
     async runUntilClosed(tickMs = 30_000): Promise<Error> {
         if (this.endedWith) return this.endedWith;
         const stop = this.opts.vault.watch?.(() => void this.sync());
-        const ticker = setInterval(() => void this.sync(), tickMs);
+        // A sync with nothing to do sends nothing, so a settled vault is a
+        // silent connection, and the server closes a silent one after five
+        // minutes. Observed against a real server: a vault that had finished
+        // syncing dropped its connection every five minutes for ever, each time
+        // reconnecting and replaying the handshake to discover it was already up
+        // to date. Nothing was lost and nothing said why.
+        //
+        // One frame every half minute is cheaper than that, and it is also how a
+        // device finds out promptly that a connection has died under it.
+        const ticker = setInterval(() => {
+            void this.sync().then(() => this.keepalive());
+        }, tickMs);
         try {
             return await new Promise<Error>((resolve) => {
                 this.notifyEnded = resolve;
@@ -189,6 +200,21 @@ export class Client {
         } finally {
             clearInterval(ticker);
             stop?.();
+        }
+    }
+
+    /**
+     * Says something, so the connection is not idle.
+     *
+     * Failures are swallowed: a ping that cannot be sent means the connection
+     * has already gone, which the run loop is about to be told by the read side.
+     * Reporting it here would report it twice.
+     */
+    private async keepalive(): Promise<void> {
+        try {
+            await this.transport.ping();
+        } catch {
+            /* the connection is gone; the loop around this will hear about it */
         }
     }
 
