@@ -262,6 +262,21 @@ export class Client {
      * because a recovery tool that can destroy the thing you have is worse than
      * no recovery tool.
      */
+    /**
+     * The bytes of one version, without writing anything.
+     *
+     * What a history view needs and what restore cannot give it: somebody
+     * deciding whether to put a version back has to read it first, and reading
+     * it must not be the act of restoring it.
+     *
+     * Queued for the same reason restore is: reassembling a version is several
+     * requests and a sync starting in the middle of them would collide.
+     */
+    async contentAt(version: Version): Promise<Uint8Array> {
+        if (version.deleted || version.folder) return new Uint8Array(0);
+        return this.serial(() => this.engine.contentOf(version.uid));
+    }
+
     async restore(version: Version, to?: string): Promise<{ path: string; bytes: number }> {
         if (version.deleted) {
             throw new Error(`version ${version.uid} of ${version.path} is the deletion itself, not a version to restore`);

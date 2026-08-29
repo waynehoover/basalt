@@ -113,7 +113,12 @@ basalt restore "Q.md" --uid 42       one exact version
 basalt restore "Q.md" --to old/Q.md  somewhere else
 ```
 
-In the plugin it is one command, "Recover a deleted note".
+In the plugin there are two ways in. Right-click a note for "Basalt: version
+history", or the "Show version history" command, which opens a sidebar of every
+version newest first with a diff against what is on disk. Deleted notes have
+their own command, "Recover a deleted note", because a note that is gone cannot
+be right-clicked. Both are also registered as `basalt:history` and
+`basalt:restore` on Obsidian's own command line, next to its `sync:history`.
 
 Restoring never overwrites: if the path is occupied the copy lands beside it
 under `(restored N)` and says so. A restored note keeps the timestamp it was

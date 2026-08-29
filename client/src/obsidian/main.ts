@@ -23,6 +23,8 @@
 
 import { Modal, Notice, Plugin, Setting, type TAbstractFile, type TextComponent } from "obsidian";
 
+import { HistoryModal, type HistorySource } from "./history.ts";
+
 import {
     Client,
     runForever,
@@ -93,6 +95,50 @@ export default class BasaltPlugin extends Plugin {
             name: "Recover a deleted note",
             callback: () => new RecoverModal(this).open(),
         });
+        this.addCommand({
+            id: "version-history",
+            name: "Show version history",
+            // Checking rather than callback, so the command does not appear in
+            // the palette while nothing is open for it to act on.
+            checkCallback: (checking) => {
+                const file = this.app.workspace.getActiveFile();
+                if (!file) return false;
+                if (!checking) this.openHistory(file.path);
+                return true;
+            },
+        });
+
+        // Where somebody already looks for this: Obsidian Sync puts version
+        // history on the file menu, so this goes in the same place.
+        this.registerEvent(
+            this.app.workspace.on("file-menu", (menu, file) => {
+                if (!("extension" in file)) return;
+                menu.addItem((item) =>
+                    item
+                        .setTitle("Basalt: version history")
+                        .setIcon("history")
+                        .onClick(() => this.openHistory(file.path))
+                );
+            })
+        );
+
+        // The same two operations without the UI, registered the way Obsidian
+        // registers its own `sync:history` and `history:restore`.
+        this.registerCliHandler(
+            "basalt:history",
+            "List Basalt version history for a note",
+            { path: { value: "<path>", description: "Vault path" } },
+            async (flags) => this.cliHistory(String(flags["path"] ?? ""))
+        );
+        this.registerCliHandler(
+            "basalt:restore",
+            "Restore a Basalt version",
+            {
+                path: { value: "<path>", description: "Vault path" },
+                uid: { value: "<n>", description: "Version uid", required: true },
+            },
+            async (flags) => this.cliRestore(String(flags["path"] ?? ""), Number(flags["uid"]))
+        );
 
         // Obsidian's own events, rather than a watcher. They are what the
         // platform gives, they work on mobile, and they say when to look rather
@@ -419,6 +465,64 @@ export default class BasaltPlugin extends Plugin {
         // without anybody having to know that they would not have.
         await this.client.settle({ coalesceWrites: false });
         return done.path;
+    }
+
+    /**
+     * Opens the history of one note.
+     *
+     * Refuses rather than opening an empty modal when there is no connection.
+     * "Nothing to show" and "I could not ask" are different answers, and a
+     * recovery tool is the worst place to confuse them.
+     */
+    openHistory(path: string): void {
+        if (!this.client) {
+            new Notice("Basalt: not connected, so there is no history to show.", 8_000);
+            return;
+        }
+        new HistoryModal(this.app, this.historySource(), path).open();
+    }
+
+    /** What HistoryModal needs, which is four calls and no plugin internals. */
+    historySource(): HistorySource {
+        return {
+            history: async (path, opts) => {
+                if (!this.client) throw new Error("not connected");
+                return this.client.history(path, opts);
+            },
+            contentAt: async (version) => {
+                if (!this.client) throw new Error("not connected");
+                return new TextDecoder().decode(await this.client.contentAt(version));
+            },
+            restoreVersion: async (version) => {
+                if (!this.client) throw new Error("not connected");
+                const done = await this.client.restore(version);
+                // Sent now rather than at the next pass, so the other devices
+                // get it without anybody having to know that they would not.
+                await this.client.settle({ coalesceWrites: false });
+                return done.path;
+            },
+            currentText: async (path) => {
+                if (!(await this.app.vault.adapter.exists(path))) return undefined;
+                return this.app.vault.adapter.read(path);
+            },
+        };
+    }
+
+    private async cliHistory(path: string): Promise<string> {
+        if (!this.client) return "Basalt is not connected.";
+        const versions = await this.client.history(path, { limit: 50 });
+        if (versions.length === 0) return `No history found for ${path}.`;
+        return versions
+            .map((v) => `${v.uid}\t${new Date(v.mtime).toISOString()}\t${v.size} B\t${v.device}`)
+            .join("\n");
+    }
+
+    private async cliRestore(path: string, uid: number): Promise<string> {
+        if (!this.client) return "Basalt is not connected.";
+        const version = (await this.client.history(path, { limit: 200 })).find((v) => v.uid === uid);
+        if (!version) return `No version ${uid} of ${path}.`;
+        const at = await this.historySource().restoreVersion(version);
+        return at === path ? `Restored ${at}.` : `Restored to ${at}, because ${path} is occupied.`;
     }
 
     /** The string another device needs, or undefined when this one is unpaired. */

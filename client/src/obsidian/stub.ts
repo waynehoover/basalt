@@ -37,7 +37,7 @@ export class FakeEl {
 
     constructor(
         readonly tag: string,
-        readonly cls: string = ""
+        public cls: string = ""
     ) {}
 
     createEl(tag: string, o?: { text?: string; cls?: string } | string): FakeEl {
@@ -59,8 +59,30 @@ export class FakeEl {
         this.text = value;
     }
 
-    addEventListener(): void {
-        /* Inputs in this stub are driven directly, not through events. */
+    /**
+     * Listeners are recorded rather than ignored, so a test can click what the
+     * plugin drew. A modal whose buttons cannot be pressed is a modal whose
+     * behaviour is untested no matter how much of its markup is asserted on.
+     */
+    private readonly listeners = new Map<string, (() => void)[]>();
+
+    addEventListener(event: string, handler: () => void): void {
+        const list = this.listeners.get(event) ?? [];
+        list.push(handler);
+        this.listeners.set(event, list);
+    }
+
+    fire(event: string): void {
+        for (const h of this.listeners.get(event) ?? []) h();
+    }
+
+    addClass(...classes: string[]): void {
+        this.cls = [this.cls, ...classes].filter(Boolean).join(" ");
+    }
+
+    removeClass(...classes: string[]): void {
+        const drop = new Set(classes);
+        this.cls = this.cls.split(" ").filter((c) => c && !drop.has(c)).join(" ");
     }
 
     readonly attributes = new Map<string, string>();
@@ -121,9 +143,30 @@ export class FakeWorkspace {
     layoutReady = true;
     private readonly waiting: (() => void)[] = [];
 
+    /** The file the plugin will be told is open. */
+    activeFile: { path: string; extension: string } | undefined;
+    /** Handlers registered per event name, so a test can fire one. */
+    readonly handlers = new Map<string, ((...args: unknown[]) => unknown)[]>();
+
     onLayoutReady(callback: () => void): void {
         if (this.layoutReady) callback();
         else this.waiting.push(callback);
+    }
+
+    on(name: string, handler: (...args: unknown[]) => unknown): { name: string } {
+        const list = this.handlers.get(name) ?? [];
+        list.push(handler);
+        this.handlers.set(name, list);
+        return { name };
+    }
+
+    getActiveFile(): { path: string; extension: string } | undefined {
+        return this.activeFile;
+    }
+
+    /** Fires a registered event, which is what Obsidian would do. */
+    fire(name: string, ...args: unknown[]): void {
+        for (const h of this.handlers.get(name) ?? []) h(...args);
     }
 
     /** Obsidian finishing its startup. */
@@ -136,6 +179,52 @@ export class FakeWorkspace {
 export class App {
     readonly vault = new FakeVault();
     readonly workspace = new FakeWorkspace();
+}
+
+/**
+ * The context menu Obsidian hands to a `file-menu` handler.
+ *
+ * Records what a plugin adds, and lets a test click it, which is the only way
+ * to find out whether the entry does what its title says.
+ */
+export class MenuItem {
+    title = "";
+    icon = "";
+    private handler: (() => void) | undefined;
+
+    setTitle(title: string): this {
+        this.title = title;
+        return this;
+    }
+
+    setIcon(icon: string): this {
+        this.icon = icon;
+        return this;
+    }
+
+    onClick(handler: () => void): this {
+        this.handler = handler;
+        return this;
+    }
+
+    click(): void {
+        this.handler?.();
+    }
+}
+
+export class Menu {
+    readonly items: MenuItem[] = [];
+
+    addItem(cb: (item: MenuItem) => unknown): this {
+        const item = new MenuItem();
+        cb(item);
+        this.items.push(item);
+        return this;
+    }
+
+    addSeparator(): this {
+        return this;
+    }
 }
 
 /* ---------------------------------------------------------------- *
@@ -176,7 +265,17 @@ export class Plugin extends Component {
     savedData: unknown = null;
     readonly statusBarItems: FakeEl[] = [];
     readonly ribbonIcons: { icon: string; title: string; callback: () => void; el: FakeEl }[] = [];
-    readonly commands: { id: string; name: string; callback?: () => void }[] = [];
+    readonly commands: {
+        id: string;
+        name: string;
+        callback?: () => void;
+        checkCallback?: (checking: boolean) => boolean;
+    }[] = [];
+    /** What registerCliHandler was given, so the handlers can be driven. */
+    readonly cliHandlers = new Map<
+        string,
+        { description: string; handler: (flags: Record<string, unknown>) => unknown }
+    >();
     readonly registeredEvents: unknown[] = [];
 
     constructor(
@@ -198,9 +297,23 @@ export class Plugin extends Component {
         return el;
     }
 
-    addCommand(command: { id: string; name: string; callback?: () => void }): typeof command {
+    addCommand(command: {
+        id: string;
+        name: string;
+        callback?: () => void;
+        checkCallback?: (checking: boolean) => boolean;
+    }): typeof command {
         this.commands.push(command);
         return command;
+    }
+
+    registerCliHandler(
+        command: string,
+        description: string,
+        _flags: unknown,
+        handler: (flags: Record<string, unknown>) => unknown
+    ): void {
+        this.cliHandlers.set(command, { description, handler });
     }
 
     registerEvent(ref: unknown): void {
@@ -238,7 +351,14 @@ export const modals: Modal[] = [];
 
 export class Modal {
     readonly contentEl = new FakeEl("div", "modal-content");
+    readonly modalEl = new FakeEl("div", "modal");
+    readonly titleEl = new FakeEl("div", "modal-title");
     isOpen = false;
+
+    setTitle(title: string): this {
+        this.titleEl.setText(title);
+        return this;
+    }
 
     constructor(public app: App) {
         modals.push(this);

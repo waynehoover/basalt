@@ -101,12 +101,20 @@ describe("loading", () => {
 
     it("registers the things a plugin registers", async () => {
         const { plugin, app } = await load();
-        expect(plugin.commands.map((c) => c.id).sort()).toEqual(["recover-deleted", "show-status", "sync-now"]);
+        expect(plugin.commands.map((c) => c.id).sort()).toEqual([
+            "recover-deleted",
+            "show-status",
+            "sync-now",
+            "version-history",
+        ]);
         expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt"]);
         expect(plugin.statusBarItems.length).toBe(1);
         // create, modify, delete, rename. Without these it only syncs on a timer.
         expect(app.vault.handlerCount()).toBe(4);
-        expect(plugin.registeredEvents.length).toBe(4);
+        // Those four, plus the file-menu entry that puts history where somebody
+        // already looks for it.
+        expect(plugin.registeredEvents.length).toBe(5);
+        expect([...plugin.cliHandlers.keys()].sort()).toEqual(["basalt:history", "basalt:restore"]);
     });
 
     /**
