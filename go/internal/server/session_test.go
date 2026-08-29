@@ -29,8 +29,16 @@ func TestReadyAdvertisesTheLimitsTheStoreActuallyEnforces(t *testing.T) {
 	if ready.Proto != wire.Proto {
 		t.Fatalf("proto = %d, want %d", ready.Proto, wire.Proto)
 	}
-	if ready.PerFileMax != store.PerFileMax {
-		t.Fatalf("perFileMax = %d, store enforces %d", ready.PerFileMax, store.PerFileMax)
+	// The file limit is the server's policy rather than the store's ceiling, so
+	// what has to hold is that the advertised number is the one enforced, and
+	// that it is something the store would accept. A server advertising more
+	// than the store holds would have clients read and seal a file to discover
+	// that Validate refuses it.
+	if ready.PerFileMax != r.srv.PerFileMax() {
+		t.Fatalf("perFileMax = %d, this server enforces %d", ready.PerFileMax, r.srv.PerFileMax())
+	}
+	if ready.PerFileMax > store.PerFileMax {
+		t.Fatalf("perFileMax = %d, above the %d the store can hold", ready.PerFileMax, store.PerFileMax)
 	}
 	if ready.ChunkMax != store.ChunkMax {
 		t.Fatalf("chunkMax = %d, store enforces %d", ready.ChunkMax, store.ChunkMax)

@@ -198,7 +198,11 @@ describe("the handshake, against the real server", () => {
         const ready = await c.connect(server);
         expect(ready.proto).toBe(1);
         expect(ready.chunkMax).toBe(1024 * 1024);
-        expect(ready.perFileMax).toBe(256 * 1024 * 1024);
+        // The default, which is a server's policy rather than the store's
+        // ceiling: preparing a file to send costs the client several times the
+        // file, so what the server accepts is chosen for the devices syncing it
+        // and `basalt serve -max-file` moves it.
+        expect(ready.perFileMax).toBe(64 * 1024 * 1024);
         expect(ready.maxChunks).toBe(65536);
     });
 

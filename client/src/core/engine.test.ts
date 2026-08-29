@@ -1042,17 +1042,64 @@ describe("what a large attachment costs to send", () => {
      * again for ever.
      */
     it("names a file the same whatever window it is sealed in", async () => {
-        const big = new Uint8Array(6 * 1024 * 1024);
+        // Comfortably more than one window. Content-defined chunking on random
+        // bytes gives a count that varies run to run, so a file sized to land
+        // near the window boundary makes this test flaky rather than wrong.
+        const big = new Uint8Array(24 * 1024 * 1024);
         for (let at = 0; at < big.length; at += 65536) {
             crypto.getRandomValues(big.subarray(at, Math.min(at + 65536, big.length)));
         }
         const pieces = [...chunkBytes(big, sizesFor(big.length, false), false)].map((c) => c.bytes);
-        expect(pieces.length, "the test file is too small to have windows at all").toBeGreaterThan(SEAL_WINDOW);
+        expect(pieces.length, "the test file is too small to have windows at all").toBeGreaterThan(
+            SEAL_WINDOW * 2
+        );
 
         const together = (await sealChunks(keys, pieces)).map((c) => c.name);
         for (const window of [1, 3, SEAL_WINDOW, pieces.length * 2]) {
             expect(await sealedNames(keys, pieces, window), `window ${window}`).toEqual(together);
         }
+    });
+
+    /**
+     * The server refuses an oversized file at the put, which is correct and far
+     * too late: by then the client has read it, chunked it and sealed it, and
+     * preparing a file costs several times its own size in memory. A file just
+     * over the limit therefore cost the most memory of anything in the vault in
+     * order to produce an error its size alone predicted.
+     */
+    it("refuses a file over the server's limit without reading it", async () => {
+        await fresh();
+        const a = await device("a");
+
+        const limit = a.engine.limits?.perFileMax ?? 0;
+        expect(limit, "the server advertised no file limit").toBeGreaterThan(0);
+
+        // Counted rather than inferred: the property is that the bytes are
+        // never fetched, and the vault is the only thing that knows.
+        let reads = 0;
+        const realRead = a.vault.read.bind(a.vault);
+        a.vault.read = async (path: string) => {
+            reads++;
+            return realRead(path);
+        };
+
+        await a.vault.write("huge.bin", new Uint8Array(limit + 1), { mtime: 1000, ctime: 1000 });
+        const report = await a.engine.sync();
+
+        expect(reads, "the oversized file was read anyway").toBe(0);
+        expect(report.skipped).toBe(1);
+        expect(report.uploaded).toBe(0);
+
+        // Written off, not retried: a file does not get smaller by trying again.
+        const again = await a.engine.sync();
+        expect(again.skipped).toBe(1);
+        expect(reads).toBe(0);
+
+        // And undone the moment it changes, so trimming an attachment syncs it.
+        await a.vault.write("huge.bin", new Uint8Array(16), { mtime: 2000, ctime: 1000 });
+        const third = await a.engine.sync();
+        expect(third.uploaded).toBe(1);
+        expect(reads).toBeGreaterThan(0);
     });
 
     it("does not hold a sealed copy of the whole file", async () => {

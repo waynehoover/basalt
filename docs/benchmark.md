@@ -106,10 +106,28 @@ once by the upload that sends it, so dropping the sealed bodies between windows
 saves more than one copy of the file. It is not slower: sealing is mostly
 waiting on WebCrypto and sixteen in flight keeps it busy.
 
-What is left is the plaintext itself. The vault hands over a whole file, and
+What is left is the plaintext itself. The vault hands over a whole file and
 Obsidian's adapter has no streaming read to offer instead, so the floor for a
-256 MiB attachment is 256 MiB plus the runtime. `chunkStream` exists for the
-case where a Blob can be read in blocks and nothing uses it yet.
+file is the file. `chunkStream` exists for the case where a Blob can be read in
+blocks, and nothing uses it yet.
+
+Peak resident scales at roughly seven times the file, measured through a whole
+sync on this laptop:
+
+| file | peak |
+|---|---|
+| 8 MiB | 142 MB |
+| 32 MiB | 453 MB |
+| 64 MiB | 642 MB |
+| 128 MiB | 969 MB |
+
+That is what sets the default file limit, rather than any cost to the server. A
+server advertises 64 MiB and a client refuses anything larger from its stat,
+before opening it. The server would refuse it too, but only after the client had
+read, chunked and sealed it, so the file just over the limit was the most
+expensive thing in the vault to prepare and produced an error its size already
+predicted. `basalt serve -max-file` raises it for a vault that really does hold
+video.
 
 ## What adding latency found
 

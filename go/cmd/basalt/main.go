@@ -183,6 +183,8 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	fs.Var(&allowOrigin, "allow-origin",
 		"additional browser origin allowed to connect, repeatable (see the log line a refused client produces)")
 	vault := fs.String("vault", "default", "the one vault this server serves")
+	maxFile := fs.Int64("max-file", store.DefaultPerFileMax,
+		"largest file to accept, in bytes; the cost is the sending device's memory, roughly seven times the file")
 	verbose := fs.Bool("v", false, "verbose logging")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -236,6 +238,11 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	srv := server.New(st, server.DerivedAuth(st, *vault, token, func() int64 {
 		return time.Now().UnixMilli()
 	}), log)
+	srv.SetPerFileMax(*maxFile)
+	if srv.PerFileMax() != *maxFile {
+		log.Warn("the file limit was clamped to what the store can hold",
+			"asked", *maxFile, "using", srv.PerFileMax())
+	}
 
 	hs := &http.Server{
 		Addr: *addr,

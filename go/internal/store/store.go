@@ -39,10 +39,27 @@ const (
 	// accept, and so that one frame can never be arbitrarily large.
 	ChunkMax = 1 << 20 // 1 MiB
 
-	// PerFileMax bounds one file's plaintext size as declared by the client.
-	// Vaults hold attachments, so this is generous; it is bounded at all so a
-	// single put cannot commit the server to unbounded work.
+	// PerFileMax is the largest file this store will ever accept, whatever a
+	// server is configured to advertise. It is the bound Validate enforces, and
+	// a server's own limit may be lower but never higher.
+	//
+	// Separate from that limit because they answer different questions. This one
+	// is "what can the format hold"; the server's is "what is worth carrying",
+	// which depends on the vault and on the devices syncing it.
 	PerFileMax = 1 << 28 // 256 MiB
+
+	// DefaultPerFileMax is what a server advertises unless told otherwise.
+	//
+	// The cost is the client's, not the server's. Preparing a file to send
+	// costs several times its own size in memory: the plaintext, the compression
+	// working set, and the sealed window. Measured through a whole sync on this
+	// laptop, peak resident runs at roughly seven times the file, so a 256 MiB
+	// attachment is about 1.8 GB and a 64 MiB one about 520 MB.
+	//
+	// 64 MiB covers images, PDFs and an hour of recorded audio, which is what a
+	// notes vault holds. It refuses long video loudly, naming the limit, and a
+	// server whose vault really does hold video can raise it.
+	DefaultPerFileMax = 1 << 26 // 64 MiB
 
 	// MaxChunksPerEntry bounds the chunk list on a put. At PerFileMax with an
 	// 8 KiB chunking average a real file needs about 32k chunks, so this is

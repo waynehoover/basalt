@@ -1,51 +1,91 @@
 <div align="center">
 
-<img src="docs/assets/logo.svg" alt="" width="150">
+<img src="docs/assets/logo.svg" alt="" width="140">
 
 # Basalt
 
-**Self-hosted sync engineered for Obsidian vaults, not for files.**
-
-One binary on your box, one string on each device.
+> Self-hosted sync engineered for Obsidian vaults, not for files
 
 [![CI](https://github.com/waynehoover/basalt/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](go/go.mod)
 [![Client](https://img.shields.io/badge/client-TypeScript-3178C6?logo=typescript&logoColor=white)](client/)
-[![Status](https://img.shields.io/badge/status-early-orange)](#status)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 </div>
+
+**Basalt** syncs an Obsidian vault between your own devices, through a server you
+run. The chunking, the merge, the encryption and the wire protocol are all
+designed around Markdown notes in a vault one person owns, rather than around
+files in general. That is where the speed comes from: a generic file syncer
+cannot send a few hundred bytes for an edit to a long note, because it does not
+know what it is carrying.
 
 ```
 server   ./basalt                       prints a setup string
 device   paste it                       that is the whole setup
 ```
 
-Both halves are built for one thing: Markdown notes in a vault one person owns.
-The chunking, the merge, the encryption and the wire protocol are all designed
-around that, rather than around files in general. It is why an edit to a long
-note costs a few hundred bytes instead of the whole file, why two devices
-editing one note usually merge cleanly and never merge wrongly, and why syncing
-a vault over a slow link costs a handful of round trips. A generic file syncer
-cannot do those things, because it does not know what it is carrying.
-
-Correctness comes first and speed second, in that order when they conflict.
-
 ## Features
 
-- **Quick to set up.** Run the binary, paste one string on each device. No
-  accounts, no subscription, no sign-in.
-- **Fast.** An edit lands in about a second over a 400 ms link. A first sync of
-  2000 files takes 2.8 minutes.
-- **Light on the wire.** Editing one line of a 2 MiB note sends 494 bytes.
-- **Encrypted before it leaves.** Notes and filenames both. The server holds no
-  key and never needs one.
-- **One static binary.** No database, no message broker. Docker image included.
-- **It will not mangle a note.** When a merge is not provably safe it keeps both
-  versions rather than dropping an edit.
-- **Nothing to configure.** No settings screen.
-- **Every version kept.** Old versions and deleted notes are recoverable, and
-  backups verify themselves.
+| Feature | Status |
+|---|---|
+| **End-to-end encryption** | ✅ Stable |
+| **Chunked sync** | ✅ Stable |
+| **Three-way merge** | ✅ Stable |
+| **Version history and recovery** | ✅ Stable |
+| **Headless CLI** | ✅ Stable |
+| **Backup, verify, restore** | ✅ Stable |
+| **Docker and systemd** | ✅ Stable |
+| **Obsidian plugin, desktop** | 🧪 Beta |
+| **Obsidian plugin, mobile** | 🗓️ Planned |
+| **Community plugin listing** | 🗓️ Planned |
+
+### End-to-end encryption
+Notes and filenames are sealed on the device. The server stores ciphertext, holds
+no key, and never needs one. Not a setting you can forget to turn on.
+
+### Chunked sync
+A rolling hash splits each note, and only the chunks that changed are sent.
+Editing one line of a 2 MiB note costs 494 bytes. Chunks are compressed before
+they are encrypted, and identical content is stored once.
+
+### Three-way merge
+Two devices editing one note usually merge cleanly. When a merge is not provably
+safe, both versions are kept instead of one being silently dropped, and the
+incoming version is the one renamed, so a sync never rewrites the file you have
+open.
+
+### Version history and recovery
+Every version of every note is on the server, deletions included. Right-click a
+note for its history, with a diff against what is on disk and a restore that
+never overwrites. Deleted notes have their own recovery list.
+
+### Fast on a slow link
+A first sync of 2000 files costs 26 round trips, not 2000. Twenty edited notes
+take about a second over 400 ms of latency. `docs/benchmark.md` has the numbers
+and the machine they were measured on.
+
+### Nothing to configure
+No accounts, no subscription, no settings screen. One binary, one pairing string,
+and every question with a right answer answered once in the source.
+
+## Install
+
+The server is one static binary with no database and no message broker.
+
+```bash
+docker compose up -d          # or: go build ./cmd/basalt && ./basalt
+```
+
+It prints a pairing string on first run. Paste that into the plugin, or into the
+headless client:
+
+```bash
+basalt pair basalt2_...
+basalt sync --watch
+```
+
+`docs/running.md` covers the tunnel, systemd, and putting the plugin in a vault.
 
 ## Status
 

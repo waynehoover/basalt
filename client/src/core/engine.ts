@@ -255,7 +255,13 @@ export class Engine {
      * however many are named runs out of memory on a corrupt row as readily as
      * on a hostile one.
      */
-    private limits: ServerLimits | undefined;
+    /**
+     * What the server said it will take, learned at the handshake.
+     *
+     * Readable because a shell has to be able to say why a file was written
+     * off, and "too large" is only meaningful next to the number.
+     */
+    limits: ServerLimits | undefined;
     /** Sealed path to plaintext, so a path is unsealed once per session. */
     private readonly unsealed = new Map<string, string>();
 
@@ -560,6 +566,18 @@ export class Engine {
     ): Promise<void> {
         const entry = this.entryFor(path);
         const remote = this.remote.get(path);
+
+        // Checked from the stat, before the file is opened. The server refuses
+        // an oversized file at the put, which is correct and far too late: by
+        // then the client has read it, chunked it and sealed it, and a file just
+        // over the limit costs several times its own size in memory to produce
+        // an error that its size alone predicted. On a phone that is not a
+        // wasted pass, it is the end of the process.
+        const perFileMax = this.limits?.perFileMax ?? 0;
+        if (stat && !stat.folder && perFileMax > 0 && stat.size > perFileMax) {
+            this.recordFailure(path, tooLarge(stat.size, perFileMax), report);
+            return;
+        }
 
         let local: LocalState | undefined;
         let sealed: SealedChunk[] | undefined;
@@ -1474,6 +1492,22 @@ export async function firstFreeName(
     // for, and inventing one silently is how the thousand-and-first overwrites
     // something.
     throw new Error(`cannot find an unused name beside ${base}`);
+}
+
+/**
+ * A refusal carrying the code that makes it permanent.
+ *
+ * `recordFailure` classifies by code, and `toolarge` is one it writes off rather
+ * than retries: a file does not become smaller by being tried again. The write
+ * off is undone the moment the file changes, because the skip is keyed on the
+ * entry's fingerprint, so somebody who trims an attachment sees it sync.
+ */
+function tooLarge(size: number, max: number): Error {
+    const err = new Error(
+        `${size} bytes, and this server said it stores at most ${max}, so it was not read`
+    );
+    (err as Error & { code: string }).code = "toolarge";
+    return err;
 }
 
 /** One version waiting for company in the inbox. */

@@ -493,9 +493,9 @@ func (s *Session) checkEntry(e store.Entry) *wire.Err {
 			fmt.Sprintf("path is %d bytes, must be 1 to %d", len(e.Path), store.MaxPathLen))
 		return &err
 	}
-	if e.Size > store.PerFileMax {
+	if e.Size > s.srv.perFileMax {
 		err := wire.Error(wire.CodeToolarge,
-			fmt.Sprintf("file is %d bytes, limit is %d", e.Size, store.PerFileMax))
+			fmt.Sprintf("file is %d bytes, limit is %d", e.Size, s.srv.perFileMax))
 		return &err
 	}
 	if len(e.Chunks) > store.MaxChunksPerEntry {
@@ -626,9 +626,9 @@ func (s *Session) handlePut(m wire.In) error {
 		return s.reject(wire.CodeBadName,
 			fmt.Errorf("path is %d bytes, must be 1 to %d", len(e.Path), store.MaxPathLen))
 	}
-	if e.Size > store.PerFileMax {
+	if e.Size > s.srv.perFileMax {
 		return s.reject(wire.CodeToolarge,
-			fmt.Errorf("file is %d bytes, limit is %d", e.Size, store.PerFileMax))
+			fmt.Errorf("file is %d bytes, limit is %d", e.Size, s.srv.perFileMax))
 	}
 	if len(e.Chunks) > store.MaxChunksPerEntry {
 		return s.reject(wire.CodeToolarge,

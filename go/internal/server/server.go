@@ -116,6 +116,13 @@ type Server struct {
 	log  *slog.Logger
 
 	maxPeers int
+
+	// perFileMax is advertised in `ready` and enforced on every put. One field
+	// for both, because advertising a limit that is not enforced, or enforcing
+	// one that is not advertised, is how a client ends up retrying a put that
+	// can never succeed.
+	perFileMax int64
+
 	// now is injectable so tests do not have to sleep to reach a timeout.
 	now func() time.Time
 
@@ -182,9 +189,28 @@ func NewWithLimit(st *store.Store, auth Authenticator, log *slog.Logger, maxPeer
 	}
 	return &Server{
 		st: st, hub: NewHub(), auth: auth, log: log,
-		maxPeers: maxPeers, now: time.Now, batchSize: BatchSize,
+		maxPeers: maxPeers, perFileMax: store.DefaultPerFileMax,
+		now: time.Now, batchSize: BatchSize,
 	}
 }
+
+// SetPerFileMax changes the largest file this server accepts and advertises.
+//
+// Clamped to what the store can hold, because a limit above that would be
+// advertised, attempted, and then refused by Validate: the client would have
+// read and sealed the file to find out.
+func (s *Server) SetPerFileMax(max int64) {
+	if max <= 0 {
+		max = store.DefaultPerFileMax
+	}
+	if max > store.PerFileMax {
+		max = store.PerFileMax
+	}
+	s.perFileMax = max
+}
+
+// PerFileMax is what this server advertises and enforces.
+func (s *Server) PerFileMax() int64 { return s.perFileMax }
 
 // Store is the persistence this server is serving. Exposed for the command line
 // tools that verify and purge, which must go through the same code the sessions
@@ -203,7 +229,7 @@ func (s *Server) ready(cursor int64) wire.Ready {
 		Res:        "ready",
 		Proto:      wire.Proto,
 		Cursor:     cursor,
-		PerFileMax: store.PerFileMax,
+		PerFileMax: s.perFileMax,
 		ChunkMax:   s.st.Chunks().Max(),
 		MaxChunks:  store.MaxChunksPerEntry,
 	}
