@@ -41,6 +41,10 @@ devices see it.
 | 100 ms | 12.7 s | 0.85 s | 0.45 s | 0.23 s | 0.01 s |
 | 400 ms, 2.6 MiB/s | 14.7 s | 5.60 s | 1.07 s | 0.63 s | 0.01 s |
 
+`BENCH_SCALE=1`: 2000 files, 213.6 MiB, at 400 ms and 2.6 MiB/s. 167.2 s up,
+64.2 s down, **26 round trips each way**, and an edit to 20 notes still costs
+1.21 s and 21 chunks whatever the size of the vault around it.
+
 Correct on every one of them: 200 sent, 200 arrived, **0 wrong, 0 missing, 0
 refused**.
 
@@ -73,25 +77,48 @@ That last figure is a laptop's. On Linux, where this actually runs, the same
 `File.Sync` on darwin and it flushes the whole drive cache. `go test
 ./internal/chunks -bench WriterWidth` prints both.
 
+The two numbers together say what the laptop figures cost. The 2000 file upload
+moves 125 MiB, which the 2.6 MiB/s link carries in 48 s, and takes 167 s; its
+33261 chunks account for 108 s of that at this machine's 307/s. At Linux's rate
+the same chunks are 7 s, which would put the upload within a few seconds of the
+bandwidth floor. That last step is arithmetic over a measured rate and not an
+end-to-end measurement: the benchmark has only ever been run on macOS.
+
 ## Read beside Sync Engine, carefully
 
 Their published figures: 2000 files uploaded in 9.43 minutes and downloaded in
 5.87, over 400 ms of ping to a self-hosted Nextcloud, on NixOS with a CPU
 scoring around 1700 single-core.
 
-Different machine, different backend, different vault. Per file, at roughly the
-same latency:
+`BENCH_SCALE=1` is 2000 files, which is their count, at the same nominal
+latency:
 
-| | upload | download |
+| 2000 files, 400 ms | upload | download |
 |---|---|---|
-| Sync Engine, their machine, WebDAV | 0.28 s/file | 0.18 s/file |
-| Basalt, this machine, 400 ms | 0.073 s/file | 0.028 s/file |
+| Sync Engine, their machine, Nextcloud over WebDAV | 9.43 min | 5.87 min |
+| Basalt, this machine, Go server behind a latency proxy | **2.79 min** | **1.07 min** |
+| | 0.084 s/file | 0.032 s/file |
+| | *theirs: 0.283 s/file* | *theirs: 0.176 s/file* |
 
-Read that as an order of magnitude and not as a race. Their number includes a
-Nextcloud, a slower CPU, and ten times the files; ours includes a Go server on
-the same laptop. What can be compared is the shape: their engine overlaps many
-requests to hide latency, and this one now sends four requests in total, so
-latency has almost nothing left to multiply.
+2000 files, 2000 arrived, 0 wrong, 0 missing. 26 round trips in each direction.
+
+**This is not a race and must not be quoted as one.** Four things differ and
+three of them favour us:
+
+- **Their backend is Nextcloud over WebDAV**; ours is a Go binary written for
+  this. Much of their per-file cost is PHP and HTTP rather than their engine.
+  That gap is a real consequence of refusing every backend but one, and it is
+  still not a comparison between two clients.
+- **Their CPU scores around 1700 single-core; this is an M4 Pro.**
+- **The 400 ms here is injected on loopback**: no jitter, no loss, no TLS, and
+  none of the congestion behaviour of a real long link.
+- **Vault size is unknown on their side.** Ours is 213.6 MiB, which is a large
+  one. If theirs was 2000 small notes, their bytes were fewer than ours.
+
+What survives all four, because none of it depends on the machine: 26 round
+trips to move 2000 files, against an engine that has to overlap many requests to
+hide one per file, and an edit to a large note that costs one chunk here and the
+whole file on any backend that stores files.
 
 The one-in-flight rule still holds and did not have to be given up to get here.
 A reply carries no request id, so a second question in flight would resolve into
