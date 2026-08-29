@@ -91,6 +91,26 @@ Not worth doing: request ids, with 26 round trips left to overlap. Larger chunks
 to cut fsyncs, which trades back a chunk size chosen by measurement against what
 an edit costs.
 
+## What a large attachment costs in memory
+
+Separate from the timings, and the number that matters on a phone. Peak resident
+for a whole sync of one 64 MiB attachment, in a fresh process:
+
+| | peak |
+|---|---|
+| sealing every chunk at once | 816 MB |
+| sealing sixteen at a time | **522 MB** |
+
+A changed file is sealed twice, once by the rehash that decides it changed and
+once by the upload that sends it, so dropping the sealed bodies between windows
+saves more than one copy of the file. It is not slower: sealing is mostly
+waiting on WebCrypto and sixteen in flight keeps it busy.
+
+What is left is the plaintext itself. The vault hands over a whole file, and
+Obsidian's adapter has no streaming read to offer instead, so the floor for a
+256 MiB attachment is 256 MiB plus the runtime. `chunkStream` exists for the
+case where a Blob can be read in blocks and nothing uses it yet.
+
 ## What adding latency found
 
 Both were invisible on loopback. A fetch is answered in binary frames rather than

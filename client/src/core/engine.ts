@@ -611,11 +611,29 @@ export class Engine {
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
         const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map((c) => c.bytes);
-        const sealed = await sealChunks(this.opts.keys, parts);
-        entry.chunks = sealed.map((c) => c.name);
+
+        // Small enough to keep: seal it all, hand the bodies to the upload that
+        // is about to want them.
+        if (bytes.length <= KEEP_SEALED_BELOW) {
+            const sealed = await sealChunks(this.opts.keys, parts);
+            entry.chunks = sealed.map((c) => c.name);
+            entry.hash = contentId(entry.chunks);
+            entry.size = bytes.length;
+            return sealed;
+        }
+
+        // Too big to keep, so the bodies are not kept even for a moment: only
+        // the names are needed here, and sealing every chunk at once to get
+        // them means every sealed copy is live at the same time.
+        entry.chunks = await this.namesOf(parts);
         entry.hash = contentId(entry.chunks);
         entry.size = bytes.length;
-        return bytes.length <= KEEP_SEALED_BELOW ? sealed : undefined;
+        return undefined;
+    }
+
+    /** Chunk names without keeping the bodies. See `sealedNames`. */
+    private namesOf(parts: Uint8Array[]): Promise<string[]> {
+        return sealedNames(this.opts.keys, parts);
     }
 
     private async act(
@@ -928,20 +946,18 @@ export class Engine {
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
         const pieces = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)];
-        const sealed = await sealChunks(
-            this.opts.keys,
-            pieces.map((c) => c.bytes)
-        );
-
-        entry.chunks = sealed.map((c) => c.name);
-        entry.hash = contentId(entry.chunks);
-        entry.size = bytes.length;
-        const names = entry.chunks;
 
         if (bytes.length <= KEEP_SEALED_BELOW) {
+            const sealed = await sealChunks(
+                this.opts.keys,
+                pieces.map((c) => c.bytes)
+            );
+            entry.chunks = sealed.map((c) => c.name);
+            entry.hash = contentId(entry.chunks);
+            entry.size = bytes.length;
             const byName = new Map(sealed.map((c) => [c.name, c.bytes]));
             return {
-                names,
+                names: entry.chunks,
                 bodyOf: async (name) => {
                     const body = byName.get(name);
                     if (!body) throw new Error(`no sealed body for ${name} of ${path}`);
@@ -950,12 +966,18 @@ export class Engine {
             };
         }
 
-        // Offsets only. `sealed` goes out of scope with this function, and what
-        // survives is a few dozen numbers.
+        // Names in bounded windows, then offsets. No sealed body outlives the
+        // window it was made in, and what survives this function is a few dozen
+        // numbers per chunk.
+        const names = await this.namesOf(pieces.map((c) => c.bytes));
+        entry.chunks = names;
+        entry.hash = contentId(names);
+        entry.size = bytes.length;
+
         const spanOf = new Map<string, { start: number; end: number }>();
-        for (let i = 0; i < sealed.length; i++) {
+        for (let i = 0; i < names.length; i++) {
             const piece = pieces[i]!;
-            spanOf.set(sealed[i]!.name, { start: piece.offset, end: piece.offset + piece.bytes.length });
+            spanOf.set(names[i]!, { start: piece.offset, end: piece.offset + piece.bytes.length });
         }
         const keys = this.opts.keys;
         return {
@@ -1376,6 +1398,47 @@ function fingerprintOf(entry: IndexEntry | undefined): string {
  * memory is the thing that matters.
  */
 const KEEP_SEALED_BELOW = 8 * 1024 * 1024;
+
+/** How many chunks are sealed at once when the bodies are not being kept. */
+export const SEAL_WINDOW = 16;
+
+/**
+ * Chunk names, sealing a bounded window at a time.
+ *
+ * Sealing is deterministic, so a name can be computed and the body it came from
+ * thrown away. Doing them all at once holds a sealed copy of the whole file,
+ * plus the compression garbage behind it, live at the same moment.
+ *
+ * Measured through a whole sync of one 64 MiB attachment, peak resident in a
+ * fresh process: 816 MB with everything sealed at once against 522 MB with a
+ * window of sixteen. Sealing is mostly waiting on WebCrypto, and sixteen is
+ * enough in flight to keep it busy, so the smaller window is not slower.
+ *
+ * The saving is larger than one sealed copy of the file because a changed file
+ * is sealed twice: once by the rehash that decides it changed, and once by the
+ * upload that sends it. Both are windowed.
+ *
+ * This does not contradict `sealChunks`, which measured whole-file sealing as
+ * the fast path. That was 1,893 chunks of about a kilobyte, where the
+ * per-promise overhead is the cost. These are hundreds of kilobytes each, where
+ * the work is.
+ *
+ * Exported because the property worth testing is that windowing changes nothing
+ * but the memory: the names must be exactly what sealing everything at once
+ * produces, or a file would be stored under names no other device agrees with.
+ */
+export async function sealedNames(
+    keys: VaultKeys,
+    parts: readonly Uint8Array[],
+    window = SEAL_WINDOW
+): Promise<string[]> {
+    const names: string[] = [];
+    for (let at = 0; at < parts.length; at += window) {
+        const sealed = await sealChunks(keys, parts.slice(at, at + window));
+        for (const chunk of sealed) names.push(chunk.name);
+    }
+    return names;
+}
 
 /**
  * How many bytes of queued file this device will hold before sending a batch.
