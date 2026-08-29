@@ -50,15 +50,17 @@ const (
 
 	// DefaultPerFileMax is what a server advertises unless told otherwise.
 	//
-	// The cost is the client's, not the server's. Preparing a file to send
-	// costs several times its own size in memory: the plaintext, the compression
-	// working set, and the sealed window. Measured through a whole sync on this
-	// laptop, peak resident runs at roughly seven times the file, so a 256 MiB
-	// attachment is about 1.8 GB and a 64 MiB one about 520 MB.
+	// The cost is the client's, not the server's: preparing a file to send holds
+	// the plaintext, the sealed window and whatever the last of it left behind.
+	// Measured through a whole sync on this laptop, peak resident is about
+	// 210 MB plus 2.7 MB per MiB of file, so 64 MiB costs about 430 MB and the
+	// 256 MiB ceiling about 900 MB.
 	//
-	// 64 MiB covers images, PDFs and an hour of recorded audio, which is what a
-	// notes vault holds. It refuses long video loudly, naming the limit, and a
-	// server whose vault really does hold video can raise it.
+	// 64 MiB by default because the smallest device syncing a vault sets the
+	// limit and the plugin has never run on a phone. It covers images, PDFs and
+	// an hour of recorded audio, refuses long video loudly with the number in
+	// the message, and -max-file raises it as far as the ceiling for a vault
+	// that really does hold video on devices that can carry it.
 	DefaultPerFileMax = 1 << 26 // 64 MiB
 
 	// MaxChunksPerEntry bounds the chunk list on a put. At PerFileMax with an

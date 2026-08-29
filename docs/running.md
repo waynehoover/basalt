@@ -197,11 +197,12 @@ path used to be created on the spot and the backup then succeeded, of nothing.
 | `-v` | off | verbose logging |
 
 `-max-file` is bounded by what the sending device can hold, not by anything the
-server pays. Preparing a file to send costs roughly seven times its size in
-memory, so 64 MiB costs a device about 520 MB and 256 MiB would cost about
-1.8 GB. Raise it for a vault that really does hold video, and expect the device
-doing the sending to feel it. The ceiling is 256 MiB whatever you pass, because
-that is what the store will accept.
+server pays. Peak memory on the sending device is about 210 MB plus 2.7 MB per
+MiB of file, so 64 MiB costs about 430 MB and the 256 MiB ceiling about 900 MB.
+The default is low because the smallest device syncing the vault sets it, and
+the plugin has never run on a phone. Raise it as far as 256 MiB for a vault that
+holds video on devices that can carry it; the ceiling holds whatever you pass,
+because that is what the store will accept.
 
 One caveat if you ever lower it: a client also refuses to *download* a version
 larger than what the server advertises, so lowering the limit below a file

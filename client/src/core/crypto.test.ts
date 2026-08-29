@@ -373,3 +373,51 @@ describe("sealing a whole file's chunks", () => {
         expect(await sealChunks(await keys(), [])).toEqual([]);
     });
 });
+
+/**
+ * Compression is decided from a prefix, because deflating already-compressed
+ * bytes does all the work and throws the answer away. What matters is that the
+ * decision is a pure function of the chunk: a chunk is named by the hash of its
+ * sealed bytes, so two devices deciding differently for the same content would
+ * give it two names and neither would recognise the other's copy.
+ */
+describe("deciding whether a chunk is worth compressing", () => {
+    const prose = (n: number) => new TextEncoder().encode("the note sync vault chunk ".repeat(n));
+    const noise = (n: number) => {
+        const out = new Uint8Array(n);
+        for (let a = 0; a < n; a += 65536) crypto.getRandomValues(out.subarray(a, Math.min(a + 65536, n)));
+        return out;
+    };
+
+    it("still compresses text, which is what a vault is mostly made of", async () => {
+        const text = prose(20_000);
+        const sealed = await sealChunk(await keys(), text);
+        expect(sealed.length, "prose was sent uncompressed").toBeLessThan(text.length / 2);
+        expect(await openChunk(await keys(), sealed)).toEqual(text);
+    });
+
+    it("round trips incompressible bytes, which are no longer deflated at all", async () => {
+        const bytes = noise(256 * 1024);
+        const sealed = await sealChunk(await keys(), bytes);
+        expect(await openChunk(await keys(), sealed)).toEqual(bytes);
+    });
+
+    it("names the same content the same way every time", async () => {
+        // The property dedup rests on. If the probe were ever anything but a
+        // function of the bytes, this is where it would show.
+        for (const bytes of [prose(500), noise(200 * 1024), new Uint8Array(0), noise(3000)]) {
+            const a = await sealChunk(await keys(), bytes);
+            const b = await sealChunk(await keys(), bytes);
+            expect(await chunkName(a)).toBe(await chunkName(b));
+        }
+    });
+
+    it("round trips a chunk that is mostly compressible behind a random start", async () => {
+        // The case the probe gets wrong: it will not compress this, and the
+        // only cost is bytes. It still has to come back exactly.
+        const mixed = new Uint8Array(200 * 1024);
+        mixed.set(noise(8192), 0);
+        mixed.set(prose(1000).subarray(0, mixed.length - 8192), 8192);
+        expect(await openChunk(await keys(), await sealChunk(await keys(), mixed))).toEqual(mixed);
+    });
+});

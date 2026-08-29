@@ -580,7 +580,7 @@ export class Engine {
         }
 
         let local: LocalState | undefined;
-        let sealed: SealedChunk[] | undefined;
+        let sealed: Scanned | undefined;
         if (stat) {
             if (!stat.folder && needsRehash(entry, Math.ceil(stat.mtime), stat.size)) {
                 // The only place a file is read for its content, and only when
@@ -625,28 +625,28 @@ export class Engine {
      * Only for files small enough to hold. Above that the bodies are dropped
      * for the reason `planUpload` explains, and it does its own work.
      */
-    private async rehash(entry: IndexEntry, path: string): Promise<SealedChunk[] | undefined> {
+    private async rehash(entry: IndexEntry, path: string): Promise<Scanned> {
         const bytes = await this.opts.vault.read(path);
         const isText = this.mergeable(path);
-        const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map((c) => c.bytes);
+        const pieces = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)];
+        const parts = pieces.map((c) => c.bytes);
 
-        // Small enough to keep: seal it all, hand the bodies to the upload that
-        // is about to want them.
+        // Small enough to keep: seal it all, and the upload that is about to
+        // want the bodies has them.
         if (bytes.length <= KEEP_SEALED_BELOW) {
             const sealed = await sealChunks(this.opts.keys, parts);
             entry.chunks = sealed.map((c) => c.name);
             entry.hash = contentId(entry.chunks);
             entry.size = bytes.length;
-            return sealed;
+            return { bytes, pieces, names: entry.chunks, sealed };
         }
 
-        // Too big to keep, so the bodies are not kept even for a moment: only
-        // the names are needed here, and sealing every chunk at once to get
-        // them means every sealed copy is live at the same time.
+        // Too big to keep the bodies even for a moment, so only the names are
+        // taken and the sealed copies are dropped a window at a time.
         entry.chunks = await this.namesOf(parts);
         entry.hash = contentId(entry.chunks);
         entry.size = bytes.length;
-        return undefined;
+        return { bytes, pieces, names: entry.chunks };
     }
 
     /** Chunk names without keeping the bodies. See `sealedNames`. */
@@ -661,8 +661,8 @@ export class Engine {
         local: LocalState | undefined,
         remote: RemoteState | undefined,
         report: SyncReport,
-        /** The sealed chunks the rehash produced, if this file was just read. */
-        sealed?: SealedChunk[]
+        /** What the rehash read and cut, if this file was just scanned. */
+        sealed?: Scanned
     ): Promise<void> {
         switch (action.kind) {
             case "nothing":
@@ -775,11 +775,11 @@ export class Engine {
         report: SyncReport,
         count = false,
         /**
-         * Bodies already sealed for this exact content. Passed only where the
-         * file has not been touched since: a merge rewrites it, so a merge
-         * seals again.
+         * What the pass already read and cut for this exact content. Passed
+         * only where the file has not been touched since: a merge rewrites it,
+         * so a merge scans again.
          */
-        sealed?: SealedChunk[]
+        sealed?: Scanned
     ): Promise<void> {
         if (entry.folder) {
             await this.queue(
@@ -946,13 +946,17 @@ export class Engine {
      * Below the threshold nothing is dropped, because almost every file is a
      * note and re-sealing a note to save a few kilobytes is a worse trade.
      */
-    private async planUpload(entry: IndexEntry, path: string, fresh?: SealedChunk[]): Promise<UploadPlan> {
-        if (fresh) {
-            // Already done by the rehash that decided this file had changed.
-            // The names are in the index and the bodies are in hand.
-            const byName = new Map(fresh.map((c) => [c.name, c.bytes]));
+    private async planUpload(entry: IndexEntry, path: string, fresh?: Scanned): Promise<UploadPlan> {
+        // The scan that decided this file changed already read it, cut it and
+        // sealed it. Doing that again was the single largest cost of sending a
+        // large attachment: a 64 MiB file was read twice, chunked twice and
+        // sealed twice, and the garbage from both passes was live at once.
+        const scan = fresh ?? (await this.scan(entry, path));
+
+        if (scan.sealed) {
+            const byName = new Map(scan.sealed.map((c) => [c.name, c.bytes]));
             return {
-                names: entry.chunks,
+                names: scan.names,
                 bodyOf: async (name) => {
                     const body = byName.get(name);
                     if (!body) throw new Error(`no sealed body for ${name} of ${path}`);
@@ -961,45 +965,18 @@ export class Engine {
             };
         }
 
-        const bytes = await this.opts.vault.read(path);
-        const isText = this.mergeable(path);
-        const pieces = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)];
-
-        if (bytes.length <= KEEP_SEALED_BELOW) {
-            const sealed = await sealChunks(
-                this.opts.keys,
-                pieces.map((c) => c.bytes)
-            );
-            entry.chunks = sealed.map((c) => c.name);
-            entry.hash = contentId(entry.chunks);
-            entry.size = bytes.length;
-            const byName = new Map(sealed.map((c) => [c.name, c.bytes]));
-            return {
-                names: entry.chunks,
-                bodyOf: async (name) => {
-                    const body = byName.get(name);
-                    if (!body) throw new Error(`no sealed body for ${name} of ${path}`);
-                    return body;
-                },
-            };
-        }
-
-        // Names in bounded windows, then offsets. No sealed body outlives the
-        // window it was made in, and what survives this function is a few dozen
-        // numbers per chunk.
-        const names = await this.namesOf(pieces.map((c) => c.bytes));
-        entry.chunks = names;
-        entry.hash = contentId(names);
-        entry.size = bytes.length;
-
+        // Offsets only, for a file too large to hold sealed. A wanted chunk is
+        // sealed again from the bytes still in hand, which is deterministic and
+        // so gives back exactly what was named.
         const spanOf = new Map<string, { start: number; end: number }>();
-        for (let i = 0; i < names.length; i++) {
-            const piece = pieces[i]!;
-            spanOf.set(names[i]!, { start: piece.offset, end: piece.offset + piece.bytes.length });
+        for (let i = 0; i < scan.names.length; i++) {
+            const piece = scan.pieces[i]!;
+            spanOf.set(scan.names[i]!, { start: piece.offset, end: piece.offset + piece.bytes.length });
         }
         const keys = this.opts.keys;
+        const bytes = scan.bytes;
         return {
-            names,
+            names: scan.names,
             bodyOf: async (name) => {
                 const span = spanOf.get(name);
                 if (!span) throw new Error(`no chunk named ${name} in ${path}`);
@@ -1007,6 +984,16 @@ export class Engine {
                 return again[0]!.bytes;
             },
         };
+    }
+
+    /**
+     * Reads and cuts a file, for an upload that arrived without a fresh scan.
+     *
+     * A merge and a conflict copy both rewrite the file before uploading it, so
+     * whatever the pass scanned is stale by the time they are done.
+     */
+    private scan(entry: IndexEntry, path: string): Promise<Scanned> {
+        return this.rehash(entry, path);
     }
 
 
@@ -1508,6 +1495,20 @@ function tooLarge(size: number, max: number): Error {
     );
     (err as Error & { code: string }).code = "toolarge";
     return err;
+}
+
+/**
+ * One read of a file, cut and named, which an upload can use as it stands.
+ *
+ * `sealed` is present only when the file was small enough to keep the bodies;
+ * above that threshold the names were taken a window at a time and the bodies
+ * dropped, and a wanted chunk is sealed again from `bytes`.
+ */
+interface Scanned {
+    readonly bytes: Uint8Array;
+    readonly pieces: readonly { offset: number; bytes: Uint8Array }[];
+    readonly names: string[];
+    readonly sealed?: SealedChunk[];
 }
 
 /** One version waiting for company in the inbox. */

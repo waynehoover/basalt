@@ -111,23 +111,36 @@ Obsidian's adapter has no streaming read to offer instead, so the floor for a
 file is the file. `chunkStream` exists for the case where a Blob can be read in
 blocks, and nothing uses it yet.
 
-Peak resident scales at roughly seven times the file, measured through a whole
-sync on this laptop:
+Peak resident and wall clock for a whole sync of one attachment, measured on
+this laptop:
 
-| file | peak |
-|---|---|
-| 8 MiB | 142 MB |
-| 32 MiB | 453 MB |
-| 64 MiB | 642 MB |
-| 128 MiB | 969 MB |
+| file | peak | time |
+|---|---|---|
+| 32 MiB | 295 MB | 0.7 s |
+| 64 MiB | 430 MB | 1.5 s |
+| 128 MiB | 666 MB | 2.9 s |
+| 256 MiB | 896 MB | 2.4 s |
 
-That is what sets the default file limit, rather than any cost to the server. A
-server advertises 64 MiB and a client refuses anything larger from its stat,
-before opening it. The server would refuse it too, but only after the client had
-read, chunked and sealed it, so the file just over the limit was the most
-expensive thing in the vault to prepare and produced an error its size already
-predicted. `basalt serve -max-file` raises it for a vault that really does hold
-video.
+Roughly 210 MB plus 2.7 MB per MiB of file. It used to be far worse, and two
+things were doing it. A changed file was read, cut and sealed **twice**, once by
+the scan that decided it had changed and once by the upload that sent it; the
+scan now hands its work to the upload. And every chunk was deflated whether or
+not it could compress, which for photographs, PDFs and video is the compressor's
+worst case: all the work, an output the size of the input, nothing found, the
+answer discarded. A chunk is now probed on its first four kilobytes. Together
+those took a 64 MiB attachment from 6.8 s and 636 MB to 1.5 s and 430 MB.
+
+For comparison, Obsidian Sync reads the whole file, encrypts it in one call and
+slices the ciphertext into 2 MiB wire frames, so it holds about twice the file.
+Neither client streams, and neither can: `DataAdapter` has no streaming read to
+offer.
+
+That curve is what sets the default file limit, rather than any cost to the
+server. A server advertises 64 MiB and a client refuses anything larger from its
+stat, before opening it: the server would refuse it too, but only after the
+client had read, chunked and sealed it, so the file just over the limit was the
+most expensive thing in the vault to prepare and produced an error its size
+already predicted. `basalt serve -max-file` raises it as far as 256 MiB.
 
 ## What adding latency found
 

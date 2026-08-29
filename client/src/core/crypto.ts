@@ -276,7 +276,7 @@ const CHUNK_DEFLATE = 1;
  * the plaintext plus 29 bytes.
  */
 export async function sealChunk(keys: VaultKeys, chunk: Uint8Array): Promise<Uint8Array> {
-    const deflated = chunk.length === 0 ? undefined : deflateSync(chunk, { level: 6 });
+    const deflated = worthDeflating(chunk) ? deflateSync(chunk, { level: 6 }) : undefined;
     const useDeflate = deflated !== undefined && deflated.length < chunk.length;
     const payload = useDeflate ? deflated : chunk;
 
@@ -285,6 +285,40 @@ export async function sealChunk(keys: VaultKeys, chunk: Uint8Array): Promise<Uin
     framed.set(payload, 1);
     return seal(keys.content, keys.nonce, framed);
 }
+
+/**
+ * Whether a chunk is worth trying to compress, decided from a small prefix.
+ *
+ * Deflating already-compressed bytes is the worst case of a compressor: it does
+ * all the work, allocates an output the size of its input, finds nothing, and
+ * the result is thrown away. A vault's large files are exactly that kind of
+ * data, because photographs, PDFs and video are compressed already.
+ *
+ * Measured over 64 MiB of incompressible data in chunks of 384 KiB: 763 ms and
+ * 260 MB peak resident deflating every chunk, against 24 ms and 131 MB probing
+ * first. The bytes on the wire are identical, because none of that work was
+ * ever going to be used.
+ *
+ * The decision is a pure function of the chunk, which it has to be: a chunk is
+ * named by the hash of its sealed bytes, so two devices that decided this
+ * differently for the same content would give it two names and neither would
+ * ever recognise the other's copy.
+ *
+ * A chunk whose first four kilobytes do not compress but whose remainder would
+ * loses that compression. It costs bytes, never correctness, and the shape of
+ * file where that happens is rare enough to prefer the measurement.
+ */
+function worthDeflating(chunk: Uint8Array): boolean {
+    if (chunk.length === 0) return false;
+    // Below the probe size there is nothing to save by probing: deflating the
+    // whole thing costs about what deflating the prefix would.
+    if (chunk.length <= PROBE_BYTES * 2) return true;
+    const probe = chunk.subarray(0, PROBE_BYTES);
+    return deflateSync(probe, { level: 6 }).length < probe.length;
+}
+
+/** How much of a chunk is tried before deciding whether to compress it. */
+const PROBE_BYTES = 4096;
 
 /** A sealed chunk and the name the server will know it by. */
 export interface SealedChunk {
