@@ -43,8 +43,8 @@ cp client/dist/plugin/manifest.json "$out/plugin/manifest.json"
 
 # versions.json maps a plugin version to the oldest Obsidian it runs on, and
 # Obsidian reads it to decide whether to offer an update to an older install.
-minapp=$(python3 -c 'import json;print(json.load(open("client/manifest.json"))["minAppVersion"])')
-pluginversion=$(python3 -c 'import json;print(json.load(open("client/manifest.json"))["version"])')
+minapp=$(python3 -c 'import json;print(json.load(open("manifest.json"))["minAppVersion"])')
+pluginversion=$(python3 -c 'import json;print(json.load(open("manifest.json"))["version"])')
 python3 -c "
 import json
 json.dump({'$pluginversion': '$minapp'}, open('$out/plugin/versions.json', 'w'), indent=2)
@@ -56,6 +56,12 @@ printf '  %-24s %s\n' "manifest.json" "version $pluginversion, needs Obsidian $m
 # A folder ready to drop into .obsidian/plugins/, and the same thing zipped for
 # anyone who would rather not.
 ( cd "$out" && zip -qr "basalt-plugin-$version.zip" plugin )
+
+# And loose beside it. Obsidian's community directory installs a plugin by
+# fetching main.js and manifest.json from the release as individual assets; a
+# zip is for a person doing it by hand.
+cp client/dist/plugin/main.js "$out/main.js"
+cp "$root/manifest.json" "$out/manifest.json"
 
 # ---- the headless client -------------------------------------------------
 echo

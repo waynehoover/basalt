@@ -9,7 +9,10 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    # Bare versions as well as v-prefixed ones: Obsidian's community directory
+    # requires a plugin release whose tag is exactly the manifest version, so
+    # that is the tag this project cuts.
+    tags: ["v*", "[0-9]+.[0-9]+.[0-9]+"]
 
 permissions:
   contents: read

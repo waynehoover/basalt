@@ -40,7 +40,7 @@ Purge needs the directory to itself, so the server steps aside:
 
 ```
 docker compose stop basalt
-docker run --rm -v basalt_basalt-data:/data basalt:0.1.1 purge -data /data -grace 0
+docker run --rm -v basalt_basalt-data:/data basalt:0.1.2 purge -data /data -grace 0
 docker compose start basalt
 ```
 
@@ -130,7 +130,7 @@ in flight, so `-grace 0` is what actually reclaims the space.
 `release/plugin/` is the folder Obsidian wants.
 
 ```
-scp -r release/plugin/ vault/.obsidian/plugins/basalt/
+scp -r release/plugin/ vault/.obsidian/plugins/basalt-sync/
 ```
 
 Then enable it in community plugins. On the first device, open it from the
@@ -142,7 +142,7 @@ the journal. On every device after that, paste the pairing string.
 Run on Android 17, a Pixel 9 Pro XL, against a server behind `tailscale serve`.
 What it did:
 
-- Loaded and enabled from `<vault>/.obsidian/plugins/basalt/`.
+- Loaded and enabled from `<vault>/.obsidian/plugins/basalt-sync/`.
 - Paired over `wss://` through Tailscale's TLS, with the Capacitor origin the
   server already allows.
 - Pulled a whole vault down: 320 files, 25 MiB, every one byte-identical to the

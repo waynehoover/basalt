@@ -58,6 +58,8 @@ const common = {
 await build({ ...common, ...cli });
 await build({ ...common, ...plugin });
 
-// The manifest sits beside main.js, because that is how Obsidian loads a plugin.
+// The manifest sits beside main.js, because that is how Obsidian loads a
+// plugin. Its source is the repository root, because that is where the
+// community directory reads it from.
 await mkdir("dist/plugin", { recursive: true });
-await copyFile("manifest.json", "dist/plugin/manifest.json");
+await copyFile("../manifest.json", "dist/plugin/manifest.json");

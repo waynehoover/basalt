@@ -74,10 +74,18 @@ describe("the plugin bundle", () => {
 
     it("ships a manifest beside it", async () => {
         const manifest = JSON.parse(await readFile("dist/plugin/manifest.json", "utf8")) as Record<string, unknown>;
-        expect(manifest["id"]).toBe("basalt");
-        // Mobile is not tested, but a manifest that declares desktop-only would
-        // make sure it never could be.
+        expect(manifest["id"]).toBe("basalt-sync");
         expect(manifest["isDesktopOnly"]).toBe(false);
+
+        // The shipped manifest has to be the repository's own, because the
+        // community directory reads that one and Obsidian installs this one. If
+        // they drifted, the directory would list a version nobody receives.
+        const root = JSON.parse(await readFile("../manifest.json", "utf8")) as Record<string, unknown>;
+        expect(manifest).toEqual(root);
+
+        // The tag a release is cut at has to be exactly this, so a version that
+        // is not plain x.y.z cannot be submitted at all.
+        expect(String(manifest["version"])).toMatch(/^\d+\.\d+\.\d+$/);
     });
 });
 

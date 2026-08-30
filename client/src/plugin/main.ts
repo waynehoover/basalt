@@ -130,21 +130,33 @@ export default class BasaltPlugin extends Plugin {
 
         // The same two operations without the UI, registered the way Obsidian
         // registers its own `sync:history` and `history:restore`.
-        this.registerCliHandler(
-            "basalt:history",
-            "List Basalt version history for a note",
-            { path: { value: "<path>", description: "Vault path" } },
-            async (flags) => this.cliHistory(String(flags["path"] ?? ""))
-        );
-        this.registerCliHandler(
-            "basalt:restore",
-            "Restore a Basalt version",
-            {
-                path: { value: "<path>", description: "Vault path" },
-                uid: { value: "<n>", description: "Version uid", required: true },
-            },
-            async (flags) => this.cliRestore(String(flags["path"] ?? ""), Number(flags["uid"]))
-        );
+        //
+        // Guarded because this arrived in Obsidian 1.12.2 and the rest of what
+        // this plugin needs is older. Calling a method that is not there throws
+        // inside onload, which stops registration where it stands: everything
+        // after it never happens and the plugin half exists, with nothing saying
+        // why. Seen exactly that on a phone running a stale build.
+        //
+        // A block rather than an early return, because returning would skip the
+        // vault event registration below and leave an older Obsidian syncing
+        // only on the timer. The first version of this guard did exactly that.
+        if (typeof this.registerCliHandler === "function") {
+            this.registerCliHandler(
+                "basalt:history",
+                "List Basalt version history for a note",
+                { path: { value: "<path>", description: "Vault path" } },
+                async (flags) => this.cliHistory(String(flags["path"] ?? ""))
+            );
+            this.registerCliHandler(
+                "basalt:restore",
+                "Restore a Basalt version",
+                {
+                    path: { value: "<path>", description: "Vault path" },
+                    uid: { value: "<n>", description: "Version uid", required: true },
+                },
+                async (flags) => this.cliRestore(String(flags["path"] ?? ""), Number(flags["uid"]))
+            );
+        }
 
         // Obsidian's own events, rather than a watcher. They are what the
         // platform gives, they work on mobile, and they say when to look rather

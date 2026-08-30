@@ -68,13 +68,16 @@ async function fresh(): Promise<void> {
 async function load(
     saved: unknown = null,
     manifest?: { id: string; dir?: string },
-    configDir?: string
+    configDir?: string,
+    /** A chance to make the host look like an older Obsidian before onload. */
+    beforeLoad?: (plugin: Testable) => void
 ): Promise<{ plugin: Testable; app: App }> {
     const app = new App();
     if (configDir !== undefined) app.vault.configDir = configDir;
     const plugin = makePlugin(app, manifest);
     plugin.savedData = saved;
     loaded.push(plugin);
+    beforeLoad?.(plugin);
     await plugin.onload();
     return { plugin, app };
 }
@@ -886,5 +889,37 @@ describe("pairing again after unlinking", () => {
         const stale = p.generation;
         p.generation++;
         expect(stale === p.generation, "a superseded run cannot tell it was superseded").toBe(false);
+    });
+});
+
+/**
+ * An Obsidian without `registerCliHandler` must still get a whole plugin.
+ *
+ * It arrived in 1.12.2 and everything else this plugin needs is older, so
+ * declaring 1.12.2 would exclude people for an optional integration. Calling a
+ * method that is not there throws inside onload, and onload stops where it
+ * throws: the commands after it never register and the plugin half exists with
+ * nothing saying why.
+ */
+describe("an older Obsidian", () => {
+    it("loads everything except the command line integration", async () => {
+        const { plugin } = await load(null, undefined, undefined, (p) => {
+            // Shadowed on the instance rather than deleted: the stub declares
+            // this on the prototype, where a delete of an own property does
+            // nothing at all and the method is still found.
+            (p as { registerCliHandler?: unknown }).registerCliHandler = undefined;
+        });
+
+        expect(plugin.commands.map((c) => c.id).sort()).toEqual([
+            "recover-deleted",
+            "show-status",
+            "sync-now",
+            "version-history",
+        ]);
+        expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt"]);
+        expect(plugin.statusBarItems.length).toBe(1);
+        // The four vault events and the file-menu entry, all after the guard.
+        expect(plugin.registeredEvents.length).toBe(5);
+        expect([...plugin.cliHandlers.keys()]).toEqual([]);
     });
 });

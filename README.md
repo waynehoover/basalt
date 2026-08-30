@@ -44,7 +44,7 @@ docker logs basalt        # prints your setup string
 
 **2. Add the plugin.** Put `main.js` and `manifest.json` from the
 [latest release](https://github.com/waynehoover/basalt-sync/releases) into
-`<vault>/.obsidian/plugins/basalt/`. In Obsidian: **Community plugins**, turn off
+`<vault>/.obsidian/plugins/basalt-sync/`. In Obsidian: **Community plugins**, turn off
 Restricted mode, enable **Basalt Sync**, paste the string.
 
 Done. Other devices paste the string from **Add another device**.
