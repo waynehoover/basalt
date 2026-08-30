@@ -9,8 +9,8 @@ services:
     build:
       context: .
       args:
-        VERSION: "0.1.0"
-    image: basalt:0.1.0
+        VERSION: "0.1.1"
+    image: basalt:0.1.1
     container_name: basalt
     restart: unless-stopped
 

@@ -40,7 +40,7 @@ Purge needs the directory to itself, so the server steps aside:
 
 ```
 docker compose stop basalt
-docker run --rm -v basalt_basalt-data:/data basalt:0.1.0 purge -data /data -grace 0
+docker run --rm -v basalt_basalt-data:/data basalt:0.1.1 purge -data /data -grace 0
 docker compose start basalt
 ```
 

@@ -37,8 +37,9 @@ correct server never would.
 
 ## The headless client
 
-`bun run build` produces `dist/basalt.mjs`, one file with nothing to
-install beside it. The command is `basalt`; the server's is `basaltd`, so a homelab can run both.
+`bun run build` produces `dist/basalt.mjs`: one 85 KB file with nothing to
+install beside it, because everything is bundled and the only imports that
+survive are `node:` builtins. The npm package declares no dependencies at all. The command is `basalt`; the server's is `basaltd`, so a homelab can run both.
 
 ```
 basalt init --server wss://host --token TOKEN   # the first device

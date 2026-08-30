@@ -25,6 +25,8 @@ designed around Markdown notes, which is where the speed comes from.
 - **Never mangles a note.** If a merge is not provably safe, both versions are kept.
 - **Full history.** Every version and every deletion, restorable from the plugin.
 - **One static binary.** No database, no broker, no accounts, no settings screen.
+- **Zero dependencies.** The plugin is one 90 KB file that needs nothing installed;
+  the CLI is 85 KB and pulls in no packages at all.
 - **Works headless.** Same engine, no GUI, for a server or a NAS.
 
 Desktop and Android are in daily use. iOS is untested.

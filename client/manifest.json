@@ -1,7 +1,7 @@
 {
   "id": "basalt",
   "name": "Basalt Sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.4.0",
   "description": "Blazing fast self-hosted sync. One binary, one pairing string. The server never sees your notes.",
   "author": "Wayne Hoover",
