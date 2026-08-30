@@ -37,7 +37,8 @@ device   paste it                       that is the whole setup
 | **Backup, verify, restore** | ✅ Stable |
 | **Docker and systemd** | ✅ Stable |
 | **Obsidian plugin, desktop** | 🧪 Beta |
-| **Obsidian plugin, mobile** | 🗓️ Planned |
+| **Obsidian plugin, Android** | 🧪 Beta |
+| **Obsidian plugin, iOS** | 🗓️ Untested |
 | **Community plugin listing** | 🗓️ Planned |
 
 ### End-to-end encryption
@@ -96,8 +97,9 @@ basalt sync --watch
 
 ## Status
 
-Early. The headless client works. The plugin has run in a real vault once, and
-never on a phone.
+Early, and further along than it was. The headless client works. The plugin syncs
+a real vault on desktop and on Android, including a whole vault pulled onto a
+phone with every file byte-identical. It has never run on iOS.
 
 ## Docs
 

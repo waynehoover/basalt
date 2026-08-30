@@ -137,26 +137,36 @@ Then enable it in community plugins. On the first device, open it from the
 ribbon, choose "Start a new vault", and give it the address and the token from
 the journal. On every device after that, paste the pairing string.
 
-## What to check on a phone
+## On a phone
 
-Obsidian mobile has no status bar, so the plugin's state is on the ribbon icon's
-tooltip instead. Everything else is the same.
+Run on Android 17, a Pixel 9 Pro XL, against a server behind `tailscale serve`.
+What it did:
 
-The one thing that may need a change on the server: it refuses a browser origin
-it does not recognise, and the mobile origins it knows are Capacitor's
-documented defaults, never checked against a device. If a phone will not
-connect, the plugin's own window says what its origin is, and the server logs
-the same thing:
+- Loaded and enabled from `<vault>/.obsidian/plugins/basalt/`.
+- Paired over `wss://` through Tailscale's TLS, with the Capacitor origin the
+  server already allows.
+- Pulled a whole vault down: 320 files, 25 MiB, every one byte-identical to the
+  desktop's copy.
+- Took a note written on the desktop within ten seconds, and a deletion after
+  it, which went to the vault's `.trash` rather than away.
+
+**Sync stops when the screen goes off.** Android's doze suspends the app's
+network, the connection drops, and nothing moves until the phone is awake again.
+It resumes on its own and loses nothing, but a first sync of a large vault will
+not finish in a pocket: leave the screen on until it has. This is the platform
+rather than the plugin, and Obsidian's own sync has the same shape.
+
+The origins the server accepts are Capacitor's documented defaults, and they
+worked here as they stand. If some future version of the app connects from
+somewhere else the server logs what it refused:
 
 ```
 journalctl -u basalt | grep 'accept refused'
-```
-
-Add it and restart:
-
-```
 basalt serve -data /var/lib/basalt -allow-origin capacitor://localhost
 ```
+
+Obsidian mobile has no status bar, so the plugin's state is on the ribbon icon's
+tooltip instead. Everything else is the same.
 
 ## What is in there
 
