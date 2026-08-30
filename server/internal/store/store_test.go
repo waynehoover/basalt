@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/waynehoover/basalt/server/internal/chunks"
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 )
 
 type harness struct {

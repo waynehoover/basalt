@@ -3,7 +3,7 @@ package server
 import (
 	"sync"
 
-	"github.com/waynehoover/basalt/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/store"
 )
 
 // Hub fans committed entries out to every device on a vault.

@@ -104,7 +104,7 @@ func unit(a unitArgs) string {
 	return strings.Join([]string{
 		"[Unit]",
 		"Description=Basalt, self-hosted sync for Obsidian",
-		"Documentation=https://github.com/waynehoover/basalt",
+		"Documentation=https://github.com/waynehoover/basalt-sync",
 		"After=network-online.target",
 		"Wants=network-online.target",
 		"",

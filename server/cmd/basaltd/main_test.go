@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/waynehoover/basalt/server/internal/dirlock"
+	"github.com/waynehoover/basalt-sync/server/internal/dirlock"
 
-	"github.com/waynehoover/basalt/server/internal/chunks"
-	"github.com/waynehoover/basalt/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
+	"github.com/waynehoover/basalt-sync/server/internal/store"
 )
 
 // seeded builds a data directory with some history in it, the way a server

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/waynehoover/basalt/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/store"
 )
 
 // One secret. The auth key is another branch of the same HKDF schedule that

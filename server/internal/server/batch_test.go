@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/waynehoover/basalt/server/internal/chunks"
-	"github.com/waynehoover/basalt/server/internal/wire"
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
+	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
 // Latency multiplies round trips. Two hundred paths were two hundred requests,

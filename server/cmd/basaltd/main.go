@@ -23,10 +23,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/waynehoover/basalt/server/internal/chunks"
-	"github.com/waynehoover/basalt/server/internal/dirlock"
-	"github.com/waynehoover/basalt/server/internal/server"
-	"github.com/waynehoover/basalt/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
+	"github.com/waynehoover/basalt-sync/server/internal/dirlock"
+	"github.com/waynehoover/basalt-sync/server/internal/server"
+	"github.com/waynehoover/basalt-sync/server/internal/store"
 )
 
 // version is stamped at build time with -X main.version=...

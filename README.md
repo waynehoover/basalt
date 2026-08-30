@@ -6,7 +6,7 @@
 
 > Blazing fast self-hosted Obsidian sync that just works
 
-[![CI](https://github.com/waynehoover/basalt/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt/actions/workflows/ci.yml)
+[![CI](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](server/go.mod)
 [![Client](https://img.shields.io/badge/client-TypeScript-3178C6?logo=typescript&logoColor=white)](client/)
@@ -35,7 +35,7 @@ Desktop and Android are in daily use. iOS is untested.
 
 ```bash
 docker run -d --name basalt -p 127.0.0.1:3003:3003 \
-  -v basalt-data:/data ghcr.io/waynehoover/basalt:latest
+  -v basalt-data:/data ghcr.io/waynehoover/basalt-sync:latest
 docker logs basalt
 ```
 
@@ -53,7 +53,7 @@ paste as it is.
 ### 2. Install the plugin
 
 Download `main.js` and `manifest.json` from the
-[latest release](https://github.com/waynehoover/basalt/releases) into
+[latest release](https://github.com/waynehoover/basalt-sync/releases) into
 `<your vault>/.obsidian/plugins/basalt/`.
 
 In Obsidian: **Settings → Community plugins**, turn off Restricted mode, enable

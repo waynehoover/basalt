@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/waynehoover/basalt/server/internal/chunks"
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 )
 
 // bigChunks uploads n distinct bodies of the given size and returns their names.

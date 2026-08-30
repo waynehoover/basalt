@@ -12,9 +12,9 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/waynehoover/basalt/server/internal/chunks"
-	"github.com/waynehoover/basalt/server/internal/store"
-	"github.com/waynehoover/basalt/server/internal/wire"
+	"github.com/waynehoover/basalt-sync/server/internal/chunks"
+	"github.com/waynehoover/basalt-sync/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
 // Session is one connected device.
