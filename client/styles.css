@@ -104,10 +104,6 @@
     align-items: center;
 }
 
-.status-bar-item.plugin-basalt-sync.basalt-muted {
-    color: var(--text-faint);
-}
-
 .status-bar-item.plugin-basalt-sync.basalt-attention {
     color: var(--text-error);
 }

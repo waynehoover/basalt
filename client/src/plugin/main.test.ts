@@ -982,3 +982,28 @@ it("does not draw the settled state the same as the working one", async () => {
     set({ kind: "synced", summary: "up to date", at: 1_700_000_000_000 });
     expect(statusIcon(plugin)).not.toBe(working);
 });
+
+/**
+ * The status bar must stay legible against the status bar.
+ *
+ * The faint states measured 2.57:1 in dark and 2.12:1 in light, both under the
+ * 3:1 a UI icon needs, and offline (the state meaning notes are not reaching
+ * the server) was the faintest thing on screen. Nothing here can measure a
+ * colour, so it pins the decision instead: only the error state is tinted, and
+ * everything else inherits the status bar's own colour.
+ */
+it("tints only the state that is actually wrong", async () => {
+    const { plugin } = await load();
+    const set = (s: unknown) => (plugin as unknown as { setState(s: unknown): void }).setState(s);
+    const tone = () =>
+        (plugin as unknown as { statusEl: { cls: string } }).statusEl.cls
+            .split(" ")
+            .filter((c) => c.startsWith("basalt-") && c !== "basalt-status-icon");
+
+    for (const s of [{ kind: "unpaired" }, { kind: "offline", why: "x", retryAt: 1 }]) {
+        set(s);
+        expect(tone(), `${s.kind} should carry no colour`).not.toContain("basalt-muted");
+    }
+    set({ kind: "stopped", why: "x" });
+    expect(tone()).toContain("basalt-attention");
+});

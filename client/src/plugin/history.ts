@@ -236,7 +236,7 @@ export class HistoryModal extends Modal {
  * most of what a row is. A version from today wants the time; one from this year
  * wants the day; only an older one needs the year at all.
  */
-function when(ms: number): string {
+export function when(ms: number): string {
     const at = new Date(ms);
     const now = new Date();
     const time = at.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });

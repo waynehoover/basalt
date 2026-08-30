@@ -23,7 +23,7 @@
 
 import { Modal, Notice, Plugin, Setting, setIcon, type TAbstractFile, type TextComponent } from "obsidian";
 
-import { HistoryModal, type HistorySource } from "./history.ts";
+import { HistoryModal, when, type HistorySource } from "./history.ts";
 
 import {
     Client,
@@ -646,7 +646,7 @@ export default class BasaltPlugin extends Plugin {
  */
 function paintStatus(el: HTMLElement, state: State): void {
     el.empty();
-    el.removeClass("basalt-attention", "basalt-muted", "basalt-working");
+    el.removeClass("basalt-attention", "basalt-working");
     const icon = el.createSpan({ cls: "basalt-status-icon" });
     setIcon(icon, iconFor(state));
     // Only when there is one. The settled state has no tone, and addClass with
@@ -684,9 +684,16 @@ function toneFor(state: State): string {
     switch (state.kind) {
         case "stopped":
             return "basalt-attention";
+        // No tone. These used --text-faint, which measures 2.57:1 against the
+        // status bar in dark and 2.12:1 in light, under the 3:1 that a UI icon
+        // needs to be made out. Offline in particular is the state that means
+        // notes are not reaching the server, and it was the least legible thing
+        // on the screen. Untinted, they inherit the status bar's own colour and
+        // sit at the same weight as every item beside them; the glyph is what
+        // tells them apart.
         case "offline":
         case "unpaired":
-            return "basalt-muted";
+            return "";
         case "connecting":
         case "syncing":
             return "basalt-working";
@@ -949,7 +956,7 @@ class RecoverModal extends Modal {
         }
 
         for (const version of deleted.notes) {
-            const when = new Date(version.mtime).toLocaleString();
+            const deletedAt = when(version.mtime);
             if (version.restorable === 0) {
                 // Listed, and honestly. A purge keeps only the newest version
                 // per path, which for a deleted note is the deletion itself, so
@@ -957,12 +964,12 @@ class RecoverModal extends Modal {
                 // it. Offering a button that could only fail would be worse.
                 new Setting(contentEl)
                     .setName(version.path)
-                    .setDesc(`Deleted ${when}. Its history has been purged, so there is nothing to restore.`);
+                    .setDesc(`Deleted ${deletedAt}. Its history has been purged, so there is nothing to restore.`);
                 continue;
             }
             new Setting(contentEl)
                 .setName(version.path)
-                .setDesc(`Deleted ${when}, last written on ${version.device}`)
+                .setDesc(`Deleted ${deletedAt}, last written on ${version.device}`)
                 .addButton((b) =>
                     b
                         .setButtonText("Restore")
