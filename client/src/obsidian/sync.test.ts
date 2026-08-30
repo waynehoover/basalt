@@ -259,3 +259,36 @@ describe("a vault reaching another device", () => {
         expect(quiet.chunksSent).toBe(0);
     }, 300_000);
 });
+
+/**
+ * A note written on one device has to appear on the other without waiting for a
+ * timer.
+ *
+ * Accepting a batch records what the server holds; it does not fetch it. The
+ * fetch used to wait for the next thirty-second tick, so two devices that were
+ * both connected and idle could be half a minute apart. Measured on a real
+ * phone before this: 0.2 s, 9.2 s, 14.2 s, and one that had still not arrived
+ * after thirty seconds.
+ *
+ * Nothing here calls sync on b after it has settled. Only the batch arriving can
+ * produce the file.
+ */
+describe("how soon the other device sees it", () => {
+    it("fetches what a batch named, without being asked again", async () => {
+        await fresh();
+        const a = await device("a");
+        const b = await device("b");
+        await b.client.settle();
+
+        const text = "# Written on a\n\nand never fetched by hand on b\n";
+        await a.adapter.write("live.md", text);
+        await a.client.settle();
+
+        const deadline = Date.now() + 10_000;
+        while (b.text("live.md") === undefined) {
+            if (Date.now() > deadline) throw new Error("b never fetched what the server told it about");
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        expect(b.text("live.md")).toBe(text);
+    }, 60_000);
+});

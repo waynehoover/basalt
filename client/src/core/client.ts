@@ -49,10 +49,19 @@ export interface ClientOptions {
 }
 
 /** One connection, from hello to close. */
+/**
+ * How long to wait after a batch arrives before fetching what it named.
+ *
+ * Long enough that a burst of catch-up batches becomes one pass, short enough
+ * that two devices side by side look immediate.
+ */
+const ARRIVAL_DELAY_MS = 150;
+
 export class Client {
     readonly engine: Engine;
     readonly transport: Transport;
     private limits: ServerLimits | undefined;
+    private soonTimer: ReturnType<typeof setTimeout> | undefined;
     private caughtUp = false;
     private endedWith: Error | undefined;
     private notifyEnded: ((cause: Error) => void) | undefined;
@@ -62,6 +71,16 @@ export class Client {
         this.transport = new Transport(opts.url, {
             onBatch: async (batch) => {
                 await engine.acceptBatch(batch);
+                // Accepting a batch records what the server has; it does not
+                // fetch it. Without this the download waited for the next tick,
+                // so a note written on one device took up to thirty seconds to
+                // appear on another that was connected and idle the whole time.
+                // Measured on a phone: 0.2 s, 9.2 s, 14.2 s, and one that had
+                // not arrived after half a minute.
+                //
+                // An empty batch is this device's own write coming back, and
+                // there is nothing to fetch for it.
+                if (batch.entries.length > 0) this.soon();
             },
             onCaughtUp: () => {
                 this.caughtUp = true;
@@ -219,6 +238,22 @@ export class Client {
     }
 
     /**
+     * Syncs shortly, coalescing a run of arrivals into one pass.
+     *
+     * Catch-up is many batches in a row and a pass per batch would be a pass
+     * per batch for nothing: they all want the same thing, which is one pass
+     * once they have stopped coming. Short enough that it still reads as
+     * immediate to somebody watching two devices.
+     */
+    private soon(): void {
+        if (this.soonTimer !== undefined) return;
+        this.soonTimer = setTimeout(() => {
+            this.soonTimer = undefined;
+            void this.sync();
+        }, ARRIVAL_DELAY_MS);
+    }
+
+    /**
      * A sync whose failure does not become an unhandled rejection.
      *
      * Public because a shell with its own reason to sync needs it: the plugin
@@ -348,6 +383,13 @@ export class Client {
     }
 
     close(): void {
+        // Or a pass fires against a closed transport after the caller has
+        // finished with this client, which in a test is a leak and in a plugin
+        // is a sync running after the vault was unlinked.
+        if (this.soonTimer !== undefined) {
+            clearTimeout(this.soonTimer);
+            this.soonTimer = undefined;
+        }
         this.transport.close();
     }
 }

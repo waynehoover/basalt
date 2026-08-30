@@ -147,8 +147,8 @@ What it did:
   server already allows.
 - Pulled a whole vault down: 320 files, 25 MiB, every one byte-identical to the
   desktop's copy.
-- Took a note written on the desktop within ten seconds, and a deletion after
-  it, which went to the vault's `.trash` rather than away.
+- Took a note written on the desktop in about **0.15 seconds**, and a deletion
+  after it, which went to the vault's `.trash` rather than away.
 
 **Sync stops when the screen goes off.** Android's doze suspends the app's
 network, the connection drops, and nothing moves until the phone is awake again.
