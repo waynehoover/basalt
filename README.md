@@ -62,7 +62,9 @@ In Obsidian: **Settings → Community plugins**, turn off Restricted mode, enabl
 Every device after the first pastes the string that one hands out, from **Add
 another device**.
 
-### No Obsidian on the machine?
+### Headless client
+
+For a server or a NAS, with no Obsidian on it:
 
 ```bash
 npm install -g basalt-sync
