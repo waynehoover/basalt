@@ -38,10 +38,11 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # No explicit latest: metadata-action adds it for a semver tag, and
+          # asking for it as well produced it twice in the tag list.
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
 
       - uses: docker/build-push-action@v6
         with:
@@ -54,6 +55,12 @@ jobs:
 
       # An image that was pushed and cannot run is worse than no image, and the
       # tag is already public by the time anyone would notice.
+      #
+      # The version comes from the metadata step rather than from the git ref:
+      # the tag is v0.1.0 and the image is 0.1.0, because semver tagging strips
+      # the prefix. Using the ref here asked for an image that does not exist,
+      # and the step failed after a successful push, which is the most confusing
+      # way for it to be wrong.
       - name: it runs
         run: |
-          docker run --rm ghcr.io/${{ github.repository }}:${{ github.ref_name }} version
+          docker run --rm ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }} version
