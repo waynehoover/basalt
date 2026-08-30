@@ -4,11 +4,12 @@
 
 # Basalt Sync
 
-> Blazing fast self-hosted Obsidian sync that just works
+> Fast, zero-dependency, self-hosted Obsidian sync
 
 [![CI](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](server/go.mod)
+[![npm](https://img.shields.io/npm/v/basalt-sync?logo=npm&label=basalt-sync)](https://www.npmjs.com/package/basalt-sync)
 [![Client](https://img.shields.io/badge/client-TypeScript-3178C6?logo=typescript&logoColor=white)](client/)
 
 </div>
@@ -33,40 +34,29 @@ Desktop and Android are in daily use. iOS is untested.
 
 ## Install
 
-### 1. Run the server
+**1. Run the server.**
 
 ```bash
 docker run -d --name basalt -p 127.0.0.1:3003:3003 \
   -v basalt-data:/data ghcr.io/waynehoover/basalt-sync:latest
-docker logs basalt
+docker logs basalt        # prints your setup string
 ```
 
-It prints a setup string:
-
-```
-  100.80.123.79:3003#JGJFZ9SQ-5E67J3KM0VBPG15AYSF381SM
-```
-
-Put TLS in front before another device reaches it. `tailscale serve` is one line;
-[`docs/running.md`](docs/running.md) has that, Compose, systemd and every flag.
-Trying it on one machine? `basaltd serve -localhost` prints a string you can
-paste as it is.
-
-### 2. Install the plugin
-
-Download `main.js` and `manifest.json` from the
+**2. Add the plugin.** Put `main.js` and `manifest.json` from the
 [latest release](https://github.com/waynehoover/basalt-sync/releases) into
-`<your vault>/.obsidian/plugins/basalt/`.
+`<vault>/.obsidian/plugins/basalt/`. In Obsidian: **Community plugins**, turn off
+Restricted mode, enable **Basalt Sync**, paste the string.
 
-In Obsidian: **Settings → Community plugins**, turn off Restricted mode, enable
-**Basalt Sync**, paste the setup string.
+Done. Other devices paste the string from **Add another device**.
 
-Every device after the first pastes the string that one hands out, from **Add
-another device**.
+Put TLS in front before anything else reaches it: `tailscale serve` is one line,
+and [`docs/running.md`](docs/running.md) covers that, Compose, systemd and every
+flag. Trying it on one machine? `basaltd serve -localhost` prints a string that
+needs no TLS.
 
 ### Headless client
 
-For a server or a NAS, with no Obsidian on it:
+No Obsidian on the machine, for a server or a NAS:
 
 ```bash
 npm install -g basalt-sync
