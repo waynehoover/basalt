@@ -2,7 +2,31 @@
   "name": "basalt-sync",
   "version": "0.1.0",
   "description": "Headless Obsidian vault sync for a Basalt server.",
-  "private": true,
+  "keywords": [
+    "obsidian",
+    "sync",
+    "self-hosted",
+    "end-to-end-encryption",
+    "notes"
+  ],
+  "homepage": "https://github.com/waynehoover/basalt-sync",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/waynehoover/basalt-sync.git",
+    "directory": "client"
+  },
+  "bugs": {
+    "url": "https://github.com/waynehoover/basalt-sync/issues"
+  },
+  "license": "MIT",
+  "author": "Wayne Hoover",
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist/basalt.mjs",
+    "README.md"
+  ],
   "type": "module",
   "scripts": {
     "build": "node esbuild.config.mjs production",
@@ -17,14 +41,12 @@
   "devDependencies": {
     "@types/diff-match-patch": "^1.0.36",
     "@types/node": "^24.10.13",
+    "diff-match-patch": "^1.0.5",
     "esbuild": "^0.28.1",
+    "fflate": "^0.8.3",
     "obsidian": "^1.13.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.8"
-  },
-  "dependencies": {
-    "diff-match-patch": "^1.0.5",
-    "fflate": "^0.8.3"
   },
   "bin": {
     "basalt": "./dist/basalt.mjs"
