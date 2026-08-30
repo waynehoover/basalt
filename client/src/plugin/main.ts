@@ -21,7 +21,7 @@
  * which is as close as it gets until it runs in a vault.
  */
 
-import { Modal, Notice, Plugin, Setting, type TAbstractFile, type TextComponent } from "obsidian";
+import { Modal, Notice, Plugin, Setting, setIcon, type TAbstractFile, type TextComponent } from "obsidian";
 
 import { HistoryModal, type HistorySource } from "./history.ts";
 
@@ -606,7 +606,7 @@ export default class BasaltPlugin extends Plugin {
 
     private setState(state: State): void {
         this.state = state;
-        this.statusEl?.setText(`Basalt: ${shortStatus(state)}`);
+        if (this.statusEl) paintStatus(this.statusEl, state);
         // Where a phone can see it. `aria-label` is what Obsidian renders as a
         // ribbon tooltip, and it is also what a screen reader reads out.
         this.ribbonEl?.setAttribute("aria-label", `Basalt: ${longStatus(state)}`);
@@ -636,6 +636,65 @@ export default class BasaltPlugin extends Plugin {
 }
 
 /** One line, because a status bar is one line. */
+/**
+ * An icon and a tooltip, which is what Obsidian's own status items are.
+ *
+ * Text in the status bar was a whole sentence competing with the word count for
+ * a strip that is one line tall, and it read as noise next to the icons either
+ * side of it. The state is a glyph now and the sentence is the tooltip, which is
+ * where somebody looks when the glyph is not enough.
+ */
+function paintStatus(el: HTMLElement, state: State): void {
+    el.empty();
+    el.removeClass("basalt-attention", "basalt-muted", "basalt-working");
+    const icon = el.createSpan({ cls: "basalt-status-icon" });
+    setIcon(icon, iconFor(state));
+    // Only when there is one. The settled state has no tone, and addClass with
+    // an empty string throws: "The token provided must not be empty", which
+    // arrives as a sync error about a DOMTokenList and says nothing about the
+    // status bar it came from.
+    const tone = toneFor(state);
+    if (tone !== "") el.addClass(tone);
+    // Both, because Obsidian styles aria-label as its own tooltip and a plain
+    // title is what shows if it ever stops.
+    el.setAttribute("aria-label", `Basalt Sync: ${longStatus(state)}`);
+    el.setAttribute("title", `Basalt Sync: ${longStatus(state)}`);
+}
+
+function iconFor(state: State): string {
+    switch (state.kind) {
+        case "unpaired":
+            return "link";
+        case "connecting":
+        case "syncing":
+            return "refresh-cw";
+        // Not refresh-cw again. Settled and working would then differ only by
+        // whether the glyph happens to be spinning, which is exactly the
+        // distinction a glance cannot make.
+        case "synced":
+            return "check";
+        case "offline":
+            return "cloud-off";
+        case "stopped":
+            return "alert-triangle";
+    }
+}
+
+function toneFor(state: State): string {
+    switch (state.kind) {
+        case "stopped":
+            return "basalt-attention";
+        case "offline":
+        case "unpaired":
+            return "basalt-muted";
+        case "connecting":
+        case "syncing":
+            return "basalt-working";
+        case "synced":
+            return "";
+    }
+}
+
 function shortStatus(state: State): string {
     switch (state.kind) {
         case "unpaired":

@@ -63,3 +63,6 @@ await build({ ...common, ...plugin });
 // community directory reads it from.
 await mkdir("dist/plugin", { recursive: true });
 await copyFile("../manifest.json", "dist/plugin/manifest.json");
+// Obsidian loads this beside main.js if it is there, and a release carries it
+// as its own asset for the same reason it carries the manifest.
+await copyFile("styles.css", "dist/plugin/styles.css");

@@ -51,6 +51,10 @@ export class FakeEl {
         return this.createEl("div", o);
     }
 
+    createSpan(o?: { text?: string; cls?: string } | string): FakeEl {
+        return this.createEl("span", o);
+    }
+
     empty(): void {
         this.children.length = 0;
     }
@@ -77,6 +81,14 @@ export class FakeEl {
     }
 
     addClass(...classes: string[]): void {
+        for (const c of classes) {
+            // What a real DOMTokenList does, word for word, because a stub that
+            // shrugs at an empty token lets a crash through: the status bar
+            // painter passed one and it surfaced as a sync error about a
+            // DOMTokenList, from a stack that never mentioned the status bar.
+            if (c === "") throw new Error("Failed to execute 'add' on 'DOMTokenList': The token provided must not be empty.");
+            if (/\s/.test(c)) throw new Error("Failed to execute 'add' on 'DOMTokenList': The token provided contains HTML space characters.");
+        }
         this.cls = [this.cls, ...classes].filter(Boolean).join(" ");
     }
 
@@ -233,6 +245,17 @@ export class Menu {
 
 /** Everything shown to the user, in order, for asserting on what was said. */
 export const notices: { message: string; duration: number | undefined }[] = [];
+
+/**
+ * Obsidian's icon helper, which sets a glyph inside an element.
+ *
+ * Recorded as an attribute so a test can assert which icon a state chose: the
+ * status bar is an icon and a tooltip now, and "which glyph" is the whole of
+ * what it says.
+ */
+export function setIcon(el: FakeEl, name: string): void {
+    el.setAttribute("data-icon", name);
+}
 
 export class Notice {
     constructor(

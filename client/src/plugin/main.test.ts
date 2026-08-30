@@ -93,13 +93,22 @@ async function until(what: string, cond: () => boolean, ms = 20_000): Promise<vo
 }
 
 const synced = (p: Testable) => until("a sync", () => p.currentState.kind === "synced");
-const status = (p: Testable) => p.statusBarItems[0]?.text ?? "";
+/**
+ * What the status bar says, which is now a tooltip rather than text: the item
+ * itself is a glyph the size of its neighbours.
+ */
+const status = (p: Testable) => p.statusBarItems[0]?.attributes.get("aria-label") ?? "";
+
+/** Which glyph it chose, which is the other half of what it says. */
+const statusIcon = (p: Testable) =>
+    p.statusBarItems[0]?.children.find((c) => c.cls.includes("basalt-status-icon"))?.attributes.get("data-icon") ?? "";
 
 describe("loading", () => {
     it("comes up unpaired, and says so", async () => {
         const { plugin } = await load();
         expect(plugin.paired).toBe(false);
-        expect(status(plugin)).toBe("Basalt: not paired");
+        expect(status(plugin)).toBe("Basalt Sync: Not paired.");
+        expect(statusIcon(plugin)).toBe("link");
     });
 
     it("registers the things a plugin registers", async () => {
@@ -223,7 +232,8 @@ describe("where its own state goes", () => {
         await plugin.pairFirst(server.wsUrl, server.token, "laptop");
         await until("it to give up", () => plugin.currentState.kind === "stopped");
         expect(notices.map((n) => n.message).join(" ")).toMatch(/would sync/);
-        expect(status(plugin)).toBe("Basalt: stopped");
+        expect(statusIcon(plugin)).toBe("alert-triangle");
+        expect(status(plugin)).toMatch(/^Basalt Sync: Stopped:/);
     }, 300_000);
 });
 
@@ -239,7 +249,8 @@ describe("pairing", () => {
 
         expect(plugin.paired).toBe(true);
         expect(plugin.deviceName).toBe("laptop");
-        expect(status(plugin)).toBe("Basalt: 1 sent");
+        expect(statusIcon(plugin)).toBe("check");
+        expect(status(plugin)).toMatch(/^Basalt Sync: 1 sent, as of /);
         // Saved in a form that survives the JSON round trip Obsidian does.
         // No token: the vault has one secret, and what authenticates is derived
         // from it. The server's first-run token is kept only until the vault has
@@ -441,7 +452,8 @@ describe("when things go wrong", () => {
         notices.length = 0;
         await plugin.syncNow();
         expect(notices.map((n) => n.message).join(" ")).toMatch(/not connected/);
-        expect(status(plugin)).toBe("Basalt: offline");
+        expect(statusIcon(plugin)).toBe("cloud-off");
+        expect(status(plugin)).toMatch(/^Basalt Sync: Offline:/);
     }, 300_000);
 
     /**
@@ -597,7 +609,8 @@ describe("unlinking", () => {
         await plugin.unlink();
         expect(plugin.paired).toBe(false);
         expect(plugin.savedData).toBe(null);
-        expect(status(plugin)).toBe("Basalt: not paired");
+        expect(statusIcon(plugin)).toBe("link");
+        expect(status(plugin)).toBe("Basalt Sync: Not paired.");
         expect(app.vault.adapter.text("keep.md")).toBe("still here");
 
         // The index goes too. It records what this device believes it has
@@ -922,4 +935,50 @@ describe("an older Obsidian", () => {
         expect(plugin.registeredEvents.length).toBe(5);
         expect([...plugin.cliHandlers.keys()]).toEqual([]);
     });
+});
+
+/**
+ * The status bar is a glyph and a tooltip, so every state has to produce both.
+ *
+ * The settled state has no tone, and painting it called addClass with an empty
+ * string, which throws. It surfaced as a sync failure complaining about a
+ * DOMTokenList, which says nothing at all about the status bar it came from.
+ */
+describe("what the status bar shows", () => {
+    const states = [
+        { kind: "unpaired" },
+        { kind: "connecting" },
+        { kind: "syncing", path: "Notes/one.md" },
+        { kind: "synced", summary: "up to date", at: 1_700_000_000_000 },
+        { kind: "offline", why: "no route to host", retryAt: 1_700_000_000_000 },
+        { kind: "stopped", why: "not authorised" },
+    ] as const;
+
+    it("gives every state a glyph and a sentence, and never throws", async () => {
+        const { plugin } = await load();
+        const seen = new Set<string>();
+        for (const state of states) {
+            expect(() => (plugin as unknown as { setState(s: unknown): void }).setState(state)).not.toThrow();
+            const icon = statusIcon(plugin);
+            expect(icon, `${state.kind} chose no glyph`).not.toBe("");
+            expect(status(plugin), `${state.kind} has no tooltip`).toMatch(/^Basalt Sync: \S/);
+            seen.add(icon);
+        }
+        // Not all the same glyph, or the bar would say nothing by changing.
+        expect(seen.size).toBeGreaterThan(2);
+    });
+});
+
+/**
+ * Working and settled must not share a glyph. If they do, the only thing
+ * separating "still syncing" from "done" is whether the icon is spinning, and
+ * a spin is not something you can see in a glance at a status bar.
+ */
+it("does not draw the settled state the same as the working one", async () => {
+    const { plugin } = await load();
+    const set = (s: unknown) => (plugin as unknown as { setState(s: unknown): void }).setState(s);
+    set({ kind: "syncing", path: "a.md" });
+    const working = statusIcon(plugin);
+    set({ kind: "synced", summary: "up to date", at: 1_700_000_000_000 });
+    expect(statusIcon(plugin)).not.toBe(working);
 });

@@ -1,0 +1,104 @@
+/*
+ * Basalt Sync.
+ *
+ * Obsidian loads this beside main.js. Everything here is either layout the
+ * markup cannot express on its own, or a colour taken from Obsidian's own
+ * variables so the plugin follows the reader's theme rather than fighting it.
+ */
+
+/* A version row is two lines, and was relying on the timestamp being long
+ * enough to wrap. Shortening the timestamp put both on one line with no space
+ * between them, which is the sort of thing that only shows up on a screenshot. */
+.mod-basalt-history .modal-sidebar-list-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 12px;
+    cursor: pointer;
+}
+
+.mod-basalt-history .modal-sidebar-list-item-header {
+    font-weight: var(--font-medium);
+}
+
+.mod-basalt-history .modal-sidebar-list-item-details {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+}
+
+.mod-basalt-history .basalt-history-content-container {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding: 0 16px 16px;
+    overflow: auto;
+}
+
+.mod-basalt-history .basalt-history-text,
+.mod-basalt-history .basalt-history-diff {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: var(--font-ui-small);
+    margin: 0;
+}
+
+.mod-basalt-history .basalt-history-content-empty,
+.mod-basalt-history .basalt-history-empty {
+    color: var(--text-muted);
+}
+
+.mod-basalt-history .modal-setting-titlebar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 12px 0;
+}
+
+.mod-basalt-history .modal-setting-titlebar-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.mod-basalt-history .basalt-history-button {
+    margin: 8px 12px;
+}
+
+/* A diff is unreadable in one colour, and these are Obsidian's own, so it
+ * follows whatever theme the reader has. */
+.mod-basalt-history .basalt-history-diff .basalt-added {
+    color: var(--color-green);
+}
+
+.mod-basalt-history .basalt-history-diff .basalt-removed {
+    color: var(--color-red);
+}
+
+/* The status bar item: a glyph the size of its neighbours, tinted by state. */
+.status-bar-item.plugin-basalt-sync {
+    display: flex;
+    align-items: center;
+}
+
+.status-bar-item.plugin-basalt-sync .basalt-status-icon {
+    display: flex;
+    align-items: center;
+}
+
+.status-bar-item.plugin-basalt-sync.basalt-muted {
+    color: var(--text-faint);
+}
+
+.status-bar-item.plugin-basalt-sync.basalt-attention {
+    color: var(--text-error);
+}
+
+.status-bar-item.plugin-basalt-sync.basalt-working .basalt-status-icon {
+    animation: basalt-spin 1.6s linear infinite;
+}
+
+@keyframes basalt-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}

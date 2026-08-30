@@ -199,9 +199,27 @@ export class HistoryModal extends Modal {
     }
 }
 
-/** A timestamp somebody can read, in their own locale. */
+/**
+ * A timestamp for a narrow column.
+ *
+ * The full locale string wrapped onto two ragged lines in the sidebar, which is
+ * most of what a row is. A version from today wants the time; one from this year
+ * wants the day; only an older one needs the year at all.
+ */
 function when(ms: number): string {
-    return new Date(ms).toLocaleString();
+    const at = new Date(ms);
+    const now = new Date();
+    const time = at.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+
+    const sameDay =
+        at.getDate() === now.getDate() &&
+        at.getMonth() === now.getMonth() &&
+        at.getFullYear() === now.getFullYear();
+    if (sameDay) return time;
+
+    const day = at.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    if (at.getFullYear() === now.getFullYear()) return `${day}, ${time}`;
+    return `${day} ${at.getFullYear()}`;
 }
 
 /**
@@ -215,7 +233,7 @@ function describe(version: Version, newest: boolean): string {
     if (version.deleted) return `Deleted on ${version.device}`;
     if (version.folder) return `Folder, ${version.device}`;
     const size = version.size < 1024 ? `${version.size} B` : `${Math.round(version.size / 1024)} KiB`;
-    return `${size}, ${version.device}${newest ? ", newest" : ""}`;
+    return `${size} · ${version.device}${newest ? " · newest" : ""}`;
 }
 
 /**
