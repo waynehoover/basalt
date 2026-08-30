@@ -38,8 +38,19 @@ done
 echo
 echo "plugin"
 ( cd client && bun run build >/dev/null )
-cp client/dist/plugin/main.js "$out/plugin/main.js"
-cp client/dist/plugin/manifest.json "$out/plugin/manifest.json"
+
+# Everything the build emits, rather than a list kept here by hand. That list
+# said main.js and manifest.json, and styles.css was added to the plugin without
+# it being updated, so a release would have installed a plugin whose history
+# rows sit on top of one another and whose status bar has no colour. Nothing
+# would have errored.
+cp -R client/dist/plugin/. "$out/plugin/"
+
+# And the ones it cannot do without, named so that a build which quietly stops
+# emitting one fails here instead of shipping.
+for required in main.js manifest.json styles.css; do
+  [ -f "$out/plugin/$required" ] || { echo "release: the plugin build produced no $required" >&2; exit 1; }
+done
 
 # versions.json maps a plugin version to the oldest Obsidian it runs on, and
 # Obsidian reads it to decide whether to offer an update to an older install.
@@ -51,6 +62,7 @@ json.dump({'$pluginversion': '$minapp'}, open('$out/plugin/versions.json', 'w'),
 open('$out/plugin/versions.json','a').write('\n')
 "
 printf '  %-24s %s\n' "main.js" "$(du -h "$out/plugin/main.js" | cut -f1)"
+printf '  %-24s %s\n' "styles.css" "$(du -h "$out/plugin/styles.css" | cut -f1)"
 printf '  %-24s %s\n' "manifest.json" "version $pluginversion, needs Obsidian $minapp"
 
 # A folder ready to drop into .obsidian/plugins/, and the same thing zipped for
@@ -58,9 +70,10 @@ printf '  %-24s %s\n' "manifest.json" "version $pluginversion, needs Obsidian $m
 ( cd "$out" && zip -qr "basalt-plugin-$version.zip" plugin )
 
 # And loose beside it. Obsidian's community directory installs a plugin by
-# fetching main.js and manifest.json from the release as individual assets; a
-# zip is for a person doing it by hand.
+# fetching main.js, manifest.json and styles.css from the release as individual
+# assets; a zip is for a person doing it by hand.
 cp client/dist/plugin/main.js "$out/main.js"
+cp client/dist/plugin/styles.css "$out/styles.css"
 cp "$root/manifest.json" "$out/manifest.json"
 
 # ---- the headless client -------------------------------------------------

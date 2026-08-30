@@ -84,7 +84,7 @@ export default class BasaltPlugin extends Plugin {
         // its tooltip is the same sentence, and it is the thing somebody taps
         // when they want to know.
         this.statusEl = this.addStatusBarItem();
-        this.ribbonEl = this.addRibbonIcon("refresh-cw", "Basalt", () => new BasaltModal(this).open());
+        this.ribbonEl = this.addRibbonIcon("refresh-cw", "Basalt Sync", () => new BasaltModal(this).open());
 
         this.addCommand({
             id: "sync-now",
@@ -738,7 +738,7 @@ class BasaltModal extends Modal {
         const { contentEl } = this;
         this.unwatch?.();
         contentEl.empty();
-        contentEl.createEl("h2", { text: "Basalt" });
+        contentEl.createEl("h2", { text: "Basalt Sync" });
 
         if (!this.plugin.paired) {
             this.renderPairing(contentEl);
@@ -1003,6 +1003,15 @@ function origin(): string {
     return l?.origin ?? "unknown";
 }
 
+/**
+ * The time of day, without seconds. A status line is read at a glance and
+ * "1:00:37 PM" is not read any differently from "1:00 PM"; the history modal
+ * has always printed it this way.
+ */
+function clock(ms: number): string {
+    return new Date(ms).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
 function longStatus(state: State): string {
     switch (state.kind) {
         case "unpaired":
@@ -1012,7 +1021,7 @@ function longStatus(state: State): string {
         case "syncing":
             return `Working on ${state.path}.`;
         case "synced":
-            return `${state.summary}, as of ${new Date(state.at).toLocaleTimeString()}.`;
+            return `${state.summary}, as of ${clock(state.at)}.`;
         case "offline":
             return `Offline: ${state.why}. Trying again shortly.`;
         case "stopped":

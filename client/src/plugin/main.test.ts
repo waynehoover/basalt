@@ -119,7 +119,7 @@ describe("loading", () => {
             "sync-now",
             "version-history",
         ]);
-        expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt"]);
+        expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt Sync"]);
         expect(plugin.statusBarItems.length).toBe(1);
         // create, modify, delete, rename. Without these it only syncs on a timer.
         expect(app.vault.handlerCount()).toBe(4);
@@ -750,7 +750,7 @@ describe("on a device with no status bar", () => {
         await fresh();
         const { plugin } = await load();
         const ribbon = plugin.ribbonIcons[0]!;
-        expect(ribbon.title).toBe("Basalt");
+        expect(ribbon.title).toBe("Basalt Sync");
 
         await plugin.pairFirst(server.wsUrl, server.token, "laptop");
         await synced(plugin);
@@ -929,7 +929,7 @@ describe("an older Obsidian", () => {
             "sync-now",
             "version-history",
         ]);
-        expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt"]);
+        expect(plugin.ribbonIcons.map((r) => r.title)).toEqual(["Basalt Sync"]);
         expect(plugin.statusBarItems.length).toBe(1);
         // The four vault events and the file-menu entry, all after the guard.
         expect(plugin.registeredEvents.length).toBe(5);
