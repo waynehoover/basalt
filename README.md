@@ -62,9 +62,10 @@ note for its history, with a diff against what is on disk and a restore that
 never overwrites. Deleted notes have their own recovery list.
 
 ### Fast on a slow link
-A first sync of 2000 files costs 26 round trips, not 2000. Twenty edited notes
-take about a second over 400 ms of latency. `docs/benchmark.md` has the numbers
-and the machine they were measured on.
+A note written on one device appears on another in about a tenth of a second,
+measured desktop to phone. A first sync of 2000 files costs 26 round trips, not
+2000, and twenty edited notes take about a second over 400 ms of latency.
+`docs/benchmark.md` has the numbers and the machine they were measured on.
 
 ### Notes first, attachments second
 Everything here is built around Markdown: the chunk sizes, the merge, the
