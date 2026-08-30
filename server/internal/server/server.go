@@ -16,8 +16,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/waynehoover/basalt/internal/store"
-	"github.com/waynehoover/basalt/internal/wire"
+	"github.com/waynehoover/basalt/server/internal/store"
+	"github.com/waynehoover/basalt/server/internal/wire"
 )
 
 const (

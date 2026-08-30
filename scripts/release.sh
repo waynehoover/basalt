@@ -29,8 +29,8 @@ for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
   goos=${target%/*}
   goarch=${target#*/}
   name="basalt-$goos-$goarch"
-  ( cd go && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
-      go build -trimpath -ldflags "-s -w -X main.version=$version" -o "$out/$name" ./cmd/basalt )
+  ( cd server && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+      go build -trimpath -ldflags "-s -w -X main.version=$version" -o "$out/$name" ./cmd/basaltd )
   printf '  %-24s %s\n' "$name" "$(du -h "$out/$name" | cut -f1)"
 done
 

@@ -15,7 +15,7 @@ const production = process.argv.includes("production");
 
 /** The headless client, as one file a person can run. */
 const cli = {
-    entryPoints: ["src/node/bin.ts"],
+    entryPoints: ["src/cli/bin.ts"],
     outfile: "dist/basalt.mjs",
     platform: "node",
     target: "node20",
@@ -35,7 +35,7 @@ const cli = {
  * copying three files.
  */
 const plugin = {
-    entryPoints: ["src/obsidian/main.ts"],
+    entryPoints: ["src/plugin/main.ts"],
     outfile: "dist/plugin/main.js",
     platform: "browser",
     target: "es2020",

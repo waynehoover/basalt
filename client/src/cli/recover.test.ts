@@ -187,7 +187,7 @@ describe("the list of what is gone", () => {
      * sees one path gone and another arrived, and nothing connects them. The
      * headless client gets no rename event and so reports what it saw. The
      * server's suppression is real and is tested where a rename can actually be
-     * observed, which is Obsidian, in src/obsidian/sync.test.ts.
+     * observed, which is Obsidian, in src/plugin/sync.test.ts.
      *
      * Nothing is lost either way. The content is on the server under both
      * names, and chunk deduplication means the second name cost nothing to

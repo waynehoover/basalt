@@ -28,7 +28,7 @@ import { Client } from "./src/core/client.ts";
 import { authToken, deriveKeys } from "./src/core/crypto.ts";
 import { TestServer, serverBinary } from "./src/core/test-server.ts";
 import { LatencyProxy, type Wire } from "./src/core/latency.ts";
-import { JsonIndexStore, NodeVault } from "./src/node/vault.ts";
+import { JsonIndexStore, NodeVault } from "./src/cli/vault.ts";
 import type { SyncReport } from "./src/core/engine.ts";
 
 const FOLDERS = [

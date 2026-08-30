@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/waynehoover/basalt/internal/chunks"
+	"github.com/waynehoover/basalt/server/internal/chunks"
 )
 
 // cmdHealth asks a running server whether it is answering.

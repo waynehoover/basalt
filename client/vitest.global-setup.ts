@@ -19,14 +19,14 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
-const GO_DIR = new URL("./../go", import.meta.url).pathname;
+const GO_DIR = new URL("./../server", import.meta.url).pathname;
 
 let dir: string | undefined;
 
 export async function setup(): Promise<void> {
     dir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
     const binary = join(dir, "basalt");
-    await run("go", ["build", "-o", binary, "./cmd/basalt"], {
+    await run("go", ["build", "-o", binary, "./cmd/basaltd"], {
         cwd: GO_DIR,
         env: { ...process.env, CGO_ENABLED: "0" },
     });

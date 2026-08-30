@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/waynehoover/basalt/internal/chunks"
+	"github.com/waynehoover/basalt/server/internal/chunks"
 
 	_ "modernc.org/sqlite"
 )

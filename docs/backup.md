@@ -6,7 +6,7 @@ Two different things people mean by "back up my notes", and confusing them is ho
 someone ends up with a directory nobody can read.
 
 ```
-basalt backup -to /mnt/usb/basalt          server side, ciphertext, incremental
+basaltd backup -to /mnt/usb/basalt          server side, ciphertext, incremental
 ```
 
 That copies everything the server holds, including full version history, into a
@@ -18,7 +18,7 @@ never seen.
 > Write the passphrase down and keep it somewhere other than the backup.
 > A backup without it is not a backup.
 
-No command can check that, which is why `basalt backup` says it every time.
+No command can check that, which is why `basaltd backup` says it every time.
 
 ## What a server backup is for
 
@@ -37,12 +37,12 @@ first; it says so afterwards, which is later than you would like.
 ## What it does
 
 ```
-basalt backup -to DIR          copy, verify, report
-basalt backup -to DIR -deep    also re-read every body already in DIR
+basaltd backup -to DIR          copy, verify, report
+basaltd backup -to DIR -deep    also re-read every body already in DIR
 ```
 
 - **The destination is a data directory.** Restore by copying it back, or point
-  the server at it: `basalt serve -data DIR`. No archive format, no restore tool.
+  the server at it: `basaltd serve -data DIR`. No archive format, no restore tool.
 - **Incremental.** Bodies are named by their content hash, so one already there
   is already correct and is skipped. Cheap enough to run nightly.
 - **Runs live.** The database is snapshotted with `VACUUM INTO`, a single point
@@ -61,8 +61,8 @@ many: debris from an upload that died, referenced by nothing.
 
 ```
 cp -a /mnt/usb/basalt /var/lib/basalt-restored
-basalt verify -deep -data /var/lib/basalt-restored
-basalt serve -data /var/lib/basalt-restored
+basaltd verify -deep -data /var/lib/basalt-restored
+basaltd serve -data /var/lib/basalt-restored
 ```
 
 If the backup is older than what a device already applied, that device is refused
@@ -76,7 +76,7 @@ A systemd timer, a launchd job, or cron. Two destinations is not paranoia: a
 backup on a disk in the same box is one power supply away from not existing.
 
 ```
-basalt backup -to /mnt/usb/basalt && basalt backup -to /mnt/nas/basalt
+basaltd backup -to /mnt/usb/basalt && basaltd backup -to /mnt/nas/basalt
 ```
 
 Run `-deep` monthly, not nightly. It re-reads every body to catch bit rot on a

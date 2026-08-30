@@ -6,8 +6,8 @@ One sync engine, two things to run it: the Obsidian plugin and a headless client
 
 ```
 src/core/       platform-free. crypto, chunking, merging, the index, the transport
-src/obsidian/   the Vault API adapter and the plugin shell
-src/node/       the filesystem adapter and the headless CLI
+src/plugin/   the Vault API adapter and the plugin shell
+src/cli/       the filesystem adapter and the headless CLI
 ```
 
 `core` is the whole client except the parts that have to know where files live.
@@ -29,7 +29,7 @@ bun run bench:sync   # a whole vault, timed and checked
 ```
 
 The tests need a Go toolchain. `src/core/server-harness.test.ts` builds
-`cmd/basalt`, runs it on a loopback port, and talks to it with the real
+`cmd/basaltd`, runs it on a loopback port, and talks to it with the real
 transport. Nothing is mocked, and its assertions are checked by asking the
 server's own `verify -deep` whether what it stored can be served.
 `src/core/transport.test.ts` is the other half: a fake socket that says things a
@@ -37,8 +37,8 @@ correct server never would.
 
 ## The headless client
 
-`bun run build` produces `dist/basalt.mjs`, one file with nothing to install
-beside it.
+`bun run build` produces `dist/basalt.mjs`, one file with nothing to
+install beside it. The command is `basalt`; the server's is `basaltd`, so a homelab can run both.
 
 ```
 basalt init --server wss://host --token TOKEN   # the first device
@@ -67,7 +67,7 @@ is a broken vault nobody hears about.
 
 ## The plugin
 
-`src/obsidian/main.ts` does the same job and then draws a status bar. No settings
+`src/plugin/main.ts` does the same job and then draws a status bar. No settings
 tab, on purpose; one modal, which pairs a vault and says what is happening.
 
 ```
@@ -85,10 +85,10 @@ the vault without asking anybody.
 The `obsidian` package is type declarations with no runtime (`"main": ""`), so
 `main.ts` and `obsidian/vault.ts` would otherwise compile and never run.
 
-- `src/obsidian/fake.ts` implements `DataAdapter`, declared against the real
+- `src/plugin/fake.ts` implements `DataAdapter`, declared against the real
   declarations so the compiler catches drift. Its `normalizePath` matches what
   the shipped app does, which was read rather than assumed.
-- `src/obsidian/stub.ts` is the runtime `obsidian` module. `vitest.config.ts`
+- `src/plugin/stub.ts` is the runtime `obsidian` module. `vitest.config.ts`
   aliases to it **for tests only**: `tsconfig.json` does not, so `tsc` checks
   against the genuine declarations, and `esbuild.config.mjs` marks it external so
   the shipped plugin gets Obsidian's.

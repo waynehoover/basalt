@@ -18,8 +18,8 @@ import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { TestServer, cleanupBinary, serverBinary } from "./core/test-server.ts";
-import * as stub from "./obsidian/stub.ts";
-import type { Plugin as StubPlugin } from "./obsidian/stub.ts";
+import * as stub from "./plugin/stub.ts";
+import type { Plugin as StubPlugin } from "./plugin/stub.ts";
 
 const run = promisify(execFile);
 const CLI = "dist/basalt.mjs";

@@ -1,7 +1,7 @@
 {
-  "name": "basalt-client",
+  "name": "basalt-sync",
   "version": "0.1.0",
-  "description": "Basalt: the shared sync core, the Obsidian plugin, and the headless client",
+  "description": "Headless Obsidian vault sync for a Basalt server.",
   "private": true,
   "type": "module",
   "scripts": {

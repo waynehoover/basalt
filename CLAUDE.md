@@ -1,6 +1,16 @@
-# Basalt
+# Basalt Sync
 
 Self-hosted sync for Obsidian. One binary, one pairing string.
+
+## Layout
+
+- `server/` is the Go server. Its binary is `basaltd`, and every subcommand it
+  has is a server operation: serve, backup, verify, purge, stats, service,
+  health.
+- `client/src/core` is the sync engine, which knows nothing about where files
+  live. `client/src/cli` is the headless client, whose binary is `basalt`.
+  `client/src/plugin` is the Obsidian plugin.
+- Two binaries, two names, because a homelab runs both.
 
 Read `docs/philosophy.md` before adding anything. It is short and it is the
 point of the project.

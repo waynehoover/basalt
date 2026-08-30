@@ -24,16 +24,16 @@ thing that can reach it. It also runs read-only with every capability dropped,
 which is checked rather than assumed: the server starts and stays healthy under
 `--read-only --cap-drop ALL --security-opt no-new-privileges`.
 
-The healthcheck runs `basalt health` from inside the image, because there is no
+The healthcheck runs `basaltd health` from inside the image, because there is no
 curl in there to write one with and adding a base image to get one would undo
 the point.
 
 Maintenance goes through the same binary:
 
 ```
-docker exec basalt /basalt stats
-docker exec basalt /basalt verify -deep
-docker exec basalt /basalt backup -data /data -to /data/backup
+docker exec basalt /basaltd stats
+docker exec basalt /basaltd verify -deep
+docker exec basalt /basaltd backup -data /data -to /data/backup
 ```
 
 Purge needs the directory to itself, so the server steps aside:
@@ -68,7 +68,7 @@ insist on it.
 scp release/basalt-linux-amd64 homelab:/usr/local/bin/basalt
 ssh homelab
 sudo mkdir -p /var/lib/basalt && sudo chown $USER /var/lib/basalt
-basalt service -data /var/lib/basalt -addr 127.0.0.1:3003
+basaltd service -data /var/lib/basalt -addr 127.0.0.1:3003
 ```
 
 That prints a systemd unit with the real paths already in it, and the commands
@@ -111,14 +111,14 @@ Backup only reads, so it runs against a live server. Put it on a timer from the
 first day.
 
 ```
-basalt backup -data /var/lib/basalt -to /backups/basalt
+basaltd backup -data /var/lib/basalt -to /backups/basalt
 ```
 
 Purge deletes chunk bodies, so it takes the data directory exclusively and will
 refuse while the server is running. That refusal is the point.
 
 ```
-systemctl stop basalt && basalt purge -data /var/lib/basalt && systemctl start basalt
+systemctl stop basalt && basaltd purge -data /var/lib/basalt && systemctl start basalt
 ```
 
 Purge spares unreferenced bodies written in the last hour, in case they belong
@@ -162,7 +162,7 @@ somewhere else the server logs what it refused:
 
 ```
 journalctl -u basalt | grep 'accept refused'
-basalt serve -data /var/lib/basalt -allow-origin capacitor://localhost
+basaltd serve -data /var/lib/basalt -allow-origin capacitor://localhost
 ```
 
 Obsidian mobile has no status bar, so the plugin's state is on the ribbon icon's
@@ -171,7 +171,7 @@ tooltip instead. Everything else is the same.
 ## What is in there
 
 ```
-basalt stats
+basaltd stats
 ```
 
 Files, folders, deletions still recoverable, versions in all, and how many of
@@ -187,13 +187,13 @@ path used to be created on the spot and the backup then succeeded, of nothing.
 
 | | |
 |---|---|
-| `basalt serve` | run the server. The default command, so bare `basalt` is this |
-| `basalt backup -to DIR` | copy everything, verified, while the server runs |
-| `basalt verify` | check the store against itself |
-| `basalt purge` | reclaim space from unreferenced bodies |
-| `basalt stats` | what the vault holds |
-| `basalt service` | print a hardened systemd unit |
-| `basalt health` | ask a running server if it is well, for a container probe |
+| `basaltd serve` | run the server. The default command, so bare `basalt` is this |
+| `basaltd backup -to DIR` | copy everything, verified, while the server runs |
+| `basaltd verify` | check the store against itself |
+| `basaltd purge` | reclaim space from unreferenced bodies |
+| `basaltd stats` | what the vault holds |
+| `basaltd service` | print a hardened systemd unit |
+| `basaltd health` | ask a running server if it is well, for a container probe |
 | `basalt version` | what this binary is |
 
 ### serve

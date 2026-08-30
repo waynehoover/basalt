@@ -23,10 +23,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/waynehoover/basalt/internal/chunks"
-	"github.com/waynehoover/basalt/internal/dirlock"
-	"github.com/waynehoover/basalt/internal/server"
-	"github.com/waynehoover/basalt/internal/store"
+	"github.com/waynehoover/basalt/server/internal/chunks"
+	"github.com/waynehoover/basalt/server/internal/dirlock"
+	"github.com/waynehoover/basalt/server/internal/server"
+	"github.com/waynehoover/basalt/server/internal/store"
 )
 
 // version is stamped at build time with -X main.version=...
@@ -38,7 +38,7 @@ var version = "dev"
 
 func main() {
 	if err := run(context.Background(), os.Args[1:], os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "basalt:", err)
+		fmt.Fprintln(os.Stderr, "basaltd:", err)
 		os.Exit(1)
 	}
 }
@@ -70,7 +70,7 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 		case "stats":
 			return cmdStats(rest, out)
 		case "version":
-			fmt.Fprintf(out, "basalt %s %s/%s %s\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+			fmt.Fprintf(out, "basaltd %s %s/%s %s\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
 			return nil
 		default:
 			return fmt.Errorf("unknown command %q (try serve, backup, verify, purge, stats, service, health, version)", cmd)
@@ -342,7 +342,7 @@ func printSetup(out io.Writer, addr, vault, token string, fresh, local bool) {
 	if fresh {
 		fmt.Fprintln(out, "A new auth token was generated for this server.")
 	}
-	fmt.Fprintf(out, "basalt %s listening on %s, serving vault %q\n", version, addr, vault)
+	fmt.Fprintf(out, "basaltd %s listening on %s, serving vault %q\n", version, addr, vault)
 	for _, host := range pairingHosts(addr) {
 		// The scheme only where it is not the usual one. A pairing string with
 		// no scheme becomes wss://, which is right behind a tunnel and wrong for

@@ -21,10 +21,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/waynehoover/basalt/internal/dirlock"
+	"github.com/waynehoover/basalt/server/internal/dirlock"
 
-	"github.com/waynehoover/basalt/internal/chunks"
-	"github.com/waynehoover/basalt/internal/store"
+	"github.com/waynehoover/basalt/server/internal/chunks"
+	"github.com/waynehoover/basalt/server/internal/store"
 )
 
 // seeded builds a data directory with some history in it, the way a server
@@ -926,13 +926,14 @@ func freeTestPort(t *testing.T) int {
 // which is later than it should be found, and the two versions live in
 // different files with nothing tying them together. This is the tie.
 func TestTheDockerfileBuildsWithAGoNewEnoughForTheModule(t *testing.T) {
-	// Tests run in the package directory, so the repository root is three up.
+	// Tests run in the package directory: the module root is two up and the
+	// repository root, where the Dockerfile lives, is three.
 	root := filepath.Join("..", "..", "..")
 	dockerfile, err := os.ReadFile(filepath.Join(root, "Dockerfile"))
 	if err != nil {
 		t.Fatalf("read Dockerfile: %v", err)
 	}
-	gomod, err := os.ReadFile(filepath.Join(root, "go", "go.mod"))
+	gomod, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
 	if err != nil {
 		t.Fatalf("read go.mod: %v", err)
 	}

@@ -1,4 +1,4 @@
-module github.com/waynehoover/basalt
+module github.com/waynehoover/basalt/server
 
 go 1.27.0
 

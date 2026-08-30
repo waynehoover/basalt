@@ -2,28 +2,80 @@
 
 <img src="docs/assets/logo.svg" alt="" width="140">
 
-# Basalt
+# Basalt Sync
 
 > Blazing fast self-hosted Obsidian sync that just works
 
 [![CI](https://github.com/waynehoover/basalt/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](go/go.mod)
+[![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](server/go.mod)
 [![Client](https://img.shields.io/badge/client-TypeScript-3178C6?logo=typescript&logoColor=white)](client/)
 
 </div>
 
-**Basalt** syncs an Obsidian vault between your own devices, through a server you
-run. It is engineered for vaults rather than for files: the chunking, the merge,
-the encryption and the wire protocol are all designed around Markdown notes that
-one person owns. That is where the speed comes from. A generic file syncer cannot
-send a few hundred bytes for an edit to a long note, because it does not know
-what it is carrying.
+**Basalt Sync** syncs an Obsidian vault between your own devices, through a
+server you run. It is engineered for vaults rather than for files: the chunking,
+the merge, the encryption and the wire protocol are all designed around Markdown
+notes that one person owns. That is where the speed comes from. A generic file
+syncer cannot send a few hundred bytes for an edit to a long note, because it
+does not know what it is carrying.
+
+## Install
+
+Two steps. Run the server, paste what it prints.
+
+### 1. Run the server
+
+```bash
+docker run -d --name basalt \
+  -p 127.0.0.1:3003:3003 \
+  -v basalt-data:/data \
+  ghcr.io/waynehoover/basalt:latest
+docker logs basalt
+```
+
+It prints a setup string the first time it runs:
 
 ```
-server   ./basalt                       prints a setup string
-device   paste it                       that is the whole setup
+basaltd 0.1.0 listening on 0.0.0.0:3003, serving vault "default"
+  100.80.123.79:3003#JGJFZ9SQ-5E67J3KM0VBPG15AYSF381SM
 ```
+
+Put TLS in front of it before another device can reach it. `tailscale serve` is
+one line and gives you a real certificate; `docs/running.md` covers that, Docker
+Compose, systemd, and every flag.
+
+Trying it on one machine first? `basaltd serve -localhost` prints a string you
+can paste as it is.
+
+### 2. Install the plugin
+
+Until it is in the community list, put it in the vault by hand. From the
+[latest release](https://github.com/waynehoover/basalt/releases), download
+`main.js` and `manifest.json` into:
+
+```
+<your vault>/.obsidian/plugins/basalt/
+```
+
+Then in Obsidian: **Settings → Community plugins**, turn off Restricted mode,
+enable **Basalt Sync**, and paste the setup string into the pairing box.
+
+That is it. Every device after the first pastes the string that one hands out,
+from **Add another device** in the plugin.
+
+### Syncing a machine with no Obsidian on it
+
+A server, a NAS, a backup box. Same engine, no GUI:
+
+```bash
+npm install -g basalt-sync
+basalt pair basalt2_...
+basalt sync --watch
+```
+
+[`client/README.md`](client/README.md#the-headless-client) documents every
+command it takes, including version history and recovery.
 
 ## Features
 
@@ -33,11 +85,11 @@ device   paste it                       that is the whole setup
 | **Chunked sync** | ✅ Stable |
 | **Three-way merge** | ✅ Stable |
 | **Version history and recovery** | ✅ Stable |
+| **Obsidian plugin, desktop** | ✅ Stable |
+| **Obsidian plugin, Android** | ✅ Stable |
 | **Headless CLI** | ✅ Stable |
 | **Backup, verify, restore** | ✅ Stable |
 | **Docker and systemd** | ✅ Stable |
-| **Obsidian plugin, desktop** | 🧪 Beta |
-| **Obsidian plugin, Android** | 🧪 Beta |
 | **Obsidian plugin, iOS** | 🗓️ Untested |
 | **Community plugin listing** | 🗓️ Planned |
 
@@ -77,30 +129,6 @@ wrong tool and `docs/philosophy.md` says why.
 ### Nothing to configure
 No accounts, no subscription, no settings screen. One binary, one pairing string,
 and every question with a right answer answered once in the source.
-
-## Install
-
-The server is one static binary with no database and no message broker.
-
-```bash
-docker compose up -d          # or: go build ./cmd/basalt && ./basalt
-```
-
-It prints a pairing string on first run. Paste that into the plugin, or into the
-headless client:
-
-```bash
-basalt pair basalt2_...
-basalt sync --watch
-```
-
-`docs/running.md` covers the tunnel, systemd, and putting the plugin in a vault.
-
-## Status
-
-Early, and further along than it was. The headless client works. The plugin syncs
-a real vault on desktop and on Android, including a whole vault pulled onto a
-phone with every file byte-identical. It has never run on iOS.
 
 ## Docs
 

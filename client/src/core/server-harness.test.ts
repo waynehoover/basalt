@@ -1,7 +1,7 @@
 /**
  * The client against the real server.
  *
- * These tests build `cmd/basalt`, run it on a loopback port with a temporary
+ * These tests build `cmd/basaltd`, run it on a loopback port with a temporary
  * data directory, and talk to it with the actual transport. Nothing is mocked:
  * the sealing is real, the chunking is real, the SQLite writes are real, and the
  * assertions are checked by asking the server's own `verify` whether what it

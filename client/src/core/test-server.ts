@@ -1,5 +1,5 @@
 /**
- * A real `cmd/basalt` for tests to talk to.
+ * A real `cmd/basaltd` for tests to talk to.
  *
  * Not a mock and not a fixture in the usual sense: it builds the Go binary and
  * runs it. Imported by the test files rather than living in one of them, because
@@ -17,7 +17,7 @@ import { createServer } from "node:net";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
-const GO_DIR = new URL("../../../go", import.meta.url).pathname;
+const GO_DIR = new URL("../../../server", import.meta.url).pathname;
 
 let built: Promise<string> | undefined;
 let buildDir: string | undefined;
@@ -39,7 +39,7 @@ export function serverBinary(): Promise<string> {
     built ??= (async () => {
         buildDir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
         const binary = join(buildDir, "basalt");
-        await run("go", ["build", "-o", binary, "./cmd/basalt"], {
+        await run("go", ["build", "-o", binary, "./cmd/basaltd"], {
             cwd: GO_DIR,
             env: { ...process.env, CGO_ENABLED: "0" },
         });

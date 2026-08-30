@@ -65,7 +65,7 @@ func cmdService(args []string, out io.Writer) error {
 	fmt.Fprintf(out, `
 # To install, as root:
 #
-#   basalt service > /etc/systemd/system/basalt.service
+#   basaltd service > /etc/systemd/system/basalt.service
 #   systemctl daemon-reload
 #   systemctl enable --now basalt
 #   systemctl status basalt

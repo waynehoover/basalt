@@ -187,7 +187,7 @@ measured, all consequences of notes being first:
   usually changes throughout.
 
 So the default file limit is 64 MiB rather than the 256 MiB the format allows,
-and `basalt serve -max-file` raises it. A vault that is mostly video is a vault
+and `basaltd serve -max-file` raises it. A vault that is mostly video is a vault
 this is the wrong tool for, and there are file syncs that are the right one.
 `docs/benchmark.md` has the numbers.
 

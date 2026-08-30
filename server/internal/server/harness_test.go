@@ -16,9 +16,9 @@ import (
 
 	"github.com/coder/websocket"
 
-	"github.com/waynehoover/basalt/internal/chunks"
-	"github.com/waynehoover/basalt/internal/store"
-	"github.com/waynehoover/basalt/internal/wire"
+	"github.com/waynehoover/basalt/server/internal/chunks"
+	"github.com/waynehoover/basalt/server/internal/store"
+	"github.com/waynehoover/basalt/server/internal/wire"
 )
 
 const (

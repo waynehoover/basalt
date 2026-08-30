@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/waynehoover/basalt/internal/chunks"
+	"github.com/waynehoover/basalt/server/internal/chunks"
 )
 
 // openBackup opens a backup directory the way the server would, which is the

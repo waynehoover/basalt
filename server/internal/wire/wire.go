@@ -12,7 +12,7 @@
 // no `ok` here.
 package wire
 
-import "github.com/waynehoover/basalt/internal/store"
+import "github.com/waynehoover/basalt/server/internal/store"
 
 // Proto is the protocol version this server implements. A mismatch is refused,
 // not negotiated: interoperating with a version we have not seen is how a
