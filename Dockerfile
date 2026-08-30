@@ -11,7 +11,12 @@
 # does. A builder older than the module needs is a build that fails only once
 # somebody tries to make an image, which is later than it should be found.
 ARG GO_VERSION=1.27
-FROM golang:${GO_VERSION}-alpine AS build
+
+# Built on whatever the builder is and cross-compiled to the target, rather than
+# emulated. Go needs nothing but two environment variables to do this and
+# CGO_ENABLED=0 was already the rule, so an arm64 image builds on an amd64
+# runner at full speed instead of through QEMU.
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 
 # Dependencies first, so a change to the source does not re-download them.
@@ -20,7 +25,10 @@ RUN go mod download
 
 COPY server/ ./
 ARG VERSION=docker
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /basaltd ./cmd/basaltd
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /basaltd ./cmd/basaltd
 
 # An empty data directory, owned by the user the server runs as. Docker
 # initialises a fresh named volume from whatever the image has at the mount
