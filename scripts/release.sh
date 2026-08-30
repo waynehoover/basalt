@@ -56,11 +56,23 @@ done
 # Obsidian reads it to decide whether to offer an update to an older install.
 minapp=$(python3 -c 'import json;print(json.load(open("manifest.json"))["minAppVersion"])')
 pluginversion=$(python3 -c 'import json;print(json.load(open("manifest.json"))["version"])')
-python3 -c "
-import json
-json.dump({'$pluginversion': '$minapp'}, open('$out/plugin/versions.json', 'w'), indent=2)
-open('$out/plugin/versions.json','a').write('\n')
-"
+#
+# It lives at the repo root, because that is where Obsidian reads it from, and
+# is updated in place rather than generated fresh: an older entry is the whole
+# point of the file, and rewriting it with only the current version would tell
+# every older install that nothing it can run exists.
+python3 - "$pluginversion" "$minapp" <<'PY'
+import json, os, sys
+
+version, minapp = sys.argv[1], sys.argv[2]
+path = "versions.json"
+known = json.load(open(path)) if os.path.exists(path) else {}
+known[version] = minapp
+with open(path, "w") as f:
+    json.dump(known, f, indent=2)
+    f.write("\n")
+PY
+cp "$root/versions.json" "$out/plugin/versions.json"
 printf '  %-24s %s\n' "main.js" "$(du -h "$out/plugin/main.js" | cut -f1)"
 printf '  %-24s %s\n' "styles.css" "$(du -h "$out/plugin/styles.css" | cut -f1)"
 printf '  %-24s %s\n' "manifest.json" "version $pluginversion, needs Obsidian $minapp"
