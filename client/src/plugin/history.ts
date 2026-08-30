@@ -67,6 +67,10 @@ export class HistoryModal extends Modal {
         this.setTitle(`History of ${this.path}`);
         this.modalEl.addClass("mod-basalt-history", "mod-sidebar-layout");
         const sidebar = this.contentEl.createDiv("modal-sidebar mod-history");
+        // setTitle above is invisible under mod-sidebar-layout, which collapses
+        // the modal header, so the path goes here instead. Without it the modal
+        // never says which note you are looking at the history of.
+        sidebar.createDiv({ cls: "basalt-history-heading", text: this.path });
         this.listEl = sidebar.createDiv("modal-sidebar-inner");
         this.paneEl = this.contentEl.createDiv("basalt-history-content-container");
         void this.load();
@@ -87,6 +91,19 @@ export class HistoryModal extends Modal {
         } catch (err) {
             this.exhausted = true;
             new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+        }
+        // Open on the newest version rather than on an empty pane. This used to
+        // ask instead, on the grounds that it should not guess which version
+        // somebody meant; but the pane is two thirds of the modal, "select a
+        // version" is not an answer to anything, and the newest is what Sync
+        // shows and what someone opening history is nearly always after.
+        // Showing a version only displays it. Restoring is still a button.
+        //
+        // Only when nothing is chosen yet, so paging further back does not drag
+        // the selection off whatever the reader is reading.
+        if (!this.chosen && this.versions.length > 0) {
+            void this.choose(this.versions[0]!);
+            return;
         }
         this.render();
     }
@@ -158,10 +175,23 @@ export class HistoryModal extends Modal {
         const restore = actions.createEl("button", { cls: "mod-cta", text: "Restore" });
         restore.addEventListener("click", () => void this.restore(version));
 
-        this.paneEl.createEl("pre", {
+        const pre = this.paneEl.createEl("pre", {
             cls: this.showDiff ? "basalt-history-diff" : "basalt-history-text",
-            text: this.text,
         });
+        if (!this.showDiff) {
+            pre.setText(this.text);
+            return;
+        }
+        // A line at a time, so the added and removed rules in styles.css have
+        // something to colour. They used to have nothing: the diff went in as
+        // one run of text, so both rules matched no element and every diff came
+        // out the single colour the stylesheet says is unreadable.
+        for (const line of this.text.split("\n")) {
+            const cls = line.startsWith("+") ? "basalt-added" : line.startsWith("-") ? "basalt-removed" : "";
+            // Never an empty class: addClass throws on one, and createSpan
+            // takes the same path.
+            pre.createSpan(cls === "" ? { text: `${line}\n` } : { cls, text: `${line}\n` });
+        }
     }
 
     private async choose(version: Version): Promise<void> {

@@ -167,10 +167,13 @@ describe("version history", () => {
         modal.open();
         await settle();
 
-        // Two rows, and nothing chosen yet, so the pane asks rather than
-        // guessing which version somebody meant.
-        expect(rendered(modal)).toMatch(/Select a version/);
+        // Opens on the newest version, so the pane is never dead space and the
+        // common case takes no clicks. "Select a version to see it." as the
+        // opening state is what this replaced.
         expect(rows(modal).length).toBe(2);
+        expect(rendered(modal)).not.toMatch(/Select a version/);
+        expect(rendered(modal)).toContain("one\ntwo\n");
+        expect(rendered(modal)).toContain("Restore");
 
         rows(modal)[1]!.click();
         await settle();
@@ -205,11 +208,77 @@ function rows(modal: HistoryModal): { click(): void }[] {
 
 interface FakeNode {
     cls: string;
+    tag: string;
     children: FakeNode[];
     fire(event: string): void;
+    allText(): string;
 }
 
 function walk(node: FakeNode, visit: (n: FakeNode) => void): void {
     visit(node);
     for (const c of node.children) walk(c, visit);
 }
+
+/**
+ * styles.css colours additions and removals. It can only do that if the diff is
+ * made of elements carrying those classes, and for a while it was not: the diff
+ * went into the <pre> as one run of text, both rules matched nothing, and every
+ * diff rendered in a single colour. Nothing failed, it just looked wrong, which
+ * is why this asserts on the markup and not on the text.
+ */
+it("marks up added and removed lines so the stylesheet can colour them", async () => {
+    const { adapter, client, source } = await device();
+    await revisions(adapter, client, "note.md", ["one\ntwo\n", "one\nthree\n"]);
+
+    const modal = new HistoryModal(new App() as never, source, "note.md");
+    modal.open();
+    await settle();
+
+    // The oldest version, against what is on disk now.
+    rows(modal)[1]!.click();
+    await settle();
+    const toggle = buttons(modal).find((b) => b.text.includes("Show changes"));
+    expect(toggle, "no toggle to switch to the diff").toBeDefined();
+    toggle!.click();
+    await settle();
+
+    const classes = classesIn(modal);
+    expect(classes).toContain("basalt-removed");
+    expect(classes).toContain("basalt-added");
+});
+
+/** Every class token present anywhere under the modal. */
+function classesIn(modal: HistoryModal): Set<string> {
+    const found = new Set<string>();
+    walk(modal.contentEl as unknown as FakeNode, (el) => {
+        for (const c of el.cls.split(" ")) if (c !== "") found.add(c);
+    });
+    return found;
+}
+
+/** The modal's buttons, as text plus a click. */
+function buttons(modal: HistoryModal): { text: string; click(): void }[] {
+    const found: { text: string; click(): void }[] = [];
+    walk(modal.contentEl as unknown as FakeNode, (el) => {
+        if (el.tag === "button") found.push({ text: el.allText(), click: () => el.fire("click") });
+    });
+    return found;
+}
+
+/**
+ * The modal has to say which note it belongs to. It calls setTitle, but
+ * mod-sidebar-layout collapses the modal header to nothing, so for a while the
+ * title was set and never drawn: the window named no note at all.
+ */
+it("names the note whose history it is showing", async () => {
+    const { adapter, client, source } = await device();
+    await revisions(adapter, client, "Projects/note.md", ["one\n"]);
+
+    const modal = new HistoryModal(new App() as never, source, "Projects/note.md");
+    modal.open();
+    await settle();
+
+    // In the body, not just in titleEl, because titleEl is the part that does
+    // not render.
+    expect(rendered(modal)).toContain("Projects/note.md");
+});

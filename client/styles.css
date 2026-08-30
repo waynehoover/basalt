@@ -29,6 +29,11 @@
 .mod-basalt-history .basalt-history-content-container {
     display: flex;
     flex-direction: column;
+    /* Fill what the sidebar leaves, rather than shrinking to whatever the
+     * chosen version happens to contain. Without it a short pane collapses:
+     * "No difference from the note on disk." rendered 314px wide inside 1080px
+     * of modal, dragging the title and the Restore button in with it. */
+    flex: 1;
     min-width: 0;
     padding: 0 16px 16px;
     overflow: auto;
@@ -52,7 +57,21 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 12px 0;
+    /* Clear of Obsidian's close button, which floats over the modal's top right
+     * corner and is not in the layout. Once the pane filled the modal the
+     * Restore button ran under it by 16px. */
+    padding: 12px 40px 12px 0;
+}
+
+/* Which note this is the history of. The modal calls setTitle, but
+ * mod-sidebar-layout collapses the header to 0x0, so that title has never been
+ * visible: the modal named no note at all. */
+.mod-basalt-history .basalt-history-heading {
+    padding: 12px 12px 8px;
+    font-weight: var(--font-medium);
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+    overflow-wrap: anywhere;
 }
 
 .mod-basalt-history .modal-setting-titlebar-actions {
