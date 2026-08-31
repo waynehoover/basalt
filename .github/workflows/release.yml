@@ -60,7 +60,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: VERSION=${{ github.ref_name }}
+          # The version matched out of the tag, not the tag. The ref is now
+          # server/v0.1.3, and `basaltd version` printing that would be wrong
+          # in the one place a person looks to find out what they are running.
+          build-args: VERSION=${{ steps.meta.outputs.version }}
 
       # An image that was pushed and cannot run is worse than no image, and the
       # tag is already public by the time anyone would notice.
