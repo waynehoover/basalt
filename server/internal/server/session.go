@@ -628,14 +628,14 @@ func (s *Session) handlePutMany(m wire.In) error {
 			continue
 		}
 
-		missing, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
+		missing, sizes, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
 		if err != nil {
 			refusal := wire.Error(wire.CodeBadChunk, err.Error())
 			items[i] = prepared{entry: e, refusal: &refusal}
 			continue
 		}
 		budget := store.CiphertextBudget(e.Size, len(e.Chunks))
-		held, err := s.heldBytes(e.Chunks, missing)
+		held, err := s.heldBytes(e.Chunks, missing, sizes)
 		if err != nil {
 			return s.reject(wire.CodeInternal, err)
 		}
@@ -716,7 +716,7 @@ func (s *Session) handlePut(m wire.In) error {
 		return s.reject(wire.CodeBadEntry, err)
 	}
 
-	missing, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
+	missing, sizes, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
 	if err != nil {
 		// The only failure Missing has is a malformed name, which Validate
 		// should already have caught. Reported rather than assumed away.
@@ -730,7 +730,7 @@ func (s *Session) handlePut(m wire.In) error {
 	// relying on it alone would let a client write the disk full and only then
 	// be told no. Refusing before the want list goes out costs nothing.
 	budget := store.CiphertextBudget(e.Size, len(e.Chunks))
-	held, err := s.heldBytes(e.Chunks, missing)
+	held, err := s.heldBytes(e.Chunks, missing, sizes)
 	if err != nil {
 		return s.reject(wire.CodeInternal, err)
 	}
@@ -772,7 +772,13 @@ func (s *Session) handlePut(m wire.In) error {
 // heldBytes totals what this entry's already-present chunks occupy, counting a
 // repeated chunk once per reference because the declared size counts its
 // plaintext once per reference too.
-func (s *Session) heldBytes(all, missing []string) (int64, error) {
+// heldBytes totals what the named chunks already occupy, from the sizes Missing
+// gathered rather than by stat'ing them again.
+//
+// Once per reference, not once per distinct chunk: an entry naming the same
+// chunk twice is charged for it twice, which is what the budget means and what
+// TestTheBudgetCountsRepeatedChunksOncePerReference is about.
+func (s *Session) heldBytes(all, missing []string, sizes map[string]int64) (int64, error) {
 	absent := make(map[string]struct{}, len(missing))
 	for _, n := range missing {
 		absent[n] = struct{}{}
@@ -782,7 +788,7 @@ func (s *Session) heldBytes(all, missing []string) (int64, error) {
 		if _, gone := absent[n]; gone {
 			continue
 		}
-		size, ok := s.srv.st.Chunks().Size(s.vaultID, n)
+		size, ok := sizes[n]
 		if !ok {
 			// Present a moment ago, when Missing looked. The sweep can do this;
 			// the commit will refuse and the client retries.

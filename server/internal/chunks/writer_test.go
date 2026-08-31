@@ -235,7 +235,7 @@ func TestACorruptBodyStopsCountingAsHeld(t *testing.T) {
 	if s.Has("v1", name) {
 		t.Fatal("a quarantined body still counts as held, so no client will ever replace it")
 	}
-	missing, err := s.Missing("v1", []string{name})
+	missing, _, err := s.Missing("v1", []string{name})
 	if err != nil {
 		t.Fatalf("missing: %v", err)
 	}

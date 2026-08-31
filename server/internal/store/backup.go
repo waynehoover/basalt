@@ -74,7 +74,13 @@ func (s *Store) SnapshotInto(path string) error {
 // caller's own presence check already makes a repeat cheap.
 func (s *Store) ChunkRefs(fn func(vaultID, name string) error) error {
 	rows, err := s.db.Query(
-		`SELECT vault_id, name FROM entry_chunks ORDER BY vault_id, uid, ord`)
+		// Ordered by vault only, which is the whole of the documented contract:
+		// oldest vault first. Adding uid and ord to it asked for a sort the
+		// covering index cannot provide, so this scanned the primary key and
+		// looked up every row: 10 ms over 20k rows against under 1 ms. The
+		// order of names within a vault was never promised and nothing reads
+		// it: this is a set of names to copy.
+		`SELECT vault_id, name FROM entry_chunks ORDER BY vault_id`)
 	if err != nil {
 		return err
 	}

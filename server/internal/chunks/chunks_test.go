@@ -198,7 +198,7 @@ func TestChunksAreNamespacedPerVault(t *testing.T) {
 	if _, err := s.Get("B", name); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("vault B Get: err = %v, want ErrNotFound", err)
 	}
-	missing, err := s.Missing("B", []string{name})
+	missing, _, err := s.Missing("B", []string{name})
 	if err != nil {
 		t.Fatalf("missing: %v", err)
 	}
@@ -217,7 +217,7 @@ func TestMissingPreservesOrderAndDeduplicates(t *testing.T) {
 
 	// nb is held; na and nc are not. The repeat of na must not produce two
 	// requests for the same body.
-	got, err := s.Missing("v1", []string{na, nb, nc, na})
+	got, sizes, err := s.Missing("v1", []string{na, nb, nc, na})
 	if err != nil {
 		t.Fatalf("missing: %v", err)
 	}
@@ -230,6 +230,20 @@ func TestMissingPreservesOrderAndDeduplicates(t *testing.T) {
 			t.Fatalf("position %d: got %s, want %s", i, got[i], want[i])
 		}
 	}
+
+	// The sizes come from the same stat that decided presence, so a caller
+	// totalling held bytes does not have to stat them all over again.
+	if len(sizes) != 1 {
+		t.Fatalf("sizes covers %d chunks, want 1 (the held one)", len(sizes))
+	}
+	if _, ok := sizes[nb]; !ok {
+		t.Fatalf("the held chunk has no size")
+	}
+	for _, n := range []string{na, nc} {
+		if _, ok := sizes[n]; ok {
+			t.Fatalf("a missing chunk was given a size")
+		}
+	}
 }
 
 // A malformed name must not simply be dropped from the want list. Dropping it
@@ -239,7 +253,7 @@ func TestMissingRefusesToShrinkOnABadName(t *testing.T) {
 	s := newTestStore(t)
 	good := Name([]byte("fine"))
 
-	got, err := s.Missing("v1", []string{good, "not-a-hash"})
+	got, _, err := s.Missing("v1", []string{good, "not-a-hash"})
 	if !errors.Is(err, ErrBadName) {
 		t.Fatalf("err = %v, want ErrBadName", err)
 	}

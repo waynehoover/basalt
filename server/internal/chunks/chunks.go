@@ -184,22 +184,31 @@ func (s *Store) Size(vaultID, name string) (int64, bool) {
 // can never arrive. Rule 5: a result smaller than its input is a bug until
 // proven otherwise, and here the proof is that the name was well-formed and the
 // chunk was genuinely present.
-func (s *Store) Missing(vaultID string, names []string) ([]string, error) {
+func (s *Store) Missing(vaultID string, names []string) ([]string, map[string]int64, error) {
 	seen := make(map[string]struct{}, len(names))
+	held := make(map[string]int64, len(names))
 	var out []string
 	for _, n := range names {
 		if !ValidName(n) {
-			return nil, fmt.Errorf("%w: %q", ErrBadName, n)
+			return nil, nil, fmt.Errorf("%w: %q", ErrBadName, n)
 		}
 		if _, dup := seen[n]; dup {
 			continue
 		}
 		seen[n] = struct{}{}
-		if !s.Has(vaultID, n) {
+		// The size comes from the same stat that answers whether it is there,
+		// so handing it back costs nothing and saves the caller a second pass
+		// over the same chunks. An already-held batch was stat'ing each chunk
+		// three times: here, again to total the bytes, and again at commit.
+		// That is the entire server cost of a batch where nothing is new, which
+		// is what a folder rename looks like.
+		if size, ok := s.Size(vaultID, n); ok {
+			held[n] = size
+		} else {
 			out = append(out, n)
 		}
 	}
-	return out, nil
+	return out, held, nil
 }
 
 // Put stores a body under its own name, verifying that the two agree.
