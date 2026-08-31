@@ -248,6 +248,14 @@ export class ObsidianVault implements Vault {
         if (normalized.split("/").some((part) => part === "..")) {
             throw new Error(`refusing a path outside the vault: ${path}`);
         }
+        // The same rule as the headless client, and for the same reason: this
+        // set was consulted on the way out and not on the way in, so a path the
+        // plugin would never upload was one it would write. Under the config
+        // folder that means `main.js` of an installed plugin, which Obsidian
+        // executes on the next reload, and this plugin's own `data.json`.
+        if (this.ignored(normalized)) {
+            throw new Error(`refusing to write inside a folder that is never synced: ${path}`);
+        }
         return this.actualName.get(normalized) ?? normalized;
     }
 

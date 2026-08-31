@@ -89,8 +89,22 @@ export class NodeVault implements Vault {
     private absolute(path: string): string {
         const full = resolve(this.root, path);
         const rel = relative(this.root, full);
-        if (rel === "" || rel.startsWith("..") || rel.startsWith(`..${sep}`)) {
+        // `startsWith("..")` also refused a note called `..hidden.md`, which is
+        // a note, not an escape, and could never sync for the life of the vault.
+        if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`)) {
             throw new Error(`refusing a path outside the vault: ${path}`);
+        }
+        // A path this client would never upload is one it must never accept.
+        //
+        // The ignore set was read by `list` and `watch` and by nothing on the
+        // way in, so the two directions disagreed: a peer naming
+        // `.obsidian/plugins/<any>/main.js` had it written, and Obsidian runs
+        // that file on the next reload in a renderer with Node integration.
+        // `.basalt/config.json` holds this device's own secret and server URL,
+        // and `.git/hooks/` runs on the next checkout.
+        const first = rel.split(sep)[0]!;
+        if (this.ignore.has(first)) {
+            throw new Error(`refusing to write inside ${first}, which is never synced: ${path}`);
         }
         return full;
     }
