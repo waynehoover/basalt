@@ -9,10 +9,13 @@ name: Release
 
 on:
   push:
-    # Bare versions as well as v-prefixed ones: Obsidian's community directory
-    # requires a plugin release whose tag is exactly the manifest version, so
-    # that is the tag this project cuts.
-    tags: ["v*", "[0-9]+.[0-9]+.[0-9]+"]
+    # Server tags only. The plugin is released on a bare version tag, because
+    # the community directory requires the tag to be exactly the manifest
+    # version, and the server has no reason to move when the plugin does: what
+    # decides whether the two can talk is the protocol version each carries,
+    # not the release number. A `server/v*` tag does not match a `v*` filter,
+    # which is what keeps the two apart.
+    tags: ["server/v*"]
 
 permissions:
   contents: read
@@ -41,11 +44,14 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
-          # No explicit latest: metadata-action adds it for a semver tag, and
-          # asking for it as well produced it twice in the tag list.
+          # server/v0.1.4 is not a semver tag as far as this action reads one,
+          # so the version is matched out of it. `latest` has to be asked for
+          # explicitly here, because it came free with type=semver and does not
+          # with type=match.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=server/v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=server/v(\d+\.\d+)\.\d+,group=1
+            type=raw,value=latest
 
       - uses: docker/build-push-action@v7
         with:

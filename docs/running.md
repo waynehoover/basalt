@@ -59,13 +59,18 @@ ownership the server cannot write its lock file and the container exits.
 
 ## Without Docker: the server
 
-If you would rather not run a container, `scripts/release.sh` builds static
-binaries for linux/amd64, linux/arm64 and both macOS architectures. They need nothing on the machine they land on: pure-Go
-SQLite is what makes `CGO_ENABLED=0` work, and that is the whole reason to
-insist on it.
+If you would rather not run a container, take a binary from a
+[server release](https://github.com/waynehoover/basalt-sync/releases?q=server),
+which is tagged `server/vX.Y.Z` and is separate from the plugin's releases
+because the two move on their own clocks. `scripts/release.sh` builds the same
+binaries locally, into `release/server/`.
+
+There is one for linux/amd64, linux/arm64 and both macOS architectures, and they
+need nothing on the machine they land on: pure-Go SQLite is what makes
+`CGO_ENABLED=0` work, and that is the whole reason to insist on it.
 
 ```
-scp release/basalt-linux-amd64 homelab:/usr/local/bin/basalt
+scp release/server/basaltd-linux-amd64 homelab:/usr/local/bin/basaltd
 ssh homelab
 sudo mkdir -p /var/lib/basalt && sudo chown $USER /var/lib/basalt
 basaltd service -data /var/lib/basalt -addr 127.0.0.1:3003

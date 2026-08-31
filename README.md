@@ -42,8 +42,8 @@ docker run -d --name basalt -p 127.0.0.1:3003:3003 \
 docker logs basalt        # prints your setup string
 ```
 
-**2. Add the plugin.** Put `main.js` and `manifest.json` from the
-[latest release](https://github.com/waynehoover/basalt-sync/releases) into
+**2. Add the plugin.** Put `main.js`, `manifest.json` and `styles.css` from the
+[latest release](https://github.com/waynehoover/basalt-sync/releases/latest) into
 `<vault>/.obsidian/plugins/basalt-sync/`. In Obsidian: **Community plugins**, turn off
 Restricted mode, enable **Basalt Sync**, paste the string.
 
