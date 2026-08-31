@@ -300,7 +300,15 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		// No WriteTimeout: these are long-lived websockets.
 	}
 
-	printSetup(out, *addr, *vault, token, fresh, *local)
+	// Whether the vault has been claimed decides whether the bootstrap token is
+	// worth printing. An error here is not worth refusing to start over, so it
+	// prints the pairing string: telling someone to pair when they cannot is a
+	// smaller failure than withholding the string they need.
+	hash, hashErr := st.AuthHash(*vault)
+	if hashErr != nil {
+		log.Warn("could not tell whether the vault is claimed", "err", hashErr)
+	}
+	printSetup(out, *addr, *vault, token, fresh, *local, hash == "" || hashErr != nil)
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -369,11 +377,31 @@ func pairingHosts(addr string) []string {
 	return out
 }
 
-func printSetup(out io.Writer, addr, vault, token string, fresh, local bool) {
-	if fresh {
-		fmt.Fprintln(out, "A new auth token was generated for this server.")
+// printSetup says what the server is and, if it is still waiting for its first
+// device, how to give it one.
+//
+// The token is printed only while it can still be used. It is a bootstrap: it
+// claims an unclaimed vault, and once a device has claimed one it opens
+// nothing. Printing it after that put a dead credential into the log on every
+// restart, and offered it as a pairing string that fails when pasted. Later
+// devices pair with each other, using a string that carries the root secret,
+// which this server has never seen and cannot print.
+func printSetup(out io.Writer, addr, vault, token string, fresh, local, unclaimed bool) {
+	if fresh && unclaimed {
+		fmt.Fprintln(out, "A new bootstrap token was generated for this server.")
 	}
 	fmt.Fprintf(out, "basaltd %s listening on %s, serving vault %q\n", resolveVersion(version, moduleVersion()), addr, vault)
+
+	if !unclaimed {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, "This vault has been claimed, so the bootstrap token no longer opens it.")
+		fmt.Fprintln(out, "To add another device, pair it with one that already has the vault:")
+		fmt.Fprintln(out, "run `basalt invite` there, or copy the pairing string from the plugin.")
+		return
+	}
+
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "No device has claimed this vault yet. Give one of these to the first:")
 	for _, host := range pairingHosts(addr) {
 		// The scheme only where it is not the usual one. A pairing string with
 		// no scheme becomes wss://, which is right behind a tunnel and wrong for

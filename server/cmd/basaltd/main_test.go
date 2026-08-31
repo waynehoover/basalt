@@ -534,19 +534,20 @@ func TestASecondServerRefusesTheSameDirectory(t *testing.T) {
 }
 
 // First run generates a token and says so, and the same directory keeps it.
-// A token that changed on restart would lock out every paired device.
+// A token that changed on restart would invalidate a pairing string somebody
+// had already copied, and the failure would look like a typo.
 func TestServeKeepsItsTokenAcrossRestarts(t *testing.T) {
 	dir := t.TempDir()
 
 	first, stop := serveCapturing(t, dir)
 	stop()
-	if !strings.Contains(first, "A new auth token was generated") {
+	if !strings.Contains(first, "A new bootstrap token was generated") {
 		t.Fatalf("the first run did not announce a new token:\n%s", first)
 	}
 
 	second, stop2 := serveCapturing(t, dir)
 	stop2()
-	if strings.Contains(second, "A new auth token was generated") {
+	if strings.Contains(second, "A new bootstrap token was generated") {
 		t.Fatalf("a restart generated a new token, locking out every paired device:\n%s", second)
 	}
 	if tokenLine(t, first) != tokenLine(t, second) {
@@ -704,7 +705,7 @@ func TestServeCreatesADataDirectoryOnItsFirstRun(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "fresh")
 	out, stop := serveCapturing(t, dir)
 	stop()
-	if !strings.Contains(out, "A new auth token was generated") {
+	if !strings.Contains(out, "A new bootstrap token was generated") {
 		t.Fatalf("a first run should have set one up:\n%s", out)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "basalt.db")); err != nil {
@@ -977,7 +978,7 @@ func majorMinor(v string) string {
 func TestTheSetupStringNamesSomethingADeviceCanDial(t *testing.T) {
 	for _, addr := range []string{"0.0.0.0:3003", ":3003", "[::]:3003"} {
 		var out bytes.Buffer
-		printSetup(&out, addr, "default", "TOKEN", true, false)
+		printSetup(&out, addr, "default", "TOKEN", true, false, true)
 		got := out.String()
 
 		for _, wildcard := range []string{"0.0.0.0:3003#", "[::]:3003#", " :3003#"} {
@@ -994,9 +995,30 @@ func TestTheSetupStringNamesSomethingADeviceCanDial(t *testing.T) {
 // An explicit address is left exactly as given: it is already the answer.
 func TestAnExplicitAddressIsPrintedAsGiven(t *testing.T) {
 	var out bytes.Buffer
-	printSetup(&out, "vault.example.ts.net:3003", "default", "TOKEN", false, false)
+	printSetup(&out, "vault.example.ts.net:3003", "default", "TOKEN", false, false, true)
 	if !strings.Contains(out.String(), "vault.example.ts.net:3003#TOKEN") {
 		t.Errorf("an explicit address was rewritten:\n%s", out.String())
+	}
+}
+
+// The bootstrap token claims an unclaimed vault and nothing else. Once a device
+// has claimed one, printing it writes a dead credential to the log on every
+// restart and offers it as a pairing string that fails when pasted.
+func TestAClaimedVaultPrintsNoToken(t *testing.T) {
+	var out bytes.Buffer
+	printSetup(&out, "vault.example.ts.net:3003", "default", "SECRETTOKEN", false, false, false)
+	got := out.String()
+
+	if strings.Contains(got, "SECRETTOKEN") {
+		t.Errorf("a claimed vault printed its spent bootstrap token:\n%s", got)
+	}
+	if !strings.Contains(got, "claimed") {
+		t.Errorf("a claimed vault did not say so, so the missing token looks like a bug:\n%s", got)
+	}
+	// Whoever reads this is here to add a device, and the answer is on another
+	// device rather than on this server.
+	if !strings.Contains(got, "basalt invite") {
+		t.Errorf("a claimed vault did not say how to add a device:\n%s", got)
 	}
 }
 
@@ -1005,7 +1027,7 @@ func TestAnExplicitAddressIsPrintedAsGiven(t *testing.T) {
 // server has no TLS in front of it.
 func TestLocalhostPrintsAStringThatCanBePastedAsIs(t *testing.T) {
 	var out bytes.Buffer
-	printSetup(&out, "127.0.0.1:3003", "default", "TOKEN", false, true)
+	printSetup(&out, "127.0.0.1:3003", "default", "TOKEN", false, true, true)
 	if !strings.Contains(out.String(), "ws://127.0.0.1:3003#TOKEN") {
 		t.Errorf("-localhost printed a string that needs editing before use:\n%s", out.String())
 	}

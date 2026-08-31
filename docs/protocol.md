@@ -338,7 +338,13 @@ its own notes. Trust on first connection would mean whoever reached the port
 first owned the vault, which is why the bootstrap token exists.
 
 A device sends `claim` on every hello, so it never has to work out whether it is
-the first. The first-run token is kept only until it has been spent.
+the first.
+
+The server prints the bootstrap token only while it can still be used. Once a
+vault is claimed it prints that instead, and says to pair from a device that
+already has the vault. The token file stays on disk, because deleting it would
+make an unclaimed vault unpairable after a restart, but a spent token is not put
+in the log on every start and not offered as a string that fails when pasted.
 
 ## Which clients may connect
 
