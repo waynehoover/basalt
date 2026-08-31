@@ -35,9 +35,9 @@ func TestABackupRestoresEverything(t *testing.T) {
 	// only tested on the easy shape.
 	want = append(want, h.file(t, "f0.md", "shared head", "a second version"))
 	for _, e := range []Entry{
-		{Path: "folder", Folder: true},
-		{Path: "f1.md", Deleted: true, MTime: 9},
-		{Path: "empty.md", Size: 0, MTime: 9},
+		{Path: "folder", Mac: testMac, Folder: true},
+		{Path: "f1.md", Mac: testMac, Deleted: true, MTime: 9},
+		{Path: "empty.md", Mac: testMac, Size: 0, MTime: 9},
 	} {
 		uid, err := h.AppendEntry("v1", e)
 		if err != nil {
@@ -101,7 +101,7 @@ func TestABackupRestoresEverything(t *testing.T) {
 
 	// The restored store must be usable, not just readable: uids continue from
 	// where they left off rather than being reissued.
-	next, err := restored.AppendEntry("v1", Entry{Path: "after.md", Size: 0, MTime: 10})
+	next, err := restored.AppendEntry("v1", Entry{Path: "after.md", Mac: testMac, Size: 0, MTime: 10})
 	if err != nil {
 		t.Fatalf("appending to a restored backup: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestABackupKeepsHistoryAndDeletions(t *testing.T) {
 	h := newTestStore(t)
 	h.file(t, "note.md", "version one")
 	h.file(t, "note.md", "version two")
-	if _, err := h.AppendEntry("v1", Entry{Path: "note.md", Deleted: true, MTime: 9}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "note.md", Mac: testMac, Deleted: true, MTime: 9}); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -441,7 +441,7 @@ func TestABackupKeepsVaultsSeparate(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 	if _, err := h.AppendEntry("v2", Entry{
-		Path: "shared.md", Size: 17, MTime: 1, Chunks: []string{name},
+		Path: "shared.md", Mac: testMac, Size: 17, MTime: 1, Chunks: []string{name},
 	}); err != nil {
 		t.Fatalf("append: %v", err)
 	}

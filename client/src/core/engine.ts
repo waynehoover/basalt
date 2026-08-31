@@ -42,7 +42,7 @@
  */
 
 import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
-import { openChunk, openPath, sealChunks, sealPath, type SealedChunk, type VaultKeys } from "./crypto.ts";
+import { entryIsOurs, macEntry, openChunk, openPath, parentOf, sealChunks, sealPath, type SealedChunk, type VaultKeys } from "./crypto.ts";
 import { conflictCopyPath, mergeText } from "./merge.ts";
 import {
     decide,
@@ -57,7 +57,7 @@ import {
     type LocalState,
     type RemoteState,
 } from "./index-state.ts";
-import { MAX_BATCH_ENTRIES, type BatchEntry, type ServerLimits, type Transport, type WireEntry } from "./transport.ts";
+import { MAX_BATCH_ENTRIES, type BatchEntry, type PutMeta, type ServerLimits, type Transport, type WireEntry } from "./transport.ts";
 import { parents, type IndexStore, type Vault } from "./vault.ts";
 
 /**
@@ -460,6 +460,34 @@ export class Engine {
      * A batch with no entries is this device's own write coming back: it carries
      * the cursor advance and nothing to apply.
      */
+    /**
+     * Authenticates one outgoing entry.
+     *
+     * Everything a receiving device acts on, signed with a key the server does
+     * not have, plus the version this was written on top of. The uid is not in
+     * it: the server assigns uids and ordering the log is its job, which this
+     * does not try to take. What it settles is that the server cannot invent an
+     * entry, alter one, or move one file's chunk list onto another file.
+     */
+    private async authFor(
+        entry: { path: string; meta: PutMeta; names: readonly string[] },
+        builtOn: string
+    ): Promise<{ mac: string; parent: string }> {
+        const parent = await parentOf(builtOn);
+        const mac = await macEntry(this.opts.keys, {
+            path: entry.path,
+            size: entry.meta.size,
+            ctime: entry.meta.ctime,
+            mtime: entry.meta.mtime,
+            folder: entry.meta.folder ?? false,
+            deleted: entry.meta.deleted ?? false,
+            prev: entry.meta.prev,
+            chunks: entry.names,
+            parent,
+        });
+        return { mac, parent };
+    }
+
     async acceptBatch(batch: { from: number; to: number; entries: WireEntry[] }): Promise<void> {
         // Staged, then committed once every entry has unsealed and passed its
         // checks. Applied entry by entry, a batch that failed part way through
@@ -472,6 +500,39 @@ export class Engine {
         // applied" unless the state is committed together.
         const staged = new Map<string, RemoteState>();
         for (const e of batch.entries) {
+            // Written by something holding this vault's key, or not applied.
+            //
+            // The bytes of a file were always sealed. Everything deciding what
+            // to do with them was not, and the server holds every sealed path in
+            // the vault, so it could name any file and say anything about it:
+            // `deleted` emptied a note on every device, a size with no chunks
+            // truncated one, another file's chunk list replaced one, and a
+            // substituted merge base deleted chosen paragraphs. None of that
+            // needed the key, which is the whole reason this check exists.
+            if (
+                !(await entryIsOurs(
+                    this.opts.keys,
+                    {
+                        path: e.path,
+                        size: e.size,
+                        ctime: e.ctime,
+                        mtime: e.mtime,
+                        folder: e.folder,
+                        deleted: e.deleted,
+                        prev: e.prev,
+                        chunks: e.chunks,
+                        // A parent of "" is a real value, so a server omitting the
+                        // field means the same thing. A mac cannot be defaulted
+                        // that way: an absent one fails, which is the point.
+                        parent: e.parent ?? "",
+                    },
+                    e.mac
+                ))
+            ) {
+                throw new Error(
+                    `version ${e.uid} is not authenticated by this vault's key, so nothing that holds the key wrote it`
+                );
+            }
             checkEntryShape(e);
             const path = await this.plaintextPath(e.path);
             staged.set(path, {
@@ -893,15 +954,26 @@ export class Engine {
                 this.log("deleted locally", path, action.why);
                 return;
 
-            case "deleteRemote":
+            case "deleteRemote": {
+                // Fixed once, because it is signed and then sent: calling now()
+                // twice would sign one timestamp and send another.
+                const deletedAt = this.now();
                 await this.queue(
                     {
                         path,
                         size: 0,
                         entry: {
                             path: await this.sealedPath(path),
-                            meta: { size: 0, ctime: 0, mtime: this.now(), deleted: true },
+                            meta: { size: 0, ctime: 0, mtime: deletedAt, deleted: true },
                             names: [],
+                            ...(await this.authFor(
+                                {
+                                    path: await this.sealedPath(path),
+                                    meta: { size: 0, ctime: 0, mtime: deletedAt, deleted: true },
+                                    names: [],
+                                },
+                                entry.synchash
+                            )),
                         },
                         bodyOf: noBodies,
                         commit: (uid) => {
@@ -926,6 +998,7 @@ export class Engine {
                     report
                 );
                 return;
+            }
 
             case "merge":
                 await this.merge(path, entry, remote, report);
@@ -964,6 +1037,15 @@ export class Engine {
                         path: await this.sealedPath(path),
                         meta: { size: 0, ctime: 0, mtime: 0, folder: true },
                         names: [],
+                        // A folder has no content and so no lineage.
+                        ...(await this.authFor(
+                            {
+                                path: await this.sealedPath(path),
+                                meta: { size: 0, ctime: 0, mtime: 0, folder: true },
+                                names: [],
+                            },
+                            ""
+                        )),
                     },
                     bodyOf: noBodies,
                     commit: (uid) => {
@@ -1005,6 +1087,22 @@ export class Engine {
                         ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
                     },
                     names: plan.names,
+                    // Built on whatever this device last had in sync, which is
+                    // what lets a receiver tell a new version from a replayed
+                    // old one.
+                    ...(await this.authFor(
+                        {
+                            path: await this.sealedPath(path),
+                            meta: {
+                                size,
+                                ctime: entry.ctime,
+                                mtime,
+                                ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
+                            },
+                            names: plan.names,
+                        },
+                        entry.synchash
+                    )),
                 },
                 bodyOf: plan.bodyOf,
                 commit: (uid) => {

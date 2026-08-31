@@ -311,7 +311,7 @@ func TestPutUploadsOnlyWhatTheServerLacks(t *testing.T) {
 
 	bodies := []string{"shared head", "unique tail"}
 	names, size := chunkNames(bodies)
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5}})
 
 	var want wire.Want
@@ -341,7 +341,7 @@ func TestPutOfAlreadyHeldContentRepliesHaveWithTheUID(t *testing.T) {
 	cl := r.dial("a")
 	cl.hello(0)
 	names, size := chunkNames([]string{"identical content"})
-	cl.sendJSON(wire.In{Op: "put", Path: "copy.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "copy.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5}})
 
 	var have wire.Have
@@ -394,7 +394,7 @@ func TestABodyThatDoesNotMatchItsNameCommitsNothing(t *testing.T) {
 	cl.hello(0)
 
 	names, size := chunkNames([]string{"what the client promised"})
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5}})
 	var want wire.Want
 	cl.recvInto("want", &want)
@@ -421,7 +421,7 @@ func TestHangingUpMidUploadCommitsNothing(t *testing.T) {
 	cl.hello(0)
 
 	names, size := chunkNames([]string{"never arrives"})
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5}})
 	var want wire.Want
 	cl.recvInto("want", &want)
@@ -444,7 +444,7 @@ func TestARepeatedBodyIsRefused(t *testing.T) {
 
 	bodies := []string{"first", "second"}
 	names, size := chunkNames(bodies)
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5}})
 	var want wire.Want
 	cl.recvInto("want", &want)
@@ -463,7 +463,7 @@ func TestATextFrameWhereABodyWasExpectedIsRefused(t *testing.T) {
 	cl.hello(0)
 
 	names, size := chunkNames([]string{"a body"})
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5}})
 	var want wire.Want
 	cl.recvInto("want", &want)
@@ -482,7 +482,7 @@ func TestARejectedPutLeavesTheSessionUsable(t *testing.T) {
 
 	// A size with no chunk list: indistinguishable from an empty file, so it is
 	// refused rather than stored as one.
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Meta: wire.PutMeta{Size: 4096, MTime: 5}})
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Mac: testMac, Meta: wire.PutMeta{Size: 4096, MTime: 5}})
 	cl.expectErr(wire.CodeBadEntry)
 
 	uid := cl.put("good.md", "this one is fine")
@@ -503,19 +503,19 @@ func TestPutRefusals(t *testing.T) {
 		msg  wire.In
 		code string
 	}{
-		{"empty path", wire.In{Op: "put", Path: "", Meta: wire.PutMeta{Size: 0}}, wire.CodeBadName},
+		{"empty path", wire.In{Op: "put", Path: "", Mac: testMac, Meta: wire.PutMeta{Size: 0}}, wire.CodeBadName},
 		{"path over the bound", wire.In{Op: "put", Path: string(longPath)}, wire.CodeBadName},
-		{"file over the ceiling", wire.In{Op: "put", Path: "big.md",
+		{"file over the ceiling", wire.In{Op: "put", Path: "big.md", Mac: testMac,
 			Meta: wire.PutMeta{Size: store.PerFileMax + 1}}, wire.CodeToolarge},
-		{"size with no chunks", wire.In{Op: "put", Path: "a.md",
+		{"size with no chunks", wire.In{Op: "put", Path: "a.md", Mac: testMac,
 			Meta: wire.PutMeta{Size: 10}}, wire.CodeBadEntry},
-		{"chunks on a deletion", wire.In{Op: "put", Path: "a.md", Chunks: []string{good},
+		{"chunks on a deletion", wire.In{Op: "put", Path: "a.md", Mac: testMac, Chunks: []string{good},
 			Meta: wire.PutMeta{Deleted: true}}, wire.CodeBadEntry},
-		{"folder and deletion at once", wire.In{Op: "put", Path: "a",
+		{"folder and deletion at once", wire.In{Op: "put", Path: "a", Mac: testMac,
 			Meta: wire.PutMeta{Folder: true, Deleted: true}}, wire.CodeBadEntry},
-		{"prev equal to path", wire.In{Op: "put", Path: "a.md",
+		{"prev equal to path", wire.In{Op: "put", Path: "a.md", Mac: testMac,
 			Meta: wire.PutMeta{Prev: "a.md"}}, wire.CodeBadEntry},
-		{"malformed chunk name", wire.In{Op: "put", Path: "a.md", Chunks: []string{"nope"},
+		{"malformed chunk name", wire.In{Op: "put", Path: "a.md", Mac: testMac, Chunks: []string{"nope"},
 			Meta: wire.PutMeta{Size: 1}}, wire.CodeBadEntry},
 	}
 	for _, c := range cases {
@@ -540,11 +540,11 @@ func TestDeletionsAndFoldersCommitWithNoUpload(t *testing.T) {
 	cl.put("note.md", "content")
 	cl.nextBatch() // own echo
 
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Meta: wire.PutMeta{Deleted: true, MTime: 9}})
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Mac: testMac, Meta: wire.PutMeta{Deleted: true, MTime: 9}})
 	var have wire.Have
 	cl.recvInto("have", &have)
 
-	cl.sendJSON(wire.In{Op: "put", Path: "folder", Meta: wire.PutMeta{Folder: true}})
+	cl.sendJSON(wire.In{Op: "put", Path: "folder", Mac: testMac, Meta: wire.PutMeta{Folder: true}})
 	cl.recvInto("have", &have)
 
 	st := r.mustStats()
@@ -565,7 +565,7 @@ func TestAnEmptyFileRoundTrips(t *testing.T) {
 	cl := r.dial("a")
 	cl.hello(0)
 
-	cl.sendJSON(wire.In{Op: "put", Path: "empty.md", Meta: wire.PutMeta{Size: 0, MTime: 5}})
+	cl.sendJSON(wire.In{Op: "put", Path: "empty.md", Mac: testMac, Meta: wire.PutMeta{Size: 0, MTime: 5}})
 	var have wire.Have
 	cl.recvInto("have", &have)
 	cl.nextBatch()
@@ -651,11 +651,11 @@ func TestGetRefusals(t *testing.T) {
 	r := newRig(t)
 	live := r.seed("note.md", "content")
 	if _, err := r.st.AppendEntry(testVault, store.Entry{
-		Path: "gone.md", Deleted: true, MTime: 2}); err != nil {
+		Path: "gone.md", Mac: testMac, Deleted: true, MTime: 2}); err != nil {
 		t.Fatalf("seed deletion: %v", err)
 	}
 	if _, err := r.st.AppendEntry(testVault, store.Entry{
-		Path: "folder", Folder: true}); err != nil {
+		Path: "folder", Mac: testMac, Folder: true}); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
 
@@ -731,7 +731,7 @@ func TestUploadsAreCutOffOnceTheyPassTheDeclaredSize(t *testing.T) {
 		names[i] = chunks.Name(b)
 	}
 
-	cl.sendJSON(wire.In{Op: "put", Path: "lie.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "lie.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: 1, MTime: 5}})
 	var want wire.Want
 	cl.recvInto("want", &want)
@@ -769,7 +769,7 @@ func TestAnEntryPointedAtAlreadyHeldChunksIsRefusedByTheBudget(t *testing.T) {
 
 	cl := r.dial("a")
 	cl.hello(0)
-	cl.sendJSON(wire.In{Op: "put", Path: "tiny.md", Chunks: e.Chunks,
+	cl.sendJSON(wire.In{Op: "put", Path: "tiny.md", Mac: testMac, Chunks: e.Chunks,
 		Meta: wire.PutMeta{Size: 10, MTime: 5}})
 	cl.expectErr(wire.CodeToolarge)
 
@@ -799,7 +799,7 @@ func TestAnHonestlySizedUploadIsNotRefused(t *testing.T) {
 		bodies[i] = string(b)
 		names[i] = chunks.Name(b)
 	}
-	cl.sendJSON(wire.In{Op: "put", Path: "real.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "real.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: plain * n, MTime: 5}})
 	var want wire.Want
 	cl.recvInto("want", &want)
@@ -821,15 +821,15 @@ func TestAnHonestlySizedUploadIsNotRefused(t *testing.T) {
 func TestEveryEntryOnTheWireCarriesAChunkArray(t *testing.T) {
 	r := newRig(t)
 	r.seed("note.md", "content")
-	if _, err := r.st.AppendEntry(testVault, store.Entry{Path: "folder", Folder: true}); err != nil {
+	if _, err := r.st.AppendEntry(testVault, store.Entry{Path: "folder", Mac: testMac, Folder: true}); err != nil {
 		t.Fatalf("folder: %v", err)
 	}
 	if _, err := r.st.AppendEntry(testVault, store.Entry{
-		Path: "note.md", Deleted: true, MTime: 2}); err != nil {
+		Path: "note.md", Mac: testMac, Deleted: true, MTime: 2}); err != nil {
 		t.Fatalf("deletion: %v", err)
 	}
 	if _, err := r.st.AppendEntry(testVault, store.Entry{
-		Path: "empty.md", Size: 0, MTime: 3}); err != nil {
+		Path: "empty.md", Mac: testMac, Size: 0, MTime: 3}); err != nil {
 		t.Fatalf("empty: %v", err)
 	}
 
@@ -868,7 +868,7 @@ func TestAZeroByteFileWithChunksIsRefused(t *testing.T) {
 	cl.hello(0)
 
 	names, _ := chunkNames([]string{"ciphertext of nothing"})
-	cl.sendJSON(wire.In{Op: "put", Path: "empty.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "empty.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: 0, MTime: 5}})
 	msg := cl.expectErr(wire.CodeBadEntry)
 	if !strings.Contains(msg, "an empty file has none") {
@@ -915,7 +915,7 @@ func TestABodyThatCannotBeWrittenCommitsNothing(t *testing.T) {
 	t.Cleanup(func() { os.Chmod(dir, 0o700) })
 
 	names, size := chunkNames([]string{"a body that cannot be written"})
-	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names,
+	cl.sendJSON(wire.In{Op: "put", Path: "note.md", Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5}})
 	var want wire.Want
 	cl.recvInto("want", &want)
@@ -940,7 +940,7 @@ func TestRepeatedChunksAreBudgetedPerReferenceOverTheWire(t *testing.T) {
 	body := make([]byte, 4096)
 	name := chunks.Name(body)
 	// Four references, but a size that only accounts for one of them.
-	cl.sendJSON(wire.In{Op: "put", Path: "lie.md",
+	cl.sendJSON(wire.In{Op: "put", Path: "lie.md", Mac: testMac,
 		Chunks: []string{name, name, name, name},
 		Meta:   wire.PutMeta{Size: 4096, MTime: 5}})
 
@@ -987,6 +987,7 @@ func TestAnEntryIsAlwaysAttributedToTheSessionsDevice(t *testing.T) {
 		Device: "laptop",
 		Meta:   wire.PutMeta{Size: int64(len(body)), MTime: 2},
 		Chunks: []string{chunks.Name([]byte(body))},
+		Mac:    testMac,
 	})
 	cl.recvInto("want", &wire.Want{})
 	cl.sendBinary([]byte(body))

@@ -82,7 +82,7 @@ async function connected(opts: {
 async function helloed(cursor = 0, opts: Parameters<typeof connected>[0] = {}) {
     const rig = await connected(opts);
     const hello = rig.t.hello({ vault: "v", token: "tok", device: "d", cursor });
-    rig.socket.reply({ res: "ready", proto: 1, cursor: 10, perFileMax: 1, chunkMax: 1, maxChunks: 1 });
+    rig.socket.reply({ res: "ready", proto: 2, cursor: 10, perFileMax: 1, chunkMax: 1, maxChunks: 1 });
     await hello;
     return rig;
 }
@@ -209,7 +209,7 @@ describe("the handshake", () => {
     it("refuses a server speaking another protocol version", async () => {
         const { t, socket } = await connected();
         const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
-        socket.reply({ res: "ready", proto: 2, cursor: 0, perFileMax: 1, chunkMax: 1, maxChunks: 1 });
+        socket.reply({ res: "ready", proto: 3, cursor: 0, perFileMax: 1, chunkMax: 1, maxChunks: 1 });
         await expect(hello).rejects.toMatchObject({ code: "proto" });
     });
 
@@ -219,7 +219,7 @@ describe("the handshake", () => {
         const { t, socket } = await connected();
         void t.hello({ vault: "v", token: "t", device: "d", cursor: 0 }).catch(() => {});
         await settle();
-        expect(socket.sentText[0]).toMatchObject({ op: "hello", proto: 1, crypto: "basalt/hkdf-aes-gcm/1" });
+        expect(socket.sentText[0]).toMatchObject({ op: "hello", proto: 2, crypto: "basalt/hkdf-aes-gcm/1" });
     });
 
     it("refuses anything other than ready", async () => {
@@ -687,7 +687,7 @@ async function engineOnFakeSocket(limits: { maxChunks?: number; perFileMax?: num
     await settle();
     socket.reply({
         res: "ready",
-        proto: 1,
+        proto: 2,
         cursor: 0,
         perFileMax: limits.perFileMax ?? 1 << 28,
         chunkMax: limits.chunkMax ?? 1 << 20,

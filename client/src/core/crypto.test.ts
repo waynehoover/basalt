@@ -6,11 +6,15 @@ import {
     base64urlEncode,
     chunkName,
     deriveKeys,
+    entryIsOurs,
     generateSecret,
     hex,
     open,
     openChunk,
+    macEntry,
     openPath,
+    type EntryFacts,
+    parentOf,
     seal,
     sealChunk,
     sealChunks,
@@ -419,5 +423,91 @@ describe("deciding whether a chunk is worth compressing", () => {
         mixed.set(noise(8192), 0);
         mixed.set(prose(1000).subarray(0, mixed.length - 8192), 8192);
         expect(await openChunk(await keys(), await sealChunk(await keys(), mixed))).toEqual(mixed);
+    });
+});
+
+/**
+ * Authenticating an entry, which is everything about a version except its bytes.
+ *
+ * The bytes were always sealed. What decided what a client did with them was
+ * not: `deleted`, `size`, `prev` and the chunk list travelled in the clear, and
+ * the server holds every sealed path in the vault. Setting `deleted` deleted a
+ * note on every device; a size with no chunks emptied one; another file's chunk
+ * list replaced one.
+ */
+describe("an entry nobody but a key holder could have written", () => {
+    const facts: EntryFacts = {
+        path: "sealed-path",
+        size: 120,
+        ctime: 1_700_000_000_000,
+        mtime: 1_700_000_000_001,
+        folder: false,
+        deleted: false,
+        chunks: ["aa", "bb"],
+        parent: "cafe",
+    };
+
+    it("verifies what it produced", async () => {
+        const k = await keys();
+        const mac = await macEntry(k, facts);
+        expect(await entryIsOurs(k, facts, mac)).toBe(true);
+    });
+
+    it("refuses every field changed one at a time", async () => {
+        const k = await keys();
+        const mac = await macEntry(k, facts);
+        const changes: Partial<EntryFacts>[] = [
+            { path: "another-sealed-path" },
+            { size: 121 },
+            { ctime: 0 },
+            { mtime: 0 },
+            { folder: true },
+            { deleted: true },
+            { chunks: ["aa"] },
+            { chunks: ["bb", "aa"] },
+            { chunks: ["aa", "bb", "cc"] },
+            { parent: "beef" },
+            { prev: "some-other-sealed-path" },
+        ];
+        for (const change of changes) {
+            const altered = { ...facts, ...change };
+            expect(await entryIsOurs(k, altered, mac), `accepted ${JSON.stringify(change)}`).toBe(false);
+        }
+    });
+
+    it("refuses a mac from a different vault", async () => {
+        const k = await keys();
+        const stranger = await deriveKeys(new Uint8Array(20).fill(7));
+        const theirs = await macEntry(stranger, facts);
+        expect(await entryIsOurs(k, facts, theirs)).toBe(false);
+    });
+
+    it("refuses a mac of the wrong length rather than comparing it", async () => {
+        const k = await keys();
+        expect(await entryIsOurs(k, facts, "")).toBe(false);
+        expect(await entryIsOurs(k, facts, "00")).toBe(false);
+    });
+
+    /**
+     * Two entries that canonicalise to the same bytes are one forgery. Length
+     * prefixes are what stop a chunk name and a path from being rearranged into
+     * each other.
+     */
+    it("does not confuse fields that could run together", async () => {
+        const k = await keys();
+        const a = await macEntry(k, { ...facts, path: "ab", chunks: ["c"] });
+        const b = await macEntry(k, { ...facts, path: "a", chunks: ["bc"] });
+        expect(a).not.toBe(b);
+
+        const c = await macEntry(k, { ...facts, chunks: ["a", "bc"] });
+        const d = await macEntry(k, { ...facts, chunks: ["ab", "c"] });
+        expect(c).not.toBe(d);
+    });
+
+    it("names a parent stably, and gives no parent an empty name", async () => {
+        expect(await parentOf("")).toBe("");
+        expect(await parentOf("aa,bb")).toBe(await parentOf("aa,bb"));
+        expect(await parentOf("aa,bb")).not.toBe(await parentOf("aa,bc"));
+        expect((await parentOf("aa,bb")).length).toBe(64);
     });
 });

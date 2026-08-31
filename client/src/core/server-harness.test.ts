@@ -20,7 +20,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { chunkBytes, looksLikeText, sizesFor } from "./chunk.ts";
-import { authToken, deriveKeys, openChunk, sealChunks, sealPath, openPath, type VaultKeys } from "./crypto.ts";
+import { authToken, deriveKeys, macEntry, openChunk, openPath, parentOf, sealChunks, sealPath, type VaultKeys } from "./crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
 import { ProtocolError, Transport, type Batch, type BatchEntry } from "./transport.ts";
 
@@ -41,6 +41,13 @@ async function vaultKeys(): Promise<VaultKeys> {
     return sharedKeys;
 }
 const enc = new TextEncoder();
+
+/**
+ * A mac of the right shape. These cases test the server's own refusals, and the
+ * server holds no key: it checks that an entry carries an authenticator, never
+ * what the authenticator says.
+ */
+const shapedMac = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const dec = new TextDecoder();
 
 // Built once for the whole suite by vitest.global-setup.ts. This file used to
@@ -103,10 +110,27 @@ class Client {
         const isText = looksLikeText(path);
         const parts = [...chunkBytes(data, sizesFor(data.length, isText), isText)].map((c) => c.bytes);
         const sealed = await sealChunks(this.keys, parts);
+        const sealedPath = await sealPath(this.keys, path);
+        const names = sealed.map((c) => c.name);
+        const meta = { size: data.length, ctime: 1, mtime };
+        // Signed, because the engine signs and this exists to do exactly what
+        // the engine does.
+        const parent = await parentOf("");
+        const mac = await macEntry(this.keys, {
+            path: sealedPath,
+            size: meta.size,
+            ctime: meta.ctime,
+            mtime: meta.mtime,
+            folder: false,
+            deleted: false,
+            chunks: names,
+            parent,
+        });
         const result = await this.transport.put(
-            await sealPath(this.keys, path),
-            { size: data.length, ctime: 1, mtime }, sealed.map((c) => c.name), async (n) => sealed.find((c) => c.name === n)!.bytes);
-        return { ...result, chunks: sealed.map((c) => c.name), plaintext: data };
+            sealedPath, meta, names,
+            async (n) => sealed.find((c) => c.name === n)!.bytes,
+            { mac, parent });
+        return { ...result, chunks: names, plaintext: data };
     }
 
     /** Chunks, seals and puts several files in one batched exchange. */
@@ -119,10 +143,26 @@ class Client {
             const parts = [...chunkBytes(data, sizesFor(data.length, isText), isText)].map((c) => c.bytes);
             const sealed = await sealChunks(this.keys, parts);
             for (const c of sealed) bodies.set(c.name, c.bytes);
+            const path = await sealPath(this.keys, f.path);
+            const meta = { size: data.length, ctime: 1, mtime: f.mtime ?? 1000 };
+            const names = sealed.map((c) => c.name);
+            // A real writer signs; the harness is standing in for one.
+            const parent = await parentOf("");
             entries.push({
-                path: await sealPath(this.keys, f.path),
-                meta: { size: data.length, ctime: 1, mtime: f.mtime ?? 1000 },
-                names: sealed.map((c) => c.name),
+                path,
+                meta,
+                names,
+                parent,
+                mac: await macEntry(this.keys, {
+                    path,
+                    size: meta.size,
+                    ctime: meta.ctime,
+                    mtime: meta.mtime,
+                    folder: false,
+                    deleted: false,
+                    chunks: names,
+                    parent,
+                }),
             });
         }
         const out = await this.transport.putMany(entries, async (n) => bodies.get(n)!);
@@ -196,7 +236,7 @@ describe("the handshake, against the real server", () => {
         const c = new Client(await deriveKeys(SECRET), "a");
         clients.push(c);
         const ready = await c.connect(server);
-        expect(ready.proto).toBe(1);
+        expect(ready.proto).toBe(2);
         expect(ready.chunkMax).toBe(1024 * 1024);
         // The default, which is a server's policy rather than the store's
         // ceiling: preparing a file to send costs the client several times the
@@ -411,10 +451,10 @@ describe("a batched write, which is one exchange for many notes", () => {
 
             const { results } = await c.transport.putMany(
                 [
-                    { path: good, meta: { size: 4, ctime: 1, mtime: 1 }, names: [body[0]!.name] },
+                    { path: good, meta: { size: 4, ctime: 1, mtime: 1 }, names: [body[0]!.name], mac: shapedMac, parent: "" },
                     // A size that no chunk list can honestly account for.
-                    { path: alsoGood, meta: { size: -1, ctime: 1, mtime: 1 }, names: [] },
-                    { path: alsoGood, meta: { size: 4, ctime: 1, mtime: 2 }, names: [body[0]!.name] },
+                    { path: alsoGood, meta: { size: -1, ctime: 1, mtime: 1 }, names: [], mac: shapedMac, parent: "" },
+                    { path: alsoGood, meta: { size: 4, ctime: 1, mtime: 2 }, names: [body[0]!.name], mac: shapedMac, parent: "" },
                 ],
                 async (n) => bodies.get(n)!
             );

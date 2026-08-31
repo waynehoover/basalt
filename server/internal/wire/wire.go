@@ -17,7 +17,10 @@ import "github.com/waynehoover/basalt-sync/server/internal/store"
 // Proto is the protocol version this server implements. A mismatch is refused,
 // not negotiated: interoperating with a version we have not seen is how a
 // silent incompatibility gets shipped.
-const Proto = 1
+// Protocol 2 added the per-entry authenticator. A client older than that sends
+// entries nothing can verify, and one newer refuses them, which is a refusal
+// rather than a negotiation for the usual reason.
+const Proto = 2
 
 // Crypto names the client-side scheme. It is a string rather than an integer
 // because an integer shared with other implementations means two projects
@@ -106,6 +109,10 @@ type In struct {
 	Path   string   `json:"path"`
 	Meta   PutMeta  `json:"meta"`
 	Chunks []string `json:"chunks"`
+	// Mac authenticates the entry and Parent names what it was written on top
+	// of. Both are opaque to the server, which holds no key to check them.
+	Mac    string `json:"mac"`
+	Parent string `json:"parent"`
 
 	// get
 	UID int64 `json:"uid"`
@@ -131,6 +138,8 @@ type PutEntry struct {
 	Path   string   `json:"path"`
 	Meta   PutMeta  `json:"meta"`
 	Chunks []string `json:"chunks"`
+	Mac    string   `json:"mac"`
+	Parent string   `json:"parent"`
 }
 
 // Entry converts one batched put into the store's record.
@@ -145,6 +154,8 @@ func (p PutEntry) Entry(device string) store.Entry {
 		Device:  device,
 		Prev:    p.Meta.Prev,
 		Chunks:  p.Chunks,
+		Mac:     p.Mac,
+		Parent:  p.Parent,
 	}
 }
 
@@ -184,6 +195,8 @@ func (in In) Entry() store.Entry {
 		Device:  in.Device,
 		Prev:    in.Meta.Prev,
 		Chunks:  in.Chunks,
+		Mac:     in.Mac,
+		Parent:  in.Parent,
 	}
 }
 

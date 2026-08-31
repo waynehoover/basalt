@@ -15,9 +15,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Engine, OWN_LIMITS, SEAL_WINDOW, boundedBy, contentId, refuseIfBehind, firstFreeName, sealedNames, type SyncReport } from "./engine.ts";
 import { chunkBytes, sizesFor } from "./chunk.ts";
-import { sealChunks, sealPath } from "./crypto.ts";
+import { macEntry, sealChunks, sealPath } from "./crypto.ts";
 import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
-import { Transport } from "./transport.ts";
+import { Transport, type WireEntry } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 
@@ -1311,6 +1311,32 @@ describe("large files", () => {
  * there was no trash copy either, and the emptied note then propagated to every
  * peer as an ordinary edit.
  */
+/**
+ * A forged entry, signed the way a key holder signs.
+ *
+ * These tests are about the checks *behind* the authenticator: a writer that
+ * holds the key and still emits something contradictory, which is a bug rather
+ * than an attack, and which a corrupt row reproduces exactly. Without a valid
+ * mac they would be refused one step earlier and prove nothing about the checks
+ * they are named for.
+ */
+async function signed(e: Omit<WireEntry, "mac">): Promise<WireEntry> {
+    return {
+        ...e,
+        mac: await macEntry(keys, {
+            path: e.path,
+            size: e.size,
+            ctime: e.ctime,
+            mtime: e.mtime,
+            folder: e.folder,
+            deleted: e.deleted,
+            prev: e.prev,
+            chunks: e.chunks,
+            parent: e.parent,
+        }),
+    };
+}
+
 describe("a batch that contradicts itself", () => {
     let server: TestServer;
     let a: Device;
@@ -1335,6 +1361,73 @@ describe("a batch that contradicts itself", () => {
         return { path, sealed: await sealPath(keys, path), before };
     }
 
+    /**
+     * The envelope itself. Everything above tests a check behind it; this tests
+     * that a server which does not hold the key cannot get past it at all.
+     *
+     * Before protocol 2 each of these worked: the bytes of a file were sealed
+     * and nothing else was, and the server holds every sealed path in the vault,
+     * so it could name any file and say anything about it.
+     */
+    it("refuses an entry carrying no authenticator", async () => {
+        const { path, sealed, before } = await synced();
+        const uid = 1_000_000;
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid,
+                entries: [
+                    {
+                        uid, path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000,
+                        folder: false, deleted: true, chunks: [], device: "b", parent: "", mac: "",
+                    },
+                ],
+            })
+        ).rejects.toThrow(/not authenticated by this vault's key/);
+        await a.engine.sync();
+        expect(await a.vault.read(path)).toEqual(before);
+    });
+
+    it("refuses a deletion the server invented for a file it can name", async () => {
+        const { path, sealed, before } = await synced();
+        const uid = 1_000_000;
+        // A well-formed mac, from a key this vault does not use.
+        const stranger = await deriveKeys(new Uint8Array(20).fill(3));
+        const facts = {
+            path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000,
+            folder: false, deleted: true, chunks: [] as string[], parent: "",
+        };
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid,
+                entries: [{ uid, device: "b", ...facts, mac: await macEntry(stranger, facts) }],
+            })
+        ).rejects.toThrow(/not authenticated by this vault's key/);
+        await a.engine.sync();
+        expect(await a.vault.read(path)).toEqual(before);
+    });
+
+    it("refuses an entry whose fields were edited after it was signed", async () => {
+        const { path, sealed, before } = await synced();
+        const uid = 1_000_000;
+        // Signed honestly as a small edit, then altered into a deletion.
+        const honest = {
+            path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000,
+            folder: false, deleted: false, chunks: [] as string[], parent: "",
+        };
+        const mac = await macEntry(keys, honest);
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid,
+                entries: [{ uid, device: "b", ...honest, deleted: true, mac }],
+            })
+        ).rejects.toThrow(/not authenticated by this vault's key/);
+        await a.engine.sync();
+        expect(await a.vault.read(path)).toEqual(before);
+    });
+
     it("refuses a size with no chunks, rather than emptying the note", async () => {
         const { path, sealed, before } = await synced();
         const uid = 1_000_000;
@@ -1344,8 +1437,7 @@ describe("a batch that contradicts itself", () => {
                 from: uid,
                 to: uid,
                 entries: [
-                    {
-                        uid,
+                    await signed({uid,
                         path: sealed,
                         size: before.length,
                         ctime: 0,
@@ -1353,8 +1445,7 @@ describe("a batch that contradicts itself", () => {
                         folder: false,
                         deleted: false,
                         chunks: [],
-                        device: "b",
-                    },
+                        device: "b", parent: ""}),
                 ],
             })
         ).rejects.toThrow(/size|chunk/i);
@@ -1371,7 +1462,7 @@ describe("a batch that contradicts itself", () => {
                 from: uid,
                 to: uid,
                 entries: [
-                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock, folder: false, deleted: true, chunks: ["deadbeef"], device: "b" },
+                    await signed({uid, path: sealed, size: 0, ctime: 0, mtime: a.clock, folder: false, deleted: true, chunks: ["deadbeef"], device: "b", parent: ""}),
                 ],
             })
         ).rejects.toThrow(/chunk/i);
@@ -1385,7 +1476,7 @@ describe("a batch that contradicts itself", () => {
                 from: uid,
                 to: uid,
                 entries: [
-                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock, folder: true, deleted: false, chunks: ["deadbeef"], device: "b" },
+                    await signed({uid, path: sealed, size: 0, ctime: 0, mtime: a.clock, folder: true, deleted: false, chunks: ["deadbeef"], device: "b", parent: ""}),
                 ],
             })
         ).rejects.toThrow(/chunk/i);
@@ -1418,8 +1509,7 @@ describe("a batch that contradicts itself", () => {
             from: uid,
             to: uid,
             entries: [
-                {
-                    uid,
+                await signed({uid,
                     path: sealed,
                     // The size of the file being overwritten, with the chunks of
                     // the one being substituted in.
@@ -1429,8 +1519,7 @@ describe("a batch that contradicts itself", () => {
                     folder: false,
                     deleted: false,
                     chunks: [...otherChunks],
-                    device: "b",
-                },
+                    device: "b", parent: ""}),
             ],
         });
 
@@ -1460,8 +1549,8 @@ describe("a batch that contradicts itself", () => {
                 from: uid,
                 to: uid + 1,
                 entries: [
-                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: true, chunks: [], device: "b" },
-                    { uid: uid + 1, path: foreign, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: false, chunks: [], device: "b" },
+                    await signed({uid, path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: true, chunks: [], device: "b", parent: ""}),
+                    await signed({uid: uid + 1, path: foreign, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: false, chunks: [], device: "b", parent: ""}),
                 ],
             })
         ).rejects.toThrow();
@@ -1479,7 +1568,7 @@ describe("a batch that contradicts itself", () => {
                 from: uid,
                 to: uid,
                 entries: [
-                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: false, chunks: [], device: "b" },
+                    await signed({uid, path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: false, chunks: [], device: "b", parent: ""}),
                 ],
             })
         ).resolves.toBeUndefined();

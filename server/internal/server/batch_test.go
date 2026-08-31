@@ -64,6 +64,7 @@ func entryFor(path string, bodies ...string) (wire.PutEntry, map[string]string) 
 		Path:   path,
 		Meta:   wire.PutMeta{Size: int64(size), MTime: 5},
 		Chunks: names,
+		Mac:    testMac,
 	}, byName
 }
 
@@ -171,7 +172,7 @@ func TestOneBadEntryDoesNotRefuseTheRest(t *testing.T) {
 	cl.hello(0)
 
 	good, bodies := entryFor("good.md", "fine")
-	bad := wire.PutEntry{Path: "", Meta: wire.PutMeta{Size: 1}}
+	bad := wire.PutEntry{Path: "", Mac: testMac, Meta: wire.PutMeta{Size: 1}}
 	alsoGood, more := entryFor("also-good.md", "also fine")
 	for k, v := range more {
 		bodies[k] = v
@@ -220,7 +221,7 @@ func TestABatchIsBounded(t *testing.T) {
 
 	huge := make([]wire.PutEntry, wire.MaxBatchEntries+1)
 	for i := range huge {
-		huge[i] = wire.PutEntry{Path: "x.md", Meta: wire.PutMeta{MTime: 1}}
+		huge[i] = wire.PutEntry{Path: "x.md", Mac: testMac, Meta: wire.PutMeta{MTime: 1}}
 	}
 	cl.sendJSON(wire.In{Op: "putmany", Entries: huge})
 	cl.expectErr(wire.CodeToolarge)
@@ -256,8 +257,8 @@ func TestACommitRefusalDoesNotTakeTheBatchWithIt(t *testing.T) {
 	bodies := map[string]string{bigName: string(big)}
 
 	entries := []wire.PutEntry{
-		{Path: "honest.md", Meta: wire.PutMeta{Size: 4096, MTime: 1}, Chunks: []string{bigName}},
-		{Path: "liar.md", Meta: wire.PutMeta{Size: 1, MTime: 2}, Chunks: []string{bigName}},
+		{Path: "honest.md", Meta: wire.PutMeta{Size: 4096, MTime: 1}, Chunks: []string{bigName}, Mac: testMac},
+		{Path: "liar.md", Meta: wire.PutMeta{Size: 1, MTime: 2}, Chunks: []string{bigName}, Mac: testMac},
 	}
 	for _, name := range []string{"after-one.md", "after-two.md"} {
 		e, b := entryFor(name, "content of "+name)

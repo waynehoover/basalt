@@ -27,6 +27,11 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/store"
 )
 
+// A mac of the right shape, standing in for a real writer's. The server holds no
+// key and checks only that an entry carries one, because an entry nothing can
+// authenticate is refused by every reader for ever.
+const testMac = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 // seeded builds a data directory with some history in it, the way a server
 // would have, and returns its path.
 func seeded(t *testing.T) string {
@@ -52,7 +57,7 @@ func seeded(t *testing.T) string {
 			names = append(names, n)
 			size += len(b)
 		}
-		e := store.Entry{Path: path, Size: int64(size), MTime: 10, Device: "seed", Chunks: names}
+		e := store.Entry{Path: path, Size: int64(size), MTime: 10, Device: "seed", Chunks: names, Mac: testMac}
 		uid, err := st.AppendEntry("default", e)
 		if err != nil {
 			t.Fatalf("append %s: %v", path, err)
@@ -66,7 +71,7 @@ func seeded(t *testing.T) string {
 	put("note.md", "version three")
 	put("other.md", "only version")
 	put("attachment.bin", "part one ", "part two ", "part three")
-	if _, err := st.AppendEntry("default", store.Entry{Path: "gone.md", Deleted: true, MTime: 20}); err != nil {
+	if _, err := st.AppendEntry("default", store.Entry{Path: "gone.md", Deleted: true, MTime: 20, Mac: testMac}); err != nil {
 		t.Fatalf("append deletion: %v", err)
 	}
 	if err := st.Close(); err != nil {

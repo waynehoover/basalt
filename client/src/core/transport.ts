@@ -31,8 +31,14 @@
 
 import { CRYPTO_SUITE, chunkName } from "./crypto.ts";
 
-/** The protocol version this client speaks. A mismatch is refused, not negotiated. */
-export const PROTO = 1;
+/**
+ * The protocol version this client speaks. A mismatch is refused, not negotiated.
+ *
+ * 2 added the per-entry authenticator. Before it, everything a client acted on
+ * except the bytes themselves travelled unsigned, so a server could say anything
+ * about any file whose sealed path it held, which is all of them.
+ */
+export const PROTO = 2;
 
 /** How long a request may go unanswered before the connection is considered dead. */
 export const REQUEST_TIMEOUT_MS = 60_000;
@@ -46,6 +52,10 @@ export interface WireDeletion extends WireEntry {
 export interface WireEntry {
     readonly uid: number;
     readonly path: string;
+    /** The writer's authenticator over this entry. Empty from a server predating protocol 2. */
+    readonly mac: string;
+    /** The version this entry was written on top of, as `parentOf` names it. */
+    readonly parent: string;
     readonly size: number;
     readonly ctime: number;
     readonly mtime: number;
@@ -89,6 +99,8 @@ export interface BatchEntry {
     readonly path: string;
     readonly meta: PutMeta;
     readonly names: readonly string[];
+    readonly mac: string;
+    readonly parent: string;
 }
 
 /** What became of one entry in a batch. */
@@ -662,13 +674,17 @@ export class Transport {
          * and this is a map lookup; a large one keeps offsets and seals the
          * chunk again, which is deterministic and so gives the same bytes.
          */
-        bodyOf: (name: string) => Promise<Uint8Array>
+        bodyOf: (name: string) => Promise<Uint8Array>,
+        /** The authenticator and parent this entry travels with. */
+        auth: { mac: string; parent: string } = { mac: "", parent: "" }
     ): Promise<{ uid: number; uploaded: number; bytes: number }> {
         const reply = await this.request({
             op: "put",
             path,
             meta: wireMeta(meta),
             chunks: [...names],
+            mac: auth.mac,
+            parent: auth.parent,
         });
 
         if (reply["res"] === "have") {
@@ -727,7 +743,13 @@ export class Transport {
 
         const reply = await this.request({
             op: "putmany",
-            entries: entries.map((e) => ({ path: e.path, meta: wireMeta(e.meta), chunks: [...e.names] })),
+            entries: entries.map((e) => ({
+                path: e.path,
+                meta: wireMeta(e.meta),
+                chunks: [...e.names],
+                mac: e.mac,
+                parent: e.parent,
+            })),
         });
 
         let acks = reply;

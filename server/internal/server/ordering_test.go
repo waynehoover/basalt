@@ -360,7 +360,7 @@ func TestCommitAndAnnounceCannotBeInterleaved(t *testing.T) {
 		go func(i int, s *Session) {
 			defer wg.Done()
 			if _, _, err := s.commit(store.Entry{
-				Path: fmt.Sprintf("f%d.md", i), MTime: 1, Device: "d",
+				Path: fmt.Sprintf("f%d.md", i), MTime: 1, Device: "d", Mac: testMac,
 			}); err != nil {
 				t.Errorf("commit: %v", err)
 			}

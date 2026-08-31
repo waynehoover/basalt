@@ -13,6 +13,11 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 )
 
+// A mac of the right shape, standing in for a real writer's. The server holds
+// no key and checks only that an entry carries one, because an entry nothing can
+// authenticate is refused by every reader for ever.
+const testMac = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 type harness struct {
 	*Store
 	dir string
@@ -82,7 +87,7 @@ func (h *harness) write(path string, bodies ...string) (Entry, error) {
 		names = append(names, n)
 		size += len(b)
 	}
-	e := Entry{Path: path, Size: int64(size), MTime: 42, Device: "d1", Chunks: names}
+	e := Entry{Path: path, Size: int64(size), MTime: 42, Device: "d1", Chunks: names, Mac: testMac}
 	uid, err := h.AppendEntry("v1", e)
 	if err != nil {
 		return Entry{}, err
@@ -128,8 +133,7 @@ func TestConcurrentAppendsProduceUniqueMonotonicUIDs(t *testing.T) {
 				}
 				uid, err := h.AppendEntry("v1", Entry{
 					Path: fmt.Sprintf("w%d-%d.md", w, i), Size: int64(len(body)),
-					Chunks: []string{name},
-				})
+					Chunks: []string{name}, Mac: testMac})
 				if err != nil {
 					t.Errorf("append: %v", err)
 					return
@@ -163,7 +167,7 @@ func TestConcurrentAppendsProduceUniqueMonotonicUIDs(t *testing.T) {
 func TestAppendToUnknownVaultFails(t *testing.T) {
 	h := newTestStore(t)
 	names := h.put(t, "ghost", "body")
-	_, err := h.AppendEntry("ghost", Entry{Path: "a.md", Size: 4, Chunks: names})
+	_, err := h.AppendEntry("ghost", Entry{Path: "a.md", Mac: testMac, Size: 4, Chunks: names})
 	if !errors.Is(err, ErrUnknownVault) {
 		t.Fatalf("err = %v, want ErrUnknownVault", err)
 	}
@@ -182,7 +186,7 @@ func TestAppendRefusesAnEntryWhoseChunksAreAbsent(t *testing.T) {
 	absent := chunks.Name([]byte("never uploaded"))
 
 	_, err := h.AppendEntry("v1", Entry{
-		Path: "a.md", Size: 20, Chunks: []string{present[0], absent},
+		Path: "a.md", Mac: testMac, Size: 20, Chunks: []string{present[0], absent},
 	})
 	if !errors.Is(err, ErrChunkMissing) {
 		t.Fatalf("err = %v, want ErrChunkMissing", err)
@@ -209,7 +213,7 @@ func TestAppendDoesNotAcceptAnotherVaultsChunk(t *testing.T) {
 	}
 	names := h.put(t, "v1", "vault one content")
 
-	_, err := h.AppendEntry("v2", Entry{Path: "a.md", Size: 17, Chunks: names})
+	_, err := h.AppendEntry("v2", Entry{Path: "a.md", Mac: testMac, Size: 17, Chunks: names})
 	if !errors.Is(err, ErrChunkMissing) {
 		t.Fatalf("err = %v, want ErrChunkMissing", err)
 	}
@@ -225,17 +229,17 @@ func TestValidateRejectsStructurallyBadEntries(t *testing.T) {
 		why   string
 		entry Entry
 	}{
-		{"empty path", Entry{Path: "", Size: 1, Chunks: []string{good}}},
+		{"empty path", Entry{Path: "", Mac: testMac, Size: 1, Chunks: []string{good}}},
 		{"oversized path", Entry{Path: string(make([]byte, MaxPathLen+1)), Size: 0}},
-		{"prev equals path", Entry{Path: "a.md", Prev: "a.md"}},
-		{"folder and deletion at once", Entry{Path: "a", Folder: true, Deleted: true}},
-		{"negative size", Entry{Path: "a.md", Size: -1}},
-		{"size over the ceiling", Entry{Path: "a.md", Size: PerFileMax + 1}},
-		{"chunks on a deletion", Entry{Path: "a.md", Deleted: true, Chunks: []string{good}}},
-		{"chunks on a folder", Entry{Path: "a", Folder: true, Chunks: []string{good}}},
-		{"size on a deletion", Entry{Path: "a.md", Deleted: true, Size: 10}},
-		{"content with no chunks", Entry{Path: "a.md", Size: 10}},
-		{"malformed chunk name", Entry{Path: "a.md", Size: 1, Chunks: []string{"nope"}}},
+		{"prev equals path", Entry{Path: "a.md", Mac: testMac, Prev: "a.md"}},
+		{"folder and deletion at once", Entry{Path: "a", Mac: testMac, Folder: true, Deleted: true}},
+		{"negative size", Entry{Path: "a.md", Mac: testMac, Size: -1}},
+		{"size over the ceiling", Entry{Path: "a.md", Mac: testMac, Size: PerFileMax + 1}},
+		{"chunks on a deletion", Entry{Path: "a.md", Mac: testMac, Deleted: true, Chunks: []string{good}}},
+		{"chunks on a folder", Entry{Path: "a", Mac: testMac, Folder: true, Chunks: []string{good}}},
+		{"size on a deletion", Entry{Path: "a.md", Mac: testMac, Deleted: true, Size: 10}},
+		{"content with no chunks", Entry{Path: "a.md", Mac: testMac, Size: 10}},
+		{"malformed chunk name", Entry{Path: "a.md", Mac: testMac, Size: 1, Chunks: []string{"nope"}}},
 	}
 	for _, c := range cases {
 		if err := c.entry.Validate(); !errors.Is(err, ErrBadEntry) {
@@ -250,7 +254,7 @@ func TestValidateRejectsStructurallyBadEntries(t *testing.T) {
 // note having been emptied.
 func TestAppendRefusesContentWithNoChunks(t *testing.T) {
 	h := newTestStore(t)
-	_, err := h.AppendEntry("v1", Entry{Path: "a.md", Size: 4096})
+	_, err := h.AppendEntry("v1", Entry{Path: "a.md", Mac: testMac, Size: 4096})
 	if !errors.Is(err, ErrBadEntry) {
 		t.Fatalf("err = %v, want ErrBadEntry", err)
 	}
@@ -260,7 +264,7 @@ func TestAppendRefusesContentWithNoChunks(t *testing.T) {
 // creating an empty note fails to sync.
 func TestZeroByteFileIsAcceptedWithNoChunks(t *testing.T) {
 	h := newTestStore(t)
-	uid, err := h.AppendEntry("v1", Entry{Path: "empty.md", Size: 0, MTime: 1})
+	uid, err := h.AppendEntry("v1", Entry{Path: "empty.md", Mac: testMac, Size: 0, MTime: 1})
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -305,7 +309,7 @@ func TestRepeatedChunkKeepsBothPositions(t *testing.T) {
 	h.put(t, "v1", "AAAA", "BBBB")
 
 	uid, err := h.AppendEntry("v1", Entry{
-		Path: "repeat.md", Size: 12, Chunks: []string{a, b, a},
+		Path: "repeat.md", Mac: testMac, Size: 12, Chunks: []string{a, b, a},
 	})
 	if err != nil {
 		t.Fatalf("append: %v", err)
@@ -493,8 +497,7 @@ func TestAVaultOfDeletedFilesIsNotAnEmptyVault(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		if _, err := h.AppendEntry("v1", Entry{
-			Path: fmt.Sprintf("f%d.md", i), Deleted: true, MTime: 99,
-		}); err != nil {
+			Path: fmt.Sprintf("f%d.md", i), Deleted: true, MTime: 99, Mac: testMac}); err != nil {
 			t.Fatalf("delete: %v", err)
 		}
 	}
@@ -527,11 +530,11 @@ func TestRenameDeletionIsSuppressedInTheDeletedList(t *testing.T) {
 	h := newTestStore(t)
 	old := h.file(t, "old.md", "the note")
 
-	if _, err := h.AppendEntry("v1", Entry{Path: "old.md", Deleted: true, MTime: 50}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "old.md", Mac: testMac, Deleted: true, MTime: 50}); err != nil {
 		t.Fatalf("delete old: %v", err)
 	}
 	if _, err := h.AppendEntry("v1", Entry{
-		Path: "new.md", Prev: "old.md", Size: old.Size, MTime: 50, Chunks: old.Chunks,
+		Path: "new.md", Mac: testMac, Prev: "old.md", Size: old.Size, MTime: 50, Chunks: old.Chunks,
 	}); err != nil {
 		t.Fatalf("append new: %v", err)
 	}
@@ -884,8 +887,7 @@ func TestAnEntryIsNeverCommittedWhileItsChunkIsBeingSwept(t *testing.T) {
 		// No Put: the server said it had this chunk, so the client sent nothing.
 		_, err := h.AppendEntry("v1", Entry{
 			Path: fmt.Sprintf("reverted%d.md", i), Size: 20, MTime: 7,
-			Chunks: []string{name},
-		})
+			Chunks: []string{name}, Mac: testMac})
 		switch {
 		case err == nil:
 			committed.Add(1)
@@ -989,7 +991,7 @@ func TestPruneRemovesOnlyGenuinelyEmptyVaults(t *testing.T) {
 	}
 	// "deleted-only" holds nothing but a deletion. It is not empty: that record
 	// is what makes the file recoverable.
-	if _, err := h.AppendEntry("deleted-only", Entry{Path: "gone.md", Deleted: true}); err != nil {
+	if _, err := h.AppendEntry("deleted-only", Entry{Path: "gone.md", Mac: testMac, Deleted: true}); err != nil {
 		t.Fatalf("append deletion: %v", err)
 	}
 	h.file(t, "kept.md", "content") // v1 has entries
@@ -1065,7 +1067,7 @@ func TestStatsCountsFoldersSeparatelyFromFiles(t *testing.T) {
 	h := newTestStore(t)
 	h.file(t, "notes/a.md", "content a")
 	h.file(t, "notes/b.md", "content b")
-	if _, err := h.AppendEntry("v1", Entry{Path: "notes", Folder: true}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "notes", Mac: testMac, Folder: true}); err != nil {
 		t.Fatalf("append folder: %v", err)
 	}
 
@@ -1115,11 +1117,11 @@ func TestRenameDeletionIsSuppressedWhenTheNewPathIsPublishedFirst(t *testing.T) 
 
 	// New path first, carrying prev. Then the old path is retired.
 	if _, err := h.AppendEntry("v1", Entry{
-		Path: "new.md", Prev: "old.md", Size: old.Size, MTime: 50, Chunks: old.Chunks,
+		Path: "new.md", Mac: testMac, Prev: "old.md", Size: old.Size, MTime: 50, Chunks: old.Chunks,
 	}); err != nil {
 		t.Fatalf("append new: %v", err)
 	}
-	if _, err := h.AppendEntry("v1", Entry{Path: "old.md", Deleted: true, MTime: 51}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "old.md", Mac: testMac, Deleted: true, MTime: 51}); err != nil {
 		t.Fatalf("delete old: %v", err)
 	}
 
@@ -1139,17 +1141,17 @@ func TestADeletionIsStillListedWhenThePathWasReusedAfterARename(t *testing.T) {
 	h := newTestStore(t)
 	first := h.file(t, "notes.md", "the original")
 	if _, err := h.AppendEntry("v1", Entry{
-		Path: "moved.md", Prev: "notes.md", Size: first.Size, MTime: 11, Chunks: first.Chunks,
+		Path: "moved.md", Mac: testMac, Prev: "notes.md", Size: first.Size, MTime: 11, Chunks: first.Chunks,
 	}); err != nil {
 		t.Fatalf("append rename: %v", err)
 	}
-	if _, err := h.AppendEntry("v1", Entry{Path: "notes.md", Deleted: true, MTime: 12}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "notes.md", Mac: testMac, Deleted: true, MTime: 12}); err != nil {
 		t.Fatalf("delete after rename: %v", err)
 	}
 
 	// Later, something new takes the name and is then deleted for real.
 	h.file(t, "notes.md", "a different note entirely")
-	if _, err := h.AppendEntry("v1", Entry{Path: "notes.md", Deleted: true, MTime: 31}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "notes.md", Mac: testMac, Deleted: true, MTime: 31}); err != nil {
 		t.Fatalf("delete the reused path: %v", err)
 	}
 
@@ -1228,10 +1230,10 @@ func TestVerifyIsQuietOnAHealthyVault(t *testing.T) {
 	h := newTestStore(t)
 	h.file(t, "note.md", "content", "more content")
 	h.file(t, "empty.md")
-	if _, err := h.AppendEntry("v1", Entry{Path: "gone.md", Deleted: true, MTime: 3}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "gone.md", Mac: testMac, Deleted: true, MTime: 3}); err != nil {
 		t.Fatalf("seed deletion: %v", err)
 	}
-	if _, err := h.AppendEntry("v1", Entry{Path: "dir", Folder: true, MTime: 4}); err != nil {
+	if _, err := h.AppendEntry("v1", Entry{Path: "dir", Mac: testMac, Folder: true, MTime: 4}); err != nil {
 		t.Fatalf("seed folder: %v", err)
 	}
 

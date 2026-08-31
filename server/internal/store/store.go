@@ -155,6 +155,18 @@ type Entry struct {
 	// deleted-files list suppress the phantom deletion a rename leaves behind.
 	Prev string `json:"prev,omitempty"`
 
+	// Mac authenticates everything in this entry except the uid, and Parent
+	// names the version it was written on top of. Both are the client's, both
+	// are opaque here, and the server can check neither: it holds no key. It
+	// stores them and hands them back so that the devices can, which is the
+	// whole point. Before protocol 2 an entry had neither and a server could say
+	// anything about a file it had never been told about.
+	// Always sent, never omitted. An absent field arrives as undefined rather
+	// than as the empty string, and a parent of "" is a real value: the first
+	// version of a file, written on top of nothing.
+	Mac    string `json:"mac"`
+	Parent string `json:"parent"`
+
 	// Chunks names the encrypted chunks of this version, in order. Empty for a
 	// folder, a deletion, and a zero-byte file, and empty rather than absent:
 	// there is no omitempty here, and the read paths fill in an empty slice, so
@@ -207,6 +219,11 @@ CREATE TABLE IF NOT EXISTS entries (
   deleted   INTEGER NOT NULL DEFAULT 0,
   device    TEXT    NOT NULL DEFAULT '',
   prev_path TEXT    NOT NULL DEFAULT '',
+  -- The client's authenticator over everything in this row that is not the
+  -- uid, and the version it was written on top of. Opaque here: the server
+  -- holds no key, cannot check either, and stores them so the devices can.
+  mac       TEXT    NOT NULL DEFAULT '',
+  parent    TEXT    NOT NULL DEFAULT '',
   PRIMARY KEY (vault_id, uid)
 );
 
@@ -326,6 +343,21 @@ func (s *Store) ensureVaultLocked(vaultID string, now int64) error {
 
 // Validate checks an entry's shape. Exported so the session can reject a put
 // before reading any body, and so the reason is the same one in both places.
+// isHex64 is the shape of a SHA-256 digest written out, which is what both the
+// authenticator and the parent name are.
+func isHex64(v string) bool {
+	if len(v) != 64 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func (e Entry) Validate() error {
 	if e.Path == "" {
 		return fmt.Errorf("%w: empty path", ErrBadEntry)
@@ -387,6 +419,22 @@ func (e Entry) Validate() error {
 		return fmt.Errorf("%w: zero-byte file carries %d chunks; an empty file has none",
 			ErrBadEntry, len(e.Chunks))
 	}
+
+	// Last, so that an entry which is wrong in some other way says so first: a
+	// missing authenticator is the least specific thing that can be wrong with
+	// it, and the most confusing to be told when the real fault is the path.
+	//
+	// An entry nothing can authenticate is a poison pill. Every reader refuses
+	// it, for ever, and the only party in a position to notice is the one that
+	// wrote it. The server holds no key and cannot check the value, but it can
+	// insist there is one of the right shape, so the refusal lands on the writer
+	// at the moment of writing rather than on everybody else afterwards.
+	if !isHex64(e.Mac) {
+		return fmt.Errorf("%w: mac is not a 64 character hex digest", ErrBadEntry)
+	}
+	if e.Parent != "" && !isHex64(e.Parent) {
+		return fmt.Errorf("%w: parent is neither empty nor a 64 character hex digest", ErrBadEntry)
+	}
 	return nil
 }
 
@@ -447,10 +495,10 @@ func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
 	}
 
 	if _, err := tx.Exec(
-		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path)
-		 VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO entries (vault_id, uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		vaultID, uid, e.Path, e.Size, e.CTime, e.MTime,
-		boolToInt(e.Folder), boolToInt(e.Deleted), e.Device, e.Prev); err != nil {
+		boolToInt(e.Folder), boolToInt(e.Deleted), e.Device, e.Prev, e.Mac, e.Parent); err != nil {
 		return 0, err
 	}
 
@@ -472,7 +520,7 @@ func (s *Store) AppendEntry(vaultID string, e Entry) (int64, error) {
  * Reading
  * ---------------------------------------------------------------- */
 
-const entryCols = `uid, path, size, ctime, mtime, folder, deleted, device, prev_path`
+const entryCols = `uid, path, size, ctime, mtime, folder, deleted, device, prev_path, mac, parent`
 
 // Batch is a covered range of the uid sequence, in the shape the wire protocol
 // sends it.
@@ -642,7 +690,7 @@ type Deletion struct {
 // Deleted returns paths whose newest version is a deletion, newest first, and
 // whether there were more than it returned.
 func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Deletion, bool, error) {
-	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path,
+	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path, e.mac, e.parent,
 	             COALESCE((SELECT MAX(r.uid) FROM entries r
 	                        WHERE r.vault_id = e.vault_id AND r.path = e.path
 	                          AND r.deleted = 0 AND r.folder = 0 AND r.uid < e.uid), 0)
@@ -684,7 +732,7 @@ func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Dele
 		var d Deletion
 		var prev sql.NullString
 		if err := rows.Scan(&d.UID, &d.Path, &d.Size, &d.CTime, &d.MTime,
-			&d.Folder, &d.Deleted, &d.Device, &prev, &d.RestorableUID); err != nil {
+			&d.Folder, &d.Deleted, &d.Device, &prev, &d.Mac, &d.Parent, &d.RestorableUID); err != nil {
 			return nil, false, err
 		}
 		d.Prev = prev.String
@@ -1192,7 +1240,7 @@ type scannable interface {
 func scanEntry(r scannable) (Entry, error) {
 	var e Entry
 	var folder, deleted int
-	err := r.Scan(&e.UID, &e.Path, &e.Size, &e.CTime, &e.MTime, &folder, &deleted, &e.Device, &e.Prev)
+	err := r.Scan(&e.UID, &e.Path, &e.Size, &e.CTime, &e.MTime, &folder, &deleted, &e.Device, &e.Prev, &e.Mac, &e.Parent)
 	e.Folder = folder != 0
 	e.Deleted = deleted != 0
 	return e, err
@@ -1242,6 +1290,21 @@ func migrate(db *sql.DB) error {
 	if !has {
 		if _, err := db.Exec(`ALTER TABLE vaults ADD COLUMN auth_hash TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
+		}
+	}
+
+	// Entries carry their own authenticator from protocol 2 on. An older row
+	// has none and cannot be given one here, because the server has no key: it
+	// keeps the empty string, and a client refuses it.
+	for _, col := range []string{"mac", "parent"} {
+		has, err := hasColumn(db, "entries", col)
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE entries ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

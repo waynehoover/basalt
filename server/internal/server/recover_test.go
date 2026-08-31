@@ -260,7 +260,7 @@ func (c *client) rawEntries(want string) string {
 // remove puts a deletion, which is a put like any other.
 func (c *client) remove(path string) int64 {
 	c.t.Helper()
-	c.sendJSON(wire.In{Op: "put", Path: path, Meta: wire.PutMeta{Deleted: true, MTime: 9}})
+	c.sendJSON(wire.In{Op: "put", Path: path, Meta: wire.PutMeta{Deleted: true, MTime: 9}, Mac: testMac})
 	// "have" rather than "ack": a deletion carries no chunks, so every body the
 	// server needs is already present, vacuously.
 	var have wire.Have
@@ -274,7 +274,7 @@ func (c *client) rename(to, from string, bodies ...string) int64 {
 	c.t.Helper()
 	names, size := chunkNames(bodies)
 	c.sendJSON(wire.In{
-		Op: "put", Path: to, Chunks: names,
+		Op: "put", Path: to, Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 6, Prev: from},
 	})
 	m := c.recv()

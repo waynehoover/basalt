@@ -21,6 +21,11 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
+// A mac of the right shape, standing in for a real writer's. The server holds
+// no key and checks only that an entry carries one, because an entry nothing can
+// authenticate is refused by every reader for ever.
+const testMac = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 const (
 	testVault = "v1"
 	testToken = "correct-horse-battery-staple"
@@ -86,7 +91,7 @@ func (r *rig) seed(path string, bodies ...string) store.Entry {
 	if err := r.st.EnsureVault(testVault, 1); err != nil {
 		r.t.Fatalf("ensure vault: %v", err)
 	}
-	e := store.Entry{Path: path, Size: int64(size), MTime: 1, Device: "seed", Chunks: names}
+	e := store.Entry{Path: path, Size: int64(size), MTime: 1, Device: "seed", Chunks: names, Mac: testMac}
 	uid, err := r.st.AppendEntry(testVault, e)
 	if err != nil {
 		r.t.Fatalf("seed append: %v", err)
@@ -363,7 +368,7 @@ func (c *client) put(path string, bodies ...string) int64 {
 	c.t.Helper()
 	names, size := chunkNames(bodies)
 	c.sendJSON(wire.In{
-		Op: "put", Path: path, Chunks: names,
+		Op: "put", Path: path, Chunks: names, Mac: testMac,
 		Meta: wire.PutMeta{Size: size, MTime: 5},
 	})
 

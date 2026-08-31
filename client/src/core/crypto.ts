@@ -78,6 +78,7 @@ const INFO = {
     path: "basalt/path/1",
     content: "basalt/content/1",
     nonce: "basalt/nonce/1",
+    meta: "basalt/meta/1",
 } as const;
 
 /**
@@ -97,6 +98,17 @@ export interface VaultKeys {
     readonly content: CryptoKey;
     /** Derives synthetic nonces. Never seals anything itself. */
     readonly nonce: CryptoKey;
+    /**
+     * Authenticates an entry: everything about a version except its bytes.
+     *
+     * The bytes were always sealed. What decides what a client *does* with them
+     * was not: `deleted`, `size`, `prev` and the chunk list travelled in the
+     * clear, and the server holds every sealed path in the vault, so it could
+     * name any file and say anything about it. Setting `deleted` deleted a note
+     * everywhere; a size with no chunks emptied one; a chunk list borrowed from
+     * another file replaced one.
+     */
+    readonly meta: CryptoKey;
 }
 
 function subtle(): SubtleCrypto {
@@ -149,14 +161,15 @@ export async function deriveKeys(secret: Uint8Array): Promise<VaultKeys> {
         info: enc.encode(info),
     });
 
-    const [auth, path, content, nonce] = await Promise.all([
+    const [auth, path, content, nonce, meta] = await Promise.all([
         s.deriveBits(hkdf(INFO.auth), ikm, 256),
         s.deriveKey(hkdf(INFO.path), ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
         s.deriveKey(hkdf(INFO.content), ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
         s.deriveKey(hkdf(INFO.nonce), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+        s.deriveKey(hkdf(INFO.meta), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
     ]);
 
-    return { auth: new Uint8Array(auth), path, content, nonce };
+    return { auth: new Uint8Array(auth), path, content, nonce, meta };
 }
 
 
@@ -475,4 +488,81 @@ export function base64urlDecode(s: string): Uint8Array {
         }
     }
     return out.subarray(0, o);
+}
+
+
+/**
+ * What an entry's authentication covers.
+ *
+ * Everything the receiving client acts on, and nothing the server assigns. The
+ * uid is the server's, so it cannot be in here; ordering is the server's job and
+ * this does not try to take it. What this settles is that the server cannot
+ * invent an entry, alter one, or move one file's chunk list onto another file.
+ *
+ * Length-prefixed rather than delimited, because a delimiter is a character
+ * somebody's filename eventually contains, and two different entries that
+ * canonicalise to the same bytes are one forgery.
+ */
+export interface EntryFacts {
+    readonly path: string;
+    readonly size: number;
+    readonly ctime: number;
+    readonly mtime: number;
+    readonly folder: boolean;
+    readonly deleted: boolean;
+    readonly prev?: string | undefined;
+    readonly chunks: readonly string[];
+    /** The version this was written on top of, as `parentOf` produces it. */
+    readonly parent: string;
+}
+
+function canonical(e: EntryFacts): Uint8Array {
+    const parts = [
+        e.path,
+        String(e.size),
+        String(e.ctime),
+        String(e.mtime),
+        e.folder ? "1" : "0",
+        e.deleted ? "1" : "0",
+        e.prev ?? "",
+        e.parent,
+        String(e.chunks.length),
+        ...e.chunks,
+    ];
+    return enc.encode(parts.map((p) => `${p.length}:${p}`).join(""));
+}
+
+/** The authenticator for one entry, as hex. */
+export async function macEntry(keys: VaultKeys, e: EntryFacts): Promise<string> {
+    const mac = await subtle().sign("HMAC", keys.meta, toBuffer(canonical(e)));
+    return hex(new Uint8Array(mac));
+}
+
+/**
+ * Whether an entry is one a holder of this vault's key wrote.
+ *
+ * Compared in constant time. A server learning which byte of a guess was wrong
+ * is a server that can guess the rest, and this runs on every entry of every
+ * batch.
+ */
+export async function entryIsOurs(keys: VaultKeys, e: EntryFacts, mac: string): Promise<boolean> {
+    const want = await macEntry(keys, e);
+    if (want.length !== mac.length) return false;
+    let diff = 0;
+    for (let i = 0; i < want.length; i++) diff |= want.charCodeAt(i) ^ mac.charCodeAt(i);
+    return diff === 0;
+}
+
+/**
+ * A short, stable name for the version an entry was written on top of.
+ *
+ * The content id is the chunk names joined, which for a large file is tens of
+ * kilobytes, and it would travel on every entry. A digest of it is 64 characters
+ * and says the same thing. Empty means there was no parent: a file this device
+ * had never synced.
+ */
+export async function parentOf(contentId: string): Promise<string> {
+    if (contentId === "") return "";
+    const d = await subtle().digest("SHA-256", toBuffer(enc.encode(contentId)));
+    return hex(new Uint8Array(d));
 }
