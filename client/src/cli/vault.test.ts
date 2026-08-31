@@ -536,3 +536,61 @@ describe("a symlinked folder is not a way out of the vault", () => {
         expect(dec.decode(await vault.read("Attachments/real.md"))).toBe("fine\n");
     });
 });
+
+/**
+ * A pass that changed nothing should not rewrite the index.
+ *
+ * Every pass ends with a save, and a settled vault passes on every watch tick
+ * and every keepalive, so a 2000 file vault was serialising and flushing
+ * megabytes every thirty seconds to record that nothing had happened. Two
+ * separate performance audits found it independently.
+ */
+describe("the index is not rewritten when it has not changed", () => {
+    const state = { cursor: 7, entries: {}, remote: {}, pending: [] } as never;
+
+    it("leaves the file alone on an identical save", async () => {
+        const file = join(root, ".basalt", "index.json");
+        const store = new JsonIndexStore(file);
+        await store.save(state);
+        const first = await stat(file);
+
+        // Far enough apart that a rewrite would be visible in the timestamps.
+        await new Promise((r) => setTimeout(r, 20));
+        await store.save(state);
+        const second = await stat(file);
+
+        expect(second.mtimeMs, "the index was rewritten with the same bytes").toBe(first.mtimeMs);
+    });
+
+    it("writes when something did change", async () => {
+        const file = join(root, ".basalt", "index2.json");
+        const store = new JsonIndexStore(file);
+        await store.save(state);
+        const first = await stat(file);
+
+        await new Promise((r) => setTimeout(r, 20));
+        await store.save({ ...(state as object), cursor: 8 } as never);
+        const second = await stat(file);
+
+        expect(second.mtimeMs).not.toBe(first.mtimeMs);
+        expect((await store.load())?.cursor).toBe(8);
+    });
+
+    /**
+     * A skipped write must never be one that failed.
+     *
+     * The failure has to land in the write itself rather than in the mkdir
+     * ahead of it, or this proves nothing about the ordering: an earlier throw
+     * happens before the record either way. So the index path is a directory,
+     * which lets the mkdir succeed and the write fail.
+     */
+    it("still owes the write after a failed one", async () => {
+        const file = join(root, "blocked", "index.json");
+        await mkdir(file, { recursive: true });
+        const store = new JsonIndexStore(file);
+
+        await expect(store.save(state), "the write should have failed").rejects.toThrow();
+        // The second attempt must try again rather than think it already wrote.
+        await expect(store.save(state), "a failed write was recorded as done").rejects.toThrow();
+    });
+});
