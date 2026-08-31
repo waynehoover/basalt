@@ -1,0 +1,82 @@
+# Publishes the headless client to npm.
+#
+# Its own file rather than a job in release.yml, because npm's trusted publishing
+# names one workflow and grants that file the right to publish this package. The
+# fewer other things the file does, the smaller the grant.
+#
+# No token lives here and none is stored in the repository. GitHub mints a
+# short-lived OIDC credential, npm checks it against the trusted publisher
+# configured on the package, and that is also why publishing from here needs no
+# 2FA code: publishing by hand does, which is what this replaces.
+name: npm
+
+on:
+  push:
+    tags: ["v*", "[0-9]+.[0-9]+.[0-9]+"]
+  # So a version can be published without cutting a new tag. 0.1.3 needs this:
+  # its tag was pushed before this workflow existed, so the tag trigger never
+  # fired for it.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # What npm verifies. Publishing fails without it, and the failure reads like a
+  # missing token rather than a missing permission.
+  id-token: write
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Built with bun, like CI, so what is published is what the tests ran
+      # against. npm is here only to do the publishing.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or newer. The npm bundled with
+      # Node 22 is older and refuses with a message about authentication, which
+      # sends you looking for a token that is deliberately not there.
+      - name: npm new enough to publish this way
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: install
+        working-directory: client
+        run: bun install --frozen-lockfile
+
+      # A tag that disagrees with the manifest publishes the wrong version under
+      # the right name, and npm versions cannot be replaced once published.
+      - name: the tag and the package agree
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./client/package.json').version")
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $GITHUB_REF_NAME is version $tag, but client/package.json says $pkg" >&2
+            exit 1
+          fi
+          echo "publishing $pkg"
+
+      # `files` in package.json ships dist/basalt.mjs, which exists only after a
+      # build. Publishing without this puts an empty package on the registry.
+      - name: build
+        working-directory: client
+        run: bun run build
+
+      - name: it is actually there
+        working-directory: client
+        run: test -s dist/basalt.mjs
+
+      - name: publish
+        working-directory: client
+        run: npm publish --access public
