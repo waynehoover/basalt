@@ -2,7 +2,7 @@
 //
 // It exists because the maintenance commands and the server are separate
 // processes over one data directory, and the store's own mutex is per process.
-// Without this, `basalt purge` run while the server is up would sweep chunk
+// Without this, `basaltd purge` run while the server is up would sweep chunk
 // bodies with nothing holding off the server's commits, and an entry could be
 // committed referencing a body that had just been deleted. That is the exact
 // hazard the store's write mutex closes *within* a process, undone by having two.

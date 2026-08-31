@@ -101,6 +101,51 @@ That token is a bootstrap. The first device claims the vault with it and it
 stops working, and the server then prints that the vault is claimed rather than
 printing a string that would fail. See `docs/protocol.md`.
 
+## Upgrading from 0.1
+
+0.2.0 is the first release where every version carries an authenticator, and a
+device checks one before it writes anything. Nothing signed the versions a 0.1
+server holds, so nothing can check them now: a new device catching up on an old
+vault refuses at the first of them and says so.
+
+There is no migration, and there cannot be one. Retroactively signing history
+would mean the server producing authenticators, which is the thing the
+authenticator exists to prevent.
+
+So the upgrade is to start the server's store fresh. Your notes are on your
+devices in plaintext and are not what is being thrown away; the server's version
+history is.
+
+On the server:
+
+```
+systemctl stop basalt
+basaltd backup -data /var/lib/basalt -to /backups/basalt-0.1-final
+mv /var/lib/basalt /var/lib/basalt-0.1
+systemctl start basalt                 # a new store, and a new bootstrap token
+```
+
+Then on the one device that has the whole vault. `unlink` is needed and is not a
+formality: `init` refuses over a paired vault, because re-pairing replaces the
+root secret and doing that by accident is how a vault becomes unreadable. It
+removes the pairing and touches no notes.
+
+```
+basalt unlink
+basalt init --server wss://... --token <the new one>
+basalt sync
+```
+
+Every other device pairs from that one with `basalt invite`, as usual. The root
+secret is new, so the old pairing string is no longer the vault's.
+
+Keep the old data directory until every device is across: an old `basaltd`
+binary still reads it, and that is the only way back to the old history.
+
+Mixed versions do not half-work. The handshake carries the protocol version and
+a mismatch is refused by name, so a 0.1 device against a 0.2 server reads
+`protocol 1 not supported, this server speaks 2` and stops.
+
 ## TLS
 
 There is none here, on purpose: no key material lives in this binary. Bind it to

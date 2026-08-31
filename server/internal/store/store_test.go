@@ -1169,7 +1169,7 @@ func TestADeletionIsStillListedWhenThePathWasReusedAfterARename(t *testing.T) {
 // Its query joined entries to their chunk rows, so an entry whose chunk rows are
 // gone had nothing to join to and was never examined. An entry declaring a size
 // with no chunks behind it is a note that reads as empty rather than as an
-// error, and `basalt verify` called the vault clean.
+// error, and `basaltd verify` called the vault clean.
 func TestVerifyNoticesAnEntryWhoseChunksAreGone(t *testing.T) {
 	h := newTestStore(t)
 	e := h.file(t, "note.md", "the content of a note")

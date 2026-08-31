@@ -81,7 +81,7 @@ func main() {
 // list smaller prints its arithmetic, and backup and purge both do; an
 // untestable print is an untestable promise.
 func run(ctx context.Context, args []string, out io.Writer) error {
-	// Subcommands come before flag parsing so `basalt verify -deep` reads the
+	// Subcommands come before flag parsing so `basaltd verify -deep` reads the
 	// way it looks.
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd, rest := args[0], args[1:]
@@ -168,7 +168,7 @@ func requireDataDir(dataDir, verb string) error {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf(
 				"there is no basalt data directory at %s, so there is nothing to %s.\n"+
-					"Check the -data path. Only `basalt serve` creates one.", dataDir, verb)
+					"Check the -data path. Only `basaltd serve` creates one.", dataDir, verb)
 		}
 		return err
 	}
@@ -674,7 +674,7 @@ func cmdBackup(args []string, out io.Writer) error {
 	fmt.Fprintln(out, "which this server has never seen. Keep that written down somewhere")
 	fmt.Fprintln(out, "else, or the backup is a pile of bytes nobody can read.")
 	fmt.Fprintf(out, "\nTo restore: point the server at it, or copy it back.\n")
-	fmt.Fprintf(out, "  basalt verify -deep -data %s\n", rep.Dir)
+	fmt.Fprintf(out, "  basaltd verify -deep -data %s\n", rep.Dir)
 	return nil
 }
 
