@@ -29,7 +29,7 @@ jobs:
     name: publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Built with bun, like CI, so what is published is what the tests ran
       # against. npm is here only to do the publishing.
@@ -37,14 +37,16 @@ jobs:
         with:
           bun-version: latest
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: 24
           registry-url: https://registry.npmjs.org
 
-      # Trusted publishing needs npm 11.5.1 or newer. The npm bundled with
-      # Node 22 is older and refuses with a message about authentication, which
-      # sends you looking for a token that is deliberately not there.
+      # Trusted publishing needs npm 11.5.1 or newer, and the npm bundled with a
+      # Node release is whatever shipped with it. When it is too old it refuses
+      # with a message about authentication, which sends you looking for a token
+      # that is deliberately not there, so this does not depend on which npm
+      # came with the Node above.
       - name: npm new enough to publish this way
         run: |
           npm install -g npm@latest
