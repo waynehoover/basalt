@@ -1320,12 +1320,32 @@ export class Engine {
      * its content and writing it back, and there is no reason for a second copy
      * of the reassembly to exist for that.
      */
-    async contentOf(uid: number, known?: readonly string[]): Promise<Uint8Array> {
+    async contentOf(uid: number, known?: readonly string[], expected?: string): Promise<Uint8Array> {
         // `known` is what a caller already has. A download does: the batch that
         // announced the version carried its chunk list, so asking for it again
         // is a round trip spent learning something already known. A restore
         // works from a uid alone and has to ask.
         const meta = known !== undefined ? { chunks: known } : await this.opts.transport.get(uid);
+        // `expected` is a content id the caller already holds for this uid, and
+        // the one that matters is the merge ancestor's. A three-way merge
+        // decides which side's changes are already present, so whoever chooses
+        // the base chooses what can be dropped: a base equal to the local file
+        // plus some paragraphs makes those paragraphs look deleted by the other
+        // side, and mergeText then drops them cleanly, writes the result and
+        // uploads it. No conflict copy, one counted merge, and the shortened
+        // text becomes canonical everywhere.
+        //
+        // `entry.synchash` is this device's own record of the ancestor from the
+        // last completed sync, so the server cannot move it. That is what makes
+        // this check worth anything; comparing an incoming version against the
+        // hash the same server announced a moment ago only catches it
+        // contradicting itself.
+        if (expected !== undefined && contentId(meta.chunks) !== expected) {
+            throw new Error(
+                `version ${uid} is made of chunks this device did not record for it, ` +
+                    `so it is not the version it is being offered as`
+            );
+        }
         if (meta.chunks.length === 0) return new Uint8Array(0);
         this.checkChunkCount(uid, meta.chunks.length);
         return this.assemble(uid, await this.opts.transport.fetch(meta.chunks));
@@ -1392,9 +1412,9 @@ export class Engine {
             // what `synchash` and `syncuid` are for: one field to identify the
             // common ancestor and one to go and get it, with no version history
             // on the device.
-            base = dec.decode(await this.contentOf(entry.syncuid));
+            base = dec.decode(await this.contentOf(entry.syncuid, undefined, entry.synchash));
             mine = dec.decode(await this.opts.vault.read(path));
-            theirs = dec.decode(await this.contentOf(remote.uid));
+            theirs = dec.decode(await this.contentOf(remote.uid, undefined, remote.hash));
         } catch {
             const why = "one side is not valid UTF-8, so merging it would rewrite bytes nobody edited";
             this.log("merge refused", path, why);
@@ -1466,7 +1486,7 @@ export class Engine {
     ): Promise<void> {
         if (!remote) return;
         const copyPath = await this.freeConflictPath(path);
-        const incoming = await this.contentOf(remote.uid);
+        const incoming = await this.contentOf(remote.uid, undefined, remote.hash);
         await this.opts.vault.write(copyPath, incoming, { mtime: remote.mtime, ctime: remote.mtime });
 
         const copyEntry = this.entryFor(copyPath);

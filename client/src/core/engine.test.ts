@@ -1535,3 +1535,50 @@ describe("a server that is behind this device", () => {
         expect(() => refuseIfBehind(0, 0)).not.toThrow();
     });
 });
+
+/**
+ * Whoever picks the merge base picks what can be thrown away.
+ *
+ * A three-way merge decides which side's changes are already present. A base
+ * equal to the local file plus a few paragraphs makes those paragraphs look
+ * deleted by the other side; mergeText drops them, the engine writes the result
+ * and uploads it, and the shortened text becomes canonical on every device. No
+ * conflict copy, and the pass reports one clean merge.
+ *
+ * The base is fetched by uid from the server. What the server cannot touch is
+ * `entry.synchash`, this device's own record of the ancestor as of the last
+ * completed sync, so the fetched chunks are checked against it.
+ */
+describe("a version that is not the version it is offered as", () => {
+    let server: TestServer;
+    let a: Device;
+
+    afterEach(async () => {
+        a?.transport?.close();
+        if (server) await server.cleanup();
+    });
+
+    it("is refused when its chunks are not the ones recorded for it", async () => {
+        server = new TestServer();
+        await server.start();
+        a = new Device("a");
+        await a.connect(server);
+
+        const path = "Notes/n.md";
+        await a.vault.write(path, new TextEncoder().encode("one\ntwo\n"), { mtime: a.clock, ctime: a.clock });
+        await a.engine.sync();
+
+        const stored = await a.store.load();
+        const entry = stored?.entries[path] as { chunks?: string[]; syncuid?: number; synchash?: string } | undefined;
+        const chunks = entry?.chunks ?? [];
+        expect(chunks.length).toBeGreaterThan(0);
+
+        // The real chunks under the real uid still open.
+        await expect(a.engine.contentOf(entry!.syncuid!, chunks, entry!.synchash!)).resolves.toBeInstanceOf(Uint8Array);
+
+        // A different chunk list for the same uid does not.
+        await expect(
+            a.engine.contentOf(entry!.syncuid!, [...chunks, chunks[0]!], entry!.synchash!)
+        ).rejects.toThrow(/not the version it is being offered as/);
+    });
+});
