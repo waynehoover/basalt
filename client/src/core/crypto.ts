@@ -410,7 +410,7 @@ export function authToken(keys: VaultKeys): string {
  * at chunk sizes and removes the question.
  */
 function toBuffer(view: Uint8Array): ArrayBuffer {
-    return view.slice().buffer as ArrayBuffer;
+    return view.slice().buffer;
 }
 
 export function hex(bytes: Uint8Array): string {

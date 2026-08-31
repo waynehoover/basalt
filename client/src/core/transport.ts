@@ -1025,7 +1025,7 @@ function defaultSocketFactory(url: string): SocketLike {
     if (!ctor) {
         throw new Error("no WebSocket available in this environment");
     }
-    return new ctor(url) as unknown as SocketLike;
+    return new ctor(url) as SocketLike;
 }
 
 /**

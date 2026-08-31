@@ -269,7 +269,7 @@ export class ObsidianVault implements Vault {
         // Copied into its own buffer. A Uint8Array that is a view into a larger
         // one would hand over neighbouring bytes, and chunk reassembly produces
         // exactly that kind of view.
-        const buffer = bytes.slice().buffer as ArrayBuffer;
+        const buffer = bytes.slice().buffer;
         await this.adapter.writeBinary(normalized, buffer, {
             ...(times.mtime > 0 ? { mtime: times.mtime } : {}),
             ...(times.ctime > 0 ? { ctime: times.ctime } : {}),

@@ -291,7 +291,12 @@ export class Plugin extends Component {
     readonly commands: {
         id: string;
         name: string;
-        callback?: () => void;
+        // Obsidian permits an async command callback and runCommand below
+        // awaits one. Typed as returning void, that await was awaiting a
+        // non-promise: the stub would resolve before the command it ran had
+        // finished, which is the sort of thing that makes a test flake rather
+        // than fail.
+        callback?: () => void | Promise<void>;
         checkCallback?: (checking: boolean) => boolean;
     }[] = [];
     /** What registerCliHandler was given, so the handlers can be driven. */

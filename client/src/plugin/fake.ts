@@ -139,11 +139,11 @@ export class FakeAdapter implements DataAdapter {
         // Obsidian throws for a missing file rather than returning empty, and
         // the difference is rule 2: an unreadable file is not an empty one.
         if (!file) throw new Error(`ENOENT: no such file or directory, open '${normalizedPath}'`);
-        return file.binary.slice().buffer as ArrayBuffer;
+        return file.binary.slice().buffer;
     }
 
     async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
-        await this.writeBinary(normalizedPath, new TextEncoder().encode(data).slice().buffer as ArrayBuffer, options);
+        await this.writeBinary(normalizedPath, new TextEncoder().encode(data).slice().buffer, options);
     }
 
     async writeBinary(normalizedPath: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
@@ -168,7 +168,7 @@ export class FakeAdapter implements DataAdapter {
         const both = new Uint8Array(before.length + added.length);
         both.set(before, 0);
         both.set(added, before.length);
-        await this.writeBinary(normalizedPath, both.slice().buffer as ArrayBuffer, options);
+        await this.writeBinary(normalizedPath, both.slice().buffer, options);
     }
 
     async process(normalizedPath: string, fn: (data: string) => string, options?: DataWriteOptions): Promise<string> {
@@ -258,7 +258,7 @@ export class FakeAdapter implements DataAdapter {
     index(): TAbstractFile[] {
         const out: TAbstractFile[] = [];
         for (const path of this.folders) {
-            out.push({ path, name: path.split("/").pop() ?? path } as unknown as TAbstractFile);
+            out.push({ path, name: path.split("/").pop() ?? path } as TAbstractFile);
         }
         for (const [path, f] of this.files) {
             out.push({

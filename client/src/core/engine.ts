@@ -344,7 +344,7 @@ export class Engine {
         if (stored) {
             this.cursor = stored.cursor;
             for (const [path, raw] of Object.entries(stored.entries)) {
-                this.entries.set(path, { ...newEntry(path), ...(raw as object) } as IndexEntry);
+                this.entries.set(path, { ...newEntry(path), ...(raw as object) });
             }
             for (const [path, raw] of Object.entries(stored.remote)) {
                 this.remote.set(path, raw as RemoteState);
