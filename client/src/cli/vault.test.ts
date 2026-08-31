@@ -1,9 +1,10 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { JsonIndexStore, NodeVault, TEMP_MARK, isTemporary, writeDurably } from "./vault.ts";
+import { removeTree } from "../core/test-server.ts";
 
 let root: string;
 
@@ -12,7 +13,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-    await rm(root, { recursive: true, force: true });
+    await removeTree(root);
 });
 
 const enc = new TextEncoder();
@@ -85,7 +86,7 @@ describe("listing", () => {
             const listed = await new NodeVault(root).list();
             expect(listed.map((f) => f.path)).toEqual(["real.md"]);
         } finally {
-            await rm(outside, { recursive: true, force: true });
+            await removeTree(outside);
         }
     });
 
@@ -353,7 +354,7 @@ describe("writing durably", () => {
             const strays = (await readdir(dir)).filter(isTemporary);
             expect(strays, `temporary files survived: ${strays.join(", ")}`).toEqual([]);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -384,7 +385,7 @@ describe("writing durably", () => {
                 expect(await readFile(join(dir, name), "utf8"), `${name} was modified`).toBe(text);
             }
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -399,7 +400,7 @@ describe("writing durably", () => {
             expect(paths).toContain("real.md");
             expect(paths.some(isTemporary)).toBe(false);
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 });
@@ -438,7 +439,7 @@ describe("reading a file in blocks and in ranges", () => {
             }
             expect(joined).toEqual(await vault.read("big.bin"));
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -460,7 +461,7 @@ describe("reading a file in blocks and in ranges", () => {
                 at += b.length;
             }
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 
@@ -481,7 +482,7 @@ describe("reading a file in blocks and in ranges", () => {
             expect(past.length).toBe(1_000);
             expect(past).toEqual(bytes.subarray(9_000));
         } finally {
-            await rm(dir, { recursive: true, force: true });
+            await removeTree(dir);
         }
     });
 });

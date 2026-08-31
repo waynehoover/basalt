@@ -13,11 +13,11 @@
  */
 
 import { execFile } from "node:child_process";
-import { readFile, rm } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { TestServer, cleanupBinary, serverBinary } from "./core/test-server.ts";
+import { cleanupBinary, removeTree, serverBinary, TestServer } from "./core/test-server.ts";
 import * as stub from "./plugin/stub.ts";
 import type { Plugin as StubPlugin } from "./plugin/stub.ts";
 
@@ -29,7 +29,7 @@ let plugin = "";
 let cli = "";
 
 beforeAll(async () => {
-    await rm("dist", { recursive: true, force: true });
+    await removeTree("dist");
     await run("node", ["esbuild.config.mjs", "production"]);
     plugin = await readFile(PLUGIN, "utf8");
     cli = await readFile(CLI, "utf8");

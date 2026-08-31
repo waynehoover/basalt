@@ -57,9 +57,27 @@ export function serverBinary(): Promise<string> {
  */
 export async function cleanupBinary(): Promise<void> {
     if (process.env["BASALT_TEST_BINARY"]) return;
-    if (buildDir) await rm(buildDir, { recursive: true, force: true });
+    if (buildDir) await removeTree(buildDir);
     buildDir = undefined;
     built = undefined;
+}
+
+/**
+ * Removes a directory tree, retrying the races a parallel suite creates.
+ *
+ * `rm` lists a directory and then removes it, and with twenty-one test files
+ * running at once against the same /tmp it can find the tree repopulated in
+ * between and throw ENOTEMPTY. Node retries that, and EBUSY and EPERM with it,
+ * only when asked to. Every teardown goes through this so the next one written
+ * gets it without anybody remembering.
+ *
+ * It is not covering for a write that outlived a command, which was the first
+ * suspicion when this appeared and would have been a real bug: save() is
+ * awaited, a sync is awaited before close(), close() is synchronous, and
+ * neither the CLI nor the engine leaves work running.
+ */
+export async function removeTree(path: string): Promise<void> {
+    await rm(path, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 });
 }
 
 /** One server, on its own port, with its own data directory. */
@@ -173,11 +191,7 @@ export class TestServer {
 
     async cleanup(): Promise<void> {
         await this.stop();
-        // Retried for the reason the afterEach in cli.test.ts is: a parallel
-        // suite makes a recursive remove race its own listing. stop() waits for
-        // the process to exit first, but it gives up after five seconds, and a
-        // server still running is exactly when this would bite.
-        if (this.dataDir) await rm(this.dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+        if (this.dataDir) await removeTree(this.dataDir);
     }
 
     /** Runs a maintenance subcommand against this server's data directory. */

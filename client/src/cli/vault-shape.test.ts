@@ -14,14 +14,14 @@
  * overhead vanished into the saving.
  */
 
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "../core/client.ts";
 import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
-import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
+import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 import { JsonIndexStore, NodeVault } from "./vault.ts";
 
 let keys: VaultKeys;
@@ -37,7 +37,7 @@ const dirs: string[] = [];
 
 afterEach(async () => {
     while (open.length) open.pop()!.close();
-    while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
+    while (dirs.length) await removeTree(dirs.pop()!);
     if (server) await server.cleanup();
 });
 

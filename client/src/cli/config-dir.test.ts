@@ -8,18 +8,19 @@
  * disagreeing with itself about the one thing this project says it will not
  * sync.
  */
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { parseArgs } from "./cli.ts";
 import { NodeVault, configFolderName } from "./vault.ts";
+import { removeTree } from "../core/test-server.ts";
 
 const made: string[] = [];
 
 afterEach(async () => {
-    for (const d of made.splice(0)) await rm(d, { recursive: true, force: true });
+    for (const d of made.splice(0)) await removeTree(d);
 });
 
 /** A vault holding one note and two candidate config folders. */

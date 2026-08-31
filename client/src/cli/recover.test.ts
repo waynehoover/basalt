@@ -19,7 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
+import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 import { run, type Console } from "./cli.ts";
 
 beforeAll(async () => {
@@ -62,7 +62,7 @@ async function vaultDir(name: string): Promise<string> {
 }
 
 afterEach(async () => {
-    while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
+    while (dirs.length) await removeTree(dirs.pop()!);
     if (server) await server.cleanup();
 });
 

@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
+import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 import { PAIRING_PREFIX } from "../core/pairing.ts";
 import { run, normaliseUrl, parseArgs, type Console } from "./cli.ts";
 
@@ -81,7 +81,7 @@ afterEach(async () => {
     // sync is awaited before close(), close() is synchronous, and neither the
     // CLI nor the engine leaves anything running. Nothing of ours is still
     // writing by the time this runs.
-    while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    while (dirs.length) await removeTree(dirs.pop()!);
     if (server) await server.cleanup();
 });
 
