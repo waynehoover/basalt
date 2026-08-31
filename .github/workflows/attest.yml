@@ -30,9 +30,11 @@ jobs:
   plugin:
     name: plugin
     runs-on: ubuntu-latest
-    # Plugin releases only. A server release has no main.js to sign, and this
-    # would fail trying to build one.
-    if: ${{ !startsWith(github.event.release.tag_name || inputs.tag, 'server/') }}
+    # Plugin releases only, which are the ones tagged with a bare version. A
+    # server or client release has no main.js to sign and this would fail trying
+    # to build one, so anything with a prefix is skipped rather than naming each
+    # prefix as it appears.
+    if: ${{ !contains(github.event.release.tag_name || inputs.tag, '/') }}
     steps:
       - uses: actions/checkout@v7
         with:

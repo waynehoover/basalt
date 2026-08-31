@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Builds what the two releases are made of, and keeps them apart.
+# Builds what the releases are made of, and keeps them apart.
 #
 # They are separate releases because they are separate things on separate
 # clocks. The plugin follows Obsidian's API and the community directory's rule
@@ -12,14 +12,20 @@
 #
 #   plugin, tagged  X.Y.Z          release/plugin/
 #   server, tagged  server/vX.Y.Z  release/server/
+#   client, tagged  cli/vX.Y.Z     npm, and nothing here
+#
+# Each tag shape is whatever its own ecosystem demands: Obsidian requires the
+# plugin's to be exactly the manifest version with no `v`, Go requires
+# server/vX.Y.Z to resolve a module in a subdirectory, and npm requires nothing
+# of the client, which matches the server for the sake of looking like it.
 #
 # The plugin release holds exactly the three files Obsidian downloads and
 # nothing else. Anything extra is a file the installer will never fetch and one
 # more thing for a reviewer to ask about.
 #
-# The headless client is not here at all any more: it lives on npm, published by
-# .github/workflows/npm-publish.yml, and a copy attached to a release is a
-# second answer to "where do I get it".
+# The headless client produces no files here. It goes to npm, published by
+# .github/workflows/npm-publish.yml when a cli/v tag is pushed, and a copy
+# attached to a release would be a second answer to "where do I get it".
 #
 # No uploading, no tagging, no publishing. It puts files in release/ and prints
 # their checksums, then prints the two commands that would upload them. A script
@@ -126,4 +132,11 @@ To publish the server, on its own tag because it moves on its own clock:
     release/server/* release/SHA256SUMS
 
 Pushing that tag is also what builds and pushes the container image.
+
+The headless client builds nothing here, because npm is where it goes. Bump
+client/package.json on its own clock, then:
+
+  git tag -a cli/v1.2.3 -m "basalt CLI 1.2.3" && git push origin cli/v1.2.3
+
+That tag publishes it over OIDC, with no token and no 2FA code.
 EOF
