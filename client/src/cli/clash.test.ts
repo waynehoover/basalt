@@ -127,11 +127,17 @@ describe("a path that is a file here and a folder there", () => {
 
         const { writeFile, mkdir } = await import("node:fs/promises");
         // A has a folder called `notes`; B has a note of the same name.
+        //
+        // Both decide locally before either syncs. Settling A first pushes the
+        // folder to B over its live connection, and then this writeFile lands on
+        // a directory and throws EISDIR: the disagreement being tested never
+        // gets set up. It failed that way on CI while passing here, because it
+        // only needs B to win the race.
         await mkdir(join(a.dir, "notes"));
         await writeFile(join(a.dir, "notes", "inside.md"), "in the folder\n");
-        await a.c.settle();
-
         await writeFile(join(b.dir, "notes"), "a file, not a folder\n");
+
+        await a.c.settle();
         await b.c.settle();
 
         for (let i = 0; i < 5; i++) {
@@ -164,10 +170,13 @@ describe("a path that is a file here and a folder there", () => {
         const b = await device("b");
 
         const { writeFile, mkdir, rename } = await import("node:fs/promises");
+        // Both sides local first, for the reason above. This one raced the
+        // other way and threw EEXIST on the mkdir.
         await writeFile(join(a.dir, "notes"), "a file, not a folder\n");
-        await a.c.settle();
         await mkdir(join(b.dir, "notes"));
         await writeFile(join(b.dir, "notes", "inside.md"), "in the folder\n");
+
+        await a.c.settle();
         await b.c.settle();
         for (let i = 0; i < 4; i++) {
             await a.c.settle();
