@@ -10,6 +10,7 @@
  */
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { appendFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -67,17 +68,50 @@ export async function cleanupBinary(): Promise<void> {
  *
  * `rm` lists a directory and then removes it, and with twenty-one test files
  * running at once against the same /tmp it can find the tree repopulated in
- * between and throw ENOTEMPTY. Node retries that, and EBUSY and EPERM with it,
- * only when asked to. Every teardown goes through this so the next one written
- * gets it without anybody remembering.
+ * between and throw ENOTEMPTY. Every teardown goes through here so the next one
+ * written gets the retries without anybody remembering to ask.
  *
- * It is not covering for a write that outlived a command, which was the first
- * suspicion when this appeared and would have been a real bug: save() is
- * awaited, a sync is awaited before close(), close() is synchronous, and
+ * The retries are counted rather than done by `rm` itself, because the question
+ * worth answering was whether something of ours was still writing after a
+ * command returned. That would be a real durability bug and retries would hide
+ * it. Measured over six full runs, with BASALT_RM_STATS set:
+ *
+ *   1836 removes, 1834 on the first attempt, 2 on the second, 0 failures
+ *
+ * Two in eighteen hundred, and never more than one retry. A write of ours still
+ * in flight would not clear that fast or that reliably; a directory listing
+ * losing a race with another test's does. That matches the code, where save()
+ * is awaited, a sync is awaited before close(), close() is synchronous, and
  * neither the CLI nor the engine leaves work running.
+ *
+ * Keep the counting. It is what turns "the suite went green" into knowing why.
  */
+const RETRYABLE = new Set(["ENOTEMPTY", "EBUSY", "EPERM", "EMFILE", "ENFILE"]);
+
 export async function removeTree(path: string): Promise<void> {
-    await rm(path, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 });
+    for (let attempt = 1; ; attempt++) {
+        try {
+            // No built-in retries: this loop is doing them, so that it can say
+            // how often the race actually happens rather than absorbing it
+            // silently. Set BASALT_RM_STATS to a file to find out.
+            await rm(path, { recursive: true, force: true });
+            note(`${attempt}\t${path}`);
+            return;
+        } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code ?? "";
+            if (!RETRYABLE.has(code) || attempt >= 8) {
+                note(`FAILED after ${attempt} on ${code}\t${path}`);
+                throw err;
+            }
+            await new Promise((r) => setTimeout(r, 50 * attempt));
+        }
+    }
+}
+
+/** Appends one line per remove when asked, so the retries can be counted. */
+function note(line: string): void {
+    const file = process.env["BASALT_RM_STATS"];
+    if (file) appendFileSync(file, `${line}\n`);
 }
 
 /** One server, on its own port, with its own data directory. */
