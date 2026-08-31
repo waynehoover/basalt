@@ -3,7 +3,7 @@
 	"name": "Basalt Sync",
 	"version": "0.1.6",
 	"minAppVersion": "1.7.2",
-	"description": "Sync your vault across devices with a self-hosted server. End-to-end encrypted, fast, and nothing to configure.",
+	"description": "Self-hosted sync. End-to-end encrypted, fast, and nothing to configure.",
 	"author": "Wayne Hoover",
 	"isDesktopOnly": false
 }
