@@ -145,7 +145,7 @@ describe("refusing to merge rather than losing an edit", () => {
             (s: string) => s.replace("\n", "\nINSERTED AT THE TOP\n"),
             (s: string) => `${s}APPENDED AT THE BOTTOM\n`,
             (s: string) => s.replace(/e/g, "E"),
-            (s: string) => "",
+            () => "",
             (s: string) => s.split("\n").reverse().join("\n"),
         ];
 

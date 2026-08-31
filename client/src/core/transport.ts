@@ -29,7 +29,7 @@
  * next frame is its reply will read a batch as an answer and hang.
  */
 
-import { CRYPTO_SUITE, chunkName, type SealedChunk } from "./crypto.ts";
+import { CRYPTO_SUITE, chunkName } from "./crypto.ts";
 
 /** The protocol version this client speaks. A mismatch is refused, not negotiated. */
 export const PROTO = 1;

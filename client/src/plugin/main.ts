@@ -702,23 +702,6 @@ function toneFor(state: State): string {
     }
 }
 
-function shortStatus(state: State): string {
-    switch (state.kind) {
-        case "unpaired":
-            return "not paired";
-        case "connecting":
-            return "connecting";
-        case "syncing":
-            return `syncing ${basename(state.path)}`;
-        case "synced":
-            return state.summary;
-        case "offline":
-            return "offline";
-        case "stopped":
-            return "stopped";
-    }
-}
-
 /**
  * The whole interface: what is happening, and pairing when there is none.
  *
@@ -999,12 +982,6 @@ class RecoverModal extends Modal {
  * Read rather than assumed, because the assumption is the thing that might be
  * wrong.
  */
-/** The last part of a path, because a status bar is one line. */
-function basename(path: string): string {
-    const at = path.lastIndexOf("/");
-    return at === -1 ? path : path.slice(at + 1);
-}
-
 function origin(): string {
     const l = (globalThis as { location?: { origin?: string } }).location;
     return l?.origin ?? "unknown";

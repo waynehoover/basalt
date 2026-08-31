@@ -620,4 +620,3 @@ function brief(v: unknown): string {
     return typeof v === "string" ? v : JSON.stringify(v);
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

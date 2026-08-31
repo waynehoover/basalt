@@ -1,0 +1,87 @@
+# Signs the three files Obsidian actually installs, so anyone can check that the
+# main.js in a release was built from this repository at that commit and not
+# pasted in by hand.
+#
+# It rebuilds them here rather than attesting whatever was uploaded, because an
+# attestation over a file of unknown origin says only that this workflow saw it.
+# The rebuilt files replace the uploaded ones, so what the release holds is what
+# was attested.
+#
+# On release rather than on tag: the tag is pushed first and the release is made
+# afterwards, so a tag trigger would fire before there was anything to upload to.
+name: attest
+
+on:
+  release:
+    types: [published]
+  # For a release that predates this workflow, or one to re-attest.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: The release tag to build and attest
+        required: true
+
+permissions:
+  contents: write # replaces the release assets with the attested build
+  id-token: write # OIDC, which is what the attestation is signed against
+  attestations: write # records it
+
+jobs:
+  plugin:
+    name: plugin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: install
+        working-directory: client
+        run: bun install --frozen-lockfile
+
+      - name: build
+        working-directory: client
+        run: bun run build
+
+      # Exactly the three files Obsidian downloads, and nothing else. The
+      # build already puts all three in dist/plugin.
+      - name: gather
+        run: |
+          mkdir -p attested
+          cp client/dist/plugin/main.js attested/
+          cp client/dist/plugin/manifest.json attested/
+          cp client/dist/plugin/styles.css attested/
+          ls -l attested
+
+      # A release whose manifest says one version and whose tag says another
+      # would be attested happily, so check before signing anything.
+      - name: the tag and the manifest agree
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          want="${TAG#v}"
+          got=$(node -p "require('./attested/manifest.json').version")
+          if [ "$want" != "$got" ]; then
+            echo "release $TAG carries manifest version $got" >&2
+            exit 1
+          fi
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            attested/main.js
+            attested/manifest.json
+            attested/styles.css
+
+      - name: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            attested/main.js attested/manifest.json attested/styles.css \
+            --clobber --repo "$GITHUB_REPOSITORY"

@@ -9,7 +9,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { Client, type Version } from "../core/client.ts";
+import { Client } from "../core/client.ts";
 import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
 import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
@@ -36,8 +36,6 @@ afterEach(async () => {
     if (server) await server.cleanup();
     notices.length = 0;
 });
-
-const enc = new TextEncoder();
 
 /** One device, plus the source the modal talks to. */
 async function device(): Promise<{ adapter: FakeAdapter; client: Client; source: HistorySource }> {

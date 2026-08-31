@@ -824,7 +824,7 @@ describe("a batch frame that cannot be trusted", () => {
 
     for (const { why, frame } of badFrames) {
         it(`refuses ${why} rather than advancing the cursor`, async () => {
-            const { t, socket, batches } = await helloed(0);
+            const { socket, batches } = await helloed(0);
             socket.reply(frame);
             await settle();
 
