@@ -537,3 +537,50 @@ describe("chunks that have to survive being sealed", () => {
         );
     });
 });
+
+/**
+ * The boundary test, against the modulo it replaces.
+ *
+ * `(hash >>> 0) % avg === 1` was costing a libm call per byte on V8, which is
+ * the engine the shipped CLI runs on, and every benchmark here was taken under
+ * JavaScriptCore, which hid it. The replacement has to be exactly equivalent
+ * and not approximately: a boundary that moved would rechunk every vault,
+ * rename every chunk, and deduplicate against nothing.
+ *
+ * So this walks the arithmetic rather than trusting the algebra, over every avg
+ * the size tables can produce and the values most likely to break it.
+ */
+describe("the boundary test is the modulo it replaces", () => {
+    /** Every avg reachable through textSizesFor, plus the binary one. */
+    const avgs = new Set<number>([BINARY_SIZES.avg, TEXT_SIZES.avg]);
+    for (const size of [0, 1, 512, 4096, 64 * 1024, 1 << 20, 8 << 20, 64 << 20, 256 << 20]) {
+        avgs.add(textSizesFor(size).avg);
+    }
+
+    it("agrees for every avg the size tables produce", () => {
+        for (const avg of avgs) {
+            expect(avg, "an avg outside the range the proof assumes").toBeLessThanOrEqual(1 << 18);
+            expect(avg).toBeGreaterThan(1);
+
+            // The edges first, then a stride that lands on and around multiples.
+            const edges = [0, 1, 2, avg - 1, avg, avg + 1, avg + 2, 2 * avg, 2 * avg + 1, 0xffffffff, 0xfffffffe];
+            for (const u of edges) {
+                const want = u % avg === 1;
+                expect(Math.floor(u / avg) * avg === u - 1, `avg=${avg} u=${u}`).toBe(want);
+            }
+        }
+    });
+
+    it("agrees across the whole 32 bit range, sampled near the top where a double is coarsest", () => {
+        for (const avg of avgs) {
+            for (let k = 0; k < 20000; k++) {
+                // Biased to the top of the range: that is where an ulp is 2^-21
+                // and where an approximate version would first disagree.
+                const u = (0xffffffff - k * 7919) >>> 0;
+                if (Math.floor(u / avg) * avg === u - 1 !== (u % avg === 1)) {
+                    throw new Error(`disagreed at avg=${avg} u=${u}`);
+                }
+            }
+        }
+    });
+});

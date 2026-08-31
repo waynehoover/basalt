@@ -50,6 +50,35 @@ const PRIME = 31;
 const BOUNDARY = 1;
 
 /**
+ * Whether the rolling hash says to cut here.
+ *
+ * This is `(hash >>> 0) % avg === BOUNDARY`, which is what it used to say and
+ * what it still means. `hash >>> 0` is a double above 2^31, so `%` is a
+ * floating point remainder, and V8 calls out to fmod for it once per byte: 32
+ * MiB/s against 996 for the same answer written without a division. JavaScript-
+ * Core is indifferent, every benchmark here was taken under it, and the shipped
+ * CLI runs node. That is how a 31x cost in the hottest loop in the project
+ * stayed invisible.
+ *
+ * Exact, not approximate. `u % avg === BOUNDARY` iff
+ * `floor(u / avg) * avg === u - BOUNDARY`, given `0 <= BOUNDARY < avg`, which
+ * holds because BOUNDARY is 1 and the smallest avg any size table produces is
+ * 1024. For `u < 2^32` and `avg <= 2^18`, which `sizesFor` guarantees, a
+ * double's ulp near 2^32 is 2^-21 while the true quotient sits at least
+ * `1/avg >= 2^-18` below the next integer whenever the remainder is non-zero:
+ * two orders of margin. `chunk.test.ts` walks it against the modulo it replaces
+ * for every avg the size tables can produce.
+ *
+ * Cutting differently is not a performance question. A boundary that moved
+ * would rechunk every vault, rename every chunk, and deduplicate against
+ * nothing.
+ */
+function atBoundary(hash: number, avg: number): boolean {
+    const u = hash >>> 0;
+    return Math.floor(u / avg) * avg === u - BOUNDARY;
+}
+
+/**
  * Chunk size targets.
  *
  * Text and binary get different sizes for the same reason LiveSync separates
@@ -283,7 +312,7 @@ export function* chunkBytes(data: Uint8Array, sizes: ChunkSizes, isUtf8: boolean
         }
 
         const size = pos - start + 1;
-        let boundary = size >= min && (hash >>> 0) % avg === BOUNDARY;
+        let boundary = size >= min && atBoundary(hash, avg);
         // A forced cut at the maximum. Without it a file with no boundary in it
         // is one chunk however large, which the server would refuse.
         if (size >= max) boundary = true;
@@ -321,12 +350,67 @@ export function* chunkBytes(data: Uint8Array, sizes: ChunkSizes, isUtf8: boolean
  * The chunk being accumulated is bounded by `sizes.max`, so peak memory is that
  * plus one incoming block, whatever the file size.
  */
+/**
+ * The rolling hash over a stream, as a class so its loop is a method.
+ *
+ * The only reason this is not a closure inside `chunkStream` is that the loop
+ * has to be somewhere JavaScriptCore will optimise, and an async generator body
+ * is not. See the comment at the call site.
+ */
+class Roller {
+    used = 0;
+    hash = 0;
+
+    constructor(
+        private readonly buf: Uint8Array,
+        private readonly sizes: ChunkSizes,
+        private readonly pPowW: number
+    ) {}
+
+    /**
+     * Consumes bytes from `block` starting at `from` until a chunk is due.
+     *
+     * Returns the index to resume at, or -1 when the block ran out first. The
+     * caller cuts and calls again.
+     */
+    scanTo(block: Uint8Array, from: number): number {
+        const { min, avg, max } = this.sizes;
+        const buf = this.buf;
+        const pPowW = this.pPowW;
+        let used = this.used;
+        let hash = this.hash;
+
+        for (let i = from; i < block.length; i++) {
+            const byte = block[i]!;
+            buf[used++] = byte;
+            if (used >= WINDOW + 1) {
+                hash = (hash - Math.imul(buf[used - 1 - WINDOW]!, pPowW)) | 0;
+                hash = Math.imul(hash, PRIME);
+                hash = (hash + byte) | 0;
+            } else {
+                hash = Math.imul(hash, PRIME);
+                hash = (hash + byte) | 0;
+            }
+
+            if (used >= max || (used >= min && atBoundary(hash, avg))) {
+                this.used = used;
+                this.hash = hash;
+                return i + 1;
+            }
+        }
+
+        this.used = used;
+        this.hash = hash;
+        return -1;
+    }
+}
+
 export async function* chunkStream(
     blocks: AsyncIterable<Uint8Array>,
     sizes: ChunkSizes,
     isUtf8: boolean
 ): AsyncGenerator<Chunk> {
-    const { min, avg, max } = sizes;
+    const { max } = sizes;
 
     let pPowW = 1;
     for (let i = 0; i < WINDOW - 1; i++) pPowW = Math.imul(pPowW, PRIME);
@@ -357,23 +441,27 @@ export async function* chunkStream(
         return chunk;
     };
 
+    // The byte loop lives in a plain function, not in this generator's body.
+    //
+    // JavaScriptCore does not optimise a hot loop inside an async generator:
+    // the same arithmetic moved out of one goes from 39 MiB/s to 700. V8 is
+    // indifferent to this and JavaScriptCore is indifferent to the modulo in
+    // `atBoundary`, so the two defects are disjoint and both engines were slow,
+    // each for its own reason. iOS is JavaScriptCore, which makes this the
+    // mobile half.
+    const roll = new Roller(buf, sizes, pPowW);
     for await (const block of blocks) {
-        for (let i = 0; i < block.length; i++) {
-            const byte = block[i]!;
-            buf[used++] = byte;
-            if (used >= WINDOW + 1) {
-                hash = (hash - Math.imul(buf[used - 1 - WINDOW]!, pPowW)) | 0;
-                hash = Math.imul(hash, PRIME);
-                hash = (hash + byte) | 0;
-            } else {
-                hash = Math.imul(hash, PRIME);
-                hash = (hash + byte) | 0;
-            }
-
-            if (used >= max || (used >= min && (hash >>> 0) % avg === BOUNDARY)) {
-                yield cut();
-            }
+        let from = 0;
+        for (;;) {
+            const at = roll.scanTo(block, from);
+            if (at < 0) break;
+            used = roll.used;
+            yield cut();
+            roll.used = used;
+            roll.hash = hash;
+            from = at;
         }
+        used = roll.used;
     }
 
     if (used > 0) {
