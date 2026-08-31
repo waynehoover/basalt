@@ -1,6 +1,6 @@
-# Signs the three files Obsidian actually installs, so anyone can check that the
-# main.js in a release was built from this repository at that commit and not
-# pasted in by hand.
+# Signs what a release hands people, so anyone can check the bytes were built
+# from this repository at that commit and not pasted in by hand. The plugin's
+# three files, and the server's four binaries.
 #
 # It rebuilds them here rather than attesting whatever was uploaded, because an
 # attestation over a file of unknown origin says only that this workflow saw it.
@@ -30,10 +30,9 @@ jobs:
   plugin:
     name: plugin
     runs-on: ubuntu-latest
-    # Plugin releases only, which are the ones tagged with a bare version. A
-    # server or client release has no main.js to sign and this would fail trying
-    # to build one, so anything with a prefix is skipped rather than naming each
-    # prefix as it appears.
+    # Plugin releases only, which are the ones tagged with a bare version.
+    # Every other line is prefixed, so a slash means this is not one. The tag
+    # and manifest check below fails closed for anything that slips past.
     if: ${{ !contains(github.event.release.tag_name || inputs.tag, '/') }}
     steps:
       - uses: actions/checkout@v7
@@ -89,4 +88,75 @@ jobs:
         run: |
           gh release upload "$TAG" \
             attested/main.js attested/manifest.json attested/styles.css \
+            --clobber --repo "$GITHUB_REPOSITORY"
+
+  server:
+    name: server
+    runs-on: ubuntu-latest
+    # The server's own tag line. Without this the binaries were the one thing a
+    # release shipped with no provenance at all: built on a laptop, checksummed
+    # by the same script from the same bytes, and uploaded. SHA256SUMS generated
+    # beside them proves the download was not corrupted in transit and nothing
+    # whatsoever about where the bytes came from.
+    if: ${{ startsWith(github.event.release.tag_name || inputs.tag, 'server/v') }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+
+      # The same four targets and the same flags as scripts/release.sh, because
+      # the point is to rebuild what was uploaded rather than to build something
+      # near it. Go stamps the commit into the binary itself, so this is
+      # reproducible per commit: rebuilding server/v0.1.4 from a clean worktree
+      # gave the published bytes exactly, which is what makes --clobber safe.
+      - name: build
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          version="${TAG#server/v}"
+          mkdir -p attested
+          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
+            goos="${target%/*}"
+            goarch="${target#*/}"
+            ( cd server && CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+                go build -trimpath -ldflags "-s -w -X main.version=$version" \
+                -o "../attested/basaltd-$goos-$goarch" ./cmd/basaltd )
+          done
+          ls -l attested
+
+      # Generated here rather than uploaded from a laptop, so it says something
+      # about the binaries beside it instead of about itself.
+      - name: checksums
+        working-directory: attested
+        run: |
+          shasum -a 256 basaltd-* > SHA256SUMS
+          cat SHA256SUMS
+
+      # A binary that reports a version other than the tag it ships under is
+      # the same lie the plugin's manifest check refuses.
+      - name: the tag and the binary agree
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          want="${TAG#server/v}"
+          got=$(./attested/basaltd-linux-amd64 version | awk '{print $2}')
+          if [ "$want" != "$got" ]; then
+            echo "release $TAG carries a binary calling itself $got" >&2
+            exit 1
+          fi
+
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: attested/basaltd-*
+
+      - name: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh release upload "$TAG" attested/basaltd-* attested/SHA256SUMS \
             --clobber --repo "$GITHUB_REPOSITORY"

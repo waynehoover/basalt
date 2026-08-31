@@ -39,6 +39,19 @@ out="$root/release"
 version=${1:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}
 commit=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
+# A release is built from a committed state or it is not built.
+#
+# Passing a version explicitly, which is the normal way to call this, threw away
+# the only signal that the tree was dirty: `--dirty` above appears in the
+# version string and only when $1 is absent. Go stamps the commit and a
+# "modified" flag into the binary itself, so a release built over an unfinished
+# edit is a different binary that nobody would think to look at.
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "release: the tree has uncommitted changes, and a release is built from a commit" >&2
+  git status --short >&2
+  exit 1
+fi
+
 rm -rf "$out"
 mkdir -p "$out/plugin" "$out/server"
 
