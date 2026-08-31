@@ -82,7 +82,8 @@ jitter or loss. And their vault size is not published, where ours is 213.6 MiB.
 
 What survives all four: 26 round trips to move 2000 files, against an engine that
 overlaps requests to hide one per file, and an edit to a large note that costs
-one chunk here and the whole file on any backend that stores files.
+one chunk plus its entry here and the whole file on any backend that stores
+files.
 
 ## What three audits found, and what was done
 

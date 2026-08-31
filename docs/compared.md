@@ -14,7 +14,8 @@ This is what differs, what was learned from each, and where theirs is better.
 | Cost | subscription | electricity |
 | Setup | sign in | run a binary, paste one string |
 | Editing one line of a 2 MiB note | 2 MiB | 21.7 KiB |
-| Encryption | optional | always |
+| Encryption | optional | always, with no way to turn it off |
+| A server forging a version | not tested here | refused: every entry is authenticated by the device that wrote it |
 | Merge conflicts | merged silently, failures dropped | merged when provably safe, both kept otherwise |
 | Plugins, themes, config | syncs them | does not, and that one is still open |
 | Mobile | iOS and Android | Android in daily use, iOS untested |
@@ -37,12 +38,10 @@ one hash for the whole file, ours names every chunk of the new version. That
 entry is most of what Basalt sends on a large note, and it is what bounds the
 gap. `cd client && bun run bench` prints this table.
 
-> These numbers used to read 494 B and 4245x. Two things were wrong with them.
-> The benchmark counted only chunk bodies and not the entry that carries their
-> names, and the chunk sizes have since been tuned: a 2 MiB note was 5638 chunks
-> then and is 133 now. The old sizes did send a smaller body, and paid for it
-> with 5638 names in every version, which is the cost the old figure omitted.
-> 94x is what it has always actually been worth.
+> This table used to read 494 B and 4245x, from a benchmark that counted chunk
+> bodies and not the entry naming them, taken when a 2 MiB note was 5638 chunks
+> rather than 133. Those smaller chunks did send a smaller body, and paid 5638
+> names for it in every version. 94x is what it was always worth.
 
 The gap grows with the file, which is the point: a vault accumulates long notes.
 Basalt also deflates each chunk before sealing it, taking a full upload of a

@@ -6,7 +6,7 @@ One binary on a machine that stays on, and a plugin on each device.
 
 ## Docker
 
-The image is a single static binary on an empty filesystem: 11 MB, no shell, no
+The image is a single static binary on an empty filesystem: 12 MB, no shell, no
 package manager, nothing to update. Pure-Go SQLite is what makes
 `CGO_ENABLED=0` work and `CGO_ENABLED=0` is what makes `scratch` possible.
 
