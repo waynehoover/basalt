@@ -87,9 +87,37 @@ one chunk here and the whole file on any backend that stores files.
    and every candidate measured the same afternoon. Until then their numbers are
    theirs.
 
+Since measured, and worth doing, from an audit of the two client shells on a
+10,000 note vault:
+
+5. **The headless walk stats one file at a time.** 138 ms at 10k files, of which
+   112 ms is waiting: `readdir` over the same tree is 25 ms. Issuing each
+   directory's stats together takes it to 27 ms. It runs on every pass, so an
+   idle vault pays it every keepalive tick. The plugin does not have this
+   problem, because it reads Obsidian's own index instead: 10 ms at 10k, about a
+   fourteenth of the cost per file, and the best decision in either shell.
+6. **The index is rewritten in full on passes that changed nothing.** 21 ms at
+   10k entries, of which 11 ms is two fsyncs of a byte-identical 5.3 MiB file,
+   every thirty seconds, forever. Remembering the last string written takes the
+   idle pass from 37 ms to 10 ms.
+7. **`writeDurably` flushes a directory per file.** Files sharing a folder
+   re-flush the same directory: 2000 files across 200 folders cost 10.7 s with
+   16 in flight, and 6.1 s flushing each directory once. This one touches the
+   durability contract, so it goes last and with a failing test first.
+8. **The plugin's block re-assembly reallocates per stream chunk.** Moving
+   64 MiB copies 2144 MiB and allocates 4160 buffers at a 16 KiB fetch chunk
+   size. A preallocated block buffer makes it 128 MiB and 65. Small in wall
+   clock, and the allocation churn is on the axis that matters on a phone.
+
 Not worth doing: request ids, with 26 round trips left to overlap. Larger chunks
 to cut fsyncs, which trades back a chunk size chosen by measurement against what
-an edit costs.
+an edit costs. Raising `UV_THREADPOOL_SIZE`, which was measured at 16 and made
+the pooled walk 2.6x worse than the default 4.
+
+Measured and already fast, so left alone: the realpath containment check added
+to every write, at 0.2 to 0.6% of one; CLI cold start, which is 30 ms of which
+22 ms is Node itself and 0.1 ms is the key schedule; the plugin's status bar and
+per-event work, none of which is O(vault).
 
 ## What a large attachment costs in memory
 
@@ -172,6 +200,58 @@ laptop's memory is not evidence about a phone's. A client refuses
 anything larger from its stat, before opening it. `basaltd serve -max-file` raises
 it as far as 256 MiB, which is comfortable for a vault whose large files are only
 ever moved by the headless client.
+
+## What a move costs
+
+Moving files was already free for the sender. Chunk names are hashes of
+ciphertext, so the server holds every chunk already and only metadata travels.
+Twenty notes moved into another folder:
+
+    uploaded=21  chunksSent=0  bytesSent=0
+
+The receiver used to pay full price for the same move. It downloaded each file
+back under a name it was already storing the identical bytes under, because the
+fetch asked the server for chunks without looking at what the device had. One
+6.2 MiB attachment moved meant 6.2 MiB re-downloaded, on every other device.
+
+A download whose content id matches a file this device holds is now written from
+those bytes. The local copy is re-chunked and re-sealed and the names compared
+before anything is written, which is exact rather than trusting: sealing is
+deterministic, so identical content gives identical names.
+
+Measured by emptying the server. Every chunk body deleted before the receiving
+device syncs, so a byte off the wire would fail rather than merely be slower:
+
+    server holds 0 chunk bodies
+    downloaded=1  retrying=0        byte identical to the source device
+
+Deletions had to move for it to work. They were applied before the pass wrote
+anything, so a move deleted the only local copy of the bytes it was about to
+want. They are deferred until after the writes now, which durability rule 3
+argues for on its own.
+
+## What the entry authenticator costs
+
+Protocol 2 authenticates every entry. Measured before it was built, because the
+answer decided the design:
+
+| | per entry | 256-entry batch | 2000-file first sync |
+|---|---|---|---|
+| Per-entry, parallel | 2.2 us | 0.56 ms | 4 ms |
+| Globally chained, sequential | 12.7 us | 3.26 ms | 25 ms |
+
+Against 167 seconds of upload, both are nothing. The chain was rejected for what
+it does to concurrent writers rather than for its arithmetic: a global head must
+be known at write time, so two devices writing at once serialise and each
+conflict costs a round trip, 400 ms against 3 ms of hashing.
+
+On the wire it is 149 bytes per entry, flat:
+
+| | before | after | |
+|---|---|---|---|
+| A one-chunk note | 274 B | 423 B | +54% |
+| A 1024-chunk attachment | 68815 B | 68964 B | +0.2% |
+| 2000-file first sync, metadata | 535 KB | 826 KB | +2.7% of the upload |
 
 ## What adding latency found
 

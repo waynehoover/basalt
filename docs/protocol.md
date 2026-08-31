@@ -109,11 +109,19 @@ a rolling hash says, so inserting a line near the start of a large note changes
 one chunk instead of shifting every chunk after it.
 
 ```
--> {op:"put", path, meta:{size, ctime, mtime, folder, deleted, prev}, chunks:[h1,h2,h3]}
+-> {op:"put", path, meta:{size, ctime, mtime, folder, deleted, prev},
+    chunks:[h1,h2,h3], mac, parent}
 <- {res:"want", chunks:[h2]}          only what the server lacks
 -> binary frame for h2
 <- {res:"ack", uid:152}
 ```
+
+- `mac` authenticates the entry and `parent` names the version it was written
+  on top of. Both are opaque to the server, which holds no key and checks
+  neither value. It does refuse an entry carrying no `mac` of the right shape,
+  because an entry nothing can authenticate is one every reader refuses for
+  ever while only the writer is placed to notice. See **Authenticating an
+  entry** below.
 
 - `chunks` are hashes of the *encrypted* chunks, so the server dedups without
   learning anything. A chunk hash is the lowercase hex SHA-256 of the encrypted
@@ -205,6 +213,33 @@ is the same exchange for up to 256 entries.
 - `put` is unchanged and still there. `putmany` of one entry is the same thing
   with a different reply shape, and a client with one file to write may use
   either.
+
+## Authenticating an entry
+
+The bytes of a file were always sealed. Until protocol 2 everything deciding
+what a client *did* with them was not: `deleted`, `size`, `prev` and the chunk
+list travelled in the clear, and the server holds every sealed path in the
+vault, so it could name any file and say anything about it. Setting `deleted`
+deleted that note on every device. A size with no chunks emptied one, through a
+write rather than a delete, so not even into the trash. Another file's chunk
+list replaced one.
+
+None of that needed a key, which is what the `mac` is for. It is an HMAC under a
+key derived for this and nothing else, over a canonical encoding of the sealed
+path, the size and times, the flags, `prev`, the chunk list in order, and
+`parent`. Fields are length-prefixed rather than delimited: a delimiter is a
+character somebody's filename eventually contains, and two entries that
+canonicalise to the same bytes are one forgery.
+
+The uid is deliberately not covered. The server assigns uids and ordering the
+log is its job, which this does not try to take.
+
+`parent` is a digest of the content id of the version the writer was building
+on, or empty for a file it had never synced. It is what tells a new version from
+an old one replayed, and it is per path rather than global, which is what keeps
+concurrent writers from having to serialise. The cost of that choice is that a
+server withholding a version is still undetectable; catching that needs a chain
+over the whole log, and a chain has to be known at write time.
 
 ## Reading a file
 

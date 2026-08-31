@@ -70,3 +70,11 @@ history and recovery.
 ## Docs
 
 [Read the docs](docs/index.md).
+
+**[How it compares](docs/compared.md)** is the one to read first if you are
+deciding. It sets Basalt against Obsidian Sync, Sync Engine and Fast Note Sync,
+and it is honest in both directions: an edit to a 2 MiB note costs 494 bytes
+here against 2 MiB there, encryption is always on rather than optional, and a
+merge that cannot be made safely keeps both versions instead of dropping one.
+It also says plainly where the others are better, which is the part worth
+trusting a comparison for.
