@@ -909,9 +909,15 @@ func (s *Store) LatestUID(vaultID string) (int64, error) {
 // collapse into a single number or a boolean. A caller that wants a headline
 // figure has to choose which of these it means.
 type Stats struct {
-	Files       int64 // live, non-deleted, non-folder
-	Folders     int64
-	Deleted     int64 // paths whose newest version is a deletion
+	Files   int64 // live, non-deleted, non-folder
+	Folders int64
+	Deleted int64 // paths whose newest version is a deletion
+	// Recoverable is how many of those still have a version with content
+	// behind them. Purge keeps only the newest version per path, and for a
+	// deleted note that is the deletion record, so a purge can leave a path
+	// deleted and unrecoverable. Reporting only Deleted said "still
+	// recoverable" over those, which is rule 7: the two are separate facts.
+	Recoverable int64
 	Bytes       int64 // sum of declared plaintext sizes of live files
 	Versions    int64 // entry rows, including superseded ones
 	ChunkRefs   int64 // distinct chunk names referenced by any entry
@@ -926,12 +932,20 @@ func (s *Store) Stats(vaultID string) (Stats, error) {
 		   COALESCE(SUM(CASE WHEN e.deleted = 0 AND e.folder = 0 THEN 1 ELSE 0 END), 0),
 		   COALESCE(SUM(CASE WHEN e.folder = 1 THEN 1 ELSE 0 END), 0),
 		   COALESCE(SUM(CASE WHEN e.deleted = 1 THEN 1 ELSE 0 END), 0),
+		   -- The same "is there anything behind it" question Deleted() asks, and
+		   -- for the same reason. A deletion with no earlier version holding
+		   -- content cannot be restored from, whatever the list says.
+		   COALESCE(SUM(CASE WHEN e.deleted = 1 AND EXISTS (
+		       SELECT 1 FROM entries r
+		        WHERE r.vault_id = e.vault_id AND r.path = e.path
+		          AND r.deleted = 0 AND r.folder = 0 AND r.uid < e.uid)
+		     THEN 1 ELSE 0 END), 0),
 		   COALESCE(SUM(CASE WHEN e.deleted = 0 AND e.folder = 0 THEN e.size ELSE 0 END), 0)
 		 FROM entries e
 		 JOIN (SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path) latest
 		   ON e.path = latest.path AND e.uid = latest.uid
 		 WHERE e.vault_id = ?`, vaultID, vaultID)
-	if err := row.Scan(&st.Files, &st.Folders, &st.Deleted, &st.Bytes); err != nil {
+	if err := row.Scan(&st.Files, &st.Folders, &st.Deleted, &st.Recoverable, &st.Bytes); err != nil {
 		return st, err
 	}
 	if err := s.db.QueryRow(

@@ -34,6 +34,12 @@ where no device survives.
 `purge` is the one command that destroys something no device holds. Take a backup
 first; it says so afterwards, which is later than you would like.
 
+What it takes from a deleted note is the note. Purge keeps the newest version of
+each path, and for a deleted one that is the deletion record, so the content
+behind it goes and the path stays listed as deleted. `basalt deleted` marks
+those `(content purged)` and `basaltd stats` counts them separately from the
+ones that can still be restored.
+
 ## What it does
 
 ```

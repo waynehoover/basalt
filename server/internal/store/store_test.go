@@ -1063,6 +1063,48 @@ func TestEntriesAndChunksSurviveAReopen(t *testing.T) {
 	}
 }
 
+// Rule 7: a status describes the vault, not what was convenient to count.
+//
+// Purge keeps the newest version per path, which for a deleted note is the
+// deletion record itself, so the content behind it goes. `basaltd stats` went
+// on reporting "deleted and still recoverable" over exactly those, which is
+// telling somebody their note is safe when nothing can bring it back. The
+// client already told the truth here; the server did not.
+func TestStatsStopsCallingAPurgedDeletionRecoverable(t *testing.T) {
+	h := newTestStore(t)
+	h.file(t, "keep.md", "still here")
+	h.file(t, "gone.md", "about to be deleted")
+	if _, err := h.AppendEntry("v1", Entry{Path: "gone.md", Mac: testMac, Deleted: true}); err != nil {
+		t.Fatalf("append deletion: %v", err)
+	}
+
+	before, err := h.Stats("v1")
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if before.Deleted != 1 || before.Recoverable != 1 {
+		t.Fatalf("before purge: Deleted = %d, Recoverable = %d, want 1 and 1",
+			before.Deleted, before.Recoverable)
+	}
+
+	if _, err := h.Purge("v1", 0); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+
+	after, err := h.Stats("v1")
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	// Still deleted, and no longer recoverable. Both facts, separately.
+	if after.Deleted != 1 {
+		t.Fatalf("after purge: Deleted = %d, want 1", after.Deleted)
+	}
+	if after.Recoverable != 0 {
+		t.Fatalf("after purge: Recoverable = %d, want 0; purge took the only version "+
+			"with content in it", after.Recoverable)
+	}
+}
+
 func TestStatsCountsFoldersSeparatelyFromFiles(t *testing.T) {
 	h := newTestStore(t)
 	h.file(t, "notes/a.md", "content a")

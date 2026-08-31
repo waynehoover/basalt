@@ -829,11 +829,17 @@ func TestServiceTellsYouHowToInstallIt(t *testing.T) {
 
 // The numbers are separate rather than summed. "1.2 GB" says nothing about
 // whether a purge would help; versions against files says exactly that.
+//
+// The seeded vault's deletion has no earlier version with content, so it is
+// deleted and not recoverable, and stats has to say both. It said "1 deleted
+// and still recoverable" for as long as this test existed, and this test
+// asserted that string.
 func TestStatsSaysWhatIsThereAndWhatAPurgeWouldDrop(t *testing.T) {
 	dir := seeded(t)
 	out := mustRun(t, "stats", "-data", dir)
 
-	for _, want := range []string{"files", "deleted and still recoverable", "versions in all", "history"} {
+	for _, want := range []string{"files", "versions in all", "history",
+		"1 deleted: 0 still recoverable, 1 purged and gone for good"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("stats does not mention %q:\n%s", want, out)
 		}
@@ -844,6 +850,45 @@ func TestStatsSaysWhatIsThereAndWhatAPurgeWouldDrop(t *testing.T) {
 	after := mustRun(t, "stats", "-data", dir)
 	if strings.Contains(after, "would drop") {
 		t.Fatalf("stats still offers a purge with nothing left to drop:\n%s", after)
+	}
+}
+
+// The other half: a deletion that can be restored from says so, and in the
+// short form, because that is the ordinary case and it should stay one number.
+func TestStatsKeepsTheShortLineWhenEveryDeletionIsRecoverable(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "basalt.db"), filepath.Join(dir, "chunks"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := st.EnsureVault("default", 1); err != nil {
+		t.Fatalf("ensure vault: %v", err)
+	}
+	body := "something worth getting back"
+	name := chunks.Name([]byte(body))
+	if err := st.Chunks().Put("default", name, []byte(body)); err != nil {
+		t.Fatalf("put chunk: %v", err)
+	}
+	if _, err := st.AppendEntry("default", store.Entry{
+		Path: "gone.md", Size: int64(len(body)), MTime: 10, Chunks: []string{name}, Mac: testMac,
+	}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := st.AppendEntry("default", store.Entry{
+		Path: "gone.md", Deleted: true, MTime: 20, Mac: testMac,
+	}); err != nil {
+		t.Fatalf("append deletion: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	out := mustRun(t, "stats", "-data", dir)
+	if !strings.Contains(out, "1 deleted and still recoverable") {
+		t.Fatalf("a recoverable deletion did not read as one:\n%s", out)
+	}
+	if strings.Contains(out, "gone for good") {
+		t.Fatalf("a recoverable deletion was called gone:\n%s", out)
 	}
 }
 

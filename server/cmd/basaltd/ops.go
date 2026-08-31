@@ -97,7 +97,15 @@ func cmdStats(args []string, out io.Writer) error {
 		fmt.Fprintf(out, "vault %q\n", v)
 		fmt.Fprintf(out, "  %d files, %d folders, %s of notes as the devices see them\n",
 			s.Files, s.Folders, human(s.Bytes))
-		fmt.Fprintf(out, "  %d deleted and still recoverable\n", s.Deleted)
+		// Deleted and recoverable are two facts, and conflating them told
+		// people a purged note was safe. Only spelled out when they differ, so
+		// the ordinary line stays one number.
+		if lost := s.Deleted - s.Recoverable; lost > 0 {
+			fmt.Fprintf(out, "  %d deleted: %d still recoverable, %d purged and gone for good\n",
+				s.Deleted, s.Recoverable, lost)
+		} else {
+			fmt.Fprintf(out, "  %d deleted and still recoverable\n", s.Deleted)
+		}
 		fmt.Fprintf(out, "  %d versions in all, %d chunks referenced\n", s.Versions, s.ChunkRefs)
 		// The one number that says whether a purge is worth running: history is
 		// every version beyond the newest of each path.
