@@ -245,6 +245,13 @@ CREATE INDEX IF NOT EXISTS entries_by_path ON entries(vault_id, path, uid DESC);
 -- Makes the live-set query for the chunk sweep an index scan rather than a
 -- table scan, and makes "is this chunk still referenced" answerable.
 CREATE INDEX IF NOT EXISTS entry_chunks_by_name ON entry_chunks(vault_id, name);
+
+-- Deleted() suppresses a deletion whose path was reused by a later rename, and
+-- that subquery matches on prev_path, which was in no index. It scanned every
+-- entry newer than the deletion and filtered in memory, once per deleted path:
+-- 112 ms against 5.6 ms with this, and the write it costs is 5 us against a
+-- chunk fsync of 7.8 ms.
+CREATE INDEX IF NOT EXISTS entries_by_prev ON entries(vault_id, prev_path, uid);
 `
 
 // Store is the server's whole persistent state: entries in SQLite, bodies in a
@@ -776,6 +783,11 @@ func (s *Store) manyEntries(vaultID, query string, args ...any) ([]Entry, error)
 //
 // It reads the whole uid span rather than one query per entry so that a batch of
 // 200 entries is two round trips, not 201.
+// listedUIDsMax bounds the IN list, because a parameter list is not free and
+// SQLite has its own ceiling on how many it will take. Above it the range read
+// is the better shape anyway: that many entries at once is a batch.
+const listedUIDsMax = 500
+
 func attachChunks(tx *sql.Tx, vaultID string, entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
@@ -795,10 +807,41 @@ func attachChunks(tx *sql.Tx, vaultID string, entries []Entry) error {
 		entries[i].Chunks = []string{}
 	}
 
-	rows, err := tx.Query(
-		`SELECT uid, ord, name FROM entry_chunks
-		  WHERE vault_id = ? AND uid BETWEEN ? AND ? ORDER BY uid ASC, ord ASC`,
-		vaultID, lo, hi)
+	// A range for a batch, a list for anything scattered.
+	//
+	// A catch-up batch is contiguous, so BETWEEN reads exactly the rows it
+	// wants. A page of one file's history is not: version 1 and version 5 of a
+	// note sit thousands of uids apart, so the same range read nearly every
+	// chunk row in the vault and threw almost all of it away. Measured at 6.1 ms
+	// for a 100 row page over 10k entries, and 83 ms over 100k, against 0.07 ms
+	// and 0.3 ms keyed on the uids actually wanted. It grew with the vault's
+	// history rather than with the page, and history is paged.
+	span := hi - lo + 1
+	useList := len(entries) <= listedUIDsMax && span > int64(len(entries))*4
+
+	var rows *sql.Rows
+	var err error
+	if useList {
+		args := make([]any, 0, len(entries)+1)
+		args = append(args, vaultID)
+		marks := make([]byte, 0, len(entries)*2)
+		for i, e := range entries {
+			if i > 0 {
+				marks = append(marks, ',')
+			}
+			marks = append(marks, '?')
+			args = append(args, e.UID)
+		}
+		rows, err = tx.Query(
+			`SELECT uid, ord, name FROM entry_chunks
+			  WHERE vault_id = ? AND uid IN (`+string(marks)+`) ORDER BY uid ASC, ord ASC`,
+			args...)
+	} else {
+		rows, err = tx.Query(
+			`SELECT uid, ord, name FROM entry_chunks
+			  WHERE vault_id = ? AND uid BETWEEN ? AND ? ORDER BY uid ASC, ord ASC`,
+			vaultID, lo, hi)
+	}
 	if err != nil {
 		return err
 	}
@@ -1291,6 +1334,14 @@ func migrate(db *sql.DB) error {
 		if _, err := db.Exec(`ALTER TABLE vaults ADD COLUMN auth_hash TEXT NOT NULL DEFAULT ''`); err != nil {
 			return err
 		}
+	}
+
+	// The index behind Deleted()'s rename suppression. CREATE INDEX IF NOT
+	// EXISTS in the schema covers a new database; this covers one that already
+	// existed.
+	if _, err := db.Exec(
+		`CREATE INDEX IF NOT EXISTS entries_by_prev ON entries(vault_id, prev_path, uid)`); err != nil {
+		return err
 	}
 
 	// Entries carry their own authenticator from protocol 2 on. An older row
