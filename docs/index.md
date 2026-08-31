@@ -22,6 +22,10 @@ was measured and turned out not to be worth doing.
 Obsidian Sync, Sync Engine and Fast Note Sync: what differs, where theirs is
 better, and what was borrowed from each.
 
+**[Review](review.md)**
+What the community directory's automated review flags, which two points were
+real, and why the rest do not apply.
+
 **[Backup](backup.md)**
 The two kinds of backup, what each one saves you from, and how to restore.
 
