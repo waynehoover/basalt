@@ -312,6 +312,53 @@ describe("chunk names", () => {
   });
 });
 
+/**
+ * Everything here goes through one helper that hands WebCrypto an ArrayBuffer,
+ * and a Uint8Array that is a view into a larger buffer is where that gets
+ * dangerous: hand over the buffer and the call reads the neighbours too. The
+ * helper only skips its copy when the view spans its whole buffer, so these
+ * pin the case it must never skip.
+ */
+describe("a view into a larger buffer", () => {
+  const bytes = enc.encode("the bytes that are actually the message");
+
+  /**
+   * The same bytes as a view of a larger array of 0xff, at `at`. Offset zero
+   * is its own case: a view can start at the start and still stop short, and
+   * a check that only looked at where it began would wave that one through.
+   */
+  function embedded(at: number): Uint8Array {
+    const backing = new Uint8Array(bytes.length + 64).fill(0xff);
+    backing.set(bytes, at);
+    return backing.subarray(at, at + bytes.length);
+  }
+
+  it("names a chunk by its own bytes, not its neighbours'", async () => {
+    for (const at of [0, 32, 64]) {
+      expect(await chunkName(embedded(at)), `at ${at}`).toBe(await chunkName(bytes));
+    }
+  });
+
+  it("seals to the same ciphertext either way", async () => {
+    const k = await keys();
+    for (const at of [0, 32, 64]) {
+      expect(hex(await sealChunk(k, embedded(at))), `at ${at}`).toBe(
+        hex(await sealChunk(k, bytes)),
+      );
+    }
+  });
+
+  it("derives the same keys from a secret held in a larger buffer", async () => {
+    const secret = generateSecret();
+    const backing = new Uint8Array(secret.length + 16).fill(0xff);
+    backing.set(secret, 8);
+    const inner = await deriveKeys(backing.subarray(8, 8 + secret.length));
+    expect(await sealPath(inner, "notes/a.md")).toBe(
+      await sealPath(await deriveKeys(secret), "notes/a.md"),
+    );
+  });
+});
+
 describe("base64url", () => {
   it("round trips every byte value", async () => {
     const all = new Uint8Array(256);

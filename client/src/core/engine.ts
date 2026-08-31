@@ -70,7 +70,6 @@ import {
 import {
   MAX_BATCH_ENTRIES,
   type BatchEntry,
-  type PutMeta,
   type ServerLimits,
   type Transport,
   type WireEntry,
@@ -524,7 +523,7 @@ export class Engine {
    * entry, alter one, or move one file's chunk list onto another file.
    */
   private async authFor(
-    entry: { path: string; meta: PutMeta; names: readonly string[] },
+    entry: PutFacts,
     builtOn: string,
   ): Promise<{ mac: string; parent: string }> {
     const parent = await parentOf(builtOn);
@@ -1037,23 +1036,16 @@ export class Engine {
         // Fixed once, because it is signed and then sent: calling now()
         // twice would sign one timestamp and send another.
         const deletedAt = this.now();
+        const facts: PutFacts = {
+          path: await this.sealedPath(path),
+          meta: { size: 0, ctime: 0, mtime: deletedAt, deleted: true },
+          names: [],
+        };
         await this.queue(
           {
             path,
             size: 0,
-            entry: {
-              path: await this.sealedPath(path),
-              meta: { size: 0, ctime: 0, mtime: deletedAt, deleted: true },
-              names: [],
-              ...(await this.authFor(
-                {
-                  path: await this.sealedPath(path),
-                  meta: { size: 0, ctime: 0, mtime: deletedAt, deleted: true },
-                  names: [],
-                },
-                entry.synchash,
-              )),
-            },
+            entry: { ...facts, ...(await this.authFor(facts, entry.synchash)) },
             bodyOf: noBodies,
             commit: (uid) => {
               // Recorded before the entry is forgotten. This
@@ -1108,24 +1100,17 @@ export class Engine {
     sealed?: Scanned,
   ): Promise<void> {
     if (entry.folder) {
+      const facts: PutFacts = {
+        path: await this.sealedPath(path),
+        meta: { size: 0, ctime: 0, mtime: 0, folder: true },
+        names: [],
+      };
       await this.queue(
         {
           path,
           size: 0,
-          entry: {
-            path: await this.sealedPath(path),
-            meta: { size: 0, ctime: 0, mtime: 0, folder: true },
-            names: [],
-            // A folder has no content and so no lineage.
-            ...(await this.authFor(
-              {
-                path: await this.sealedPath(path),
-                meta: { size: 0, ctime: 0, mtime: 0, folder: true },
-                names: [],
-              },
-              "",
-            )),
-          },
+          // A folder has no content and so no lineage.
+          entry: { ...facts, ...(await this.authFor(facts, "")) },
           bodyOf: noBodies,
           commit: (uid) => {
             synced(entry, "", [], uid, this.now());
@@ -1153,36 +1138,24 @@ export class Engine {
     const size = entry.size;
     const mtime = entry.mtime;
 
+    const facts: PutFacts = {
+      path: await this.sealedPath(path),
+      meta: {
+        size,
+        ctime: entry.ctime,
+        mtime,
+        ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
+      },
+      names: plan.names,
+    };
+
     await this.queue(
       {
         path,
         size,
-        entry: {
-          path: await this.sealedPath(path),
-          meta: {
-            size,
-            ctime: entry.ctime,
-            mtime,
-            ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
-          },
-          names: plan.names,
-          // Built on whatever this device last had in sync, which is
-          // what lets a receiver tell a new version from a replayed
-          // old one.
-          ...(await this.authFor(
-            {
-              path: await this.sealedPath(path),
-              meta: {
-                size,
-                ctime: entry.ctime,
-                mtime,
-                ...(entry.prev ? { prev: await this.sealedPath(entry.prev) } : {}),
-              },
-              names: plan.names,
-            },
-            entry.synchash,
-          )),
-        },
+        // Built on whatever this device last had in sync, which is what lets
+        // a receiver tell a new version from a replayed old one.
+        entry: { ...facts, ...(await this.authFor(facts, entry.synchash)) },
         bodyOf: plan.bodyOf,
         commit: (uid) => {
           synced(entry, hash, chunks, uid, this.now());
@@ -2087,6 +2060,16 @@ interface Queued {
   /** Run only once the server has committed it, with the uid it was given. */
   readonly commit: (uid: number) => void;
 }
+
+/**
+ * Everything about an entry that its MAC covers.
+ *
+ * Built once and then both sent and authenticated, rather than written out
+ * twice: the MAC has to cover exactly what goes on the wire, and two literals
+ * kept in step by hand is how that stops being true. Sealing the path is a key
+ * derivation and a cipher call, so building it once also halves them.
+ */
+type PutFacts = Pick<BatchEntry, "path" | "meta" | "names">;
 
 /** What an upload needs: every chunk's name, and a way to get one's bytes. */
 interface UploadPlan {
