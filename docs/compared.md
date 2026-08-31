@@ -17,7 +17,8 @@ This is what differs, what was learned from each, and where theirs is better.
 | Encryption | optional | always |
 | Merge conflicts | merged silently, failures dropped | merged when provably safe, both kept otherwise |
 | Plugins, themes, config | syncs them | refuses to |
-| Mobile | works today | never run on a phone |
+| Mobile | works today | Android verified, iOS untested |
+| Version history | in the app | in the app, and restoring never overwrites |
 | Maturity | years in production | early |
 
 **Transfer is the real difference.** Theirs keeps one hash per file and pushes
@@ -38,11 +39,17 @@ vault's text from 108% of plaintext to 67%.
 **Deletions lose to edits, in both directions.** Deleted here and changed there,
 theirs propagates the delete; Basalt restores the file.
 
-**Where theirs is better**, and it is not close in places: nothing to run, mobile
-that works today, version history you can look at, and years of production
-finding edge cases that were found here by reading code. Whole-file upload also
-has fewer moving parts than chunking plus deterministic sealing plus
-compression, and larger machinery has more ways to be wrong.
+**Where theirs is better**, and it is not close in places: nothing to run, iOS,
+and years of production finding edge cases that were found here by reading code.
+Whole-file upload also has fewer moving parts than chunking plus deterministic
+sealing plus compression, and larger machinery has more ways to be wrong.
+
+This paragraph used to concede mobile and version history as well. Both have
+since been built: a phone synced a 320 file vault with every checksum matching,
+and version history landed in 0.1.3, with a diff against what is on disk and a
+restore that writes beside a file rather than over it. iOS stays conceded
+because it has not been run there, which is a different statement from saying it
+does not work.
 
 ## Against Sync Engine and Fast Note Sync
 

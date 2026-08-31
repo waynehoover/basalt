@@ -160,7 +160,10 @@ slices the ciphertext into 2 MiB wire frames, so it holds about twice the file.
 
 That curve is what sets the default file limit, rather than any cost to the
 server, and it is set for the weakest device rather than the strongest: 64 MiB,
-because the plugin buffers and has never run on a phone. A client refuses
+because the plugin buffers and this curve was measured on a laptop. A phone has
+since synced a vault, so "never run on a phone" is no longer the reason; what is
+still unmeasured is what a large attachment costs on one, and a limit set from a
+laptop's memory is not evidence about a phone's. A client refuses
 anything larger from its stat, before opening it. `basaltd serve -max-file` raises
 it as far as 256 MiB, which is comfortable for a vault whose large files are only
 ever moved by the headless client.
