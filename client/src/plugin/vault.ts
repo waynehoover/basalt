@@ -156,22 +156,36 @@ export class ObsidianVault implements Vault {
     // Re-blocked rather than passed through, because what a fetch hands back
     // is whatever the transport felt like and the chunker should not have
     // its memory decided by that.
-    let held = new Uint8Array(0);
+    //
+    // Filled into one buffer rather than grown by concatenation. Growing it
+    // reallocated and copied everything held on every arriving piece, so moving
+    // 64 MiB copied 2144 MiB and allocated 4160 buffers when the pieces came
+    // 16 KiB at a time: 33x the file, to move the file. This is 128 MiB and 65
+    // buffers. Wall clock barely notices on a laptop; allocation churn is the
+    // axis that matters on a phone, which is where this path runs.
+    //
+    // `subarray` was the other half of it: the remainder kept the whole block
+    // alive to hold a few spare kilobytes.
+    const block = new Uint8Array(blockSize);
+    let filled = 0;
     for (;;) {
       const { done, value } = await reader.read();
       if (value && value.length > 0) {
-        const merged = new Uint8Array(held.length + value.length);
-        merged.set(held, 0);
-        merged.set(value, held.length);
-        held = merged;
-      }
-      while (held.length >= blockSize) {
-        yield held.slice(0, blockSize);
-        held = held.subarray(blockSize);
+        let at = 0;
+        while (at < value.length) {
+          const take = Math.min(blockSize - filled, value.length - at);
+          block.set(value.subarray(at, at + take), filled);
+          filled += take;
+          at += take;
+          if (filled === blockSize) {
+            yield block.slice(0, blockSize);
+            filled = 0;
+          }
+        }
       }
       if (done) break;
     }
-    if (held.length > 0) yield held.slice(0);
+    if (filled > 0) yield block.slice(0, filled);
   }
 
   async readRange(path: string, start: number, end: number): Promise<Uint8Array> {

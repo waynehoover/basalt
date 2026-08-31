@@ -429,14 +429,30 @@ class CountingAdapter {
  * engine falls back rather than failing a file.
  */
 describe("reading a file through its resource URL", () => {
+  /**
+   * Test bytes that do not repeat.
+   *
+   * This was `(i * 37 + (i >> 7)) & 0xff`, whose period is 32768, so every
+   * 64 KiB block of it was byte-identical to every other. That made a whole
+   * class of bug invisible: yielding a view of the reused block buffer instead
+   * of a copy passed, because all the aliased blocks looked the same anyway.
+   * Data that repeats at the block size cannot test blocking.
+   */
   const body = (n: number) => {
     const out = new Uint8Array(n);
-    for (let i = 0; i < n; i++) out[i] = (i * 37 + (i >> 7)) & 0xff;
+    let x = 0x2545f491;
+    for (let i = 0; i < n; i++) {
+      x = (Math.imul(x, 1103515245) + 12345) | 0;
+      out[i] = (x >>> 16) & 0xff;
+    }
     return out;
   };
 
   /** A vault whose resource URLs are served by a fetch this test controls. */
-  function streaming(bytes: Uint8Array, opts: { honourRange?: boolean; fail?: boolean } = {}) {
+  function streaming(
+    bytes: Uint8Array,
+    opts: { honourRange?: boolean; fail?: boolean; pieces?: number } = {},
+  ) {
     const adapter = new FakeAdapter();
     const vault = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian");
     (adapter as unknown as { getResourcePath(p: string): string }).getResourcePath = (p) =>
@@ -456,12 +472,17 @@ describe("reading a file through its resource URL", () => {
         arrayBuffer: async () => slice.slice().buffer,
         body: {
           getReader() {
-            let sent = false;
+            // One piece unless the test asks for a shape. What a fetch hands
+            // back is the transport's business, and re-blocking exists so the
+            // chunker never sees it, so the shapes have to be tested.
+            const piece = opts.pieces ?? slice.length;
+            let at = 0;
             return {
               async read() {
-                if (sent) return { done: true, value: undefined };
-                sent = true;
-                return { done: false, value: slice.slice() };
+                if (at >= slice.length) return { done: true, value: undefined };
+                const next = slice.slice(at, at + Math.max(1, piece));
+                at += next.length;
+                return { done: false, value: next };
               },
             };
           },
@@ -494,6 +515,44 @@ describe("reading a file through its resource URL", () => {
       at += b.length;
     }
     expect(joined).toEqual(bytes);
+  });
+
+  /**
+   * The blocks must not depend on how the response arrived.
+   *
+   * The re-blocking used to grow a buffer by concatenation, which copied
+   * everything held on every arriving piece: 2144 MiB copied and 4160 buffers
+   * allocated to move 64 MiB when the pieces came 16 KiB at a time. It fills one
+   * buffer now, and that is a different loop, so the shapes that used to take
+   * the other branch are the ones worth checking.
+   */
+  it("blocks the same whatever size the pieces arrive in", async () => {
+    // Small blocks, so the byte-at-a-time shapes are a few thousand reads
+    // rather than a few hundred thousand.
+    const size = 10_000;
+    const bytes = body(size);
+    const blockSize = 4096;
+
+    for (const pieces of [1, 3, 1000, blockSize - 1, blockSize, blockSize + 1, size, size * 2]) {
+      const vault = streaming(bytes, { pieces });
+      const blocks: Uint8Array[] = [];
+      for await (const b of vault.readBlocks("big.bin", blockSize)) blocks.push(b);
+
+      expect(blocks.length, `pieces=${pieces}`).toBe(Math.ceil(size / blockSize));
+      expect(
+        blocks.slice(0, -1).every((b) => b.length === blockSize),
+        `pieces=${pieces}: a block that is not full`,
+      ).toBe(true);
+      expect(blocks[blocks.length - 1]!.length, `pieces=${pieces}`).toBe(size % blockSize);
+
+      const joined = new Uint8Array(size);
+      let at = 0;
+      for (const b of blocks) {
+        joined.set(b, at);
+        at += b.length;
+      }
+      expect(joined, `pieces=${pieces}: the bytes came out different`).toEqual(bytes);
+    }
   });
 
   it("reads a range from the middle", async () => {
