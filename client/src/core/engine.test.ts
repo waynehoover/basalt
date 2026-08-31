@@ -15,7 +15,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Engine, SEAL_WINDOW, contentId, firstFreeName, sealedNames, type SyncReport } from "./engine.ts";
 import { chunkBytes, sizesFor } from "./chunk.ts";
-import { sealChunks } from "./crypto.ts";
+import { sealChunks, sealPath } from "./crypto.ts";
 import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
 import { Transport } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
@@ -1292,4 +1292,165 @@ describe("large files", () => {
             `changing 1 KiB of an 8 MiB attachment cost ${again.bytesSent} bytes`
         ).toBeLessThan(4 * 1024 * 1024);
     }, 300_000);
+});
+
+/**
+ * What the client refuses to be told by the server it is talking to.
+ *
+ * Everything the engine acts on beyond the chunk bodies and the sealed path
+ * arrives in the clear and unauthenticated: `size`, `deleted`, `folder` and the
+ * chunk list. The server holds every sealed path in the vault, so it can name
+ * any file. These are the invariants the protocol doc already states and the
+ * client was not checking on the way in.
+ *
+ * `docs/protocol.md`: "a file declaring a size names at least one chunk, since a
+ * size with no chunks is byte-identical on the wire to an empty note." That was
+ * assigned to the server and never mirrored here, so one frame emptied a note:
+ * chunkNamesOf("-empty-") is [], nothing was fetched, and the zero-length
+ * assembly was written straight over the file. Through `write`, not `remove`, so
+ * there was no trash copy either, and the emptied note then propagated to every
+ * peer as an ordinary edit.
+ */
+describe("a batch that contradicts itself", () => {
+    let server: TestServer;
+    let a: Device;
+
+    afterEach(async () => {
+        a?.transport?.close();
+        if (server) await server.cleanup();
+    });
+
+    /** One device holding one synced note, and that note's sealed path. */
+    async function synced(): Promise<{ path: string; sealed: string; before: Uint8Array }> {
+        server = new TestServer();
+        await server.start();
+        a = new Device("a");
+        await a.connect(server);
+
+        const path = "Notes/keep.md";
+        const before = new TextEncoder().encode("a paragraph worth keeping\n");
+        await a.vault.write(path, before, { mtime: a.clock, ctime: a.clock });
+        await a.engine.sync();
+        expect(await a.vault.read(path)).toEqual(before);
+        return { path, sealed: await sealPath(keys, path), before };
+    }
+
+    it("refuses a size with no chunks, rather than emptying the note", async () => {
+        const { path, sealed, before } = await synced();
+        const uid = 1_000_000;
+
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid,
+                entries: [
+                    {
+                        uid,
+                        path: sealed,
+                        size: before.length,
+                        ctime: 0,
+                        mtime: a.clock + 1000,
+                        folder: false,
+                        deleted: false,
+                        chunks: [],
+                        device: "b",
+                    },
+                ],
+            })
+        ).rejects.toThrow(/size|chunk/i);
+
+        // And the note is still there. A refusal that already wrote is not one.
+        expect(await a.vault.read(path)).toEqual(before);
+    });
+
+    it("refuses chunks on an entry that says it is a deletion", async () => {
+        const { sealed } = await synced();
+        const uid = 1_000_000;
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid,
+                entries: [
+                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock, folder: false, deleted: true, chunks: ["deadbeef"], device: "b" },
+                ],
+            })
+        ).rejects.toThrow(/chunk/i);
+    });
+
+    it("refuses chunks on an entry that says it is a folder", async () => {
+        const { sealed } = await synced();
+        const uid = 1_000_000;
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid,
+                entries: [
+                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock, folder: true, deleted: false, chunks: ["deadbeef"], device: "b" },
+                ],
+            })
+        ).rejects.toThrow(/chunk/i);
+    });
+
+    /**
+     * The attack the arrival check cannot see: a chunk list that is internally
+     * consistent and belongs to a different file. Every chunk authenticates,
+     * because every chunk is authentic; nothing binds one to the file it was cut
+     * from. What catches it is that the bytes do not add up to the size the
+     * entry declares, and the declared size is a count of the bytes that were
+     * chunked rather than a stat, so that comparison is exact.
+     */
+    it("refuses a chunk list belonging to another file", async () => {
+        const { path, sealed, before } = await synced();
+
+        const other = "Notes/other.md";
+        await a.vault.write(other, new TextEncoder().encode("a different length entirely, longer\n"), {
+            mtime: a.clock,
+            ctime: a.clock,
+        });
+        await a.engine.sync();
+
+        const stored = await a.store.load();
+        const otherChunks = (stored?.entries[other] as { chunks?: string[] } | undefined)?.chunks ?? [];
+        expect(otherChunks.length, "the other note should have chunks to steal").toBeGreaterThan(0);
+
+        const uid = 1_000_000;
+        await a.engine.acceptBatch({
+            from: uid,
+            to: uid,
+            entries: [
+                {
+                    uid,
+                    path: sealed,
+                    // The size of the file being overwritten, with the chunks of
+                    // the one being substituted in.
+                    size: before.length,
+                    ctime: 0,
+                    mtime: a.clock + 5000,
+                    folder: false,
+                    deleted: false,
+                    chunks: [...otherChunks],
+                    device: "b",
+                },
+            ],
+        });
+
+        await a.engine.sync();
+
+        // The note is untouched. A refusal that already wrote is not a refusal.
+        expect(await a.vault.read(path)).toEqual(before);
+    });
+
+    it("still accepts an ordinary empty note, which is a size of zero and no chunks", async () => {
+        const { sealed } = await synced();
+        const uid = 1_000_000;
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid,
+                entries: [
+                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: false, chunks: [], device: "b" },
+                ],
+            })
+        ).resolves.toBeUndefined();
+    });
 });

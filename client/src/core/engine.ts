@@ -76,6 +76,36 @@ export function contentId(chunkNames: readonly string[]): string {
 }
 
 /**
+ * Refuses a batch entry that contradicts itself, before anything acts on it.
+ *
+ * Everything here except the sealed path arrives in the clear and unsigned, and
+ * the server holds every sealed path in the vault, so it can name any file. The
+ * protocol doc states this invariant and assigned it to the server: "a file
+ * declaring a size names at least one chunk, since a size with no chunks is
+ * byte-identical on the wire to an empty note." It was never mirrored here.
+ *
+ * Unmirrored, one frame emptied a note. `contentId([])` is `-empty-`,
+ * `chunkNamesOf` gives it back as no chunks, nothing is fetched, and the
+ * zero-length assembly is written over the file. Through `write` rather than
+ * `remove`, so there is no trash copy, and the emptied note then goes to every
+ * peer as an ordinary edit.
+ *
+ * A corrupt row does this as readily as a hostile server, which is the same
+ * reason the size and chunk-count limits exist.
+ */
+function checkEntryShape(e: WireEntry): void {
+    if (!e.folder && !e.deleted && e.size > 0 && e.chunks.length === 0) {
+        throw new Error(
+            `version ${e.uid} declares ${e.size} bytes and names no chunks, which cannot both be true`
+        );
+    }
+    if (e.chunks.length > 0 && (e.folder || e.deleted)) {
+        const what = e.folder ? "a folder" : "a deletion";
+        throw new Error(`version ${e.uid} is ${what} and names ${e.chunks.length} chunks`);
+    }
+}
+
+/**
  * The chunk names back out of a content id.
  *
  * The id is the names joined, so this is not a lookup, it is punctuation. It
@@ -377,6 +407,7 @@ export class Engine {
      */
     async acceptBatch(batch: { from: number; to: number; entries: WireEntry[] }): Promise<void> {
         for (const e of batch.entries) {
+            checkEntryShape(e);
             const path = await this.plaintextPath(e.path);
             this.remote.set(path, {
                 uid: e.uid,
@@ -1194,6 +1225,15 @@ export class Engine {
             return body;
         });
         const content = await this.assemble(d.remote.uid, bodies);
+        // The declared size is the count of the bytes that were chunked, so this
+        // is exact rather than approximate, and a mismatch means the chunk list
+        // is not the one that file was made of. Checked here as well as on
+        // arrival because this is the line that overwrites somebody's note.
+        if (content.length !== d.remote.size) {
+            throw new Error(
+                `version ${d.remote.uid} of ${d.path} assembled to ${content.length} bytes, not the ${d.remote.size} it declares`
+            );
+        }
 
         await this.opts.vault.write(d.path, content, { mtime: d.remote.mtime, ctime: d.remote.mtime });
         observe(d.entry, { folder: false, mtime: d.remote.mtime, ctime: d.remote.mtime, size: content.length });
