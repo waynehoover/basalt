@@ -81,12 +81,18 @@ describe("a path that is a file here and a folder there", () => {
         const b = await device("b");
 
         // A has a note called `notes`. B makes a folder of the same name.
+        //
+        // Both decide locally before either syncs, for the reason the other two
+        // tests here say: settling A first pushes `notes` to B over its live
+        // connection, and then this mkdir lands on an existing file and throws
+        // EEXIST. The disagreement never gets built, and whether that happens
+        // is a race, so it passed here and failed on CI.
         const { writeFile, mkdir } = await import("node:fs/promises");
         await writeFile(join(a.dir, "notes"), "a file, not a folder\n");
-        await a.c.settle();
-
         await mkdir(join(b.dir, "notes"));
         await writeFile(join(b.dir, "notes", "inside.md"), "in the folder\n");
+
+        await a.c.settle();
         await b.c.settle();
 
         for (let i = 0; i < 5; i++) {
