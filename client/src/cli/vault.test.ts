@@ -486,3 +486,53 @@ describe("reading a file in blocks and in ranges", () => {
         }
     });
 });
+
+/**
+ * A symlinked folder inside a vault is ordinary practice: a shared attachments
+ * directory, a media mount, a notes tree living elsewhere. `absolute` proved
+ * containment on the *string* only, and every write followed the link, so a peer
+ * naming a path under such a folder wrote outside the vault with the user's
+ * privileges. `list` deliberately does not follow or report symlinks, so the
+ * folder never syncs out and the vault never learns it exists: the write side
+ * was the only side that disagreed.
+ */
+describe("a symlinked folder is not a way out of the vault", () => {
+    it("refuses to write through one, and leaves what is out there alone", async () => {
+        const { symlink, mkdir: mkdirp, writeFile: wf, readFile: rf } = await import("node:fs/promises");
+        const outside = join(root, "..", `outside-${Date.now()}`);
+        await mkdirp(outside, { recursive: true });
+        const victim = join(outside, "authorized_keys");
+        await wf(victim, "the real contents\n");
+        await symlink(outside, join(root, "Attachments"));
+
+        const vault = new NodeVault(root);
+        await expect(
+            vault.write("Attachments/authorized_keys", enc.encode("written by a peer\n"), {
+                mtime: 1_700_000_000_000,
+                ctime: 1_700_000_000_000,
+            })
+        ).rejects.toThrow();
+
+        expect(await rf(victim, "utf8")).toBe("the real contents\n");
+        await removeTree(outside);
+    });
+
+    it("refuses to make a directory through one", async () => {
+        const { symlink, mkdir: mkdirp } = await import("node:fs/promises");
+        const outside = join(root, "..", `outside2-${Date.now()}`);
+        await mkdirp(outside, { recursive: true });
+        await symlink(outside, join(root, "Media"));
+
+        await expect(new NodeVault(root).mkdir("Media/deep")).rejects.toThrow();
+        await removeTree(outside);
+    });
+
+    it("still writes into an ordinary folder of the same shape", async () => {
+        const vault = new NodeVault(root);
+        await vault.write("Attachments/real.md", enc.encode("fine\n"), {
+            mtime: 1_700_000_000_000,
+            ctime: 1_700_000_000_000,
+        });
+        expect(dec.decode(await vault.read("Attachments/real.md"))).toBe("fine\n");
+    });
+});

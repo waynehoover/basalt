@@ -9,7 +9,7 @@
  */
 
 import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
-import { access, cp, mkdir, open, readFile, readdir, rename, rm, stat, utimes } from "node:fs/promises";
+import { access, cp, mkdir, open, readFile, readdir, realpath, rename, rm, stat, utimes } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
@@ -86,6 +86,45 @@ export class NodeVault implements Vault {
      * the vault key; it does not prove they meant this device well, and a bug on
      * another device is enough.
      */
+    /** The vault root with its links resolved, worked out once. */
+    private realRootOnce: Promise<string> | undefined;
+
+    /**
+     * Proves containment against the filesystem rather than the string.
+     *
+     * `absolute` resolves `..` lexically. That is everything for a path trying
+     * to climb out and nothing for one walking through a symlinked folder, and
+     * a vault with `Attachments -> /elsewhere` is ordinary: a shared media
+     * directory, a notes tree living on another disk. `list` neither follows nor
+     * reports such a folder, so it never syncs out and the vault never learns it
+     * is there, but every write followed it. A peer naming a path under one
+     * wrote outside the vault with the user's privileges, and `remove` deleted
+     * out there.
+     *
+     * The deepest ancestor that exists is the one worth resolving; anything
+     * below it is about to be created and cannot be a link yet.
+     */
+    private async insideForReal(full: string): Promise<void> {
+        const root = await (this.realRootOnce ??= realpath(this.root));
+        let at = dirname(full);
+        for (;;) {
+            const real = await realpath(at).catch((err: NodeJS.ErrnoException) => {
+                if (err.code === "ENOENT") return undefined;
+                throw err;
+            });
+            if (real !== undefined) {
+                if (real !== root && !real.startsWith(root + sep)) {
+                    throw new Error(`refusing a path that leaves the vault through a link: ${full}`);
+                }
+                return;
+            }
+            const up = dirname(at);
+            // The filesystem root, which cannot be inside the vault.
+            if (up === at) return;
+            at = up;
+        }
+    }
+
     private absolute(path: string): string {
         const full = resolve(this.root, path);
         const rel = relative(this.root, full);
@@ -210,6 +249,7 @@ export class NodeVault implements Vault {
      */
     async write(path: string, bytes: Uint8Array, times: { mtime: number; ctime: number }): Promise<void> {
         const full = this.absolute(path);
+        await this.insideForReal(full);
         await mkdir(dirname(full), { recursive: true });
         await writeDurably(full, bytes);
         if (times.mtime > 0) {
@@ -233,6 +273,7 @@ export class NodeVault implements Vault {
      */
     async remove(path: string): Promise<void> {
         const full = this.absolute(path);
+        await this.insideForReal(full);
         try {
             await access(full, constants.F_OK);
         } catch {
@@ -279,7 +320,9 @@ export class NodeVault implements Vault {
     }
 
     async mkdir(path: string): Promise<void> {
-        await mkdir(this.absolute(path), { recursive: true });
+        const full = this.absolute(path);
+        await this.insideForReal(full);
+        await mkdir(full, { recursive: true });
     }
 
     async exists(path: string): Promise<boolean> {
