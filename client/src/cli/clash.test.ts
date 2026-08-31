@@ -8,7 +8,7 @@
  * is the question.
  */
 
-import { mkdtemp, readFile, readdir, stat } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -72,6 +72,90 @@ async function contents(dir: string): Promise<string> {
   await walk(dir, "");
   return out.sort().join(" | ");
 }
+
+/**
+ * Whether this filesystem folds case, asked rather than assumed.
+ *
+ * macOS and Windows do by default and Linux does not, and the test below is
+ * only meaningful where it does. Skipping is honest; asserting case-sensitive
+ * behaviour on a case-folding machine, or the reverse, is not.
+ */
+async function foldsCase(dir: string): Promise<boolean> {
+  await writeFile(join(dir, "CaseProbe.tmp"), "probe");
+  try {
+    await stat(join(dir, "caseprobe.tmp"));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await rm(join(dir, "CaseProbe.tmp"), { force: true });
+  }
+}
+
+describe("a rename that changes only case", () => {
+  /**
+   * The note went missing on the receiving device, and the server agreed.
+   *
+   * One device renames `Note.md` to `NOTE.md`. The other is told to write the
+   * new name and delete the old, and deletions are applied after writes so a
+   * move can be served from bytes already on disk. On a filesystem that folds
+   * case those are one file: it wrote the note and then deleted it, then
+   * reported the deletion, and the server marked the note gone. The device
+   * that still had it was told so on its next pass.
+   */
+  it("does not delete the file it has just written", async () => {
+    server = new TestServer();
+    await server.start();
+    const a = await device("a");
+    const b = await device("b");
+    if (!(await foldsCase(b.dir))) {
+      // Nothing to prove here: two names, two files, and the delete is right.
+      return;
+    }
+
+    await writeFile(join(a.dir, "Note.md"), "the only copy of this text\n");
+    await a.c.settle({}, 8);
+    await b.c.settle({}, 8);
+    expect(await contents(b.dir)).toContain("Note.md: the only copy of this text");
+
+    await rename(join(a.dir, "Note.md"), join(a.dir, "NOTE.md"));
+    await a.c.settle({}, 8);
+    await b.c.settle({}, 8);
+    await a.c.settle({}, 8);
+
+    // The property is the text, not the spelling. Which case each device shows
+    // is the filesystem's business; that the note is readable is not.
+    const onB = await contents(b.dir);
+    expect(onB, `b holds: ${onB}`).toContain("the only copy of this text");
+    const onA = await contents(a.dir);
+    expect(onA, `a holds: ${onA}`).toContain("the only copy of this text");
+
+    // Both devices spell it the way the rename asked for. Getting the bytes
+    // right and the name wrong is not enough: the next scan would call the new
+    // name missing and report a deletion nobody made.
+    expect(onB).toContain("NOTE.md:");
+    expect(onA).toContain("NOTE.md:");
+
+    // The old name is deleted, which is what a rename is. The new one must not
+    // be: b reporting that deletion is how the note disappeared everywhere, so
+    // this is the assertion that actually pins the bug.
+    const deleted = await b.c.deleted();
+    const names = deleted.notes.map((n) => n.path);
+    expect(names, `the server thinks these are deleted: ${names.join(", ")}`).not.toContain(
+      "NOTE.md",
+    );
+    expect(names).toContain("Note.md");
+
+    // And it holds after another pass each way, which is where it went wrong
+    // before: the first pass looked right and the second reported the loss.
+    await b.c.settle({}, 8);
+    await a.c.settle({}, 8);
+    expect(await contents(a.dir)).toContain("the only copy of this text");
+    expect(await contents(b.dir)).toContain("the only copy of this text");
+    const later = (await b.c.deleted()).notes.map((n) => n.path);
+    expect(later, `after settling: ${later.join(", ")}`).not.toContain("NOTE.md");
+  }, 60_000);
+});
 
 describe("a path that is a file here and a folder there", () => {
   it("keeps the note and settles on something", async () => {

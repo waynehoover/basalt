@@ -577,3 +577,75 @@ describe("reading a file through its resource URL", () => {
     await expect(vault.readRange("big.bin", 0, 10)).rejects.toThrow(/404/);
   });
 });
+
+/**
+ * A filesystem that folds case, which is what macOS and Windows are.
+ *
+ * `FakeAdapter` is a Map and so is case-sensitive, like Linux. Most of this
+ * file is right to use it. This corner is not: the bug it covers only exists
+ * where two spellings are one file, and on a case-sensitive fake there is
+ * nothing to reproduce. So the writes and reads are folded, and `list` reports
+ * the spelling the directory entry actually has, which is the whole point.
+ */
+class FoldingAdapter extends FakeAdapter {
+  private readonly spelling = new Map<string, string>();
+
+  private key(path: string): string {
+    return path.normalize("NFC").toLowerCase();
+  }
+
+  private real(path: string): string {
+    return this.spelling.get(this.key(path)) ?? path;
+  }
+
+  override async writeBinary(path: string, data: ArrayBuffer, opts?: unknown): Promise<void> {
+    const at = this.real(path);
+    this.spelling.set(this.key(path), at);
+    await super.writeBinary(at, data, opts as never);
+  }
+
+  override async exists(path: string): Promise<boolean> {
+    return super.exists(this.real(path));
+  }
+
+  override async readBinary(path: string): Promise<ArrayBuffer> {
+    return super.readBinary(this.real(path));
+  }
+
+  override async rename(from: string, to: string): Promise<void> {
+    await super.rename(this.real(from), to);
+    this.spelling.delete(this.key(from));
+    this.spelling.set(this.key(to), to);
+  }
+}
+
+describe("writing a name that differs only by case", () => {
+  it("renames the file rather than leaving the old spelling", async () => {
+    const folding = new FoldingAdapter();
+    const vault = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
+    const times = { mtime: 1000, ctime: 1000 };
+
+    await vault.write("Note.md", new TextEncoder().encode("first"), times);
+    expect((await folding.list("/")).files).toContain("Note.md");
+
+    // The other device renamed it. Writing the new spelling has to move the
+    // directory entry, or the next scan calls NOTE.md missing and reports a
+    // deletion that nobody made.
+    await vault.write("NOTE.md", new TextEncoder().encode("first"), times);
+    const listed = (await folding.list("/")).files;
+    expect(listed).toContain("NOTE.md");
+    expect(listed).not.toContain("Note.md");
+    expect(listed.filter((f) => f.toLowerCase() === "note.md")).toHaveLength(1);
+  });
+
+  it("calls two spellings of one file the same file, and two files not", async () => {
+    const folding = new FoldingAdapter();
+    const vault = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
+    await vault.write("Note.md", new TextEncoder().encode("first"), { mtime: 1, ctime: 1 });
+
+    expect(await vault.sameFile("Note.md", "NOTE.md")).toBe(true);
+    expect(await vault.sameFile("Note.md", "Note.md")).toBe(true);
+    // Different names are different files whatever the filesystem does.
+    expect(await vault.sameFile("Note.md", "Other.md")).toBe(false);
+  });
+});

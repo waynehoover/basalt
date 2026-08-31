@@ -765,8 +765,10 @@ export class Engine {
 
     // Whatever is still queued moves now. Until these return, no write in
     // this pass has been acknowledged and no queued file is on disk.
+    this.wroteThisPass = [];
     await this.fill(report);
     await this.applyDeletes(report);
+    this.wroteThisPass = [];
     await this.flush(report);
 
     this.opts.onProgress?.(undefined);
@@ -1467,15 +1469,54 @@ export class Engine {
    * The local deletions this pass decided on, applied once its writes are done.
    *
    * A path is either deleted or written in one pass, never both, because
-   * `decide` returns one action for it, so nothing here can undo a download.
+   * `decide` returns one action for it. That is true of paths and was taken to
+   * be true of files, and it is not: rename `Note.md` to `NOTE.md` and the
+   * other device is told to write one and delete the other, which on macOS or
+   * Windows is one file. It wrote the note and then deleted it, reported the
+   * deletion back, and the server agreed the note was gone. Nothing on that
+   * device was left to notice.
+   *
+   * So the writes are remembered, and a deletion naming a file one of them
+   * produced is refused. Rule 3 in its smallest form: not "the path is
+   * different" but "the file is a different file".
    */
   private pendingDeletes: { path: string; why: string }[] = [];
+  private wroteThisPass: string[] = [];
+
+  /**
+   * Whether removing `path` would remove something this pass wrote.
+   *
+   * The vault answers where it can, because the filesystem is the only thing
+   * that actually knows. Where it cannot, two paths equal under case folding
+   * are treated as one file, which keeps the note.
+   */
+  private async wouldUndoAWrite(path: string): Promise<string | undefined> {
+    const vault = this.opts.vault;
+    for (const wrote of this.wroteThisPass) {
+      if (wrote === path) continue;
+      const same = vault.sameFile
+        ? await vault.sameFile(wrote, path)
+        : wrote.normalize("NFC").toLowerCase() === path.normalize("NFC").toLowerCase();
+      if (same) return wrote;
+    }
+    return undefined;
+  }
 
   private async applyDeletes(report: SyncReport): Promise<void> {
     const deletes = this.pendingDeletes;
     this.pendingDeletes = [];
     for (const { path, why } of deletes) {
       try {
+        const wrote = await this.wouldUndoAWrite(path);
+        if (wrote !== undefined) {
+          // Not a failure and not retried: the file is where it should be,
+          // under the name the server asked for. Only the deletion of its old
+          // name has nowhere to land, because that name was never a second
+          // file here.
+          this.entries.delete(path);
+          this.log("kept", path, `deleting it would remove ${wrote}, which is the same file`);
+          continue;
+        }
         await this.opts.vault.remove(path);
         this.entries.delete(path);
         report.deletedLocally++;
@@ -1535,6 +1576,7 @@ export class Engine {
     if (contentId(names) !== contentId(d.chunks)) return false;
 
     await this.opts.vault.write(d.path, bytes, { mtime: d.remote.mtime, ctime: d.remote.mtime });
+    this.wroteThisPass.push(d.path);
     observe(d.entry, {
       folder: false,
       mtime: d.remote.mtime,
@@ -1567,6 +1609,7 @@ export class Engine {
     }
 
     await this.opts.vault.write(d.path, content, { mtime: d.remote.mtime, ctime: d.remote.mtime });
+    this.wroteThisPass.push(d.path);
     observe(d.entry, {
       folder: false,
       mtime: d.remote.mtime,

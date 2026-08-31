@@ -300,6 +300,7 @@ export class ObsidianVault implements Vault {
   ): Promise<void> {
     const normalized = this.resolve(path);
     await this.ensureParents(normalized);
+    await this.matchCase(normalized);
     // Copied into its own buffer. A Uint8Array that is a view into a larger
     // one would hand over neighbouring bytes, and chunk reassembly produces
     // exactly that kind of view.
@@ -308,6 +309,61 @@ export class ObsidianVault implements Vault {
       ...(times.mtime > 0 ? { mtime: times.mtime } : {}),
       ...(times.ctime > 0 ? { ctime: times.ctime } : {}),
     });
+  }
+
+  /**
+   * Renames an existing file to the spelling being written, where they differ.
+   *
+   * macOS and Windows fold case, so writing `NOTE.md` over an existing
+   * `Note.md` writes the same file and leaves the name spelled the old way.
+   * The bytes are then right and the name is not, the next scan calls the new
+   * name missing, and the deletion that follows travels to every device. A
+   * rename that changed only case lost the note, one pass after it looked
+   * fine. Obsidian's own index is asked rather than the platform guessed at.
+   */
+  private async matchCase(normalized: string): Promise<void> {
+    if (!(await this.adapter.exists(normalized))) return;
+
+    const cut = normalized.lastIndexOf("/");
+    const dir = cut === -1 ? "/" : normalized.slice(0, cut);
+    let listed;
+    try {
+      listed = await this.adapter.list(dir);
+    } catch {
+      return;
+    }
+    if (listed.files.includes(normalized)) return; // Already spelled this way.
+
+    const folded = normalized.normalize("NFC").toLowerCase();
+    const actual = listed.files.find((f) => f.normalize("NFC").toLowerCase() === folded);
+    if (actual === undefined || actual === normalized) return;
+    await this.adapter.rename(actual, normalized);
+    this.actualName.delete(actual);
+  }
+
+  /**
+   * Whether two paths are one file, according to Obsidian's own listing.
+   *
+   * Two spellings that fold together and appear once between them are one
+   * file. The engine asks before applying a deletion, because deleting the old
+   * name of a case-only rename would delete the note it just wrote.
+   */
+  async sameFile(a: string, b: string): Promise<boolean> {
+    if (a === b) return true;
+    const left = this.resolve(a);
+    const right = this.resolve(b);
+    if (left === right) return true;
+    if (left.normalize("NFC").toLowerCase() !== right.normalize("NFC").toLowerCase()) return false;
+
+    const cut = left.lastIndexOf("/");
+    const dir = cut === -1 ? "/" : left.slice(0, cut);
+    try {
+      const listed = await this.adapter.list(dir);
+      // Both spellings present means two files, and both deserve their fate.
+      return !(listed.files.includes(left) && listed.files.includes(right));
+    } catch {
+      return true;
+    }
   }
 
   /**

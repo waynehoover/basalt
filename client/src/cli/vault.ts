@@ -324,12 +324,51 @@ export class NodeVault implements Vault {
     const full = this.absolute(path);
     await this.insideForReal(full);
     await mkdir(dirname(full), { recursive: true });
+    await this.matchCase(full);
     await writeDurably(full, bytes, false);
     this.unflushed.add(dirname(full));
     if (times.mtime > 0) {
       const seconds = times.mtime / 1000;
       await utimes(full, seconds, seconds);
     }
+  }
+
+  /**
+   * Renames an existing file to the spelling being written, where they differ.
+   *
+   * On a filesystem that folds case, writing `NOTE.md` over an existing
+   * `Note.md` writes the same file and leaves the directory entry spelled the
+   * old way. The bytes are then right and the name is not, so the next scan
+   * reports `NOTE.md` missing, the engine calls it deleted, and the deletion
+   * travels to every other device. A rename that only changed case therefore
+   * lost the note everywhere, one pass later than it looked.
+   *
+   * Only reached when the target already exists, which for a first download is
+   * never, so it costs nothing on the path that moves the most files.
+   */
+  private async matchCase(full: string): Promise<void> {
+    let there;
+    try {
+      there = await stat(full);
+    } catch {
+      return; // Nothing there under any spelling.
+    }
+    if (there.isDirectory()) return;
+
+    const dir = dirname(full);
+    const want = basename(full);
+    let entries: string[];
+    try {
+      entries = await readdir(dir);
+    } catch {
+      return;
+    }
+    if (entries.includes(want)) return; // Spelled the way it is being written.
+
+    const folded = want.normalize("NFC").toLowerCase();
+    const actual = entries.find((e) => e.normalize("NFC").toLowerCase() === folded);
+    if (actual === undefined) return;
+    await rename(join(dir, actual), full);
   }
 
   /**
@@ -408,6 +447,25 @@ export class NodeVault implements Vault {
     try {
       await access(this.absolute(path), constants.F_OK);
       return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Whether two paths are one file, asked of the filesystem rather than guessed.
+   *
+   * Device and inode, which is the only answer that holds everywhere: case
+   * folding on macOS and Windows, Unicode normalisation on HFS+, and a hard
+   * link, which no amount of comparing strings would catch. A path that is not
+   * there is not the same file as anything, including another path that is not
+   * there.
+   */
+  async sameFile(a: string, b: string): Promise<boolean> {
+    if (a === b) return true;
+    try {
+      const [x, y] = await Promise.all([stat(this.absolute(a)), stat(this.absolute(b))]);
+      return x.dev === y.dev && x.ino === y.ino;
     } catch {
       return false;
     }

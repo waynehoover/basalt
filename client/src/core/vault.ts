@@ -77,6 +77,20 @@ export interface Vault {
   mkdir(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
   /**
+   * Whether two paths name the same file on this filesystem.
+   *
+   * Not the same question as string equality, and the difference loses notes.
+   * macOS and Windows fold case, so `Note.md` and `NOTE.md` are two paths here
+   * and one file there. A pass that writes one and deletes the other then
+   * deletes what it just wrote.
+   *
+   * Optional, because only a vault that can ask the platform should answer.
+   * When it is absent the engine assumes two paths differing only by case are
+   * the same file, which is right on every platform the plugin runs on and
+   * errs towards keeping a file rather than removing one.
+   */
+  sameFile?(a: string, b: string): Promise<boolean>;
+  /**
    * Watches for changes, returning a function that stops watching.
    *
    * Optional. A vault that cannot watch is polled instead, which is slower to
@@ -139,6 +153,7 @@ interface MemoryFile {
 export class MemoryVault implements Vault {
   private readonly files = new Map<string, MemoryFile>();
   private readonly folders = new Set<string>();
+
   private listeners: ((path: string) => void)[] = [];
   /** Every write this vault has seen, for tests that care about how it got here. */
   readonly writeLog: string[] = [];
