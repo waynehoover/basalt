@@ -1059,7 +1059,17 @@ func TestASilentConnectionIsKeptRatherThanClosed(t *testing.T) {
 // caught sooner and more cheaply, by the read failing.
 func TestAConnectionThatDoesNotAnswerAPingIsReaped(t *testing.T) {
 	r := newRig(t)
-	r.srv.pingEvery = 10 * time.Millisecond
+	// The first ping has to land after the check below, not before it. At ten
+	// milliseconds it did not reliably: a loaded runner took longer than that to
+	// get from hello to peerCount, the session was reaped in between, and the
+	// test failed claiming a connection had never been made. The reap is what is
+	// being tested and it still happens a quarter of a second in, so the test is
+	// no slower in any way that matters.
+	//
+	// Set before dialling because the ticker reads pingEvery once when the
+	// session starts. pongWait is read per ping, but writing it from here while
+	// that goroutine reads it would be a data race, so it is set once too.
+	r.srv.pingEvery = 250 * time.Millisecond
 	r.srv.pongWait = time.Nanosecond // no pong can arrive this fast
 
 	cl := r.dial("a")
