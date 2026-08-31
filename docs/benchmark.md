@@ -106,10 +106,15 @@ once by the upload that sends it, so dropping the sealed bodies between windows
 saves more than one copy of the file. It is not slower: sealing is mostly
 waiting on WebCrypto and sixteen in flight keeps it busy.
 
-What is left is the plaintext itself. The vault hands over a whole file and
-Obsidian's adapter has no streaming read to offer instead, so the floor for a
-file is the file. `chunkStream` exists for the case where a Blob can be read in
-blocks, and nothing uses it yet.
+What was left at that point was the plaintext itself. The vault handed over a
+whole file, `DataAdapter` offers no streaming read beside it, and so the floor
+for a file was the file. `chunkStream` existed for a vault that could be read in
+blocks and nothing called it.
+
+That is what the rest of this section is about. It is called now, by the engine,
+for any vault offering `readBlocks` and `readRange`, which both the headless
+client and the plugin do. The floor is gone, and the numbers below are what
+replaced it.
 
 Peak resident and wall clock for a whole sync of one attachment, measured on
 this laptop, with the headless client:
