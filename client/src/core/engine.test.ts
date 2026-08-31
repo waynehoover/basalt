@@ -1671,3 +1671,61 @@ describe("a version that is not the version it is offered as", () => {
         ).rejects.toThrow(/not the version it is being offered as/);
     });
 });
+
+/**
+ * A move should not put the file back on the wire.
+ *
+ * Chunk names are hashes of ciphertext, so moving a file costs the sender
+ * nothing: the server already holds every chunk and only metadata travels. The
+ * receiver had no such luck and downloaded the whole file back, under a name it
+ * was already storing the identical bytes under. Moving one folder of
+ * attachments re-pulled all of it, on every other device.
+ *
+ * Proved the only way that leaves no doubt: every chunk body is deleted from the
+ * server before the receiving device syncs, so a single byte off the wire would
+ * fail the test rather than merely be slower.
+ */
+describe("a move is not a download", () => {
+    let server: TestServer;
+    let a: Device;
+    let b: Device;
+
+    afterEach(async () => {
+        a?.transport?.close();
+        b?.transport?.close();
+        if (server) await server.cleanup();
+    });
+
+    it("applies from bytes the device already holds, with the server emptied", async () => {
+        server = new TestServer();
+        await server.start();
+        a = new Device("a");
+        b = new Device("b");
+        await a.connect(server);
+        await b.connect(server);
+
+        const body = new TextEncoder().encode("a paragraph worth moving.\n".repeat(400));
+        await a.vault.write("Notes/big.md", body, { mtime: a.clock, ctime: a.clock });
+        await convergeBoth(a, b);
+        expect(await b.vault.read("Notes/big.md")).toEqual(body);
+
+        // The move, as a delete of the old path and a write of the new one,
+        // which is what a filesystem scan sees.
+        await a.vault.remove("Notes/big.md");
+        await a.vault.write("Archive/big.md", body, { mtime: a.clock + 1000, ctime: a.clock + 1000 });
+        await a.engine.sync();
+        await new Promise((r) => setTimeout(r, 120));
+
+        // Now the server cannot serve a single byte of it.
+        const { rm, readdir } = await import("node:fs/promises");
+        const { join } = await import("node:path");
+        const chunks = join(server.dataDir, "chunks");
+        for (const vault of await readdir(chunks)) {
+            await rm(join(chunks, vault), { recursive: true, force: true });
+        }
+
+        await b.engine.sync();
+
+        expect(await b.vault.read("Archive/big.md"), "the move needed the wire after all").toEqual(body);
+    }, 300_000);
+});

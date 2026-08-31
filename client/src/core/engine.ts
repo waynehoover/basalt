@@ -702,6 +702,7 @@ export class Engine {
         // Whatever is still queued moves now. Until these return, no write in
         // this pass has been acknowledged and no queued file is on disk.
         await this.fill(report);
+        await this.applyDeletes(report);
         await this.flush(report);
 
         this.opts.onProgress?.(undefined);
@@ -948,10 +949,16 @@ export class Engine {
 
 
             case "deleteLocal":
-                await this.opts.vault.remove(path);
-                this.entries.delete(path);
-                report.deletedLocally++;
-                this.log("deleted locally", path, action.why);
+                // Held until the pass has written everything it is going to.
+                //
+                // Rule 3 argues for this on its own: never delete until a
+                // verified copy exists elsewhere. A move makes it concrete. The
+                // old path is deleted and the new one downloaded in the same
+                // pass, and deleting first threw away the only local copy of
+                // bytes the pass was about to write back, so the file came over
+                // the wire instead. Deferring costs nothing and means there is
+                // never a moment where neither name holds the note.
+                this.pendingDeletes.push({ path, why: action.why });
                 return;
 
             case "deleteRemote": {
@@ -1347,9 +1354,25 @@ export class Engine {
         this.inbox = [];
         this.inboxBytes = 0;
 
+        // Bytes this device already holds are not worth asking for again.
+        //
+        // A move is the case that matters. Chunk names are hashes of
+        // ciphertext, so moving a file costs the sender nothing: the server
+        // already has every chunk and only metadata travels. The receiver had
+        // no such luck, and downloaded the whole file back over a name it was
+        // already storing under. Moving one folder of attachments re-pulled all
+        // of it, on every other device.
+        const local = new Map<Incoming, string>();
+        const byContent = this.heldByContent();
+        for (const d of batch) {
+            const from = byContent.get(contentId(d.chunks));
+            if (from !== undefined && from !== d.path) local.set(d, from);
+        }
+
         const wanted: string[] = [];
         const seen = new Set<string>();
         for (const d of batch) {
+            if (local.has(d)) continue;
             for (const name of d.chunks) {
                 if (!seen.has(name)) {
                     seen.add(name);
@@ -1373,7 +1396,20 @@ export class Engine {
 
         for (const d of batch) {
             try {
-                await this.land(d, held);
+                const from = local.get(d);
+                if (from !== undefined && (await this.landFromLocal(d, from))) {
+                    if (d.kind === "download") report.downloaded++;
+                    else report.restored++;
+                    this.log(d.kind, d.path, `${d.why}, from ${from} without asking`);
+                    continue;
+                }
+                if (from !== undefined) {
+                    // The local copy did not prove out, so ask for it after all.
+                    // Rare, and it costs one extra round trip rather than a file.
+                    await this.land(d, await this.fetchFor(d));
+                } else {
+                    await this.land(d, held);
+                }
                 if (d.kind === "download") report.downloaded++;
                 else report.restored++;
                 this.log(d.kind, d.path, d.why);
@@ -1381,6 +1417,84 @@ export class Engine {
                 this.recordFailure(d.path, err, report);
             }
         }
+    }
+
+    /**
+     * The local deletions this pass decided on, applied once its writes are done.
+     *
+     * A path is either deleted or written in one pass, never both, because
+     * `decide` returns one action for it, so nothing here can undo a download.
+     */
+    private pendingDeletes: { path: string; why: string }[] = [];
+
+    private async applyDeletes(report: SyncReport): Promise<void> {
+        const deletes = this.pendingDeletes;
+        this.pendingDeletes = [];
+        for (const { path, why } of deletes) {
+            try {
+                await this.opts.vault.remove(path);
+                this.entries.delete(path);
+                report.deletedLocally++;
+                this.log("deleted locally", path, why);
+            } catch (err) {
+                this.recordFailure(path, err, report);
+            }
+        }
+    }
+
+    /** Every path this device holds, by the content it holds, newest wins. */
+    private heldByContent(): Map<string, string> {
+        const by = new Map<string, string>();
+        for (const [path, entry] of this.entries) {
+            if (entry.folder || entry.hash === "" || entry.hash === "-empty-") continue;
+            by.set(entry.hash, path);
+        }
+        return by;
+    }
+
+    /** The chunks for one entry, asked for on their own. */
+    private async fetchFor(d: Incoming): Promise<Map<string, Uint8Array>> {
+        const bodies = await this.opts.transport.fetch([...d.chunks]);
+        const held = new Map<string, Uint8Array>();
+        d.chunks.forEach((name, i) => held.set(name, bodies[i]!));
+        return held;
+    }
+
+    /**
+     * Writes a version from a copy this device already has, or declines to.
+     *
+     * Declining is the important half. The index says this path holds that
+     * content, and the index can be out of date: the file may have been edited
+     * between the scan and here. So the bytes are re-chunked and re-sealed and
+     * the names compared, which is exact rather than trusting: sealing is
+     * deterministic, so identical content gives identical names, and that is
+     * the same property deduplication is built on.
+     *
+     * A false negative costs one round trip, which is what the old code did
+     * every time. A false positive would write the wrong bytes into somebody's
+     * note, so there is no version of this worth guessing at.
+     */
+    private async landFromLocal(d: Incoming, from: string): Promise<boolean> {
+        let bytes: Uint8Array;
+        try {
+            bytes = await this.opts.vault.read(from);
+        } catch {
+            return false;
+        }
+        if (bytes.length !== d.remote.size) return false;
+
+        const isText = this.mergeable(from);
+        const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map((c) => c.bytes);
+        const names = (await sealChunks(this.opts.keys, parts)).map((c) => c.name);
+        if (contentId(names) !== contentId(d.chunks)) return false;
+
+        await this.opts.vault.write(d.path, bytes, { mtime: d.remote.mtime, ctime: d.remote.mtime });
+        observe(d.entry, { folder: false, mtime: d.remote.mtime, ctime: d.remote.mtime, size: bytes.length });
+        d.entry.chunks = [...d.chunks];
+        d.entry.hash = contentId(d.chunks);
+        d.entry.size = bytes.length;
+        synced(d.entry, d.entry.hash, d.entry.chunks, d.remote.uid, this.now());
+        return true;
     }
 
     /** Writes one queued version from bodies already in hand. */

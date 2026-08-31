@@ -476,15 +476,13 @@ describe("one secret", () => {
         const a = await vaultDir("a");
         await cli("init", "--dir", a, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
 
-        // Kept until it has been used, because until then it is the only thing
-        // that opens an unclaimed vault.
-        const before = JSON.parse(await read(a, ".basalt/config.json")) as Record<string, string>;
-        expect(before["bootstrap"]).toBe(server.token);
-
+        // Spent during init, because init is what claims the vault. It used to
+        // survive until the first sync, which meant the vault was unclaimed
+        // until then and a second device paired in between was refused.
         await write(a, "note.md", "claimed\n");
         expect((await cli("sync", "--dir", a, "--json")).code).toBe(0);
 
-        // Spent. Keeping it is keeping a second secret that opens nothing.
+        // Keeping it is keeping a second secret that opens nothing.
         const after = JSON.parse(await read(a, ".basalt/config.json")) as Record<string, string>;
         expect(after["bootstrap"]).toBeUndefined();
         expect(Object.keys(after).sort()).toEqual(["device", "secret", "url", "vaultId"]);
@@ -588,5 +586,46 @@ describe("what counts as a successful run", () => {
         await cli("sync", "--dir", dir);
         const again = await cli("sync", "--dir", dir);
         expect(again.code).toBe(0);
+    }, 300_000);
+});
+
+/**
+ * A second device must work the moment it is paired.
+ *
+ * `init` wrote a config and never contacted the server, so the vault stayed
+ * unclaimed until the first device happened to sync. A second device paired
+ * with the printed string and syncing first was refused with "not authorised
+ * for this vault": true, unhelpful, and the remedy is not in the message. It
+ * looks exactly like a bad key.
+ *
+ * Nothing caught it because every test, and every demo, syncs the first device
+ * before the second exists.
+ */
+describe("a vault is claimed when init says it is", () => {
+    it("lets a second device sync before the first ever has", async () => {
+        await fresh();
+        const a = await vaultDir("a");
+        const b = await vaultDir("b");
+
+        const init = await cli("init", "--dir", a, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
+        expect(init.code, init.all).toBe(0);
+        const pairing = init.json()["pairing"] as string;
+
+        // Device a has still never synced. Device b is the first to try.
+        const paired = await cli("pair", pairing, "--dir", b, "--device", "b", "--json");
+        expect(paired.code, paired.all).toBe(0);
+
+        const first = await cli("sync", "--dir", b, "--json");
+        expect(first.code, first.all).toBe(0);
+    }, 300_000);
+
+    it("spends the first-run token during init, not later", async () => {
+        await fresh();
+        const a = await vaultDir("a");
+        const init = await cli("init", "--dir", a, "--server", server.wsUrl, "--token", server.token, "--device", "a", "--json");
+        expect(init.code, init.all).toBe(0);
+
+        const config = JSON.parse(await readFile(join(a, ".basalt", "config.json"), "utf8")) as Record<string, unknown>;
+        expect(config["bootstrap"], "the token is spent once the vault is claimed").toBeUndefined();
     }, 300_000);
 });

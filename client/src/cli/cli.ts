@@ -140,6 +140,22 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
     };
     await saveConfig(args.dir, config);
 
+    // Claim the vault now, rather than leaving it to whenever this device first
+    // syncs.
+    //
+    // init used to write a config and contact nothing, so it reported a paired
+    // vault that the server had never heard of. A second device pairing with
+    // the string printed below and syncing before this one ever did was refused
+    // with "not authorised for this vault": true, unhelpful, and indis-
+    // tinguishable from a bad key. `open` sends the bootstrap token, which is
+    // what claims it, and spends the token on success.
+    //
+    // The config is kept if this throws. The claim may have committed with the
+    // reply lost, and a config discarded in that case is a vault that nothing
+    // will ever open again: the secret in it is the only copy.
+    const claimed = await open(config, args, io);
+    claimed.close();
+
     const pairing = formatPairing(config);
     if (args.json) {
         io.out(JSON.stringify({ ok: true, paired: args.dir, device: config.device, pairing }));
