@@ -109,6 +109,40 @@ Since measured, and worth doing, from an audit of the two client shells on a
    size. A preallocated block buffer makes it 128 MiB and 65. Small in wall
    clock, and the allocation churn is on the axis that matters on a phone.
 
+From an audit of the server, whose headline is that it is not the bottleneck on
+the sync path. A whole sync on loopback profiled at **10.4% CPU**, of which
+`chunks.place` is 64% and its fsync another 16%; everything that is not the
+chunk fsync, meaning the websocket, the JSON, the want list and all of SQLite,
+is under 1.6% of the upload. The server serves a 1000-file vault back in 100 ms.
+So these are real and none of them is on the path a sync takes:
+
+9. **`Deleted()` has no index for its rename-suppression subquery.** It scans
+   every entry newer than the deletion, once per deleted path, and filters
+   `prev_path` in memory. 112 ms against 5.6 ms with an index on
+   `(vault_id, prev_path, uid)`, and the extra index costs 5 us on an insert
+   whose fsync is 7.8 ms.
+10. **`HistoryForPath` reads nearly every chunk row in the vault.** Chunks are
+    attached by `uid BETWEEN min AND max`, which is right for a contiguous batch
+    and wrong for history, whose uids are spread across the vault's whole life.
+    6.1 ms at 10k entries and 83 ms at 100k, against 0.07 ms and 0.3 ms keyed on
+    the actual uids. It grows with history rather than with the page.
+11. **A fetch buffers whole chunk bodies.** The send queue is bounded at 256
+    frames and not in bytes, so one peer that stops reading grew the heap by
+    272 MB, measured. The arithmetic bound is 256 MiB per peer. A vault of
+    incompressible attachments produces chunks at the 1 MiB ceiling, which is
+    exactly when it bites.
+
+Smaller, worth folding into whatever next touches those files: `entry_chunks`
+would be 36% faster to insert as `WITHOUT ROWID`; an already-held chunk is
+stat'ed three times on the put path, which is the entire server cost of a batch
+where nothing is new; and the backup's chunk enumeration orders by more than it
+needs, forcing a non-covering scan.
+
+Measured and deliberately not done: batching a whole `putmany` into one
+transaction is a genuine 10x on the SQL, and saves 0.7% of an upload in exchange
+for making "an ack means durable" a per-batch argument. Fan-out is 63 ns at
+eight peers and one slow peer provably cannot block another.
+
 Not worth doing: request ids, with 26 round trips left to overlap. Larger chunks
 to cut fsyncs, which trades back a chunk size chosen by measurement against what
 an edit costs. Raising `UV_THREADPOOL_SIZE`, which was measured at 16 and made
