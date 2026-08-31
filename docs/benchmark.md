@@ -109,6 +109,38 @@ Since measured, and worth doing, from an audit of the two client shells on a
    size. A preallocated block buffer makes it 128 MiB and 65. Small in wall
    clock, and the allocation churn is on the axis that matters on a phone.
 
+From an audit of the engine, whose headline is that **every number in this
+document was taken under bun, and the shipped CLI is `#!/usr/bin/env node`**.
+The two engines are not close on the one loop that matters:
+
+12. **The boundary test costs a libm call per byte on V8.** `(hash >>> 0) % avg`
+    is a double modulo, and V8 calls `fmod` for it. Over 8 MiB: 252 ms on node
+    against 8 ms written as an exact reciprocal, 32 MiB/s against 996, with
+    identical boundaries. Bun does not care either way. Verified independently
+    of the audit.
+13. **The `chunkStream` byte loop is inside an async generator body**, which
+    JavaScriptCore does not optimise: 39 MiB/s against 700 with the same
+    arithmetic in a plain function. V8 does not care about this one. The two
+    defects are disjoint, so both are needed, and together the scan of a 64 MiB
+    attachment goes from 1.77 s to 0.19 s on bun and 0.49 s on node.
+
+That reorders the open questions rather than answering them. iOS is
+JavaScriptCore, so 13 is the unmeasured mobile attachment story; the plugin runs
+all of this on Obsidian's render thread, which is what a stall on save is.
+
+Smaller and measured, in the engine: `toBuffer` copies every buffer
+unconditionally where the hazard it guards cannot arise, 1.36x on attachments;
+`transport.fetch` verifies each body's hash serially, which is 90% of the client
+cost of a fetch and 4.3x when taken together; `assemble` and `acceptBatch` are
+serial for the same reason and gain 1.3x and 2.2x; and a path is sealed twice
+per uploaded file.
+
+Not available, and worth writing down so it stops being suggested: deflate is
+81-84% of what sealing text costs, and the level is baked into the sealed bytes,
+which are the chunk name, which is what dedup is. Changing it re-chunks every
+vault in existence. The same goes for the chunk-size targets and for snapping
+`avg` to a power of two.
+
 From an audit of the server, whose headline is that it is not the bottleneck on
 the sync path. A whole sync on loopback profiled at **10.4% CPU**, of which
 `chunks.place` is 64% and its fsync another 16%; everything that is not the

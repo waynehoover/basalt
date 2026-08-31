@@ -5,10 +5,20 @@
  * real vault. Read only: it never writes into the vault.
  *
  * This is a script and not a test on purpose. The chunker measures 575 MiB/s
- * under `bun run` and 32 MiB/s under vitest, an 18x spread from the runner
- * alone, so a floor loose enough to survive that would catch nothing. The
- * deterministic half of performance, bytes on the wire, is asserted in
- * `src/perf.test.ts` where it belongs.
+ * under `bun run` and 32 MiB/s under vitest, so a floor loose enough to survive
+ * that would catch nothing. The deterministic half of performance, bytes on the
+ * wire, is asserted in `src/perf.test.ts` where it belongs.
+ *
+ * That spread was written down as the runner's doing and it is not. It is the
+ * engine: bun is JavaScriptCore and vitest is V8, and the boundary test in
+ * `chunk.ts` costs 32 MiB/s on one and 996 MiB/s on the other, because
+ * `(hash >>> 0) % avg` is a double modulo and V8 calls out to fmod for it once
+ * per byte. Measured here at 252 ms against 8 ms over 8 MiB, same boundaries
+ * either way.
+ *
+ * Which matters more than a benchmark footnote, because the shipped CLI is
+ * `#!/usr/bin/env node`. The number this script prints under bun is not the
+ * number the thing people install runs at.
  *
  * Two things every measurement here does, because the first version of it did
  * neither and reported a 2.7x gain where the honest figure was 1.3x:
