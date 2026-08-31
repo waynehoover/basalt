@@ -1,5 +1,7 @@
 # Answers to the automated review
 
+[Docs index](index.md)
+
 The community directory's scanner raises the same points each run. Two were real
 and are fixed. The rest are correct readings of the source that do not apply to
 the plugin, and this says why, with what was checked rather than what was
@@ -13,8 +15,9 @@ and replaces the release assets with what it signed. Verify any of them with:
 
     gh attestation verify main.js --repo waynehoover/basalt-sync
 
-Rebuilding is safe because the build is reproducible: rebuilding tag 0.1.3 from
-a clean worktree gives byte-identical files to the published ones.
+Rebuilding is safe because the build is reproducible: rebuilding a tag from a
+clean worktree gives byte-identical files to the published ones, which was
+checked rather than assumed.
 
 **Dead code.** `noUnusedLocals` and `noUnusedParameters` are on, and the eight
 things they found are gone.
@@ -43,7 +46,7 @@ installed when the rules ran.
 With the types resolved, `tsc` under `strict`, `noUncheckedIndexedAccess` and
 `exactOptionalPropertyTypes` reports no errors:
 
-    cd client && bunx tsc --noEmit
+    cd client && npx tsc --noEmit
 
 ## `window.setTimeout` rather than `setTimeout`
 

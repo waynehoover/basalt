@@ -24,9 +24,14 @@ Any sync decision that appears in a shell is in the wrong file.
 bun install
 bun run test         # everything, including against a real server
 bun run typecheck
+bun run format       # prettier, and CI fails on anything it would change
 bun run bench        # throughput and bandwidth, reported not asserted
 bun run bench:sync   # a whole vault, timed and checked
 ```
+
+The benchmarks run under bun and the shipped CLI runs under node, which is not a
+detail: two of the largest wins in `docs/benchmark.md` were each invisible under
+one of the two engines. Anything measuring the chunker should be run under both.
 
 The tests need a Go toolchain. `src/core/server-harness.test.ts` builds
 `cmd/basaltd`, runs it on a loopback port, and talks to it with the real
@@ -37,7 +42,7 @@ correct server never would.
 
 ## The headless client
 
-`bun run build` produces `dist/basalt.mjs`: one 85 KB file with nothing to
+`bun run build` produces `dist/basalt.mjs`: one 91 KB file with nothing to
 install beside it, because everything is bundled and the only imports that
 survive are `node:` builtins. The npm package declares no dependencies at all. The command is `basalt`; the server's is `basaltd`, so a homelab can run both.
 

@@ -20,14 +20,16 @@ designed around Markdown notes, which is where the speed comes from.
 
 ## Features
 
-- **End-to-end encrypted.** Notes and filenames both. The server holds no key.
-- **Sends only what changed.** One line edited in a 2 MiB note costs 494 bytes.
+- **End-to-end encrypted.** Notes and filenames both, and the server cannot
+  forge a version either: every one is authenticated by the device that wrote it.
+  The server holds no key and is never sent one.
+- **Sends only what changed.** One line edited in a 2 MiB note costs 22 KB, not 2 MB.
 - **Fast.** A note reaches another device in about a tenth of a second.
 - **Never mangles a note.** If a merge is not provably safe, both versions are kept.
 - **Full history.** Every version and every deletion, restorable from the plugin.
 - **One static binary.** No database, no broker, no accounts, no settings screen.
-- **Zero dependencies.** The plugin is one 90 KB file that needs nothing installed;
-  the CLI is 85 KB and pulls in no packages at all.
+- **Zero dependencies.** The plugin is one 96 KB file that needs nothing installed;
+  the CLI is 91 KB and pulls in no packages at all.
 - **Works headless.** Same engine, no GUI, for a server or a NAS.
 
 Desktop and Android are in daily use. iOS is untested.
@@ -39,7 +41,7 @@ Desktop and Android are in daily use. iOS is untested.
 ```bash
 docker run -d --name basalt -p 127.0.0.1:3003:3003 \
   -v basalt-data:/data ghcr.io/waynehoover/basalt-sync:latest
-docker logs basalt        # prints your setup string
+docker logs basalt        # prints the string for your first device
 ```
 
 **2. Add the plugin.** Put `main.js`, `manifest.json` and `styles.css` from the
@@ -73,8 +75,8 @@ history and recovery.
 
 **[How it compares](docs/compared.md)** is the one to read first if you are
 deciding. It sets Basalt against Obsidian Sync, Sync Engine and Fast Note Sync,
-and it is honest in both directions: an edit to a 2 MiB note costs 494 bytes
-here against 2 MiB there, encryption is always on rather than optional, and a
+and it is honest in both directions: an edit to a 2 MiB note costs 22 KB here
+against 2 MiB there, encryption is always on rather than optional, and a
 merge that cannot be made safely keeps both versions instead of dropping one.
 It also says plainly where the others are better, which is the part worth
 trusting a comparison for.

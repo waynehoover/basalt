@@ -222,7 +222,6 @@ async function run(wire: Wire) {
 
   try {
     const a = await device("a");
-    const b = await device("b");
 
     const bytes = await buildVault(a.dir);
     const files = COUNTS.small + COUNTS.medium + COUNTS.large;
@@ -232,6 +231,13 @@ async function run(wire: Wire) {
     const up = await a.c.settle({}, 64);
     row("first sync, upload", performance.now() - t, up, bytes);
 
+    // The second device is created here, and not beside the first, because a
+    // device connected during the upload follows it live: it applies almost
+    // every entry as the first one pushes it, and the "download" that follows
+    // is whatever was left over. That measured 0.3 s for a 213 MiB vault and
+    // was read as a download speed. A first sync is a device arriving at a
+    // vault that is already there, so this one arrives afterwards.
+    const b = await device("b");
     t = performance.now();
     const down = await b.c.settle({}, 64);
     row("first sync, download", performance.now() - t, down, bytes);

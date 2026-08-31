@@ -12,11 +12,13 @@ package manager, nothing to update. Pure-Go SQLite is what makes
 
 ```
 docker compose up -d
-docker compose logs basalt | grep '#'
+docker compose logs basalt
 ```
 
-That last line is the token for pairing the first device. It is a bootstrap: the
-first device claims the vault with it and it stops working afterwards.
+The log holds the pairing string for the first device. It is a bootstrap: the
+first device claims the vault with it and it stops working afterwards, so the
+server stops printing it and says the vault is claimed instead. Adding a device
+after that is done from a device that already has the vault, not from here.
 
 `compose.yaml` publishes to `127.0.0.1:3003` rather than to every interface,
 because there is no TLS in this binary and something in front should be the only
@@ -40,7 +42,8 @@ Purge needs the directory to itself, so the server steps aside:
 
 ```
 docker compose stop basalt
-docker run --rm -v basalt_basalt-data:/data basalt:0.1.2 purge -data /data -grace 0
+docker run --rm -v basalt_basalt-data:/data \
+  ghcr.io/waynehoover/basalt-sync:latest purge -data /data -grace 0
 docker compose start basalt
 ```
 
@@ -88,14 +91,15 @@ families limited to what a socket needs. `ProtectHome` goes on only when the
 data directory is not inside a home directory, since otherwise the most
 obviously correct hardening line is the one that stops the server starting.
 
-The token it prints on first run is in the journal:
+The pairing string it prints on first run is in the journal:
 
 ```
-journalctl -u basalt | grep '#'
+journalctl -u basalt
 ```
 
 That token is a bootstrap. The first device claims the vault with it and it
-stops working; see `docs/protocol.md`.
+stops working, and the server then prints that the vault is claimed rather than
+printing a string that would fail. See `docs/protocol.md`.
 
 ## TLS
 
@@ -192,14 +196,14 @@ path used to be created on the spot and the backup then succeeded, of nothing.
 
 | | |
 |---|---|
-| `basaltd serve` | run the server. The default command, so bare `basalt` is this |
+| `basaltd serve` | run the server. The default command, so bare `basaltd` is this |
 | `basaltd backup -to DIR` | copy everything, verified, while the server runs |
 | `basaltd verify` | check the store against itself |
 | `basaltd purge` | reclaim space from unreferenced bodies |
 | `basaltd stats` | what the vault holds |
 | `basaltd service` | print a hardened systemd unit |
 | `basaltd health` | ask a running server if it is well, for a container probe |
-| `basalt version` | what this binary is |
+| `basaltd version` | what this binary is |
 
 ### serve
 
@@ -271,7 +275,7 @@ server stopped.
 ## Version
 
 ```
-basalt version
+basaltd version
 ```
 
 Also the first line the server logs at startup, so the journal on every machine

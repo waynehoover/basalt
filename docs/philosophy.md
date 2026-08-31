@@ -101,9 +101,10 @@ should never rewrite the file you have open.
 ## Fast, because it sends less
 
 Basalt chunks on a rolling hash and sends only the chunks that moved, where
-whole-file sync sends the body. One line inserted: 284 B against 4 KiB at 4 KiB,
-494 B against 2 MiB at 2 MiB. The advantage grows with the file, which is the
-property that matters.
+whole-file sync sends the body. One line inserted into a 2 MiB note: 21.7 KiB
+against 2 MiB, of which 9 KiB is the entry naming every chunk of the new
+version. The advantage grows with the file, which is the property that matters,
+and it is bounded by that entry rather than by the chunk.
 
 Chunks are compressed before they are encrypted, taking a full upload of a
 vault's text from 108% of plaintext to 67%. That ordering is forced: after

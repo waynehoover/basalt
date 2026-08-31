@@ -13,11 +13,11 @@ This is what differs, what was learned from each, and where theirs is better.
 | Where it runs | their servers | your box |
 | Cost | subscription | electricity |
 | Setup | sign in | run a binary, paste one string |
-| Editing one line of a 2 MiB note | 2 MiB | 494 B |
+| Editing one line of a 2 MiB note | 2 MiB | 21.7 KiB |
 | Encryption | optional | always |
 | Merge conflicts | merged silently, failures dropped | merged when provably safe, both kept otherwise |
 | Plugins, themes, config | syncs them | does not, and that one is still open |
-| Mobile | works today | Android verified, iOS untested |
+| Mobile | iOS and Android | Android in daily use, iOS untested |
 | Version history | in the app | in the app, and restoring never overwrites |
 | Maturity | years in production | early |
 
@@ -26,11 +26,23 @@ the whole body when it changes; the 2 MB websocket pieces are framing, not
 identity, so nothing can be skipped. Basalt chunks on a rolling hash and sends
 only what the server lacks. One line inserted:
 
-| Note | Theirs | Basalt | |
-|---|---|---|---|
-| 4 KiB | 4 KiB | 284 B | 15x |
-| 128 KiB | 128 KiB | 349 B | 376x |
-| 2 MiB | 2 MiB | 494 B | 4245x |
+| Note | Theirs | Basalt | of that, the entry | |
+|---|---|---|---|---|
+| 4 KiB | 4.4 KiB | 1.9 KiB | 624 B | 2x |
+| 128 KiB | 128.4 KiB | 5.8 KiB | 2.7 KiB | 22x |
+| 2 MiB | 2.0 MiB | 21.7 KiB | 9.0 KiB | 94x |
+
+Both columns include the entry, because both protocols send one: theirs names
+one hash for the whole file, ours names every chunk of the new version. That
+entry is most of what Basalt sends on a large note, and it is what bounds the
+gap. `cd client && bun run bench` prints this table.
+
+> These numbers used to read 494 B and 4245x. Two things were wrong with them.
+> The benchmark counted only chunk bodies and not the entry that carries their
+> names, and the chunk sizes have since been tuned: a 2 MiB note was 5638 chunks
+> then and is 133 now. The old sizes did send a smaller body, and paid for it
+> with 5638 names in every version, which is the cost the old figure omitted.
+> 94x is what it has always actually been worth.
 
 The gap grows with the file, which is the point: a vault accumulates long notes.
 Basalt also deflates each chunk before sealing it, taking a full upload of a
@@ -42,14 +54,9 @@ theirs propagates the delete; Basalt restores the file.
 **Where theirs is better**, and it is not close in places: nothing to run, iOS,
 and years of production finding edge cases that were found here by reading code.
 Whole-file upload also has fewer moving parts than chunking plus deterministic
-sealing plus compression, and larger machinery has more ways to be wrong.
-
-This paragraph used to concede mobile and version history as well. Both have
-since been built: a phone synced a 320 file vault with every checksum matching,
-and version history landed in 0.1.3, with a diff against what is on disk and a
-restore that writes beside a file rather than over it. iOS stays conceded
-because it has not been run there, which is a different statement from saying it
-does not work.
+sealing plus compression, and larger machinery has more ways to be wrong. iOS
+stays conceded because Basalt has not been run there, which is a different
+statement from saying it does not work.
 
 ## Against Sync Engine and Fast Note Sync
 
@@ -71,9 +78,11 @@ is character-granular, which merges two devices editing different arguments of
 `compute(1, 2)`. It also merges a re-indented Python block with a line appended
 to it into code that no longer runs, which their region splitter would not.
 
-**Where theirs is ahead:** they run on phones, they have 351 and 2890 stars
-against a plugin that has run in a real vault once, they work with storage you
-already pay for, and they are installable from Obsidian's community list.
+**Where theirs is ahead:** they have 351 and 2890 stars against a plugin nobody
+has installed yet, they work with storage you already pay for, and they are
+installable from Obsidian's community list. Phones used to be on this list and
+are not any more: Android is in daily use here, and iOS is untested on all
+three.
 
 ## What was borrowed
 

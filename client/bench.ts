@@ -167,12 +167,31 @@ async function wire(
     if (!held.has(Buffer.from(c.bytes).toString("base64"))) send.push(c.bytes);
   }
   const sealed = await sealChunks(keys, send);
-  return { bytes: sealed.reduce((n, c) => n + c.bytes.length, 0), changed: send.length, total };
+  const bodies = sealed.reduce((n, c) => n + c.bytes.length, 0);
+  // The entry travels too, and it names every chunk of the new version rather
+  // than only the changed ones: 64 hex characters plus JSON quoting and a
+  // comma each. Counting only the bodies is what made a chunk size of a few
+  // hundred bytes look free, when a 2 MiB note was then 5638 names.
+  const entry = ENTRY_OVERHEAD + total * NAME_ON_THE_WIRE;
+  return { bytes: bodies + entry, bodies, entry, changed: send.length, total };
 }
+
+/** 64 hex characters, two quotes and a comma. */
+const NAME_ON_THE_WIRE = 67;
+/**
+ * A sealed path, the meta object, and the authenticator, with no chunks.
+ *
+ * Checked against the two entries measured on the real wire in
+ * `docs/benchmark.md`: 356 + 67 is the 423 B of a one-chunk note, and
+ * 356 + 1024 * 67 is the 68964 B of a 1024-chunk attachment.
+ */
+const ENTRY_OVERHEAD = 356;
 
 async function bandwidth() {
   console.log("\nbytes on the wire for one line inserted into a note");
-  console.log("  note size    basalt      whole file    ratio    chunks changed");
+  console.log("  Both columns carry the entry as well as the bodies, because both");
+  console.log("  protocols send one. Theirs is a whole file and one hash.\n");
+  console.log("  note size    basalt      of that: entry   whole file    ratio    chunks");
   const keys = await deriveKeys(new Uint8Array(20).fill(11));
   for (const size of [4096, 32 * 1024, 128 * 1024, 512 * 1024, 2 * MIB]) {
     const original = note(size);
@@ -184,9 +203,12 @@ async function bandwidth() {
     edited.set(original.subarray(at), at + ins.length);
 
     const r = await wire(original, edited, sizesFor(size, true), true, keys);
+    // Theirs is the whole body plus an entry naming one hash for it.
+    const theirs = edited.length + ENTRY_OVERHEAD + NAME_ON_THE_WIRE;
     console.log(
-      `  ${fmt(size).padStart(9)}  ${fmt(r.bytes).padStart(9)}   ${fmt(edited.length).padStart(9)}` +
-        `   ${(edited.length / Math.max(1, r.bytes)).toFixed(0).padStart(6)}x   ${r.changed} of ${r.total}`,
+      `  ${fmt(size).padStart(9)}  ${fmt(r.bytes).padStart(9)}   ${fmt(r.entry).padStart(14)}` +
+        `   ${fmt(theirs).padStart(9)}   ${(theirs / Math.max(1, r.bytes)).toFixed(0).padStart(6)}x` +
+        `   ${r.changed} of ${r.total}`,
     );
   }
 }

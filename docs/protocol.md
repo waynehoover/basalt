@@ -1,4 +1,4 @@
-# The Basalt wire protocol, v1
+# The Basalt wire protocol, v2
 
 [Docs index](index.md)
 
@@ -49,13 +49,22 @@ version and a mismatch is refused, not negotiated.
 ## Handshake
 
 ```
--> {op:"hello", proto:1, vault, token, device, crypto:"basalt/hkdf-aes-gcm/1", cursor}
+-> {op:"hello", proto:2, vault, token, device, crypto:"basalt/hkdf-aes-gcm/1", cursor}
 <- {res:"ready", cursor, perFileMax, chunkMax}
 ```
 
 `cursor` is the last uid the client has applied, or 0. The server refuses on a
 `proto` or `crypto` it does not implement, with `{res:"err", code:"proto"}`,
 rather than trying to interoperate.
+
+The two versions move separately. `proto` is the wire, at 2 since entries
+carry an authenticator. `crypto` is the key schedule and the sealing, unchanged
+at 1: protocol 2 added a key to the schedule and changed nothing about how a
+chunk is sealed, so every chunk written under protocol 1 still opens.
+
+The wire version is exact, not a minimum, so a device and a server that disagree
+refuse each other rather than half-working. Upgrade the server and the plugin
+together; the refusal names both numbers.
 
 `ready` carries every ceiling the server enforces, and it arrives before any
 catch-up, so a client knows all of them before its first `put` rather than

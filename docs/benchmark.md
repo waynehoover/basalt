@@ -2,8 +2,8 @@
 
 [Docs index](index.md)
 
-`cd client && bun run bench:sync`. `BENCH_SCALE=1` for the full size,
-`BENCH_WIRE=400` for one wire.
+`cd client && bun run bench:sync`, which is 2000 files over four wires.
+`BENCH_SCALE=0.1` for a tenth of the vault, `BENCH_WIRE=400` for one wire.
 
 Correctness is reported next to the timings, which is
 [Sync Engine](https://github.com/hesprs/sync-engine)'s idea. A sync benchmark
@@ -26,10 +26,10 @@ Apple M4 Pro, Bun 1.4. 200 files, 17.8 MiB.
 
 | Round trip | Up | Down | 20 notes up | 20 notes down | Nothing changed |
 |---|---|---|---|---|---|
-| loopback | 12.1 s | 0.63 s | 0.25 s | 0.12 s | 0.01 s |
-| 20 ms | 12.5 s | 0.67 s | 0.30 s | 0.14 s | 0.01 s |
-| 100 ms | 12.7 s | 0.85 s | 0.45 s | 0.23 s | 0.01 s |
-| 400 ms, 2.6 MiB/s | 14.7 s | 5.60 s | 1.07 s | 0.63 s | 0.01 s |
+| loopback | 12.2 s | 0.60 s | 0.25 s | 0.11 s | 0.00 s |
+| 20 ms | 12.1 s | 0.64 s | 0.28 s | 0.14 s | 0.00 s |
+| 100 ms | 12.2 s | 0.81 s | 0.46 s | 0.23 s | 0.00 s |
+| 400 ms, 2.6 MiB/s | 15.0 s | 5.60 s | 1.09 s | 0.63 s | 0.01 s |
 
 200 sent, 200 arrived, 0 wrong, 0 missing, 0 refused, on every row.
 
@@ -54,6 +54,15 @@ That last figure is a laptop's. On Linux the same 3000 chunks go at 4527/s
 against 307/s here, because Go issues `F_FULLFSYNC` on darwin. `go test
 ./internal/chunks -bench WriterWidth` prints both.
 
+**The download column nearly stopped meaning anything.** Both devices used to be
+created before the vault was built, so the second one followed the first live
+and its "first sync" was whatever was left over. That had always been true and
+had never mattered, because downloads were slower than uploads; once they were
+not, the row collapsed to 0.3 s for a 213 MiB vault, which is a plausible-looking
+number for something that did not happen. The second device is created after the
+upload now. Every figure above is from the fixed harness, and they came back the
+same, which is the reason to trust them.
+
 ## Beside Sync Engine, carefully
 
 `BENCH_SCALE=1` is 2000 files, which is their published count, at the same
@@ -62,7 +71,7 @@ latency:
 | 2000 files, 400 ms | up | down |
 |---|---|---|
 | Sync Engine, their machine, Nextcloud over WebDAV | 9.43 min | 5.87 min |
-| Basalt, this machine, Go server behind a latency proxy | 2.79 min | 1.07 min |
+| Basalt, this machine, Go server behind a latency proxy | 2.79 min | 1.06 min |
 
 26 round trips each way. 2000 arrived, 0 wrong.
 
@@ -75,110 +84,101 @@ What survives all four: 26 round trips to move 2000 files, against an engine tha
 overlaps requests to hide one per file, and an edit to a large note that costs
 one chunk here and the whole file on any backend that stores files.
 
+## What three audits found, and what was done
+
+The client shells, the engine and the server were each audited against a 10,000
+note vault. Everything below was measured before and after; the fixes are in.
+
+**The engine's two biggest were the same defect seen twice, and neither showed
+up under the runtime the benchmarks used.** Every number in this document was
+taken under bun, and the shipped CLI is `#!/usr/bin/env node`.
+
+| | Was | Now |
+|---|---|---|
+| Boundary test, a double modulo V8 answers with `fmod` | 32 MiB/s on node | 996 MiB/s, identical boundaries |
+| The byte loop inside an async generator, which JavaScriptCore leaves unoptimised | 39 MiB/s on bun | 700 MiB/s |
+
+The two are disjoint, one per engine, so both were needed. Together, scanning a
+64 MiB attachment went from 1.77 s to 0.19 s on bun and 0.49 s on node. iOS is
+JavaScriptCore, so the second is the one that mattered for a phone, and the
+plugin runs all of it on Obsidian's render thread, which is what a stall on save
+would have been.
+
+Also in the engine: `transport.fetch` verified each body's hash serially, 90% of
+the client cost of a fetch and 4.3x taken together; `assemble` and `acceptBatch`
+were serial for the same reason, 1.3x and 2.2x; a path was sealed twice per
+upload, and building the entry once instead also means the MAC cannot drift from
+what is sent; and `toBuffer` copied every buffer where the hazard it guards
+cannot arise, 1.06x on sealing an attachment.
+
+**The two client shells**, where an idle vault paid on every keepalive tick:
+
+| | Was | Now |
+|---|---|---|
+| The headless walk, one stat at a time | 138 ms at 10k files | 27 ms, each directory's stats issued together |
+| The index rewritten in full on a pass that changed nothing | 21 ms, two fsyncs of a byte-identical 5.3 MiB file | skipped; the idle pass went 37 ms to 10 ms |
+| `writeDurably` flushing a directory per file | 10.7 s for 2000 files across 200 folders | 6.1 s, each directory flushed once |
+| The plugin's block re-assembly, reallocating per stream chunk | 2144 MiB copied, 4160 buffers | 128 MiB, 65 |
+
+The plugin never had the walk problem, because it reads Obsidian's own index:
+10 ms at 10k files, a fourteenth of the cost per file, and the best decision in
+either shell.
+
+**The server was not the bottleneck and still is not.** A whole sync on loopback
+profiles at 10.4% CPU, of which `chunks.place` is 64% and its fsync another 16%.
+Everything that is not the chunk fsync, meaning the websocket, the JSON, the
+want list and all of SQLite, is under 1.6% of an upload. So none of these were
+on the sync path, and all are fixed:
+
+| | Was | Now |
+|---|---|---|
+| `Deleted()` scanning for its rename suppression, with no index on `prev_path` | 112 ms | 5.6 ms; the index costs 5 us on an insert whose fsync is 7.8 ms |
+| `HistoryForPath` attaching chunks by `uid BETWEEN`, a range spanning the vault's whole life | 6.1 ms at 10k, 83 ms at 100k | 0.07 ms and 0.3 ms, keyed on the actual uids |
+| An already-held chunk stat'ed three times per put, the whole server cost of a batch where nothing is new | 3.37 ms per 512 chunks | 1.08 ms |
+| The backup ordering by more than its contract, forcing a non-covering scan | 10 ms over 20k rows | under 1 ms |
+
+And one that was a memory bound rather than a speed one: the send queue was
+bounded at 256 frames and not in bytes, so a peer that stopped reading grew the
+heap by 272 MB, measured, with an arithmetic bound of 256 MiB per peer. It is
+bounded in bytes now. A vault of incompressible attachments produces chunks at
+the 1 MiB ceiling, which is exactly when that bit.
+
 ## What is next
 
 1. **Run it on Linux.** 108 of the 2000-file upload's 167 seconds are this
    laptop's `F_FULLFSYNC`. Every upload figure above is a laptop's until then.
 2. **Then probably stop.** After that, upload is within seconds of what the link
    can carry and download already is: 64 s against a 48 s floor.
-3. **Run it on a phone.** Never done. WebCrypto in a webview, memory during a
-   first sync, and battery are all unmeasured.
+3. **What a large attachment costs on a phone.** A phone has synced a 320 file
+   vault, so the platform is no longer the unknown; the memory curve below is a
+   laptop's, and the file limit is set from it.
 4. **Measure their plugin on this machine.** It needs Obsidian, a WebDAV server,
    and every candidate measured the same afternoon. Until then their numbers are
    theirs.
 
-Since measured, and worth doing, from an audit of the two client shells on a
-10,000 note vault:
+## Measured and deliberately not done
 
-5. **The headless walk stats one file at a time.** 138 ms at 10k files, of which
-   112 ms is waiting: `readdir` over the same tree is 25 ms. Issuing each
-   directory's stats together takes it to 27 ms. It runs on every pass, so an
-   idle vault pays it every keepalive tick. The plugin does not have this
-   problem, because it reads Obsidian's own index instead: 10 ms at 10k, about a
-   fourteenth of the cost per file, and the best decision in either shell.
-6. **The index is rewritten in full on passes that changed nothing.** 21 ms at
-   10k entries, of which 11 ms is two fsyncs of a byte-identical 5.3 MiB file,
-   every thirty seconds, forever. Remembering the last string written takes the
-   idle pass from 37 ms to 10 ms.
-7. **`writeDurably` flushes a directory per file.** Files sharing a folder
-   re-flush the same directory: 2000 files across 200 folders cost 10.7 s with
-   16 in flight, and 6.1 s flushing each directory once. This one touches the
-   durability contract, so it goes last and with a failing test first.
-8. **The plugin's block re-assembly reallocates per stream chunk.** Moving
-   64 MiB copies 2144 MiB and allocates 4160 buffers at a 16 KiB fetch chunk
-   size. A preallocated block buffer makes it 128 MiB and 65. Small in wall
-   clock, and the allocation churn is on the axis that matters on a phone.
+**A global hash chain over the log**, which would catch a server withholding
+versions. 12.7 us per entry against 2.2, which is nothing; it was rejected for
+what a global head does to concurrent writers, and `docs/security.md` says what
+that leaves undetected.
 
-From an audit of the engine, whose headline is that **every number in this
-document was taken under bun, and the shipped CLI is `#!/usr/bin/env node`**.
-The two engines are not close on the one loop that matters:
+**One transaction per `putmany`.** A genuine 10x on the SQL, worth 0.7% of an
+upload, in exchange for making "an ack means durable" a per-batch argument.
 
-12. **The boundary test costs a libm call per byte on V8.** `(hash >>> 0) % avg`
-    is a double modulo, and V8 calls `fmod` for it. Over 8 MiB: 252 ms on node
-    against 8 ms written as an exact reciprocal, 32 MiB/s against 996, with
-    identical boundaries. Bun does not care either way. Verified independently
-    of the audit.
-13. **The `chunkStream` byte loop is inside an async generator body**, which
-    JavaScriptCore does not optimise: 39 MiB/s against 700 with the same
-    arithmetic in a plain function. V8 does not care about this one. The two
-    defects are disjoint, so both are needed, and together the scan of a 64 MiB
-    attachment goes from 1.77 s to 0.19 s on bun and 0.49 s on node.
+**`entry_chunks` as `WITHOUT ROWID`.** 36% faster to insert and 20% faster to
+read, and all of SQLite is 0.25 s of a 29 s upload, so it is worth about 0.05 s.
+It cannot be done with `ALTER`: the table has to be rebuilt and copied. That is
+a migration of the metadata store for a twentieth of a second.
 
-That reorders the open questions rather than answering them. iOS is
-JavaScriptCore, so 13 is the unmeasured mobile attachment story; the plugin runs
-all of this on Obsidian's render thread, which is what a stall on save is.
+**A different deflate level, or different chunk-size targets.** The level is
+baked into the sealed bytes, which are the chunk name, which is what dedup is.
+Changing any of them re-chunks every vault in existence.
 
-Smaller and measured, in the engine: `toBuffer` copies every buffer
-unconditionally where the hazard it guards cannot arise, 1.36x on attachments;
-`transport.fetch` verifies each body's hash serially, which is 90% of the client
-cost of a fetch and 4.3x when taken together; `assemble` and `acceptBatch` are
-serial for the same reason and gain 1.3x and 2.2x; and a path is sealed twice
-per uploaded file.
-
-Not available, and worth writing down so it stops being suggested: deflate is
-81-84% of what sealing text costs, and the level is baked into the sealed bytes,
-which are the chunk name, which is what dedup is. Changing it re-chunks every
-vault in existence. The same goes for the chunk-size targets and for snapping
-`avg` to a power of two.
-
-From an audit of the server, whose headline is that it is not the bottleneck on
-the sync path. A whole sync on loopback profiled at **10.4% CPU**, of which
-`chunks.place` is 64% and its fsync another 16%; everything that is not the
-chunk fsync, meaning the websocket, the JSON, the want list and all of SQLite,
-is under 1.6% of the upload. The server serves a 1000-file vault back in 100 ms.
-So these are real and none of them is on the path a sync takes:
-
-9. **`Deleted()` has no index for its rename-suppression subquery.** It scans
-   every entry newer than the deletion, once per deleted path, and filters
-   `prev_path` in memory. 112 ms against 5.6 ms with an index on
-   `(vault_id, prev_path, uid)`, and the extra index costs 5 us on an insert
-   whose fsync is 7.8 ms.
-10. **`HistoryForPath` reads nearly every chunk row in the vault.** Chunks are
-    attached by `uid BETWEEN min AND max`, which is right for a contiguous batch
-    and wrong for history, whose uids are spread across the vault's whole life.
-    6.1 ms at 10k entries and 83 ms at 100k, against 0.07 ms and 0.3 ms keyed on
-    the actual uids. It grows with history rather than with the page.
-11. **A fetch buffers whole chunk bodies.** The send queue is bounded at 256
-    frames and not in bytes, so one peer that stops reading grew the heap by
-    272 MB, measured. The arithmetic bound is 256 MiB per peer. A vault of
-    incompressible attachments produces chunks at the 1 MiB ceiling, which is
-    exactly when it bites.
-
-Smaller, worth folding into whatever next touches those files: `entry_chunks`
-would be 36% faster to insert as `WITHOUT ROWID`; an already-held chunk is
-stat'ed three times on the put path, which is the entire server cost of a batch
-where nothing is new; and the backup's chunk enumeration orders by more than it
-needs, forcing a non-covering scan.
-
-Measured and deliberately not done: batching a whole `putmany` into one
-transaction is a genuine 10x on the SQL, and saves 0.7% of an upload in exchange
-for making "an ack means durable" a per-batch argument. Fan-out is 63 ns at
-eight peers and one slow peer provably cannot block another.
-
-Not worth doing: request ids, with 26 round trips left to overlap. Larger chunks
-to cut fsyncs, which trades back a chunk size chosen by measurement against what
-an edit costs. Raising `UV_THREADPOOL_SIZE`, which was measured at 16 and made
-the pooled walk 2.6x worse than the default 4.
+**Request ids**, with 26 round trips left to overlap. **Larger chunks** to cut
+fsyncs, which trades back a chunk size chosen by measurement against what an
+edit costs. **Raising `UV_THREADPOOL_SIZE`**, measured at 16 and 2.6x worse than
+the default 4.
 
 Measured and already fast, so left alone: the realpath containment check added
 to every write, at 0.2 to 0.6% of one; CLI cold start, which is 30 ms of which
@@ -336,3 +336,24 @@ files still failing now exits non-zero.
 the wire for one line inserted. It warms up and alternates the order of anything
 compared, because the first version did neither and reported a 2.7x gain where
 the honest figure was 1.3x.
+
+Its bandwidth table counted only chunk bodies until recently, and the entry
+carrying their names is most of what a large note costs:
+
+| Note | Whole file | Basalt | of that, the entry | |
+|---|---|---|---|---|
+| 4 KiB | 4.4 KiB | 1.9 KiB | 624 B | 2x |
+| 32 KiB | 32.4 KiB | 4.9 KiB | 1.3 KiB | 7x |
+| 128 KiB | 128.4 KiB | 5.8 KiB | 2.7 KiB | 22x |
+| 512 KiB | 512.4 KiB | 9.6 KiB | 4.8 KiB | 54x |
+| 2 MiB | 2.0 MiB | 21.7 KiB | 9.0 KiB | 94x |
+
+Counting bodies alone read 494 B and 4245x at 2 MiB, and was quoted in three
+documents. It also flattered a chunk size that has since been tuned: the same
+note was 5638 chunks when that figure was taken and is 133 now, so the old sizes
+really did send a smaller body and paid for it with 5638 names in every version.
+The entry is what bounds the gap, and it is why chunk size is chosen by
+`sqrt(NAME_BYTES * size)` rather than by what one edit costs.
+
+The generator writes random words, which deflate barely helps, so the body
+column is a floor rather than a typical note.
