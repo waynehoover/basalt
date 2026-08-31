@@ -173,7 +173,11 @@ export class TestServer {
 
     async cleanup(): Promise<void> {
         await this.stop();
-        if (this.dataDir) await rm(this.dataDir, { recursive: true, force: true });
+        // Retried for the reason the afterEach in cli.test.ts is: a parallel
+        // suite makes a recursive remove race its own listing. stop() waits for
+        // the process to exit first, but it gives up after five seconds, and a
+        // server still running is exactly when this would bite.
+        if (this.dataDir) await rm(this.dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     }
 
     /** Runs a maintenance subcommand against this server's data directory. */

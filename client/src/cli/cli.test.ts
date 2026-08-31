@@ -70,7 +70,18 @@ async function fresh(): Promise<void> {
 }
 
 afterEach(async () => {
-    while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true });
+    // Retried, because `rm` lists a directory and then removes it, and with
+    // twenty-one test files running at once against the same /tmp it can find
+    // the directory repopulated in between and throw ENOTEMPTY. Node retries
+    // that error specifically when asked to. It showed up once in twelve full
+    // runs, on `.basalt`.
+    //
+    // This is not covering for a write that outlived the command, which was the
+    // first suspicion and would have been a real bug. save() is awaited, the
+    // sync is awaited before close(), close() is synchronous, and neither the
+    // CLI nor the engine leaves anything running. Nothing of ours is still
+    // writing by the time this runs.
+    while (dirs.length) await rm(dirs.pop()!, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     if (server) await server.cleanup();
 });
 
