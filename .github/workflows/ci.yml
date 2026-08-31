@@ -63,6 +63,12 @@ jobs:
         working-directory: client
         run: bun install --frozen-lockfile
 
+      # Formatting is checked, never written, because a CI job that rewrites
+      # your branch is one you stop trusting. `bun run format` fixes it.
+      - name: format
+        working-directory: client
+        run: bun run format:check
+
       - name: typecheck
         working-directory: client
         run: bun run typecheck

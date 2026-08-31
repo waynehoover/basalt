@@ -14,24 +14,24 @@ import { defineConfig } from "vitest/config";
  * one is the thing being tested.
  */
 export default defineConfig({
-    resolve: {
-        alias: {
-            obsidian: new URL("./src/plugin/stub.ts", import.meta.url).pathname,
-        },
+  resolve: {
+    alias: {
+      obsidian: new URL("./src/plugin/stub.ts", import.meta.url).pathname,
     },
-    test: {
-        globals: true,
-        globalSetup: ["./vitest.global-setup.ts"],
-        /**
-         * Most test files here start real Go servers and talk to them over real
-         * sockets. Fifteen files at once means dozens of processes competing for
-         * the same cores, and the first thing that gives is a timeout in
-         * whichever test was unlucky. Capping this trades a little wall clock
-         * for a suite whose failures mean something.
-         */
-        maxWorkers: 4,
-        minWorkers: 1,
-        testTimeout: 60_000,
-        hookTimeout: 180_000,
-    },
+  },
+  test: {
+    globals: true,
+    globalSetup: ["./vitest.global-setup.ts"],
+    /**
+     * Most test files here start real Go servers and talk to them over real
+     * sockets. Fifteen files at once means dozens of processes competing for
+     * the same cores, and the first thing that gives is a timeout in
+     * whichever test was unlucky. Capping this trades a little wall clock
+     * for a suite whose failures mean something.
+     */
+    maxWorkers: 4,
+    minWorkers: 1,
+    testTimeout: 60_000,
+    hookTimeout: 180_000,
+  },
 });

@@ -35,18 +35,18 @@ let buildDir: string | undefined;
  * having done nothing.
  */
 export function serverBinary(): Promise<string> {
-    const shared = process.env["BASALT_TEST_BINARY"];
-    if (shared) return Promise.resolve(shared);
-    built ??= (async () => {
-        buildDir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
-        const binary = join(buildDir, "basalt");
-        await run("go", ["build", "-o", binary, "./cmd/basaltd"], {
-            cwd: GO_DIR,
-            env: { ...process.env, CGO_ENABLED: "0" },
-        });
-        return binary;
-    })();
-    return built;
+  const shared = process.env["BASALT_TEST_BINARY"];
+  if (shared) return Promise.resolve(shared);
+  built ??= (async () => {
+    buildDir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
+    const binary = join(buildDir, "basalt");
+    await run("go", ["build", "-o", binary, "./cmd/basaltd"], {
+      cwd: GO_DIR,
+      env: { ...process.env, CGO_ENABLED: "0" },
+    });
+    return binary;
+  })();
+  return built;
 }
 
 /**
@@ -57,10 +57,10 @@ export function serverBinary(): Promise<string> {
  * hypothetical, it is what happens when several files run at once.
  */
 export async function cleanupBinary(): Promise<void> {
-    if (process.env["BASALT_TEST_BINARY"]) return;
-    if (buildDir) await removeTree(buildDir);
-    buildDir = undefined;
-    built = undefined;
+  if (process.env["BASALT_TEST_BINARY"]) return;
+  if (buildDir) await removeTree(buildDir);
+  buildDir = undefined;
+  built = undefined;
 }
 
 /**
@@ -89,164 +89,164 @@ export async function cleanupBinary(): Promise<void> {
 const RETRYABLE = new Set(["ENOTEMPTY", "EBUSY", "EPERM", "EMFILE", "ENFILE"]);
 
 export async function removeTree(path: string): Promise<void> {
-    for (let attempt = 1; ; attempt++) {
-        try {
-            // No built-in retries: this loop is doing them, so that it can say
-            // how often the race actually happens rather than absorbing it
-            // silently. Set BASALT_RM_STATS to a file to find out.
-            await rm(path, { recursive: true, force: true });
-            note(`${attempt}\t${path}`);
-            return;
-        } catch (err) {
-            const code = (err as NodeJS.ErrnoException).code ?? "";
-            if (!RETRYABLE.has(code) || attempt >= 8) {
-                note(`FAILED after ${attempt} on ${code}\t${path}`);
-                throw err;
-            }
-            await new Promise((r) => setTimeout(r, 50 * attempt));
-        }
+  for (let attempt = 1; ; attempt++) {
+    try {
+      // No built-in retries: this loop is doing them, so that it can say
+      // how often the race actually happens rather than absorbing it
+      // silently. Set BASALT_RM_STATS to a file to find out.
+      await rm(path, { recursive: true, force: true });
+      note(`${attempt}\t${path}`);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      if (!RETRYABLE.has(code) || attempt >= 8) {
+        note(`FAILED after ${attempt} on ${code}\t${path}`);
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 50 * attempt));
     }
+  }
 }
 
 /** Appends one line per remove when asked, so the retries can be counted. */
 function note(line: string): void {
-    const file = process.env["BASALT_RM_STATS"];
-    if (file) appendFileSync(file, `${line}\n`);
+  const file = process.env["BASALT_RM_STATS"];
+  if (file) appendFileSync(file, `${line}\n`);
 }
 
 /** One server, on its own port, with its own data directory. */
 export class TestServer {
-    private proc: ChildProcess | undefined;
-    dataDir = "";
-    port = 0;
-    token = "";
-    readonly stderr: string[] = [];
+  private proc: ChildProcess | undefined;
+  dataDir = "";
+  port = 0;
+  token = "";
+  readonly stderr: string[] = [];
 
-    /**
-     * Starts a server, retrying if the port turned out to be taken.
-     *
-     * Ports come from the operating system rather than from a random number,
-     * because several test files run at once and each starts servers. A random
-     * port in a range collides eventually, and when it does the failure lands on
-     * whichever test happened to be running: a suite that fails somewhere
-     * different each time is a suite people stop believing.
-     *
-     * There is still a gap between releasing the port and binding it, so this
-     * retries rather than pretending the gap is closed.
-     */
-    async start(): Promise<void> {
-        let last: Error | undefined;
-        for (let attempt = 0; attempt < 4; attempt++) {
-            try {
-                await this.startOnce();
-                return;
-            } catch (err) {
-                last = err as Error;
-                await this.stop();
-                await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
-            }
-        }
-        throw new Error(`server would not start after four attempts: ${last?.message}`);
-    }
-
-    private async startOnce(fixedPort?: number): Promise<void> {
-        const binary = await serverBinary();
-        if (!this.dataDir) this.dataDir = await mkdtemp(join(tmpdir(), "basalt-data-"));
-        this.port = fixedPort ?? (await freePort());
-        this.stderr.length = 0;
-        this.proc = spawn(binary, ["serve", "-data", this.dataDir, "-addr", `127.0.0.1:${this.port}`], {
-            stdio: ["ignore", "pipe", "pipe"],
-        });
-        this.proc.stderr?.on("data", (b: Buffer) => this.stderr.push(b.toString()));
-
-        // Waited for rather than slept through.
-        const deadline = Date.now() + 30_000;
-        for (;;) {
-            // A process that has already exited will never answer, and waiting
-            // the full timeout to say so turns one clear error into a slow one.
-            if (this.proc.exitCode !== null) {
-                throw new Error(`server exited with ${this.proc.exitCode}: ${this.stderr.join("")}`);
-            }
-            if (Date.now() > deadline) throw new Error(`server did not start: ${this.stderr.join("")}`);
-            try {
-                const res = await fetch(`http://127.0.0.1:${this.port}/health`);
-                if (res.ok) break;
-            } catch {
-                await new Promise((r) => setTimeout(r, 50));
-            }
-        }
-        this.token = (await readFile(join(this.dataDir, "auth-token"), "utf8")).trim();
-    }
-
-    /**
-     * Stops the server, runs something that needs the directory to itself, and
-     * starts again on the same port.
-     *
-     * `purge` and `backup` take the data directory's exclusive lock, so they
-     * cannot run against a live server, which is the whole point of the lock.
-     * The port is kept because a client's stored config names it, and a test
-     * that had to re-pair afterwards would be testing the re-pairing.
-     */
-    async whileStopped(fn: () => Promise<void>): Promise<void> {
-        const port = this.port;
+  /**
+   * Starts a server, retrying if the port turned out to be taken.
+   *
+   * Ports come from the operating system rather than from a random number,
+   * because several test files run at once and each starts servers. A random
+   * port in a range collides eventually, and when it does the failure lands on
+   * whichever test happened to be running: a suite that fails somewhere
+   * different each time is a suite people stop believing.
+   *
+   * There is still a gap between releasing the port and binding it, so this
+   * retries rather than pretending the gap is closed.
+   */
+  async start(): Promise<void> {
+    let last: Error | undefined;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        await this.startOnce();
+        return;
+      } catch (err) {
+        last = err as Error;
         await this.stop();
-        try {
-            await fn();
-        } finally {
-            await this.startOnce(port);
-        }
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
     }
+    throw new Error(`server would not start after four attempts: ${last?.message}`);
+  }
 
-    /**
-     * What a client should authenticate with.
-     *
-     * The first device to connect uses the token the server printed on its
-     * first run, and offers the auth key the vault should belong to from then
-     * on. Every device after that uses the key. This mirrors what the shells
-     * do, and a harness that handed out the bootstrap for ever would be testing
-     * a server that does not exist.
-     */
-    credentials(derivedAuthKey: string): { token: string; claim: string } {
-        const token = this.claimed ? derivedAuthKey : this.token;
-        this.claimed = true;
-        return { token, claim: derivedAuthKey };
+  private async startOnce(fixedPort?: number): Promise<void> {
+    const binary = await serverBinary();
+    if (!this.dataDir) this.dataDir = await mkdtemp(join(tmpdir(), "basalt-data-"));
+    this.port = fixedPort ?? (await freePort());
+    this.stderr.length = 0;
+    this.proc = spawn(binary, ["serve", "-data", this.dataDir, "-addr", `127.0.0.1:${this.port}`], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    this.proc.stderr?.on("data", (b: Buffer) => this.stderr.push(b.toString()));
+
+    // Waited for rather than slept through.
+    const deadline = Date.now() + 30_000;
+    for (;;) {
+      // A process that has already exited will never answer, and waiting
+      // the full timeout to say so turns one clear error into a slow one.
+      if (this.proc.exitCode !== null) {
+        throw new Error(`server exited with ${this.proc.exitCode}: ${this.stderr.join("")}`);
+      }
+      if (Date.now() > deadline) throw new Error(`server did not start: ${this.stderr.join("")}`);
+      try {
+        const res = await fetch(`http://127.0.0.1:${this.port}/health`);
+        if (res.ok) break;
+      } catch {
+        await new Promise((r) => setTimeout(r, 50));
+      }
     }
+    this.token = (await readFile(join(this.dataDir, "auth-token"), "utf8")).trim();
+  }
 
-    private claimed = false;
-
-    async stop(): Promise<void> {
-        if (this.proc && this.proc.exitCode === null) {
-            const ended = new Promise<void>((resolve) => this.proc!.once("exit", () => resolve()));
-            this.proc.kill("SIGTERM");
-            await Promise.race([ended, new Promise((r) => setTimeout(r, 5000))]);
-        }
-        this.proc = undefined;
+  /**
+   * Stops the server, runs something that needs the directory to itself, and
+   * starts again on the same port.
+   *
+   * `purge` and `backup` take the data directory's exclusive lock, so they
+   * cannot run against a live server, which is the whole point of the lock.
+   * The port is kept because a client's stored config names it, and a test
+   * that had to re-pair afterwards would be testing the re-pairing.
+   */
+  async whileStopped(fn: () => Promise<void>): Promise<void> {
+    const port = this.port;
+    await this.stop();
+    try {
+      await fn();
+    } finally {
+      await this.startOnce(port);
     }
+  }
 
-    async cleanup(): Promise<void> {
-        await this.stop();
-        if (this.dataDir) await removeTree(this.dataDir);
-    }
+  /**
+   * What a client should authenticate with.
+   *
+   * The first device to connect uses the token the server printed on its
+   * first run, and offers the auth key the vault should belong to from then
+   * on. Every device after that uses the key. This mirrors what the shells
+   * do, and a harness that handed out the bootstrap for ever would be testing
+   * a server that does not exist.
+   */
+  credentials(derivedAuthKey: string): { token: string; claim: string } {
+    const token = this.claimed ? derivedAuthKey : this.token;
+    this.claimed = true;
+    return { token, claim: derivedAuthKey };
+  }
 
-    /** Runs a maintenance subcommand against this server's data directory. */
-    async cli(...args: string[]): Promise<string> {
-        const binary = await serverBinary();
-        const { stdout } = await run(binary, [...args, "-data", this.dataDir]);
-        return stdout;
-    }
+  private claimed = false;
 
-    get wsUrl(): string {
-        return `ws://127.0.0.1:${this.port}`;
+  async stop(): Promise<void> {
+    if (this.proc && this.proc.exitCode === null) {
+      const ended = new Promise<void>((resolve) => this.proc!.once("exit", () => resolve()));
+      this.proc.kill("SIGTERM");
+      await Promise.race([ended, new Promise((r) => setTimeout(r, 5000))]);
     }
+    this.proc = undefined;
+  }
+
+  async cleanup(): Promise<void> {
+    await this.stop();
+    if (this.dataDir) await removeTree(this.dataDir);
+  }
+
+  /** Runs a maintenance subcommand against this server's data directory. */
+  async cli(...args: string[]): Promise<string> {
+    const binary = await serverBinary();
+    const { stdout } = await run(binary, [...args, "-data", this.dataDir]);
+    return stdout;
+  }
+
+  get wsUrl(): string {
+    return `ws://127.0.0.1:${this.port}`;
+  }
 }
 
 /** Waits for a condition rather than sleeping a guessed interval. */
 export async function until(what: string, cond: () => boolean, ms = 15_000): Promise<void> {
-    const deadline = Date.now() + ms;
-    while (!cond()) {
-        if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-        await new Promise((r) => setTimeout(r, 10));
-    }
+  const deadline = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
 }
 
 /**
@@ -258,13 +258,13 @@ export async function until(what: string, cond: () => boolean, ms = 15_000): Pro
  * regularly and blames whichever test was unlucky.
  */
 async function freePort(): Promise<number> {
-    return new Promise((resolve, reject) => {
-        const probe = createServer();
-        probe.once("error", reject);
-        probe.listen(0, "127.0.0.1", () => {
-            const address = probe.address();
-            const port = typeof address === "object" && address !== null ? address.port : 0;
-            probe.close(() => (port === 0 ? reject(new Error("no free port")) : resolve(port)));
-        });
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address !== null ? address.port : 0;
+      probe.close(() => (port === 0 ? reject(new Error("no free port")) : resolve(port)));
     });
+  });
 }

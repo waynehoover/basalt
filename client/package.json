@@ -29,14 +29,16 @@
   ],
   "type": "module",
   "scripts": {
+    "bench": "bun run bench.ts",
+    "bench:sync": "bun run bench-sync.ts",
     "build": "node esbuild.config.mjs production",
+    "build:cli": "node esbuild.config.mjs production",
     "dev": "node esbuild.config.mjs",
+    "format": "prettier --config ../.prettierrc --write \"src/**/*.ts\" \"*.ts\" \"*.mjs\"",
+    "format:check": "prettier --config ../.prettierrc --check \"src/**/*.ts\" \"*.ts\" \"*.mjs\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "bench": "bun run bench.ts",
-    "build:cli": "node esbuild.config.mjs production",
-    "bench:sync": "bun run bench-sync.ts"
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@types/diff-match-patch": "^1.0.36",
@@ -46,7 +48,8 @@
     "fflate": "^0.8.3",
     "obsidian": "^1.13.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.8",
+    "prettier": "^3.6.2"
   },
   "bin": {
     "basalt": "./dist/basalt.mjs"

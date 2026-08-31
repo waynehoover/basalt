@@ -133,8 +133,8 @@ const INSERT = 1;
  * there. A wider span is text that was deleted or replaced.
  */
 interface Span {
-    readonly start: number;
-    readonly end: number;
+  readonly start: number;
+  readonly end: number;
 }
 
 /**
@@ -145,24 +145,24 @@ interface Span {
  * describe the same edit and neither is wrong.
  */
 function changedSpans(diff: Diff[]): Span[] {
-    const spans: Span[] = [];
-    let at = 0;
-    for (const [op, text] of diff) {
-        if (op === EQUAL) {
-            at += text.length;
-        } else if (op === DELETE) {
-            spans.push({ start: at, end: at + text.length });
-            // Deleted text still occupied space in the base, so the cursor has
-            // to move past it or every later span is recorded too early. No test
-            // reaches this on its own any more: the two-directions check catches
-            // whatever a wrong offset lets through, and the tests for ordinary
-            // merges catch a wrong offset that invents a collision.
-            at += text.length;
-        } else {
-            spans.push({ start: at, end: at });
-        }
+  const spans: Span[] = [];
+  let at = 0;
+  for (const [op, text] of diff) {
+    if (op === EQUAL) {
+      at += text.length;
+    } else if (op === DELETE) {
+      spans.push({ start: at, end: at + text.length });
+      // Deleted text still occupied space in the base, so the cursor has
+      // to move past it or every later span is recorded too early. No test
+      // reaches this on its own any more: the two-directions check catches
+      // whatever a wrong offset lets through, and the tests for ordinary
+      // merges catch a wrong offset that invents a collision.
+      at += text.length;
+    } else {
+      spans.push({ start: at, end: at });
     }
-    return spans;
+  }
+  return spans;
 }
 
 /**
@@ -195,42 +195,42 @@ function changedSpans(diff: Diff[]): Span[] {
  * needed a concept of its own to do it.
  */
 function conflictingSpans(mine: Span[], theirs: Span[]): Span | undefined {
-    for (const l of mine) {
-        for (const r of theirs) {
-            const lPoint = l.start === l.end;
-            const rPoint = r.start === r.end;
-            // Two additions at one point are never a collision here, whether
-            // they land on a line boundary or inside a sentence. Nothing was
-            // destroyed, so this check has nothing to say about them; whether
-            // concatenating them reads as two additions or as one mangled
-            // sentence is decided by the two-directions check below, which
-            // catches the mangled case and lets the daily-note case through.
-            if (lPoint && rPoint) continue;
-            if (lPoint) {
-                // An insertion into text the other side removed.
-                if (r.start < l.start && l.start < r.end) return l;
-                continue;
-            }
-            if (rPoint) {
-                if (l.start < r.start && r.start < l.end) return r;
-                continue;
-            }
-            if (l.start < r.end && r.start < l.end) return l;
-        }
+  for (const l of mine) {
+    for (const r of theirs) {
+      const lPoint = l.start === l.end;
+      const rPoint = r.start === r.end;
+      // Two additions at one point are never a collision here, whether
+      // they land on a line boundary or inside a sentence. Nothing was
+      // destroyed, so this check has nothing to say about them; whether
+      // concatenating them reads as two additions or as one mangled
+      // sentence is decided by the two-directions check below, which
+      // catches the mangled case and lets the daily-note case through.
+      if (lPoint && rPoint) continue;
+      if (lPoint) {
+        // An insertion into text the other side removed.
+        if (r.start < l.start && l.start < r.end) return l;
+        continue;
+      }
+      if (rPoint) {
+        if (l.start < r.start && r.start < l.end) return r;
+        continue;
+      }
+      if (l.start < r.end && r.start < l.end) return l;
     }
-    return undefined;
+  }
+  return undefined;
 }
 
 export type MergeOutcome =
-    /** Nothing to do: the two sides already agree, or only one of them moved. */
-    | { readonly kind: "take"; readonly text: string; readonly why: string }
-    /** A clean three-way merge, verified to contain both sides' edits. */
-    | { readonly kind: "merged"; readonly text: string }
-    /**
-     * Not merged, and deliberately so. The caller keeps both versions rather
-     * than choosing, and `why` is for the human who finds the conflict copy.
-     */
-    | { readonly kind: "conflict"; readonly why: string };
+  /** Nothing to do: the two sides already agree, or only one of them moved. */
+  | { readonly kind: "take"; readonly text: string; readonly why: string }
+  /** A clean three-way merge, verified to contain both sides' edits. */
+  | { readonly kind: "merged"; readonly text: string }
+  /**
+   * Not merged, and deliberately so. The caller keeps both versions rather
+   * than choosing, and `why` is for the human who finds the conflict copy.
+   */
+  | { readonly kind: "conflict"; readonly why: string };
 
 /**
  * Merges `mine` and `theirs` over their common ancestor `base`.
@@ -241,119 +241,119 @@ export type MergeOutcome =
  * version history at all.
  */
 export function mergeText(
-    base: string,
-    mine: string,
-    theirs: string,
-    /**
-     * Whether the merged text is still the kind of thing it was.
-     *
-     * For prose there is nothing to ask: any arrangement of lines is a valid
-     * note. For a structured file there is, and a line-wise merge does not know
-     * it: two edits to different parts of a canvas can each apply cleanly and
-     * leave JSON that does not parse, which Obsidian then refuses to open. The
-     * four checks below all pass, because nothing was lost and nothing
-     * collided; the file is simply no longer a canvas.
-     *
-     * Reported against Sync Engine's neighbours as an overwrite risk on canvas
-     * files, and found here by reading their issues rather than by anything
-     * failing.
-     */
-    stillValid: (text: string) => boolean = () => true
+  base: string,
+  mine: string,
+  theirs: string,
+  /**
+   * Whether the merged text is still the kind of thing it was.
+   *
+   * For prose there is nothing to ask: any arrangement of lines is a valid
+   * note. For a structured file there is, and a line-wise merge does not know
+   * it: two edits to different parts of a canvas can each apply cleanly and
+   * leave JSON that does not parse, which Obsidian then refuses to open. The
+   * four checks below all pass, because nothing was lost and nothing
+   * collided; the file is simply no longer a canvas.
+   *
+   * Reported against Sync Engine's neighbours as an overwrite risk on canvas
+   * files, and found here by reading their issues rather than by anything
+   * failing.
+   */
+  stillValid: (text: string) => boolean = () => true,
 ): MergeOutcome {
-    if (mine === theirs) {
-        return { kind: "take", text: mine, why: "both sides already agree" };
-    }
-    if (base === mine) {
-        // Local never diverged from the ancestor, so the incoming version is
-        // simply newer. Nothing to merge and nothing at risk.
-        return { kind: "take", text: theirs, why: "no local change since the last sync" };
-    }
-    if (base === theirs) {
-        // The incoming version *is* the ancestor, so only local moved.
-        return { kind: "take", text: mine, why: "no remote change since the last sync" };
-    }
+  if (mine === theirs) {
+    return { kind: "take", text: mine, why: "both sides already agree" };
+  }
+  if (base === mine) {
+    // Local never diverged from the ancestor, so the incoming version is
+    // simply newer. Nothing to merge and nothing at risk.
+    return { kind: "take", text: theirs, why: "no local change since the last sync" };
+  }
+  if (base === theirs) {
+    // The incoming version *is* the ancestor, so only local moved.
+    return { kind: "take", text: mine, why: "no remote change since the last sync" };
+  }
 
-    const dmp = new diff_match_patch();
-    const diff = dmp.diff_main(base, mine, true, 0);
-    if (diff.length > 2) {
-        // Both passes, as Obsidian does. They do not change what the patch
-        // means, they change how the result reads.
-        dmp.diff_cleanupSemantic(diff);
-        dmp.diff_cleanupEfficiency(diff);
-    }
+  const dmp = new diff_match_patch();
+  const diff = dmp.diff_main(base, mine, true, 0);
+  if (diff.length > 2) {
+    // Both passes, as Obsidian does. They do not change what the patch
+    // means, they change how the result reads.
+    dmp.diff_cleanupSemantic(diff);
+    dmp.diff_cleanupEfficiency(diff);
+  }
 
-    // Refuse before attempting anything, when both sides changed the same text.
-    // patch_apply would succeed and splice them together; see conflictingSpans.
-    const theirDiff = dmp.diff_main(base, theirs, true, 0);
-    if (theirDiff.length > 2) {
-        dmp.diff_cleanupSemantic(theirDiff);
-        dmp.diff_cleanupEfficiency(theirDiff);
-    }
-    const collision = conflictingSpans(changedSpans(diff), changedSpans(theirDiff));
-    if (collision !== undefined) {
-        return {
-            kind: "conflict",
-            why:
-                `both devices changed the same text, at characters ` +
-                `${collision.start} to ${collision.end} of the last synced version`,
-        };
-    }
+  // Refuse before attempting anything, when both sides changed the same text.
+  // patch_apply would succeed and splice them together; see conflictingSpans.
+  const theirDiff = dmp.diff_main(base, theirs, true, 0);
+  if (theirDiff.length > 2) {
+    dmp.diff_cleanupSemantic(theirDiff);
+    dmp.diff_cleanupEfficiency(theirDiff);
+  }
+  const collision = conflictingSpans(changedSpans(diff), changedSpans(theirDiff));
+  if (collision !== undefined) {
+    return {
+      kind: "conflict",
+      why:
+        `both devices changed the same text, at characters ` +
+        `${collision.start} to ${collision.end} of the last synced version`,
+    };
+  }
 
-    // No guard on an empty patch list. A non-empty diff always produces at
-    // least one patch, and if it ever did not, the result would simply be
-    // `theirs` and the insertion check below is exactly what notices that.
-    // Merge in both directions and require the same answer.
-    //
-    // This is what catches a misplaced hunk, and a misplaced hunk is a real
-    // thing patch_apply does: its matcher is fuzzy, so in repetitive content it
-    // will find somewhere that *looks* like the right place and report success.
-    // Observed, with the real library, on a note of twelve similar sections:
-    // a local edit to section 3 landed on section 6, every flag true, the
-    // inserted text present, and the note wrong.
-    //
-    // Neither the overlap check nor the insertion check sees that, because
-    // nothing was lost and nothing collided. What does see it is asking the
-    // question the other way round: applying the *remote* change to the *local*
-    // file has no reason to make the same mistake, so the two results diverge.
-    // A merge worth having is one that does not depend on which side you start
-    // from.
-    const forward = applyOneWay(dmp, base, diff, theirs);
-    const reverse = applyOneWay(dmp, base, theirDiff, mine);
+  // No guard on an empty patch list. A non-empty diff always produces at
+  // least one patch, and if it ever did not, the result would simply be
+  // `theirs` and the insertion check below is exactly what notices that.
+  // Merge in both directions and require the same answer.
+  //
+  // This is what catches a misplaced hunk, and a misplaced hunk is a real
+  // thing patch_apply does: its matcher is fuzzy, so in repetitive content it
+  // will find somewhere that *looks* like the right place and report success.
+  // Observed, with the real library, on a note of twelve similar sections:
+  // a local edit to section 3 landed on section 6, every flag true, the
+  // inserted text present, and the note wrong.
+  //
+  // Neither the overlap check nor the insertion check sees that, because
+  // nothing was lost and nothing collided. What does see it is asking the
+  // question the other way round: applying the *remote* change to the *local*
+  // file has no reason to make the same mistake, so the two results diverge.
+  // A merge worth having is one that does not depend on which side you start
+  // from.
+  const forward = applyOneWay(dmp, base, diff, theirs);
+  const reverse = applyOneWay(dmp, base, theirDiff, mine);
 
-    if (forward.failed > 0 || reverse.failed > 0) {
-        const failed = Math.max(forward.failed, reverse.failed);
-        const total = Math.max(forward.total, reverse.total);
-        return {
-            kind: "conflict",
-            why: `${failed} of ${total} changes could not be placed in the other version`,
-        };
-    }
+  if (forward.failed > 0 || reverse.failed > 0) {
+    const failed = Math.max(forward.failed, reverse.failed);
+    const total = Math.max(forward.total, reverse.total);
+    return {
+      kind: "conflict",
+      why: `${failed} of ${total} changes could not be placed in the other version`,
+    };
+  }
 
-    if (!sameLines(forward.text, reverse.text)) {
-        return {
-            kind: "conflict",
-            why: "merging the two versions in either order gives different content, so at least one change was placed wrongly",
-        };
-    }
+  if (!sameLines(forward.text, reverse.text)) {
+    return {
+      kind: "conflict",
+      why: "merging the two versions in either order gives different content, so at least one change was placed wrongly",
+    };
+  }
 
-    // Both directions agree and every hunk was placed. That is the library's
-    // account of its own work, twice over, so check the thing that matters.
-    const missing = missingInsertions(diff, forward.text);
-    if (missing !== undefined) {
-        return {
-            kind: "conflict",
-            why: `the merge reported success but ${describe(missing)} is not in the result`,
-        };
-    }
+  // Both directions agree and every hunk was placed. That is the library's
+  // account of its own work, twice over, so check the thing that matters.
+  const missing = missingInsertions(diff, forward.text);
+  if (missing !== undefined) {
+    return {
+      kind: "conflict",
+      why: `the merge reported success but ${describe(missing)} is not in the result`,
+    };
+  }
 
-    if (!stillValid(forward.text)) {
-        return {
-            kind: "conflict",
-            why: "both sides merged cleanly and the result is no longer a valid file of its kind",
-        };
-    }
+  if (!stillValid(forward.text)) {
+    return {
+      kind: "conflict",
+      why: "both sides merged cleanly and the result is no longer a valid file of its kind",
+    };
+  }
 
-    return { kind: "merged", text: forward.text };
+  return { kind: "merged", text: forward.text };
 }
 
 /**
@@ -387,23 +387,23 @@ export function mergeText(
  * line, so the two multisets differ and the check fires.
  */
 function sameLines(a: string, b: string): boolean {
-    if (a === b) return true;
-    const x = a.split("\n").sort();
-    const y = b.split("\n").sort();
-    if (x.length !== y.length) return false;
-    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
-    return true;
+  if (a === b) return true;
+  const x = a.split("\n").sort();
+  const y = b.split("\n").sort();
+  if (x.length !== y.length) return false;
+  for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+  return true;
 }
 
 /** Applies one side's changes to the other, reporting how many hunks landed. */
 function applyOneWay(
-    dmp: InstanceType<typeof diff_match_patch>,
-    base: string,
-    diff: Diff[],
-    onto: string
+  dmp: InstanceType<typeof diff_match_patch>,
+  base: string,
+  diff: Diff[],
+  onto: string,
 ): { text: string; failed: number; total: number } {
-    const [text, applied] = dmp.patch_apply(dmp.patch_make(base, diff), onto);
-    return { text, failed: applied.filter((ok: boolean) => !ok).length, total: applied.length };
+  const [text, applied] = dmp.patch_apply(dmp.patch_make(base, diff), onto);
+  return { text, failed: applied.filter((ok: boolean) => !ok).length, total: applied.length };
 }
 
 /**
@@ -417,17 +417,17 @@ function applyOneWay(
  * result whatever its length; skipping short runs only hid whether it had.
  */
 function missingInsertions(diff: Diff[], result: string): string | undefined {
-    for (const [op, text] of diff) {
-        if (op !== INSERT) continue;
-        if (!result.includes(text)) return text;
-    }
-    return undefined;
+  for (const [op, text] of diff) {
+    if (op !== INSERT) continue;
+    if (!result.includes(text)) return text;
+  }
+  return undefined;
 }
 
 function describe(text: string): string {
-    const oneLine = text.replace(/\s+/g, " ").trim();
-    const shown = oneLine.length > 60 ? `${oneLine.slice(0, 57)}...` : oneLine;
-    return `a local edit (${JSON.stringify(shown)})`;
+  const oneLine = text.replace(/\s+/g, " ").trim();
+  const shown = oneLine.length > 60 ? `${oneLine.slice(0, 57)}...` : oneLine;
+  return `a local edit (${JSON.stringify(shown)})`;
 }
 
 /**
@@ -447,17 +447,18 @@ function describe(text: string): string {
  * you are editing.
  */
 export function conflictCopyPath(path: string, device: string, at: Date): string {
-    const dot = path.lastIndexOf(".");
-    const slash = path.lastIndexOf("/");
-    const hasExt = dot > slash;
-    const stem = hasExt ? path.slice(0, dot) : path;
-    const ext = hasExt ? path.slice(dot) : "";
+  const dot = path.lastIndexOf(".");
+  const slash = path.lastIndexOf("/");
+  const hasExt = dot > slash;
+  const stem = hasExt ? path.slice(0, dot) : path;
+  const ext = hasExt ? path.slice(dot) : "";
 
-    const p = (n: number, width = 2) => String(n).padStart(width, "0");
-    const stamp =
-        `${at.getFullYear()}${p(at.getMonth() + 1)}${p(at.getDate())}` + `${p(at.getHours())}${p(at.getMinutes())}`;
+  const p = (n: number, width = 2) => String(n).padStart(width, "0");
+  const stamp =
+    `${at.getFullYear()}${p(at.getMonth() + 1)}${p(at.getDate())}` +
+    `${p(at.getHours())}${p(at.getMinutes())}`;
 
-    return `${stem} (Conflicted copy ${sanitiseDevice(device)} ${stamp})${ext}`;
+  return `${stem} (Conflicted copy ${sanitiseDevice(device)} ${stamp})${ext}`;
 }
 
 /**
@@ -469,10 +470,10 @@ export function conflictCopyPath(path: string, device: string, at: Date): string
  * somebody needs to find it.
  */
 export function sanitiseDevice(device: string): string {
-    const cleaned = device
-        .replace(/[-\\/:*?"<>|\s]/g, "-")
-        .replace(/-{2,}/g, "-")
-        .replace(/^[.\-\s]+|[.\-\s]+$/g, "")
-        .slice(0, 32);
-    return cleaned || "device";
+  const cleaned = device
+    .replace(/[-\\/:*?"<>|\s]/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[.\-\s]+|[.\-\s]+$/g, "")
+    .slice(0, 32);
+  return cleaned || "device";
 }

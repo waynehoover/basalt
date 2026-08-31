@@ -9,7 +9,19 @@
  */
 
 import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
-import { access, cp, mkdir, open, readFile, readdir, realpath, rename, rm, stat, utimes } from "node:fs/promises";
+import {
+  access,
+  cp,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  utimes,
+} from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
@@ -44,381 +56,392 @@ export const DEFAULT_CONFIG_DIR = ".obsidian";
  * quietly ignoring the wrong thing is how a vault's settings get uploaded.
  */
 export function configFolderName(configDir: string): string {
-    const name = configDir.replace(/^\/+|\/+$/g, "");
-    if (name === "" || name.includes("/")) {
-        throw new Error(`refusing to sync: the config folder ${JSON.stringify(configDir)} is not a plain name`);
-    }
-    return name;
+  const name = configDir.replace(/^\/+|\/+$/g, "");
+  if (name === "" || name.includes("/")) {
+    throw new Error(
+      `refusing to sync: the config folder ${JSON.stringify(configDir)} is not a plain name`,
+    );
+  }
+  return name;
 }
 
 export interface NodeVaultOptions {
-    /** Extra top-level names to leave alone. */
-    readonly alsoIgnore?: readonly string[];
-    /**
-     * Obsidian's config folder, which is `.obsidian` until somebody overrides
-     * it in the app.
-     *
-     * Defaulted here, where the plugin demands it. The plugin can ask Obsidian
-     * and get the right answer; this cannot ask anything, so refusing to run
-     * without being told would put a flag in front of every ordinary use. The
-     * cost of the default is that a vault with an overridden config folder
-     * syncs it until someone passes --config-dir, which is why the flag exists.
-     */
-    readonly configDir?: string;
+  /** Extra top-level names to leave alone. */
+  readonly alsoIgnore?: readonly string[];
+  /**
+   * Obsidian's config folder, which is `.obsidian` until somebody overrides
+   * it in the app.
+   *
+   * Defaulted here, where the plugin demands it. The plugin can ask Obsidian
+   * and get the right answer; this cannot ask anything, so refusing to run
+   * without being told would put a flag in front of every ordinary use. The
+   * cost of the default is that a vault with an overridden config folder
+   * syncs it until someone passes --config-dir, which is why the flag exists.
+   */
+  readonly configDir?: string;
 }
 
 export class NodeVault implements Vault {
-    private readonly root: string;
-    private readonly ignore: Set<string>;
+  private readonly root: string;
+  private readonly ignore: Set<string>;
 
-    constructor(root: string, opts: NodeVaultOptions = {}) {
-        this.root = resolve(root);
-        const configDir = configFolderName(opts.configDir ?? DEFAULT_CONFIG_DIR);
-        this.ignore = new Set([...NEVER_SYNC, configDir, ...(opts.alsoIgnore ?? [])]);
-    }
+  constructor(root: string, opts: NodeVaultOptions = {}) {
+    this.root = resolve(root);
+    const configDir = configFolderName(opts.configDir ?? DEFAULT_CONFIG_DIR);
+    this.ignore = new Set([...NEVER_SYNC, configDir, ...(opts.alsoIgnore ?? [])]);
+  }
 
-    /**
-     * Turns a vault-relative path into an absolute one, refusing to escape.
-     *
-     * Paths arrive from the server, sealed by another device, and a client that
-     * joined `../../.ssh/authorized_keys` onto the vault root without looking
-     * would write outside it. The seal proves the path came from someone holding
-     * the vault key; it does not prove they meant this device well, and a bug on
-     * another device is enough.
-     */
-    /** The vault root with its links resolved, worked out once. */
-    private realRootOnce: Promise<string> | undefined;
+  /**
+   * Turns a vault-relative path into an absolute one, refusing to escape.
+   *
+   * Paths arrive from the server, sealed by another device, and a client that
+   * joined `../../.ssh/authorized_keys` onto the vault root without looking
+   * would write outside it. The seal proves the path came from someone holding
+   * the vault key; it does not prove they meant this device well, and a bug on
+   * another device is enough.
+   */
+  /** The vault root with its links resolved, worked out once. */
+  private realRootOnce: Promise<string> | undefined;
 
-    /**
-     * Proves containment against the filesystem rather than the string.
-     *
-     * `absolute` resolves `..` lexically. That is everything for a path trying
-     * to climb out and nothing for one walking through a symlinked folder, and
-     * a vault with `Attachments -> /elsewhere` is ordinary: a shared media
-     * directory, a notes tree living on another disk. `list` neither follows nor
-     * reports such a folder, so it never syncs out and the vault never learns it
-     * is there, but every write followed it. A peer naming a path under one
-     * wrote outside the vault with the user's privileges, and `remove` deleted
-     * out there.
-     *
-     * The deepest ancestor that exists is the one worth resolving; anything
-     * below it is about to be created and cannot be a link yet.
-     */
-    private async insideForReal(full: string): Promise<void> {
-        const root = await (this.realRootOnce ??= realpath(this.root));
-        let at = dirname(full);
-        for (;;) {
-            const real = await realpath(at).catch((err: NodeJS.ErrnoException) => {
-                if (err.code === "ENOENT") return undefined;
-                throw err;
-            });
-            if (real !== undefined) {
-                if (real !== root && !real.startsWith(root + sep)) {
-                    throw new Error(`refusing a path that leaves the vault through a link: ${full}`);
-                }
-                return;
-            }
-            const up = dirname(at);
-            // The filesystem root, which cannot be inside the vault.
-            if (up === at) return;
-            at = up;
+  /**
+   * Proves containment against the filesystem rather than the string.
+   *
+   * `absolute` resolves `..` lexically. That is everything for a path trying
+   * to climb out and nothing for one walking through a symlinked folder, and
+   * a vault with `Attachments -> /elsewhere` is ordinary: a shared media
+   * directory, a notes tree living on another disk. `list` neither follows nor
+   * reports such a folder, so it never syncs out and the vault never learns it
+   * is there, but every write followed it. A peer naming a path under one
+   * wrote outside the vault with the user's privileges, and `remove` deleted
+   * out there.
+   *
+   * The deepest ancestor that exists is the one worth resolving; anything
+   * below it is about to be created and cannot be a link yet.
+   */
+  private async insideForReal(full: string): Promise<void> {
+    const root = await (this.realRootOnce ??= realpath(this.root));
+    let at = dirname(full);
+    for (;;) {
+      const real = await realpath(at).catch((err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return undefined;
+        throw err;
+      });
+      if (real !== undefined) {
+        if (real !== root && !real.startsWith(root + sep)) {
+          throw new Error(`refusing a path that leaves the vault through a link: ${full}`);
         }
+        return;
+      }
+      const up = dirname(at);
+      // The filesystem root, which cannot be inside the vault.
+      if (up === at) return;
+      at = up;
     }
+  }
 
-    private absolute(path: string): string {
-        const full = resolve(this.root, path);
-        const rel = relative(this.root, full);
-        // `startsWith("..")` also refused a note called `..hidden.md`, which is
-        // a note, not an escape, and could never sync for the life of the vault.
-        if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`)) {
-            throw new Error(`refusing a path outside the vault: ${path}`);
+  private absolute(path: string): string {
+    const full = resolve(this.root, path);
+    const rel = relative(this.root, full);
+    // `startsWith("..")` also refused a note called `..hidden.md`, which is
+    // a note, not an escape, and could never sync for the life of the vault.
+    if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`)) {
+      throw new Error(`refusing a path outside the vault: ${path}`);
+    }
+    // A path this client would never upload is one it must never accept.
+    //
+    // The ignore set was read by `list` and `watch` and by nothing on the
+    // way in, so the two directions disagreed: a peer naming
+    // `.obsidian/plugins/<any>/main.js` had it written, and Obsidian runs
+    // that file on the next reload in a renderer with Node integration.
+    // `.basalt/config.json` holds this device's own secret and server URL,
+    // and `.git/hooks/` runs on the next checkout.
+    const first = rel.split(sep)[0]!;
+    if (this.ignore.has(first)) {
+      throw new Error(`refusing to write inside ${first}, which is never synced: ${path}`);
+    }
+    return full;
+  }
+
+  /**
+   * Every file and folder in the vault, with the stats the engine decides on.
+   *
+   * The stats go together rather than one after another. Serially this was
+   * 14 us a file and 138 ms over ten thousand of them, of which 112 ms was
+   * nothing but waiting: `readdir` over the same tree is 25 ms. It runs on
+   * every pass, so a settled vault paid it on every watch tick and every
+   * keepalive, for ever. Together it is 27 ms.
+   *
+   * The engine's own comment, that an unchanged file costs one stat and so a
+   * full pass is affordable, was right about the number of syscalls and wrong
+   * about the wall clock, purely because they were issued one at a time.
+   *
+   * Order is unchanged and deliberately so: a folder is listed before
+   * anything inside it, because that is the order folders have to be created
+   * in. Each directory returns its own list and they are assembled in the
+   * order they were read, so concurrency cannot reshuffle them.
+   *
+   * Do not raise UV_THREADPOOL_SIZE to go further. Measured at 16 it made this
+   * 2.6x worse than the default 4.
+   */
+  async list(): Promise<FileStat[]> {
+    const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
+      let items;
+      try {
+        items = await readdir(dir, { withFileTypes: true });
+      } catch (err) {
+        // Rule 2: absent and unreadable are different states. A directory
+        // that cannot be read is not an empty one, and treating it as
+        // empty would report every file in it as deleted.
+        throw new Error(`cannot read ${dir}: ${(err as Error).message}`);
+      }
+
+      // Symlinks and anything else are left alone: following one would
+      // sync a file that is not in the vault, and copying it as a link
+      // would sync a path that means nothing elsewhere.
+      //
+      // A write in flight from this client is skipped too. Listing one
+      // would sync a half-written note under a name about to vanish.
+      const kept = items.filter(
+        (i) => !this.ignore.has(i.name) && !isTemporary(i.name) && (i.isDirectory() || i.isFile()),
+      );
+
+      const stats = await Promise.all(
+        kept.map((i) => (i.isFile() ? stat(join(dir, i.name)) : undefined)),
+      );
+      const children = await Promise.all(
+        kept.map((i) =>
+          i.isDirectory()
+            ? walk(join(dir, i.name), prefix ? `${prefix}/${i.name}` : i.name)
+            : undefined,
+        ),
+      );
+
+      const out: FileStat[] = [];
+      for (let k = 0; k < kept.length; k++) {
+        const item = kept[k]!;
+        const path = prefix ? `${prefix}/${item.name}` : item.name;
+        if (item.isDirectory()) {
+          out.push({ path, folder: true, mtime: 0, ctime: 0, size: 0 });
+          out.push(...children[k]!);
+        } else {
+          const s = stats[k]!;
+          out.push({
+            path,
+            folder: false,
+            mtime: s.mtimeMs,
+            // birthtimeMs is unreliable across platforms, which
+            // Obsidian cared about enough to ship native addons for.
+            // Carried because the protocol carries it, and read by
+            // nothing that decides.
+            ctime: s.birthtimeMs || s.ctimeMs,
+            size: s.size,
+          });
         }
-        // A path this client would never upload is one it must never accept.
-        //
-        // The ignore set was read by `list` and `watch` and by nothing on the
-        // way in, so the two directions disagreed: a peer naming
-        // `.obsidian/plugins/<any>/main.js` had it written, and Obsidian runs
-        // that file on the next reload in a renderer with Node integration.
-        // `.basalt/config.json` holds this device's own secret and server URL,
-        // and `.git/hooks/` runs on the next checkout.
-        const first = rel.split(sep)[0]!;
-        if (this.ignore.has(first)) {
-            throw new Error(`refusing to write inside ${first}, which is never synced: ${path}`);
-        }
-        return full;
+      }
+      return out;
+    };
+    return walk(this.root, "");
+  }
+
+  async read(path: string): Promise<Uint8Array> {
+    return new Uint8Array(await readFile(this.absolute(path)));
+  }
+
+  /**
+   * The file in blocks, so a large one can be chunked without being held.
+   *
+   * A megabyte at a time: large enough that the per-read cost disappears,
+   * small enough that peak memory is bounded by something other than the file.
+   */
+  async *readBlocks(path: string, blockSize = 1024 * 1024): AsyncGenerator<Uint8Array> {
+    const handle = await open(this.absolute(path), "r");
+    try {
+      const buf = new Uint8Array(blockSize);
+      for (;;) {
+        const { bytesRead } = await handle.read(buf, 0, blockSize, null);
+        if (bytesRead === 0) return;
+        // Copied rather than yielded as a view, because the buffer is
+        // reused for the next block and a consumer that kept the view
+        // would find it rewritten underneath.
+        yield buf.slice(0, bytesRead);
+      }
+    } finally {
+      await handle.close();
+    }
+  }
+
+  async readRange(path: string, start: number, end: number): Promise<Uint8Array> {
+    const handle = await open(this.absolute(path), "r");
+    try {
+      const out = new Uint8Array(end - start);
+      let at = 0;
+      while (at < out.length) {
+        const { bytesRead } = await handle.read(out, at, out.length - at, start + at);
+        if (bytesRead === 0) break;
+        at += bytesRead;
+      }
+      // Short means the file shrank since it was named. The caller checks
+      // the chunk against its name and fails this file rather than
+      // sending bytes under a name that is not theirs.
+      return at === out.length ? out : out.subarray(0, at);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  /**
+   * Writes a file, then sets its modification time to the one given.
+   *
+   * The timestamp is not decoration. The engine's decision table compares
+   * mtimes, so a downloaded file stamped with the moment it landed looks
+   * locally edited on the very next pass, and the device would upload back what
+   * it just received, forever.
+   */
+  async write(
+    path: string,
+    bytes: Uint8Array,
+    times: { mtime: number; ctime: number },
+  ): Promise<void> {
+    const full = this.absolute(path);
+    await this.insideForReal(full);
+    await mkdir(dirname(full), { recursive: true });
+    await writeDurably(full, bytes);
+    if (times.mtime > 0) {
+      const seconds = times.mtime / 1000;
+      await utimes(full, seconds, seconds);
+    }
+  }
+
+  /**
+   * Removes a path by moving it into the vault's trash.
+   *
+   * Not `rm`. A deletion arriving over the wire was somebody's decision on
+   * another device, possibly a mistaken one, and the first rule is not to
+   * lose a note. The Obsidian adapter has always trashed rather than deleted
+   * and this one did not, which is the same defect Sync Engine had reported
+   * against it as issue 232: files destroyed on one platform and trashed on
+   * another, by the same sync.
+   *
+   * `.trash` is in the never-sync list, so what lands there does not travel
+   * back out and undo the deletion everywhere else.
+   */
+  async remove(path: string): Promise<void> {
+    const full = this.absolute(path);
+    await this.insideForReal(full);
+    try {
+      await access(full, constants.F_OK);
+    } catch {
+      // Two devices deleting the same file produces this routinely.
+      return;
     }
 
-    /**
-     * Every file and folder in the vault, with the stats the engine decides on.
-     *
-     * The stats go together rather than one after another. Serially this was
-     * 14 us a file and 138 ms over ten thousand of them, of which 112 ms was
-     * nothing but waiting: `readdir` over the same tree is 25 ms. It runs on
-     * every pass, so a settled vault paid it on every watch tick and every
-     * keepalive, for ever. Together it is 27 ms.
-     *
-     * The engine's own comment, that an unchanged file costs one stat and so a
-     * full pass is affordable, was right about the number of syscalls and wrong
-     * about the wall clock, purely because they were issued one at a time.
-     *
-     * Order is unchanged and deliberately so: a folder is listed before
-     * anything inside it, because that is the order folders have to be created
-     * in. Each directory returns its own list and they are assembled in the
-     * order they were read, so concurrency cannot reshuffle them.
-     *
-     * Do not raise UV_THREADPOOL_SIZE to go further. Measured at 16 it made this
-     * 2.6x worse than the default 4.
-     */
-    async list(): Promise<FileStat[]> {
-        const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
-            let items;
-            try {
-                items = await readdir(dir, { withFileTypes: true });
-            } catch (err) {
-                // Rule 2: absent and unreadable are different states. A directory
-                // that cannot be read is not an empty one, and treating it as
-                // empty would report every file in it as deleted.
-                throw new Error(`cannot read ${dir}: ${(err as Error).message}`);
-            }
+    const target = await this.freeTrashPath(path);
+    await mkdir(dirname(target), { recursive: true });
+    try {
+      await rename(full, target);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+    }
+    // The trash is on another filesystem, which happens when a vault spans
+    // mounts. Copy and then remove, so the copy exists before the original
+    // stops existing.
+    await cp(full, target, { recursive: true });
+    await rm(full, { recursive: true, force: true });
+  }
 
-            // Symlinks and anything else are left alone: following one would
-            // sync a file that is not in the vault, and copying it as a link
-            // would sync a path that means nothing elsewhere.
-            //
-            // A write in flight from this client is skipped too. Listing one
-            // would sync a half-written note under a name about to vanish.
-            const kept = items.filter(
-                (i) => !this.ignore.has(i.name) && !isTemporary(i.name) && (i.isDirectory() || i.isFile())
-            );
+  /**
+   * Where in the trash a path can go without displacing what is already there.
+   *
+   * Deleting, restoring and deleting again is ordinary, and the second
+   * deletion overwriting the first would quietly discard a version somebody
+   * might want. Numbered rather than timestamped so the order is obvious.
+   */
+  private async freeTrashPath(path: string): Promise<string> {
+    const base = join(this.root, TRASH_DIR, path);
+    const dot = basename(path).lastIndexOf(".");
+    const [stem, ext] =
+      dot <= 0
+        ? [base, ""]
+        : [
+            base.slice(0, base.length - (basename(path).length - dot)),
+            base.slice(base.length - (basename(path).length - dot)),
+          ];
+    for (let n = 0; n < 1000; n++) {
+      const candidate = n === 0 ? base : `${stem} (${n})${ext}`;
+      try {
+        await access(candidate, constants.F_OK);
+      } catch {
+        return candidate;
+      }
+    }
+    throw new Error(`the trash already holds a thousand copies of ${path}`);
+  }
 
-            const stats = await Promise.all(
-                kept.map((i) => (i.isFile() ? stat(join(dir, i.name)) : undefined))
-            );
-            const children = await Promise.all(
-                kept.map((i) =>
-                    i.isDirectory()
-                        ? walk(join(dir, i.name), prefix ? `${prefix}/${i.name}` : i.name)
-                        : undefined
-                )
-            );
+  async mkdir(path: string): Promise<void> {
+    const full = this.absolute(path);
+    await this.insideForReal(full);
+    await mkdir(full, { recursive: true });
+  }
 
-            const out: FileStat[] = [];
-            for (let k = 0; k < kept.length; k++) {
-                const item = kept[k]!;
-                const path = prefix ? `${prefix}/${item.name}` : item.name;
-                if (item.isDirectory()) {
-                    out.push({ path, folder: true, mtime: 0, ctime: 0, size: 0 });
-                    out.push(...children[k]!);
-                } else {
-                    const s = stats[k]!;
-                    out.push({
-                        path,
-                        folder: false,
-                        mtime: s.mtimeMs,
-                        // birthtimeMs is unreliable across platforms, which
-                        // Obsidian cared about enough to ship native addons for.
-                        // Carried because the protocol carries it, and read by
-                        // nothing that decides.
-                        ctime: s.birthtimeMs || s.ctimeMs,
-                        size: s.size,
-                    });
-                }
-            }
-            return out;
-        };
-        return walk(this.root, "");
+  async exists(path: string): Promise<boolean> {
+    try {
+      await access(this.absolute(path), constants.F_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Reports changes under the vault, coalesced.
+   *
+   * What this is and is not: it decides *when to look*, never *what changed*.
+   * The scan is what decides, and it re-reads the vault from scratch, so a
+   * missed event costs latency and never correctness. That is the reason this
+   * can be built on recursive `fs.watch` at all, which is documented as
+   * best-effort and is not available on every platform.
+   *
+   * Coalesced on a short timer because saving one file in an editor produces
+   * several events, and because a folder copied into the vault produces one
+   * per file. Without it the engine would start a pass per event and spend the
+   * copy re-scanning.
+   */
+  watch(onChange: (path: string) => void): () => void {
+    let timer: NodeJS.Timeout | undefined;
+    let last = "";
+    let watcher: FSWatcher | undefined;
+
+    try {
+      watcher = fsWatch(this.root, { recursive: true, persistent: true }, (_event, filename) => {
+        if (!filename) return;
+        const path = filename.toString().split(sep).join("/");
+        // The state folder changes on every single pass, because that is
+        // where the index is written. Watching it would mean each pass
+        // scheduled the next one, forever.
+        if (path.split("/").some((part) => this.ignore.has(part))) return;
+        if (isTemporary(path)) return;
+        last = path;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          timer = undefined;
+          onChange(last);
+        }, 150);
+      });
+      watcher.on("error", () => {
+        // A watch that fails is a vault that gets scanned on a timer
+        // instead. Slower to notice, and no less correct.
+      });
+    } catch {
+      // Recursive watching is not available everywhere. The caller polls.
+      return () => {};
     }
 
-    async read(path: string): Promise<Uint8Array> {
-        return new Uint8Array(await readFile(this.absolute(path)));
-    }
-
-    /**
-     * The file in blocks, so a large one can be chunked without being held.
-     *
-     * A megabyte at a time: large enough that the per-read cost disappears,
-     * small enough that peak memory is bounded by something other than the file.
-     */
-    async *readBlocks(path: string, blockSize = 1024 * 1024): AsyncGenerator<Uint8Array> {
-        const handle = await open(this.absolute(path), "r");
-        try {
-            const buf = new Uint8Array(blockSize);
-            for (;;) {
-                const { bytesRead } = await handle.read(buf, 0, blockSize, null);
-                if (bytesRead === 0) return;
-                // Copied rather than yielded as a view, because the buffer is
-                // reused for the next block and a consumer that kept the view
-                // would find it rewritten underneath.
-                yield buf.slice(0, bytesRead);
-            }
-        } finally {
-            await handle.close();
-        }
-    }
-
-    async readRange(path: string, start: number, end: number): Promise<Uint8Array> {
-        const handle = await open(this.absolute(path), "r");
-        try {
-            const out = new Uint8Array(end - start);
-            let at = 0;
-            while (at < out.length) {
-                const { bytesRead } = await handle.read(out, at, out.length - at, start + at);
-                if (bytesRead === 0) break;
-                at += bytesRead;
-            }
-            // Short means the file shrank since it was named. The caller checks
-            // the chunk against its name and fails this file rather than
-            // sending bytes under a name that is not theirs.
-            return at === out.length ? out : out.subarray(0, at);
-        } finally {
-            await handle.close();
-        }
-    }
-
-    /**
-     * Writes a file, then sets its modification time to the one given.
-     *
-     * The timestamp is not decoration. The engine's decision table compares
-     * mtimes, so a downloaded file stamped with the moment it landed looks
-     * locally edited on the very next pass, and the device would upload back what
-     * it just received, forever.
-     */
-    async write(path: string, bytes: Uint8Array, times: { mtime: number; ctime: number }): Promise<void> {
-        const full = this.absolute(path);
-        await this.insideForReal(full);
-        await mkdir(dirname(full), { recursive: true });
-        await writeDurably(full, bytes);
-        if (times.mtime > 0) {
-            const seconds = times.mtime / 1000;
-            await utimes(full, seconds, seconds);
-        }
-    }
-
-    /**
-     * Removes a path by moving it into the vault's trash.
-     *
-     * Not `rm`. A deletion arriving over the wire was somebody's decision on
-     * another device, possibly a mistaken one, and the first rule is not to
-     * lose a note. The Obsidian adapter has always trashed rather than deleted
-     * and this one did not, which is the same defect Sync Engine had reported
-     * against it as issue 232: files destroyed on one platform and trashed on
-     * another, by the same sync.
-     *
-     * `.trash` is in the never-sync list, so what lands there does not travel
-     * back out and undo the deletion everywhere else.
-     */
-    async remove(path: string): Promise<void> {
-        const full = this.absolute(path);
-        await this.insideForReal(full);
-        try {
-            await access(full, constants.F_OK);
-        } catch {
-            // Two devices deleting the same file produces this routinely.
-            return;
-        }
-
-        const target = await this.freeTrashPath(path);
-        await mkdir(dirname(target), { recursive: true });
-        try {
-            await rename(full, target);
-            return;
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
-        }
-        // The trash is on another filesystem, which happens when a vault spans
-        // mounts. Copy and then remove, so the copy exists before the original
-        // stops existing.
-        await cp(full, target, { recursive: true });
-        await rm(full, { recursive: true, force: true });
-    }
-
-    /**
-     * Where in the trash a path can go without displacing what is already there.
-     *
-     * Deleting, restoring and deleting again is ordinary, and the second
-     * deletion overwriting the first would quietly discard a version somebody
-     * might want. Numbered rather than timestamped so the order is obvious.
-     */
-    private async freeTrashPath(path: string): Promise<string> {
-        const base = join(this.root, TRASH_DIR, path);
-        const dot = basename(path).lastIndexOf(".");
-        const [stem, ext] =
-            dot <= 0 ? [base, ""] : [base.slice(0, base.length - (basename(path).length - dot)), base.slice(base.length - (basename(path).length - dot))];
-        for (let n = 0; n < 1000; n++) {
-            const candidate = n === 0 ? base : `${stem} (${n})${ext}`;
-            try {
-                await access(candidate, constants.F_OK);
-            } catch {
-                return candidate;
-            }
-        }
-        throw new Error(`the trash already holds a thousand copies of ${path}`);
-    }
-
-    async mkdir(path: string): Promise<void> {
-        const full = this.absolute(path);
-        await this.insideForReal(full);
-        await mkdir(full, { recursive: true });
-    }
-
-    async exists(path: string): Promise<boolean> {
-        try {
-            await access(this.absolute(path), constants.F_OK);
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    /**
-     * Reports changes under the vault, coalesced.
-     *
-     * What this is and is not: it decides *when to look*, never *what changed*.
-     * The scan is what decides, and it re-reads the vault from scratch, so a
-     * missed event costs latency and never correctness. That is the reason this
-     * can be built on recursive `fs.watch` at all, which is documented as
-     * best-effort and is not available on every platform.
-     *
-     * Coalesced on a short timer because saving one file in an editor produces
-     * several events, and because a folder copied into the vault produces one
-     * per file. Without it the engine would start a pass per event and spend the
-     * copy re-scanning.
-     */
-    watch(onChange: (path: string) => void): () => void {
-        let timer: NodeJS.Timeout | undefined;
-        let last = "";
-        let watcher: FSWatcher | undefined;
-
-        try {
-            watcher = fsWatch(this.root, { recursive: true, persistent: true }, (_event, filename) => {
-                if (!filename) return;
-                const path = filename.toString().split(sep).join("/");
-                // The state folder changes on every single pass, because that is
-                // where the index is written. Watching it would mean each pass
-                // scheduled the next one, forever.
-                if (path.split("/").some((part) => this.ignore.has(part))) return;
-                if (isTemporary(path)) return;
-                last = path;
-                if (timer) clearTimeout(timer);
-                timer = setTimeout(() => {
-                    timer = undefined;
-                    onChange(last);
-                }, 150);
-            });
-            watcher.on("error", () => {
-                // A watch that fails is a vault that gets scanned on a timer
-                // instead. Slower to notice, and no less correct.
-            });
-        } catch {
-            // Recursive watching is not available everywhere. The caller polls.
-            return () => {};
-        }
-
-        return () => {
-            if (timer) clearTimeout(timer);
-            watcher?.close();
-        };
-    }
+    return () => {
+      if (timer) clearTimeout(timer);
+      watcher?.close();
+    };
+  }
 }
 
 /**
@@ -436,68 +459,68 @@ export class NodeVault implements Vault {
  * read as fact and quietly disagrees with the server about what has been synced.
  */
 export class JsonIndexStore implements IndexStore {
-    constructor(private readonly file: string) {}
+  constructor(private readonly file: string) {}
 
-    /**
-     * The last thing written, so an unchanged index is not written again.
-     *
-     * A pass ends by saving whether or not anything happened, and a settled
-     * vault passes on every watch tick and every keepalive. At 2000 files that
-     * was a 9 MiB serialisation and two fsyncs every thirty seconds, for ever,
-     * to record that nothing had changed; at 10k it measured 21 ms of which 11
-     * ms was the flushes. Two separate audits found this independently, which is
-     * the best evidence a thing is real.
-     *
-     * Comparing the string is not free either, but stringify is 2.1 ms against
-     * 10.7 ms of fsync, so it pays for itself the first time it matches. And a
-     * write skipped because the bytes on disk are already those bytes cannot
-     * lose anything: the failure it would cause is the failure it prevents.
-     */
-    private lastWritten: string | undefined;
+  /**
+   * The last thing written, so an unchanged index is not written again.
+   *
+   * A pass ends by saving whether or not anything happened, and a settled
+   * vault passes on every watch tick and every keepalive. At 2000 files that
+   * was a 9 MiB serialisation and two fsyncs every thirty seconds, for ever,
+   * to record that nothing had changed; at 10k it measured 21 ms of which 11
+   * ms was the flushes. Two separate audits found this independently, which is
+   * the best evidence a thing is real.
+   *
+   * Comparing the string is not free either, but stringify is 2.1 ms against
+   * 10.7 ms of fsync, so it pays for itself the first time it matches. And a
+   * write skipped because the bytes on disk are already those bytes cannot
+   * lose anything: the failure it would cause is the failure it prevents.
+   */
+  private lastWritten: string | undefined;
 
-    async load(): Promise<StoredState | undefined> {
-        let text: string;
-        try {
-            text = await readFile(this.file, "utf8");
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-            // Rule 2 again, and this is the incident it came from: code that read
-            // a config file, fell back to an empty result on error and wrote that
-            // back disabled every plugin on a device. Unreadable must stop.
-            throw new Error(`cannot read the index at ${this.file}: ${(err as Error).message}`);
-        }
-        try {
-            return JSON.parse(text) as StoredState;
-        } catch (err) {
-            throw new Error(
-                `the index at ${this.file} is not valid JSON, so it cannot be trusted: ${(err as Error).message}`
-            );
-        }
+  async load(): Promise<StoredState | undefined> {
+    let text: string;
+    try {
+      text = await readFile(this.file, "utf8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      // Rule 2 again, and this is the incident it came from: code that read
+      // a config file, fell back to an empty result on error and wrote that
+      // back disabled every plugin on a device. Unreadable must stop.
+      throw new Error(`cannot read the index at ${this.file}: ${(err as Error).message}`);
     }
-
-    /**
-     * Writes the index durably, and only ever after the notes it describes.
-     *
-     * The engine writes every downloaded file in a pass and saves this once at
-     * the end, so the ordering is already right. What was missing was the
-     * durability underneath it: with neither the note nor the index fsynced, a
-     * power cut could leave the index on disk saying a note was synced while the
-     * note itself was not. On the next pass the file is missing, the index says
-     * it matched the server, and `decideMissingLocally` reads that as "the user
-     * deleted it" and propagates the deletion to every other device.
-     *
-     * That is a note lost silently, by a machine losing power at the wrong
-     * moment, and it is the exact failure the first rule exists to refuse.
-     */
-    async save(state: StoredState): Promise<void> {
-        const text = JSON.stringify(state);
-        if (text === this.lastWritten) return;
-        await mkdir(dirname(this.file), { recursive: true });
-        await writeDurably(this.file, new TextEncoder().encode(text));
-        // Only after it is durable. Recording it first would skip the write
-        // that a failed one still owes.
-        this.lastWritten = text;
+    try {
+      return JSON.parse(text) as StoredState;
+    } catch (err) {
+      throw new Error(
+        `the index at ${this.file} is not valid JSON, so it cannot be trusted: ${(err as Error).message}`,
+      );
     }
+  }
+
+  /**
+   * Writes the index durably, and only ever after the notes it describes.
+   *
+   * The engine writes every downloaded file in a pass and saves this once at
+   * the end, so the ordering is already right. What was missing was the
+   * durability underneath it: with neither the note nor the index fsynced, a
+   * power cut could leave the index on disk saying a note was synced while the
+   * note itself was not. On the next pass the file is missing, the index says
+   * it matched the server, and `decideMissingLocally` reads that as "the user
+   * deleted it" and propagates the deletion to every other device.
+   *
+   * That is a note lost silently, by a machine losing power at the wrong
+   * moment, and it is the exact failure the first rule exists to refuse.
+   */
+  async save(state: StoredState): Promise<void> {
+    const text = JSON.stringify(state);
+    if (text === this.lastWritten) return;
+    await mkdir(dirname(this.file), { recursive: true });
+    await writeDurably(this.file, new TextEncoder().encode(text));
+    // Only after it is durable. Recording it first would skip the write
+    // that a failed one still owes.
+    this.lastWritten = text;
+  }
 }
 
 /**
@@ -514,7 +537,7 @@ export const TEMP_MARK = ".basalt-tmp-";
 
 /** Whether a vault-relative path is one of this client's temporary files. */
 export function isTemporary(path: string): boolean {
-    return path.includes(TEMP_MARK);
+  return path.includes(TEMP_MARK);
 }
 
 let tempCounter = 0;
@@ -524,16 +547,18 @@ let tempCounter = 0;
  * already exists: `wx` fails rather than truncating, so a file somebody else
  * put there is refused instead of destroyed.
  */
-async function openTemp(full: string): Promise<{ tmp: string; handle: Awaited<ReturnType<typeof open>> }> {
-    for (let attempt = 0; attempt < 64; attempt++) {
-        const tmp = `${full}${TEMP_MARK}${(tempCounter++).toString(36)}${attempt ? `-${attempt}` : ""}`;
-        try {
-            return { tmp, handle: await open(tmp, "wx") };
-        } catch (err) {
-            if ((err as { code?: string }).code !== "EEXIST") throw err;
-        }
+async function openTemp(
+  full: string,
+): Promise<{ tmp: string; handle: Awaited<ReturnType<typeof open>> }> {
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const tmp = `${full}${TEMP_MARK}${(tempCounter++).toString(36)}${attempt ? `-${attempt}` : ""}`;
+    try {
+      return { tmp, handle: await open(tmp, "wx") };
+    } catch (err) {
+      if ((err as { code?: string }).code !== "EEXIST") throw err;
     }
-    throw new Error(`could not find an unused temporary name beside ${full}`);
+  }
+  throw new Error(`could not find an unused temporary name beside ${full}`);
 }
 
 /**
@@ -550,19 +575,19 @@ async function openTemp(full: string): Promise<{ tmp: string; handle: Awaited<Re
  * something a process can observe, on any operating system.
  */
 export async function writeDurably(full: string, bytes: Uint8Array): Promise<void> {
-    const { tmp, handle } = await openTemp(full);
-    try {
-        await handle.write(bytes);
-        await handle.sync();
-    } finally {
-        await handle.close();
-    }
-    await rename(tmp, full);
+  const { tmp, handle } = await openTemp(full);
+  try {
+    await handle.write(bytes);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(tmp, full);
 
-    const dir = await open(dirname(full), "r");
-    try {
-        await dir.sync();
-    } finally {
-        await dir.close();
-    }
+  const dir = await open(dirname(full), "r");
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
 }

@@ -30,26 +30,28 @@ export const indexPath = (vault: string) => join(vault, STATE_DIR, "index.json")
  * An unreadable config treated as an unpaired vault would re-pair and re-upload.
  */
 export async function loadConfig(vault: string): Promise<Config | undefined> {
-    const file = configPath(vault);
-    let text: string;
-    try {
-        text = await readFile(file, "utf8");
-    } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-        throw new Error(`cannot read ${file}: ${(err as Error).message}`);
-    }
+  const file = configPath(vault);
+  let text: string;
+  try {
+    text = await readFile(file, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`cannot read ${file}: ${(err as Error).message}`);
+  }
 
-    let raw: Record<string, unknown>;
-    try {
-        raw = JSON.parse(text) as Record<string, unknown>;
-    } catch (err) {
-        throw new Error(`${file} is not valid JSON, so it cannot be trusted: ${(err as Error).message}`);
-    }
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(text) as Record<string, unknown>;
+  } catch (err) {
+    throw new Error(
+      `${file} is not valid JSON, so it cannot be trusted: ${(err as Error).message}`,
+    );
+  }
 
-    // Decoded by core, so the plugin and this agree about what a config is and
-    // refuse the same things. A secret of the wrong length still derives keys;
-    // they are the wrong keys, and the vault would sync and decrypt nothing.
-    return decodeConfig(raw, file);
+  // Decoded by core, so the plugin and this agree about what a config is and
+  // refuse the same things. A secret of the wrong length still derives keys;
+  // they are the wrong keys, and the vault would sync and decrypt nothing.
+  return decodeConfig(raw, file);
 }
 
 /**
@@ -60,17 +62,17 @@ export async function loadConfig(vault: string): Promise<Config | undefined> {
  * can read every note in the vault.
  */
 export async function saveConfig(vault: string, config: Config): Promise<void> {
-    const dir = join(vault, STATE_DIR);
-    await mkdir(dir, { recursive: true });
-    const file = configPath(vault);
-    const tmp = `${file}.tmp`;
-    await writeFile(tmp, JSON.stringify(encodeConfig(config), null, 2) + "\n", { mode: 0o600 });
-    await chmod(tmp, 0o600);
-    await rename(tmp, file);
+  const dir = join(vault, STATE_DIR);
+  await mkdir(dir, { recursive: true });
+  const file = configPath(vault);
+  const tmp = `${file}.tmp`;
+  await writeFile(tmp, JSON.stringify(encodeConfig(config), null, 2) + "\n", { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, file);
 }
 
 /** Forgets a device's pairing, leaving every note where it is. */
 export async function removeState(vault: string): Promise<void> {
-    await rm(configPath(vault), { force: true });
-    await rm(indexPath(vault), { force: true });
+  await rm(configPath(vault), { force: true });
+  await rm(indexPath(vault), { force: true });
 }

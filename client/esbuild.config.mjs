@@ -15,15 +15,15 @@ const production = process.argv.includes("production");
 
 /** The headless client, as one file a person can run. */
 const cli = {
-    entryPoints: ["src/cli/bin.ts"],
-    outfile: "dist/basalt.mjs",
-    platform: "node",
-    target: "node20",
-    format: "esm",
-    // Nothing is external. A self-hosted sync client that needs an npm install
-    // before it will run is one more thing to go wrong on the machine you were
-    // trying to make reliable.
-    banner: { js: "#!/usr/bin/env node" },
+  entryPoints: ["src/cli/bin.ts"],
+  outfile: "dist/basalt.mjs",
+  platform: "node",
+  target: "node20",
+  format: "esm",
+  // Nothing is external. A self-hosted sync client that needs an npm install
+  // before it will run is one more thing to go wrong on the machine you were
+  // trying to make reliable.
+  banner: { js: "#!/usr/bin/env node" },
 };
 
 /**
@@ -35,24 +35,24 @@ const cli = {
  * copying three files.
  */
 const plugin = {
-    entryPoints: ["src/plugin/main.ts"],
-    outfile: "dist/plugin/main.js",
-    platform: "browser",
-    target: "es2020",
-    format: "cjs",
-    external: ["obsidian", "electron", "node:fs", "node:path", "node:os", "node:crypto"],
+  entryPoints: ["src/plugin/main.ts"],
+  outfile: "dist/plugin/main.js",
+  platform: "browser",
+  target: "es2020",
+  format: "cjs",
+  external: ["obsidian", "electron", "node:fs", "node:path", "node:os", "node:crypto"],
 };
 
 const common = {
-    bundle: true,
-    logLevel: "info",
-    sourcemap: production ? false : "inline",
-    // Minified for a release, readable during development. It halves both
-    // bundles, 212 KB to 90 KB for the plugin and 198 KB to 85 KB for the
-    // client, which is a real difference on a phone loading a plugin at
-    // startup. Nothing is hidden by it: the source is MIT and in this
-    // repository, and a sourcemap is inlined in a dev build.
-    minify: production,
+  bundle: true,
+  logLevel: "info",
+  sourcemap: production ? false : "inline",
+  // Minified for a release, readable during development. It halves both
+  // bundles, 212 KB to 90 KB for the plugin and 198 KB to 85 KB for the
+  // client, which is a real difference on a phone loading a plugin at
+  // startup. Nothing is hidden by it: the source is MIT and in this
+  // repository, and a sourcemap is inlined in a dev build.
+  minify: production,
 };
 
 await build({ ...common, ...cli });

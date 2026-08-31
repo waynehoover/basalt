@@ -24,16 +24,16 @@ const GO_DIR = new URL("./../server", import.meta.url).pathname;
 let dir: string | undefined;
 
 export async function setup(): Promise<void> {
-    dir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
-    const binary = join(dir, "basalt");
-    await run("go", ["build", "-o", binary, "./cmd/basaltd"], {
-        cwd: GO_DIR,
-        env: { ...process.env, CGO_ENABLED: "0" },
-    });
-    process.env["BASALT_TEST_BINARY"] = binary;
+  dir = await mkdtemp(join(tmpdir(), "basalt-bin-"));
+  const binary = join(dir, "basalt");
+  await run("go", ["build", "-o", binary, "./cmd/basaltd"], {
+    cwd: GO_DIR,
+    env: { ...process.env, CGO_ENABLED: "0" },
+  });
+  process.env["BASALT_TEST_BINARY"] = binary;
 }
 
 export async function teardown(): Promise<void> {
-    if (dir) await rm(dir, { recursive: true, force: true });
-    dir = undefined;
+  if (dir) await rm(dir, { recursive: true, force: true });
+  dir = undefined;
 }

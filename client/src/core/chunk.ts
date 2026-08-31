@@ -74,8 +74,8 @@ const BOUNDARY = 1;
  * nothing.
  */
 function atBoundary(hash: number, avg: number): boolean {
-    const u = hash >>> 0;
-    return Math.floor(u / avg) * avg === u - BOUNDARY;
+  const u = hash >>> 0;
+  return Math.floor(u / avg) * avg === u - BOUNDARY;
 }
 
 /**
@@ -91,9 +91,9 @@ function atBoundary(hash: number, avg: number): boolean {
  * in the source.
  */
 export interface ChunkSizes {
-    readonly min: number;
-    readonly avg: number;
-    readonly max: number;
+  readonly min: number;
+  readonly avg: number;
+  readonly max: number;
 }
 
 /**
@@ -150,9 +150,9 @@ const TEXT_AVG_MAX = 64 * 1024;
  * whole point of chunking.
  */
 export function textSizesFor(size: number): ChunkSizes {
-    const ideal = Math.sqrt(NAME_BYTES * Math.max(size, 1));
-    const avg = Math.min(TEXT_AVG_MAX, Math.max(TEXT_AVG_MIN, Math.round(ideal / 512) * 512));
-    return { min: Math.max(TEXT_SIZES.min, avg / 2), avg, max: avg * 4 };
+  const ideal = Math.sqrt(NAME_BYTES * Math.max(size, 1));
+  const avg = Math.min(TEXT_AVG_MAX, Math.max(TEXT_AVG_MIN, Math.round(ideal / 512) * 512));
+  return { min: Math.max(TEXT_SIZES.min, avg / 2), avg, max: avg * 4 };
 }
 
 /**
@@ -195,29 +195,33 @@ export const TEXT_AS_BINARY_ABOVE = 4 * 1024 * 1024;
  * instead of rejected puts, and a client that has not asked yet still gets
  * something sane.
  */
-export function sizesFor(size: number, isText: boolean, serverChunkMax: number = BINARY_SIZES.max): ChunkSizes {
-    if (!Number.isFinite(serverChunkMax) || serverChunkMax <= 0) serverChunkMax = BINARY_SIZES.max;
-    const base = isText && size < TEXT_AS_BINARY_ABOVE ? textSizesFor(size) : BINARY_SIZES;
+export function sizesFor(
+  size: number,
+  isText: boolean,
+  serverChunkMax: number = BINARY_SIZES.max,
+): ChunkSizes {
+  if (!Number.isFinite(serverChunkMax) || serverChunkMax <= 0) serverChunkMax = BINARY_SIZES.max;
+  const base = isText && size < TEXT_AS_BINARY_ABOVE ? textSizesFor(size) : BINARY_SIZES;
 
-    // The ceiling is on the *sealed* chunk, and sealing adds a nonce, a tag and
-    // a marker byte. A cut made at exactly the ceiling therefore produces a
-    // body the server refuses, permanently, and the file never syncs.
-    //
-    // Nothing caught this for a long time because the test data compressed:
-    // deflate made the sealed chunk smaller than the plaintext and the overhead
-    // disappeared into the saving. Incompressible data is what an attachment
-    // actually is, and it does not.
-    const max = Math.min(base.max, serverChunkMax - SEAL_OVERHEAD);
-    // A window's worth of data is the least that can produce a boundary at all,
-    // so a maximum below it would make every chunk a forced cut and the rolling
-    // hash pointless. Clamping up keeps the algorithm meaningful even if a
-    // server advertises something absurd.
-    const clampedMax = Math.max(max, WINDOW * 4);
-    return {
-        min: Math.min(base.min, clampedMax),
-        avg: Math.min(base.avg, clampedMax),
-        max: clampedMax,
-    };
+  // The ceiling is on the *sealed* chunk, and sealing adds a nonce, a tag and
+  // a marker byte. A cut made at exactly the ceiling therefore produces a
+  // body the server refuses, permanently, and the file never syncs.
+  //
+  // Nothing caught this for a long time because the test data compressed:
+  // deflate made the sealed chunk smaller than the plaintext and the overhead
+  // disappeared into the saving. Incompressible data is what an attachment
+  // actually is, and it does not.
+  const max = Math.min(base.max, serverChunkMax - SEAL_OVERHEAD);
+  // A window's worth of data is the least that can produce a boundary at all,
+  // so a maximum below it would make every chunk a forced cut and the rolling
+  // hash pointless. Clamping up keeps the algorithm meaningful even if a
+  // server advertises something absurd.
+  const clampedMax = Math.max(max, WINDOW * 4);
+  return {
+    min: Math.min(base.min, clampedMax),
+    avg: Math.min(base.avg, clampedMax),
+    max: clampedMax,
+  };
 }
 
 /**
@@ -240,21 +244,22 @@ export function sizesFor(size: number, isText: boolean, serverChunkMax: number =
  * zero-length chunk is worth closing rather than reasoning away.
  */
 function trimIncompleteCharacter(data: Uint8Array, start: number, end: number): number {
-    // Find the lead byte of the last sequence.
-    let lead = end - 1;
-    while (lead > start && (data[lead]! & 0xc0) === 0x80) lead--;
-    if (lead < start) return end;
+  // Find the lead byte of the last sequence.
+  let lead = end - 1;
+  while (lead > start && (data[lead]! & 0xc0) === 0x80) lead--;
+  if (lead < start) return end;
 
-    const b = data[lead]!;
-    const expected = b < 0x80 ? 1 : (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : (b & 0xf8) === 0xf0 ? 4 : 1;
-    if (end - lead >= expected) return end; // complete, nothing to do
-    return lead > start ? lead : end;
+  const b = data[lead]!;
+  const expected =
+    b < 0x80 ? 1 : (b & 0xe0) === 0xc0 ? 2 : (b & 0xf0) === 0xe0 ? 3 : (b & 0xf8) === 0xf0 ? 4 : 1;
+  if (end - lead >= expected) return end; // complete, nothing to do
+  return lead > start ? lead : end;
 }
 
 /** One chunk: where it came from, and its bytes. */
 export interface Chunk {
-    readonly offset: number;
-    readonly bytes: Uint8Array;
+  readonly offset: number;
+  readonly bytes: Uint8Array;
 }
 
 /**
@@ -278,64 +283,68 @@ export interface Chunk {
  * stores strings; Basalt sends binary WebSocket frames, so the bytes go as
  * bytes and a third of the transfer is not spent on encoding.
  */
-export function* chunkBytes(data: Uint8Array, sizes: ChunkSizes, isUtf8: boolean): Generator<Chunk> {
-    const { min, avg, max } = sizes;
-    const length = data.length;
+export function* chunkBytes(
+  data: Uint8Array,
+  sizes: ChunkSizes,
+  isUtf8: boolean,
+): Generator<Chunk> {
+  const { min, avg, max } = sizes;
+  const length = data.length;
 
-    // An empty input yields nothing, and needs no special case to do it: the
-    // loop does not run and the trailing yield is guarded. That is the right
-    // answer rather than an accident. The protocol says a file has chunks if and
-    // only if it has content, so an empty note carries none and the server
-    // refuses one that carries any.
+  // An empty input yields nothing, and needs no special case to do it: the
+  // loop does not run and the trailing yield is guarded. That is the right
+  // answer rather than an accident. The protocol says a file has chunks if and
+  // only if it has content, so an empty note carries none and the server
+  // refuses one that carries any.
 
-    // PRIME^(WINDOW-1), for removing the byte leaving the window. Math.imul
-    // keeps the arithmetic in 32 bits, which is what makes the rolling update
-    // exact rather than drifting through float precision.
-    let pPowW = 1;
-    for (let i = 0; i < WINDOW - 1; i++) pPowW = Math.imul(pPowW, PRIME);
+  // PRIME^(WINDOW-1), for removing the byte leaving the window. Math.imul
+  // keeps the arithmetic in 32 bits, which is what makes the rolling update
+  // exact rather than drifting through float precision.
+  let pPowW = 1;
+  for (let i = 0; i < WINDOW - 1; i++) pPowW = Math.imul(pPowW, PRIME);
 
-    let start = 0;
-    let hash = 0;
+  let start = 0;
+  let hash = 0;
 
-    for (let pos = 0; pos < length; pos++) {
-        const byte = data[pos]!;
+  for (let pos = 0; pos < length; pos++) {
+    const byte = data[pos]!;
 
-        if (pos >= start + WINDOW) {
-            // Roll: drop the byte that has left the window, take in the new one.
-            hash = (hash - Math.imul(data[pos - WINDOW]!, pPowW)) | 0;
-            hash = Math.imul(hash, PRIME);
-            hash = (hash + byte) | 0;
-        } else {
-            // Still filling the first window of this chunk.
-            hash = Math.imul(hash, PRIME);
-            hash = (hash + byte) | 0;
-        }
-
-        const size = pos - start + 1;
-        let boundary = size >= min && atBoundary(hash, avg);
-        // A forced cut at the maximum. Without it a file with no boundary in it
-        // is one chunk however large, which the server would refuse.
-        if (size >= max) boundary = true;
-
-        if (boundary) {
-            // Sealing and reassembly are byte exact, so splitting a character
-            // would corrupt nothing. It would make a chunk that is not valid
-            // UTF-8 on its own, which cannot be diffed, logged or looked at, and
-            // LiveSync carries a regression test for a U+FEFF landing here.
-            const end = isUtf8 ? trimIncompleteCharacter(data, start, pos + 1) : pos + 1;
-            yield { offset: start, bytes: data.subarray(start, end) };
-            start = end;
-            hash = 0;
-            // The bytes backed over have not been hashed into the new chunk, so
-            // rewind to re-read them. `end > start` always holds, so this
-            // terminates.
-            pos = end - 1;
-        }
+    if (pos >= start + WINDOW) {
+      // Roll: drop the byte that has left the window, take in the new one.
+      hash = (hash - Math.imul(data[pos - WINDOW]!, pPowW)) | 0;
+      hash = Math.imul(hash, PRIME);
+      hash = (hash + byte) | 0;
+    } else {
+      // Still filling the first window of this chunk.
+      hash = Math.imul(hash, PRIME);
+      hash = (hash + byte) | 0;
     }
 
-    if (start < length) {
-        yield { offset: start, bytes: data.subarray(start, length) };
+    const size = pos - start + 1;
+    let boundary = size >= min && atBoundary(hash, avg);
+    // A forced cut at the maximum. Without it a file with no boundary in it
+    // is one chunk however large, which the server would refuse.
+    if (size >= max) boundary = true;
+
+    if (boundary) {
+      // Sealing and reassembly are byte exact, so splitting a character
+      // would corrupt nothing. It would make a chunk that is not valid
+      // UTF-8 on its own, which cannot be diffed, logged or looked at, and
+      // LiveSync carries a regression test for a U+FEFF landing here.
+      const end = isUtf8 ? trimIncompleteCharacter(data, start, pos + 1) : pos + 1;
+      yield { offset: start, bytes: data.subarray(start, end) };
+      start = end;
+      hash = 0;
+      // The bytes backed over have not been hashed into the new chunk, so
+      // rewind to re-read them. `end > start` always holds, so this
+      // terminates.
+      pos = end - 1;
     }
+  }
+
+  if (start < length) {
+    yield { offset: start, bytes: data.subarray(start, length) };
+  }
 }
 
 /**
@@ -358,120 +367,120 @@ export function* chunkBytes(data: Uint8Array, sizes: ChunkSizes, isUtf8: boolean
  * is not. See the comment at the call site.
  */
 class Roller {
-    used = 0;
-    hash = 0;
+  used = 0;
+  hash = 0;
 
-    constructor(
-        private readonly buf: Uint8Array,
-        private readonly sizes: ChunkSizes,
-        private readonly pPowW: number
-    ) {}
+  constructor(
+    private readonly buf: Uint8Array,
+    private readonly sizes: ChunkSizes,
+    private readonly pPowW: number,
+  ) {}
 
-    /**
-     * Consumes bytes from `block` starting at `from` until a chunk is due.
-     *
-     * Returns the index to resume at, or -1 when the block ran out first. The
-     * caller cuts and calls again.
-     */
-    scanTo(block: Uint8Array, from: number): number {
-        const { min, avg, max } = this.sizes;
-        const buf = this.buf;
-        const pPowW = this.pPowW;
-        let used = this.used;
-        let hash = this.hash;
+  /**
+   * Consumes bytes from `block` starting at `from` until a chunk is due.
+   *
+   * Returns the index to resume at, or -1 when the block ran out first. The
+   * caller cuts and calls again.
+   */
+  scanTo(block: Uint8Array, from: number): number {
+    const { min, avg, max } = this.sizes;
+    const buf = this.buf;
+    const pPowW = this.pPowW;
+    let used = this.used;
+    let hash = this.hash;
 
-        for (let i = from; i < block.length; i++) {
-            const byte = block[i]!;
-            buf[used++] = byte;
-            if (used >= WINDOW + 1) {
-                hash = (hash - Math.imul(buf[used - 1 - WINDOW]!, pPowW)) | 0;
-                hash = Math.imul(hash, PRIME);
-                hash = (hash + byte) | 0;
-            } else {
-                hash = Math.imul(hash, PRIME);
-                hash = (hash + byte) | 0;
-            }
+    for (let i = from; i < block.length; i++) {
+      const byte = block[i]!;
+      buf[used++] = byte;
+      if (used >= WINDOW + 1) {
+        hash = (hash - Math.imul(buf[used - 1 - WINDOW]!, pPowW)) | 0;
+        hash = Math.imul(hash, PRIME);
+        hash = (hash + byte) | 0;
+      } else {
+        hash = Math.imul(hash, PRIME);
+        hash = (hash + byte) | 0;
+      }
 
-            if (used >= max || (used >= min && atBoundary(hash, avg))) {
-                this.used = used;
-                this.hash = hash;
-                return i + 1;
-            }
-        }
-
+      if (used >= max || (used >= min && atBoundary(hash, avg))) {
         this.used = used;
         this.hash = hash;
-        return -1;
+        return i + 1;
+      }
     }
+
+    this.used = used;
+    this.hash = hash;
+    return -1;
+  }
 }
 
 export async function* chunkStream(
-    blocks: AsyncIterable<Uint8Array>,
-    sizes: ChunkSizes,
-    isUtf8: boolean
+  blocks: AsyncIterable<Uint8Array>,
+  sizes: ChunkSizes,
+  isUtf8: boolean,
 ): AsyncGenerator<Chunk> {
-    const { max } = sizes;
+  const { max } = sizes;
 
-    let pPowW = 1;
-    for (let i = 0; i < WINDOW - 1; i++) pPowW = Math.imul(pPowW, PRIME);
+  let pPowW = 1;
+  for (let i = 0; i < WINDOW - 1; i++) pPowW = Math.imul(pPowW, PRIME);
 
-    // The chunk under construction. Sized to the maximum once, then reused.
-    const buf = new Uint8Array(Math.max(max, WINDOW * 2));
-    let used = 0;
-    let hash = 0;
-    let offset = 0;
+  // The chunk under construction. Sized to the maximum once, then reused.
+  const buf = new Uint8Array(Math.max(max, WINDOW * 2));
+  let used = 0;
+  let hash = 0;
+  let offset = 0;
 
-    // Trimming an incomplete character looks only at bytes already in the
-    // buffer, so this needs no lookahead and no pending state. That is what lets
-    // both implementations share one rule.
-    const cut = (): Chunk => {
-        const end = isUtf8 ? trimIncompleteCharacter(buf, 0, used) : used;
-        const chunk = { offset, bytes: buf.slice(0, end) };
-        offset += end;
-        // Whatever was backed over stays, and is rehashed as the next chunk's
-        // opening bytes.
-        const carry = used - end;
-        buf.copyWithin(0, end, used);
-        used = carry;
-        hash = 0;
-        for (let i = 0; i < carry; i++) {
-            hash = Math.imul(hash, PRIME);
-            hash = (hash + buf[i]!) | 0;
-        }
-        return chunk;
-    };
-
-    // The byte loop lives in a plain function, not in this generator's body.
-    //
-    // JavaScriptCore does not optimise a hot loop inside an async generator:
-    // the same arithmetic moved out of one goes from 39 MiB/s to 700. V8 is
-    // indifferent to this and JavaScriptCore is indifferent to the modulo in
-    // `atBoundary`, so the two defects are disjoint and both engines were slow,
-    // each for its own reason. iOS is JavaScriptCore, which makes this the
-    // mobile half.
-    const roll = new Roller(buf, sizes, pPowW);
-    for await (const block of blocks) {
-        let from = 0;
-        for (;;) {
-            const at = roll.scanTo(block, from);
-            if (at < 0) break;
-            used = roll.used;
-            yield cut();
-            roll.used = used;
-            roll.hash = hash;
-            from = at;
-        }
-        used = roll.used;
+  // Trimming an incomplete character looks only at bytes already in the
+  // buffer, so this needs no lookahead and no pending state. That is what lets
+  // both implementations share one rule.
+  const cut = (): Chunk => {
+    const end = isUtf8 ? trimIncompleteCharacter(buf, 0, used) : used;
+    const chunk = { offset, bytes: buf.slice(0, end) };
+    offset += end;
+    // Whatever was backed over stays, and is rehashed as the next chunk's
+    // opening bytes.
+    const carry = used - end;
+    buf.copyWithin(0, end, used);
+    used = carry;
+    hash = 0;
+    for (let i = 0; i < carry; i++) {
+      hash = Math.imul(hash, PRIME);
+      hash = (hash + buf[i]!) | 0;
     }
+    return chunk;
+  };
 
-    if (used > 0) {
-        // The remainder, whatever it is. No backing off: there is no next
-        // character to protect.
-        const chunk = { offset, bytes: buf.slice(0, used) };
-        offset += used;
-        used = 0;
-        yield chunk;
+  // The byte loop lives in a plain function, not in this generator's body.
+  //
+  // JavaScriptCore does not optimise a hot loop inside an async generator:
+  // the same arithmetic moved out of one goes from 39 MiB/s to 700. V8 is
+  // indifferent to this and JavaScriptCore is indifferent to the modulo in
+  // `atBoundary`, so the two defects are disjoint and both engines were slow,
+  // each for its own reason. iOS is JavaScriptCore, which makes this the
+  // mobile half.
+  const roll = new Roller(buf, sizes, pPowW);
+  for await (const block of blocks) {
+    let from = 0;
+    for (;;) {
+      const at = roll.scanTo(block, from);
+      if (at < 0) break;
+      used = roll.used;
+      yield cut();
+      roll.used = used;
+      roll.hash = hash;
+      from = at;
     }
+    used = roll.used;
+  }
+
+  if (used > 0) {
+    // The remainder, whatever it is. No backing off: there is no next
+    // character to protect.
+    const chunk = { offset, bytes: buf.slice(0, used) };
+    offset += used;
+    used = 0;
+    yield chunk;
+  }
 }
 
 /**
@@ -481,9 +490,9 @@ export async function* chunkStream(
  * that peak memory is bounded by something other than the file.
  */
 export async function* blobBlocks(blob: Blob, blockSize = 1024 * 1024): AsyncGenerator<Uint8Array> {
-    for (let at = 0; at < blob.size; at += blockSize) {
-        yield new Uint8Array(await blob.slice(at, Math.min(at + blockSize, blob.size)).arrayBuffer());
-    }
+  for (let at = 0; at < blob.size; at += blockSize) {
+    yield new Uint8Array(await blob.slice(at, Math.min(at + blockSize, blob.size)).arrayBuffer());
+  }
 }
 
 /**
@@ -495,27 +504,27 @@ export async function* blobBlocks(blob: Blob, blockSize = 1024 * 1024): AsyncGen
  * read.
  */
 const TEXT_EXTENSIONS = new Set([
-    "md",
-    "txt",
-    "canvas",
-    "json",
-    "csv",
-    "yml",
-    "yaml",
-    "xml",
-    "html",
-    "css",
-    "js",
-    "ts",
-    "svg",
-    "bib",
-    "tex",
+  "md",
+  "txt",
+  "canvas",
+  "json",
+  "csv",
+  "yml",
+  "yaml",
+  "xml",
+  "html",
+  "css",
+  "js",
+  "ts",
+  "svg",
+  "bib",
+  "tex",
 ]);
 
 export function looksLikeText(path: string): boolean {
-    const dot = path.lastIndexOf(".");
-    if (dot < 0) return false;
-    return TEXT_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) return false;
+  return TEXT_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }
 
 /**
@@ -529,7 +538,7 @@ export function looksLikeText(path: string): boolean {
 const JSON_EXTENSIONS = new Set(["canvas", "json"]);
 
 export function looksLikeJson(path: string): boolean {
-    const dot = path.lastIndexOf(".");
-    if (dot < 0) return false;
-    return JSON_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
+  const dot = path.lastIndexOf(".");
+  if (dot < 0) return false;
+  return JSON_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }

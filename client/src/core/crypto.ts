@@ -74,11 +74,11 @@ const dec = new TextDecoder();
  * derived from every existing secret. They are versioned for that reason.
  */
 const INFO = {
-    auth: "basalt/auth/1",
-    path: "basalt/path/1",
-    content: "basalt/content/1",
-    nonce: "basalt/nonce/1",
-    meta: "basalt/meta/1",
+  auth: "basalt/auth/1",
+  path: "basalt/path/1",
+  content: "basalt/content/1",
+  nonce: "basalt/nonce/1",
+  meta: "basalt/meta/1",
 } as const;
 
 /**
@@ -90,46 +90,46 @@ const INFO = {
  * which is one fewer way for it to end up somewhere it should not be.
  */
 export interface VaultKeys {
-    /** Sent to the server, which stores only a hash of it. */
-    readonly auth: Uint8Array;
-    /** Seals paths. Deterministic, and reversible: a device must recover the name. */
-    readonly path: CryptoKey;
-    /** Seals chunk bodies. */
-    readonly content: CryptoKey;
-    /** Derives synthetic nonces. Never seals anything itself. */
-    readonly nonce: CryptoKey;
-    /**
-     * Authenticates an entry: everything about a version except its bytes.
-     *
-     * The bytes were always sealed. What decides what a client *does* with them
-     * was not: `deleted`, `size`, `prev` and the chunk list travelled in the
-     * clear, and the server holds every sealed path in the vault, so it could
-     * name any file and say anything about it. Setting `deleted` deleted a note
-     * everywhere; a size with no chunks emptied one; a chunk list borrowed from
-     * another file replaced one.
-     */
-    readonly meta: CryptoKey;
+  /** Sent to the server, which stores only a hash of it. */
+  readonly auth: Uint8Array;
+  /** Seals paths. Deterministic, and reversible: a device must recover the name. */
+  readonly path: CryptoKey;
+  /** Seals chunk bodies. */
+  readonly content: CryptoKey;
+  /** Derives synthetic nonces. Never seals anything itself. */
+  readonly nonce: CryptoKey;
+  /**
+   * Authenticates an entry: everything about a version except its bytes.
+   *
+   * The bytes were always sealed. What decides what a client *does* with them
+   * was not: `deleted`, `size`, `prev` and the chunk list travelled in the
+   * clear, and the server holds every sealed path in the vault, so it could
+   * name any file and say anything about it. Setting `deleted` deleted a note
+   * everywhere; a size with no chunks emptied one; a chunk list borrowed from
+   * another file replaced one.
+   */
+  readonly meta: CryptoKey;
 }
 
 function subtle(): SubtleCrypto {
-    const c = globalThis.crypto;
-    if (!c?.subtle) {
-        // Not a condition to work around. Without WebCrypto there is no way to
-        // read the vault, and pretending otherwise would write plaintext.
-        throw new Error("WebCrypto is unavailable, so this vault cannot be opened");
-    }
-    return c.subtle;
+  const c = globalThis.crypto;
+  if (!c?.subtle) {
+    // Not a condition to work around. Without WebCrypto there is no way to
+    // read the vault, and pretending otherwise would write plaintext.
+    throw new Error("WebCrypto is unavailable, so this vault cannot be opened");
+  }
+  return c.subtle;
 }
 
 /** A fresh root secret. This is the one thing the user has to keep. */
 export function generateSecret(): Uint8Array {
-    const c = globalThis.crypto;
-    if (!c?.getRandomValues) {
-        // Same reasoning as `subtle` above, and more urgent: a secret from a
-        // weak source is worse than no secret, because it looks like one.
-        throw new Error("no secure random source is available, so a vault cannot be created here");
-    }
-    return c.getRandomValues(new Uint8Array(SECRET_LENGTH));
+  const c = globalThis.crypto;
+  if (!c?.getRandomValues) {
+    // Same reasoning as `subtle` above, and more urgent: a secret from a
+    // weak source is worse than no secret, because it looks like one.
+    throw new Error("no secure random source is available, so a vault cannot be created here");
+  }
+  return c.getRandomValues(new Uint8Array(SECRET_LENGTH));
 }
 
 /**
@@ -146,32 +146,40 @@ export function generateSecret(): Uint8Array {
  * transport, store and lose.
  */
 export async function deriveKeys(secret: Uint8Array): Promise<VaultKeys> {
-    if (secret.length < 16) {
-        // A short secret is a bug somewhere upstream, and silently accepting it
-        // would produce a vault that looks encrypted and is not.
-        throw new Error(`root secret is ${secret.length} bytes, need at least 16`);
-    }
-    const s = subtle();
-    const ikm = await s.importKey("raw", toBuffer(secret), "HKDF", false, ["deriveKey", "deriveBits"]);
+  if (secret.length < 16) {
+    // A short secret is a bug somewhere upstream, and silently accepting it
+    // would produce a vault that looks encrypted and is not.
+    throw new Error(`root secret is ${secret.length} bytes, need at least 16`);
+  }
+  const s = subtle();
+  const ikm = await s.importKey("raw", toBuffer(secret), "HKDF", false, [
+    "deriveKey",
+    "deriveBits",
+  ]);
 
-    const hkdf = (info: string) => ({
-        name: "HKDF",
-        hash: "SHA-256",
-        salt: new Uint8Array(0),
-        info: enc.encode(info),
-    });
+  const hkdf = (info: string) => ({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: enc.encode(info),
+  });
 
-    const [auth, path, content, nonce, meta] = await Promise.all([
-        s.deriveBits(hkdf(INFO.auth), ikm, 256),
-        s.deriveKey(hkdf(INFO.path), ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
-        s.deriveKey(hkdf(INFO.content), ikm, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
-        s.deriveKey(hkdf(INFO.nonce), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
-        s.deriveKey(hkdf(INFO.meta), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
-    ]);
+  const [auth, path, content, nonce, meta] = await Promise.all([
+    s.deriveBits(hkdf(INFO.auth), ikm, 256),
+    s.deriveKey(hkdf(INFO.path), ikm, { name: "AES-GCM", length: 256 }, false, [
+      "encrypt",
+      "decrypt",
+    ]),
+    s.deriveKey(hkdf(INFO.content), ikm, { name: "AES-GCM", length: 256 }, false, [
+      "encrypt",
+      "decrypt",
+    ]),
+    s.deriveKey(hkdf(INFO.nonce), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+    s.deriveKey(hkdf(INFO.meta), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
+  ]);
 
-    return { auth: new Uint8Array(auth), path, content, nonce, meta };
+  return { auth: new Uint8Array(auth), path, content, nonce, meta };
 }
-
 
 /**
  * Seals bytes: deterministic, authenticated, reversible.
@@ -181,18 +189,22 @@ export async function deriveKeys(secret: Uint8Array): Promise<VaultKeys> {
  * would need the plaintext to recompute it and the plaintext is what it is
  * trying to produce.
  */
-export async function seal(key: CryptoKey, nonceKey: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
-    const s = subtle();
-    const nonce = await syntheticNonce(nonceKey, plaintext);
-    const sealed = await s.encrypt(
-        { name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS },
-        key,
-        toBuffer(plaintext)
-    );
-    const out = new Uint8Array(NONCE_LENGTH + sealed.byteLength);
-    out.set(nonce, 0);
-    out.set(new Uint8Array(sealed), NONCE_LENGTH);
-    return out;
+export async function seal(
+  key: CryptoKey,
+  nonceKey: CryptoKey,
+  plaintext: Uint8Array,
+): Promise<Uint8Array> {
+  const s = subtle();
+  const nonce = await syntheticNonce(nonceKey, plaintext);
+  const sealed = await s.encrypt(
+    { name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS },
+    key,
+    toBuffer(plaintext),
+  );
+  const out = new Uint8Array(NONCE_LENGTH + sealed.byteLength);
+  out.set(nonce, 0);
+  out.set(new Uint8Array(sealed), NONCE_LENGTH);
+  return out;
 }
 
 /**
@@ -204,18 +216,24 @@ export async function seal(key: CryptoKey, nonceKey: CryptoKey, plaintext: Uint8
  * empty content would write that emptiness into the vault.
  */
 export async function open(key: CryptoKey, sealed: Uint8Array): Promise<Uint8Array> {
-    if (sealed.length < NONCE_LENGTH + TAG_BITS / 8) {
-        throw new Error(`sealed value is ${sealed.length} bytes, too short to contain a nonce and a tag`);
-    }
-    const s = subtle();
-    const nonce = sealed.subarray(0, NONCE_LENGTH);
-    const body = sealed.subarray(NONCE_LENGTH);
-    try {
-        const plain = await s.decrypt({ name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS }, key, toBuffer(body));
-        return new Uint8Array(plain);
-    } catch (cause) {
-        throw new Error("sealed value failed authentication, so it is not what was stored", { cause });
-    }
+  if (sealed.length < NONCE_LENGTH + TAG_BITS / 8) {
+    throw new Error(
+      `sealed value is ${sealed.length} bytes, too short to contain a nonce and a tag`,
+    );
+  }
+  const s = subtle();
+  const nonce = sealed.subarray(0, NONCE_LENGTH);
+  const body = sealed.subarray(NONCE_LENGTH);
+  try {
+    const plain = await s.decrypt(
+      { name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS },
+      key,
+      toBuffer(body),
+    );
+    return new Uint8Array(plain);
+  } catch (cause) {
+    throw new Error("sealed value failed authentication, so it is not what was stored", { cause });
+  }
 }
 
 /**
@@ -227,8 +245,8 @@ export async function open(key: CryptoKey, sealed: Uint8Array): Promise<Uint8Arr
  * worth thinking about, and a vault is many orders of magnitude away from that.
  */
 async function syntheticNonce(nonceKey: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
-    const mac = await subtle().sign("HMAC", nonceKey, toBuffer(plaintext));
-    return new Uint8Array(mac, 0, NONCE_LENGTH);
+  const mac = await subtle().sign("HMAC", nonceKey, toBuffer(plaintext));
+  return new Uint8Array(mac, 0, NONCE_LENGTH);
 }
 
 /**
@@ -241,12 +259,12 @@ async function syntheticNonce(nonceKey: CryptoKey, plaintext: Uint8Array): Promi
  * because it keeps a second copy of the name inside the encrypted document.
  */
 export async function sealPath(keys: VaultKeys, path: string): Promise<string> {
-    return base64urlEncode(await seal(keys.path, keys.nonce, enc.encode(path)));
+  return base64urlEncode(await seal(keys.path, keys.nonce, enc.encode(path)));
 }
 
 export async function openPath(keys: VaultKeys, sealedPath: string): Promise<string> {
-    const plain = await open(keys.path, base64urlDecode(sealedPath));
-    return dec.decode(plain);
+  const plain = await open(keys.path, base64urlDecode(sealedPath));
+  return dec.decode(plain);
 }
 
 /**
@@ -289,14 +307,14 @@ const CHUNK_DEFLATE = 1;
  * the plaintext plus 29 bytes.
  */
 export async function sealChunk(keys: VaultKeys, chunk: Uint8Array): Promise<Uint8Array> {
-    const deflated = worthDeflating(chunk) ? deflateSync(chunk, { level: 6 }) : undefined;
-    const useDeflate = deflated !== undefined && deflated.length < chunk.length;
-    const payload = useDeflate ? deflated : chunk;
+  const deflated = worthDeflating(chunk) ? deflateSync(chunk, { level: 6 }) : undefined;
+  const useDeflate = deflated !== undefined && deflated.length < chunk.length;
+  const payload = useDeflate ? deflated : chunk;
 
-    const framed = new Uint8Array(1 + payload.length);
-    framed[0] = useDeflate ? CHUNK_DEFLATE : CHUNK_RAW;
-    framed.set(payload, 1);
-    return seal(keys.content, keys.nonce, framed);
+  const framed = new Uint8Array(1 + payload.length);
+  framed[0] = useDeflate ? CHUNK_DEFLATE : CHUNK_RAW;
+  framed.set(payload, 1);
+  return seal(keys.content, keys.nonce, framed);
 }
 
 /**
@@ -322,12 +340,12 @@ export async function sealChunk(keys: VaultKeys, chunk: Uint8Array): Promise<Uin
  * file where that happens is rare enough to prefer the measurement.
  */
 function worthDeflating(chunk: Uint8Array): boolean {
-    if (chunk.length === 0) return false;
-    // Below the probe size there is nothing to save by probing: deflating the
-    // whole thing costs about what deflating the prefix would.
-    if (chunk.length <= PROBE_BYTES * 2) return true;
-    const probe = chunk.subarray(0, PROBE_BYTES);
-    return deflateSync(probe, { level: 6 }).length < probe.length;
+  if (chunk.length === 0) return false;
+  // Below the probe size there is nothing to save by probing: deflating the
+  // whole thing costs about what deflating the prefix would.
+  if (chunk.length <= PROBE_BYTES * 2) return true;
+  const probe = chunk.subarray(0, PROBE_BYTES);
+  return deflateSync(probe, { level: 6 }).length < probe.length;
 }
 
 /** How much of a chunk is tried before deciding whether to compress it. */
@@ -335,8 +353,8 @@ const PROBE_BYTES = 4096;
 
 /** A sealed chunk and the name the server will know it by. */
 export interface SealedChunk {
-    readonly name: string;
-    readonly bytes: Uint8Array;
+  readonly name: string;
+  readonly bytes: Uint8Array;
 }
 
 /**
@@ -359,38 +377,41 @@ export interface SealedChunk {
  * memory then stays bounded by one file's ciphertext, and a 3.5x gain that holds
  * for a 700 MB attachment beats a 3.7x gain that does not.
  */
-export async function sealChunks(keys: VaultKeys, chunks: Iterable<Uint8Array>): Promise<SealedChunk[]> {
-    return Promise.all(
-        [...chunks].map(async (chunk) => {
-            const bytes = await sealChunk(keys, chunk);
-            return { name: await chunkName(bytes), bytes };
-        })
-    );
+export async function sealChunks(
+  keys: VaultKeys,
+  chunks: Iterable<Uint8Array>,
+): Promise<SealedChunk[]> {
+  return Promise.all(
+    [...chunks].map(async (chunk) => {
+      const bytes = await sealChunk(keys, chunk);
+      return { name: await chunkName(bytes), bytes };
+    }),
+  );
 }
 
 export async function openChunk(keys: VaultKeys, sealed: Uint8Array): Promise<Uint8Array> {
-    const framed = await open(keys.content, sealed);
-    if (framed.length === 0) {
-        throw new Error("sealed chunk carries no marker byte");
+  const framed = await open(keys.content, sealed);
+  if (framed.length === 0) {
+    throw new Error("sealed chunk carries no marker byte");
+  }
+  const marker = framed[0]!;
+  const payload = framed.subarray(1);
+  if (marker === CHUNK_RAW) return payload;
+  if (marker === CHUNK_DEFLATE) {
+    try {
+      return inflateSync(payload);
+    } catch (cause) {
+      // Authenticated, so the bytes are what was sealed, which means the
+      // writer produced something this reader cannot inflate. Never
+      // recovered from: returning anything here would write a truncated
+      // note over a good one.
+      throw new Error("sealed chunk claims to be deflated and is not", { cause });
     }
-    const marker = framed[0]!;
-    const payload = framed.subarray(1);
-    if (marker === CHUNK_RAW) return payload;
-    if (marker === CHUNK_DEFLATE) {
-        try {
-            return inflateSync(payload);
-        } catch (cause) {
-            // Authenticated, so the bytes are what was sealed, which means the
-            // writer produced something this reader cannot inflate. Never
-            // recovered from: returning anything here would write a truncated
-            // note over a good one.
-            throw new Error("sealed chunk claims to be deflated and is not", { cause });
-        }
-    }
-    // A marker from a future version. Refusing is the only honest answer: the
-    // bytes decrypt, so the content is real, and guessing at its framing would
-    // write nonsense into the vault.
-    throw new Error(`sealed chunk has an unknown marker byte ${marker}`);
+  }
+  // A marker from a future version. Refusing is the only honest answer: the
+  // bytes decrypt, so the content is real, and guessing at its framing would
+  // write nonsense into the vault.
+  throw new Error(`sealed chunk has an unknown marker byte ${marker}`);
 }
 
 /**
@@ -401,13 +422,13 @@ export async function openChunk(keys: VaultKeys, sealed: Uint8Array): Promise<Ui
  * caught on the first upload rather than becoming a corrupt vault.
  */
 export async function chunkName(sealedChunk: Uint8Array): Promise<string> {
-    const digest = await subtle().digest("SHA-256", toBuffer(sealedChunk));
-    return hex(new Uint8Array(digest));
+  const digest = await subtle().digest("SHA-256", toBuffer(sealedChunk));
+  return hex(new Uint8Array(digest));
 }
 
 /** The auth token as it goes on the wire. */
 export function authToken(keys: VaultKeys): string {
-    return base64urlEncode(keys.auth);
+  return base64urlEncode(keys.auth);
 }
 
 /* ---------------------------------------------------------------- *
@@ -423,13 +444,13 @@ export function authToken(keys: VaultKeys): string {
  * at chunk sizes and removes the question.
  */
 function toBuffer(view: Uint8Array): ArrayBuffer {
-    return view.slice().buffer;
+  return view.slice().buffer;
 }
 
 export function hex(bytes: Uint8Array): string {
-    let out = "";
-    for (const b of bytes) out += b.toString(16).padStart(2, "0");
-    return out;
+  let out = "";
+  for (const b of bytes) out += b.toString(16).padStart(2, "0");
+  return out;
 }
 
 const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -443,53 +464,52 @@ const B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_
  * where an encoding bug would corrupt every path in the vault.
  */
 export function base64urlEncode(bytes: Uint8Array): string {
-    let out = "";
-    for (let i = 0; i < bytes.length; i += 3) {
-        const b0 = bytes[i]!;
-        const b1 = i + 1 < bytes.length ? bytes[i + 1]! : undefined;
-        const b2 = i + 2 < bytes.length ? bytes[i + 2]! : undefined;
-        out += B64URL[b0 >> 2]!;
-        out += B64URL[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)]!;
-        if (b1 === undefined) break;
-        out += B64URL[((b1 & 0x0f) << 2) | ((b2 ?? 0) >> 6)]!;
-        if (b2 === undefined) break;
-        out += B64URL[b2 & 0x3f]!;
-    }
-    return out;
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i]!;
+    const b1 = i + 1 < bytes.length ? bytes[i + 1]! : undefined;
+    const b2 = i + 2 < bytes.length ? bytes[i + 2]! : undefined;
+    out += B64URL[b0 >> 2]!;
+    out += B64URL[((b0 & 0x03) << 4) | ((b1 ?? 0) >> 4)]!;
+    if (b1 === undefined) break;
+    out += B64URL[((b1 & 0x0f) << 2) | ((b2 ?? 0) >> 6)]!;
+    if (b2 === undefined) break;
+    out += B64URL[b2 & 0x3f]!;
+  }
+  return out;
 }
 
 const B64URL_INDEX = (() => {
-    const m = new Int16Array(128).fill(-1);
-    for (let i = 0; i < B64URL.length; i++) m[B64URL.charCodeAt(i)] = i;
-    return m;
+  const m = new Int16Array(128).fill(-1);
+  for (let i = 0; i < B64URL.length; i++) m[B64URL.charCodeAt(i)] = i;
+  return m;
 })();
 
 export function base64urlDecode(s: string): Uint8Array {
-    const n = s.length;
-    const out = new Uint8Array(Math.floor((n * 3) / 4));
-    let o = 0;
-    let acc = 0;
-    let bits = 0;
-    for (let i = 0; i < n; i++) {
-        const code = s.charCodeAt(i);
-        const v = code < 128 ? B64URL_INDEX[code]! : -1;
-        if (v < 0) {
-            // Not silently skipped. A stray character means the value was
-            // mangled in transit or storage, and decoding around it would
-            // produce plausible bytes that fail authentication later, further
-            // from the cause.
-            throw new Error(`invalid base64url character ${JSON.stringify(s[i])} at position ${i}`);
-        }
-        acc = (acc << 6) | v;
-        bits += 6;
-        if (bits >= 8) {
-            bits -= 8;
-            out[o++] = (acc >> bits) & 0xff;
-        }
+  const n = s.length;
+  const out = new Uint8Array(Math.floor((n * 3) / 4));
+  let o = 0;
+  let acc = 0;
+  let bits = 0;
+  for (let i = 0; i < n; i++) {
+    const code = s.charCodeAt(i);
+    const v = code < 128 ? B64URL_INDEX[code]! : -1;
+    if (v < 0) {
+      // Not silently skipped. A stray character means the value was
+      // mangled in transit or storage, and decoding around it would
+      // produce plausible bytes that fail authentication later, further
+      // from the cause.
+      throw new Error(`invalid base64url character ${JSON.stringify(s[i])} at position ${i}`);
     }
-    return out.subarray(0, o);
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[o++] = (acc >> bits) & 0xff;
+    }
+  }
+  return out.subarray(0, o);
 }
-
 
 /**
  * What an entry's authentication covers.
@@ -504,38 +524,38 @@ export function base64urlDecode(s: string): Uint8Array {
  * canonicalise to the same bytes are one forgery.
  */
 export interface EntryFacts {
-    readonly path: string;
-    readonly size: number;
-    readonly ctime: number;
-    readonly mtime: number;
-    readonly folder: boolean;
-    readonly deleted: boolean;
-    readonly prev?: string | undefined;
-    readonly chunks: readonly string[];
-    /** The version this was written on top of, as `parentOf` produces it. */
-    readonly parent: string;
+  readonly path: string;
+  readonly size: number;
+  readonly ctime: number;
+  readonly mtime: number;
+  readonly folder: boolean;
+  readonly deleted: boolean;
+  readonly prev?: string | undefined;
+  readonly chunks: readonly string[];
+  /** The version this was written on top of, as `parentOf` produces it. */
+  readonly parent: string;
 }
 
 function canonical(e: EntryFacts): Uint8Array {
-    const parts = [
-        e.path,
-        String(e.size),
-        String(e.ctime),
-        String(e.mtime),
-        e.folder ? "1" : "0",
-        e.deleted ? "1" : "0",
-        e.prev ?? "",
-        e.parent,
-        String(e.chunks.length),
-        ...e.chunks,
-    ];
-    return enc.encode(parts.map((p) => `${p.length}:${p}`).join(""));
+  const parts = [
+    e.path,
+    String(e.size),
+    String(e.ctime),
+    String(e.mtime),
+    e.folder ? "1" : "0",
+    e.deleted ? "1" : "0",
+    e.prev ?? "",
+    e.parent,
+    String(e.chunks.length),
+    ...e.chunks,
+  ];
+  return enc.encode(parts.map((p) => `${p.length}:${p}`).join(""));
 }
 
 /** The authenticator for one entry, as hex. */
 export async function macEntry(keys: VaultKeys, e: EntryFacts): Promise<string> {
-    const mac = await subtle().sign("HMAC", keys.meta, toBuffer(canonical(e)));
-    return hex(new Uint8Array(mac));
+  const mac = await subtle().sign("HMAC", keys.meta, toBuffer(canonical(e)));
+  return hex(new Uint8Array(mac));
 }
 
 /**
@@ -546,11 +566,11 @@ export async function macEntry(keys: VaultKeys, e: EntryFacts): Promise<string> 
  * batch.
  */
 export async function entryIsOurs(keys: VaultKeys, e: EntryFacts, mac: string): Promise<boolean> {
-    const want = await macEntry(keys, e);
-    if (want.length !== mac.length) return false;
-    let diff = 0;
-    for (let i = 0; i < want.length; i++) diff |= want.charCodeAt(i) ^ mac.charCodeAt(i);
-    return diff === 0;
+  const want = await macEntry(keys, e);
+  if (want.length !== mac.length) return false;
+  let diff = 0;
+  for (let i = 0; i < want.length; i++) diff |= want.charCodeAt(i) ^ mac.charCodeAt(i);
+  return diff === 0;
 }
 
 /**
@@ -562,7 +582,7 @@ export async function entryIsOurs(keys: VaultKeys, e: EntryFacts, mac: string): 
  * had never synced.
  */
 export async function parentOf(contentId: string): Promise<string> {
-    if (contentId === "") return "";
-    const d = await subtle().digest("SHA-256", toBuffer(enc.encode(contentId)));
-    return hex(new Uint8Array(d));
+  if (contentId === "") return "";
+  const d = await subtle().digest("SHA-256", toBuffer(enc.encode(contentId)));
+  return hex(new Uint8Array(d));
 }

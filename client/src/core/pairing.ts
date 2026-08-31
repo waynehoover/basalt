@@ -54,15 +54,15 @@ const CHECKSUM_BYTES = 4;
 
 /** Everything a device needs to join a vault. */
 export interface Pairing {
-    /** WebSocket URL of the server, without the path. */
-    readonly url: string;
-    /**
-     * The vault's root secret, from which every key is derived, including the
-     * one that authenticates to the server. Anyone holding this has the vault.
-     */
-    readonly secret: Uint8Array;
-    /** Which vault on that server. */
-    readonly vaultId: string;
+  /** WebSocket URL of the server, without the path. */
+  readonly url: string;
+  /**
+   * The vault's root secret, from which every key is derived, including the
+   * one that authenticates to the server. Anyone holding this has the vault.
+   */
+  readonly secret: Uint8Array;
+  /** Which vault on that server. */
+  readonly vaultId: string;
 }
 
 const enc = new TextEncoder();
@@ -70,31 +70,31 @@ const dec = new TextDecoder();
 
 /** Renders a pairing as the string a person copies. */
 export function formatPairing(p: Pairing): string {
-    if (p.secret.length !== SECRET_LENGTH) {
-        throw new Error(`a root secret is ${SECRET_LENGTH} bytes, not ${p.secret.length}`);
-    }
-    const parts = [enc.encode(p.url), enc.encode(p.vaultId)];
-    for (const part of parts) {
-        // One byte of length per field. A url or a vault id longer than this is
-        // not a case worth a wider format; it is a case worth an error.
-        if (part.length > 255) throw new Error("a pairing field is too long to encode");
-    }
+  if (p.secret.length !== SECRET_LENGTH) {
+    throw new Error(`a root secret is ${SECRET_LENGTH} bytes, not ${p.secret.length}`);
+  }
+  const parts = [enc.encode(p.url), enc.encode(p.vaultId)];
+  for (const part of parts) {
+    // One byte of length per field. A url or a vault id longer than this is
+    // not a case worth a wider format; it is a case worth an error.
+    if (part.length > 255) throw new Error("a pairing field is too long to encode");
+  }
 
-    const size = 1 + SECRET_LENGTH + parts.reduce((n, part) => n + 1 + part.length, 0);
-    const body = new Uint8Array(size);
-    body[0] = VERSION;
-    body.set(p.secret, 1);
-    let at = 1 + SECRET_LENGTH;
-    for (const part of parts) {
-        body[at++] = part.length;
-        body.set(part, at);
-        at += part.length;
-    }
+  const size = 1 + SECRET_LENGTH + parts.reduce((n, part) => n + 1 + part.length, 0);
+  const body = new Uint8Array(size);
+  body[0] = VERSION;
+  body.set(p.secret, 1);
+  let at = 1 + SECRET_LENGTH;
+  for (const part of parts) {
+    body[at++] = part.length;
+    body.set(part, at);
+    at += part.length;
+  }
 
-    const out = new Uint8Array(size + CHECKSUM_BYTES);
-    out.set(body, 0);
-    out.set(checksum(body), size);
-    return PAIRING_PREFIX + base64urlEncode(out);
+  const out = new Uint8Array(size + CHECKSUM_BYTES);
+  out.set(body, 0);
+  out.set(checksum(body), size);
+  return PAIRING_PREFIX + base64urlEncode(out);
 }
 
 /**
@@ -106,64 +106,66 @@ export function formatPairing(p: Pairing): string {
  * and leave a vault that looks like it is syncing.
  */
 export function parsePairing(input: string): Pairing {
-    const text = input.trim();
-    if (text.startsWith("basalt1_")) {
-        // Named rather than lumped in with rubbish, because somebody will have
-        // one written down. The vault it belongs to needs re-pairing: the
-        // server no longer takes the token in it, and the root secret in it is
-        // in a layout this cannot read.
-        throw new Error(
-            "this is a version 1 pairing string, from before the server token was folded into the root secret. " +
-                "Run basalt invite on a device that is already paired to get a current one."
-        );
-    }
-    if (!text.startsWith(PAIRING_PREFIX)) {
-        throw new Error(`not a pairing string: it should start with ${PAIRING_PREFIX}`);
-    }
+  const text = input.trim();
+  if (text.startsWith("basalt1_")) {
+    // Named rather than lumped in with rubbish, because somebody will have
+    // one written down. The vault it belongs to needs re-pairing: the
+    // server no longer takes the token in it, and the root secret in it is
+    // in a layout this cannot read.
+    throw new Error(
+      "this is a version 1 pairing string, from before the server token was folded into the root secret. " +
+        "Run basalt invite on a device that is already paired to get a current one.",
+    );
+  }
+  if (!text.startsWith(PAIRING_PREFIX)) {
+    throw new Error(`not a pairing string: it should start with ${PAIRING_PREFIX}`);
+  }
 
-    let raw: Uint8Array;
-    try {
-        raw = base64urlDecode(text.slice(PAIRING_PREFIX.length));
-    } catch {
-        throw new Error("this pairing string is damaged: it is not valid base64url");
+  let raw: Uint8Array;
+  try {
+    raw = base64urlDecode(text.slice(PAIRING_PREFIX.length));
+  } catch {
+    throw new Error("this pairing string is damaged: it is not valid base64url");
+  }
+  if (raw.length < 1 + SECRET_LENGTH + 2 + CHECKSUM_BYTES) {
+    throw new Error("this pairing string is too short to be complete");
+  }
+
+  const body = raw.subarray(0, raw.length - CHECKSUM_BYTES);
+  const given = raw.subarray(raw.length - CHECKSUM_BYTES);
+  const want = checksum(body);
+  for (let i = 0; i < CHECKSUM_BYTES; i++) {
+    if (given[i] !== want[i]) {
+      // The whole reason the checksum is here. A mistyped or truncated
+      // paste that still decodes would otherwise become a silently wrong
+      // secret, and this project's first rule is not to lose a note.
+      throw new Error("this pairing string is damaged: it did not survive being copied");
     }
-    if (raw.length < 1 + SECRET_LENGTH + 2 + CHECKSUM_BYTES) {
-        throw new Error("this pairing string is too short to be complete");
-    }
+  }
 
-    const body = raw.subarray(0, raw.length - CHECKSUM_BYTES);
-    const given = raw.subarray(raw.length - CHECKSUM_BYTES);
-    const want = checksum(body);
-    for (let i = 0; i < CHECKSUM_BYTES; i++) {
-        if (given[i] !== want[i]) {
-            // The whole reason the checksum is here. A mistyped or truncated
-            // paste that still decodes would otherwise become a silently wrong
-            // secret, and this project's first rule is not to lose a note.
-            throw new Error("this pairing string is damaged: it did not survive being copied");
-        }
-    }
+  if (body[0] !== VERSION) {
+    throw new Error(
+      `this pairing string is version ${body[0]}, and this device understands ${VERSION}`,
+    );
+  }
 
-    if (body[0] !== VERSION) {
-        throw new Error(`this pairing string is version ${body[0]}, and this device understands ${VERSION}`);
-    }
+  const secret = body.slice(1, 1 + SECRET_LENGTH);
+  let at = 1 + SECRET_LENGTH;
+  const field = (what: string): string => {
+    if (at >= body.length) throw new Error(`this pairing string ends before its ${what}`);
+    const length = body[at++]!;
+    if (at + length > body.length) throw new Error(`this pairing string ends inside its ${what}`);
+    const value = dec.decode(body.subarray(at, at + length));
+    at += length;
+    return value;
+  };
 
-    const secret = body.slice(1, 1 + SECRET_LENGTH);
-    let at = 1 + SECRET_LENGTH;
-    const field = (what: string): string => {
-        if (at >= body.length) throw new Error(`this pairing string ends before its ${what}`);
-        const length = body[at++]!;
-        if (at + length > body.length) throw new Error(`this pairing string ends inside its ${what}`);
-        const value = dec.decode(body.subarray(at, at + length));
-        at += length;
-        return value;
-    };
+  const url = field("server address");
+  const vaultId = field("vault name");
+  if (at !== body.length) throw new Error("this pairing string has more in it than it should");
+  if (url === "" || vaultId === "") throw new Error("this pairing string has an empty field");
 
-    const url = field("server address");
-    const vaultId = field("vault name");
-    if (at !== body.length) throw new Error("this pairing string has more in it than it should");
-    if (url === "" || vaultId === "") throw new Error("this pairing string has an empty field");
-
-    return { url, secret, vaultId };
+  return { url, secret, vaultId };
 }
 
 /**
@@ -176,15 +178,15 @@ export function parsePairing(input: string): Pairing {
  * from a constructor.
  */
 function checksum(body: Uint8Array): Uint8Array {
-    let crc = 0xffffffff;
-    for (const byte of body) {
-        crc ^= byte;
-        for (let bit = 0; bit < 8; bit++) {
-            crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
-        }
+  let crc = 0xffffffff;
+  for (const byte of body) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
     }
-    crc = (crc ^ 0xffffffff) >>> 0;
-    return new Uint8Array([(crc >>> 24) & 0xff, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff]);
+  }
+  crc = (crc ^ 0xffffffff) >>> 0;
+  return new Uint8Array([(crc >>> 24) & 0xff, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff]);
 }
 
 /* ---------------------------------------------------------------- *
@@ -199,27 +201,27 @@ function checksum(body: Uint8Array): Uint8Array {
  * other devices agreed on.
  */
 export interface DeviceConfig extends Pairing {
-    readonly device: string;
-    /**
-     * The server's first-run token, kept only until this device has claimed the
-     * vault with it.
-     *
-     * Absent on every device but the first, and absent on that one too once the
-     * claim has gone through. What authenticates after that is derived from the
-     * root secret, so there is nothing else to keep.
-     */
-    readonly bootstrap?: string;
+  readonly device: string;
+  /**
+   * The server's first-run token, kept only until this device has claimed the
+   * vault with it.
+   *
+   * Absent on every device but the first, and absent on that one too once the
+   * claim has gone through. What authenticates after that is derived from the
+   * root secret, so there is nothing else to keep.
+   */
+  readonly bootstrap?: string;
 }
 
 /** The stored form, which is JSON on both platforms. */
 export function encodeConfig(config: DeviceConfig): Record<string, string> {
-    return {
-        url: config.url,
-        vaultId: config.vaultId,
-        device: config.device,
-        secret: base64urlEncode(config.secret),
-        ...(config.bootstrap ? { bootstrap: config.bootstrap } : {}),
-    };
+  return {
+    url: config.url,
+    vaultId: config.vaultId,
+    device: config.device,
+    secret: base64urlEncode(config.secret),
+    ...(config.bootstrap ? { bootstrap: config.bootstrap } : {}),
+  };
 }
 
 /**
@@ -231,25 +233,28 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
  * the error says which one.
  */
 export function decodeConfig(raw: unknown, where: string): DeviceConfig {
-    if (typeof raw !== "object" || raw === null) throw new Error(`${where} does not hold a configuration`);
-    const record = raw as Record<string, unknown>;
-    const str = (key: string): string => {
-        const value = record[key];
-        if (typeof value !== "string" || value === "") throw new Error(`${where} has no ${key}`);
-        return value;
-    };
-    const secret = base64urlDecode(str("secret"));
-    if (secret.length !== SECRET_LENGTH) {
-        throw new Error(`${where} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH}`);
-    }
-    const bootstrap = record["bootstrap"];
-    return {
-        url: str("url"),
-        vaultId: str("vaultId"),
-        device: str("device"),
-        secret,
-        ...(typeof bootstrap === "string" && bootstrap !== "" ? { bootstrap } : {}),
-    };
+  if (typeof raw !== "object" || raw === null)
+    throw new Error(`${where} does not hold a configuration`);
+  const record = raw as Record<string, unknown>;
+  const str = (key: string): string => {
+    const value = record[key];
+    if (typeof value !== "string" || value === "") throw new Error(`${where} has no ${key}`);
+    return value;
+  };
+  const secret = base64urlDecode(str("secret"));
+  if (secret.length !== SECRET_LENGTH) {
+    throw new Error(
+      `${where} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH}`,
+    );
+  }
+  const bootstrap = record["bootstrap"];
+  return {
+    url: str("url"),
+    vaultId: str("vaultId"),
+    device: str("device"),
+    secret,
+    ...(typeof bootstrap === "string" && bootstrap !== "" ? { bootstrap } : {}),
+  };
 }
 
 /**
@@ -265,11 +270,12 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
  * copies of a rule are two rules, and only one of them had a test.
  */
 export function normaliseUrl(input: string): string {
-    const text = input.trim().replace(/\/+$/, "");
-    if (text === "") throw new Error("that is not a server address");
-    if (text.startsWith("ws://") || text.startsWith("wss://")) return text;
-    if (text.startsWith("http://")) return "ws://" + text.slice("http://".length);
-    if (text.startsWith("https://")) return "wss://" + text.slice("https://".length);
-    if (text.includes("://")) throw new Error(`a server address is ws:// or wss://, not ${text.split("://")[0]}://`);
-    return "wss://" + text;
+  const text = input.trim().replace(/\/+$/, "");
+  if (text === "") throw new Error("that is not a server address");
+  if (text.startsWith("ws://") || text.startsWith("wss://")) return text;
+  if (text.startsWith("http://")) return "ws://" + text.slice("http://".length);
+  if (text.startsWith("https://")) return "wss://" + text.slice("https://".length);
+  if (text.includes("://"))
+    throw new Error(`a server address is ws:// or wss://, not ${text.split("://")[0]}://`);
+  return "wss://" + text;
 }

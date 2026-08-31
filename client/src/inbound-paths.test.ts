@@ -35,13 +35,13 @@ import { removeTree } from "./core/test-server.ts";
 
 const made: string[] = [];
 afterEach(async () => {
-    for (const d of made.splice(0)) await removeTree(d);
+  for (const d of made.splice(0)) await removeTree(d);
 });
 
 async function nodeVault(): Promise<NodeVault> {
-    const root = await mkdtemp(join(tmpdir(), "basalt-inbound-"));
-    made.push(root);
-    return new NodeVault(root);
+  const root = await mkdtemp(join(tmpdir(), "basalt-inbound-"));
+  made.push(root);
+  return new NodeVault(root);
 }
 
 const body = new TextEncoder().encode("written by a peer\n");
@@ -49,56 +49,62 @@ const times = { mtime: 1_700_000_000_000, ctime: 1_700_000_000_000 };
 
 /** Paths no vault should ever be talked into touching. */
 const forbidden = [
-    ".obsidian/plugins/dataview/main.js",
-    ".obsidian/plugins/basalt-sync/data.json",
-    ".obsidian/app.json",
-    ".basalt/config.json",
-    ".basalt/index.json",
-    ".git/hooks/post-checkout",
-    ".trash/something.md",
+  ".obsidian/plugins/dataview/main.js",
+  ".obsidian/plugins/basalt-sync/data.json",
+  ".obsidian/app.json",
+  ".basalt/config.json",
+  ".basalt/index.json",
+  ".git/hooks/post-checkout",
+  ".trash/something.md",
 ];
 
 describe("the headless client refuses to write where it would never read", () => {
-    it("refuses every never-sync path", async () => {
-        const vault = await nodeVault();
-        for (const path of forbidden) {
-            await expect(vault.write(path, body, times), `accepted ${path}`).rejects.toThrow();
-        }
-    });
+  it("refuses every never-sync path", async () => {
+    const vault = await nodeVault();
+    for (const path of forbidden) {
+      await expect(vault.write(path, body, times), `accepted ${path}`).rejects.toThrow();
+    }
+  });
 
-    it("refuses to make a directory inside one either", async () => {
-        const vault = await nodeVault();
-        await expect(vault.mkdir(".obsidian/plugins/evil")).rejects.toThrow();
-    });
+  it("refuses to make a directory inside one either", async () => {
+    const vault = await nodeVault();
+    await expect(vault.mkdir(".obsidian/plugins/evil")).rejects.toThrow();
+  });
 
-    it("still writes ordinary notes, including ones that look close", async () => {
-        const vault = await nodeVault();
-        for (const path of ["note.md", "Projects/deep/note.md", ".obsidian-notes/n.md", "obsidian/n.md"]) {
-            await vault.write(path, body, times);
-            expect(await vault.read(path)).toEqual(body);
-        }
-    });
+  it("still writes ordinary notes, including ones that look close", async () => {
+    const vault = await nodeVault();
+    for (const path of [
+      "note.md",
+      "Projects/deep/note.md",
+      ".obsidian-notes/n.md",
+      "obsidian/n.md",
+    ]) {
+      await vault.write(path, body, times);
+      expect(await vault.read(path)).toEqual(body);
+    }
+  });
 });
 
 describe("the plugin refuses the same paths", () => {
-    const pluginVault = () => new ObsidianVault(asVault(new FakeVaultIndex(new FakeAdapter())), ".obsidian");
+  const pluginVault = () =>
+    new ObsidianVault(asVault(new FakeVaultIndex(new FakeAdapter())), ".obsidian");
 
-    it("refuses every never-sync path", async () => {
-        const vault = pluginVault();
-        for (const path of forbidden) {
-            await expect(vault.write(path, body, times), `accepted ${path}`).rejects.toThrow();
-        }
-    });
+  it("refuses every never-sync path", async () => {
+    const vault = pluginVault();
+    for (const path of forbidden) {
+      await expect(vault.write(path, body, times), `accepted ${path}`).rejects.toThrow();
+    }
+  });
 
-    it("refuses to make a directory inside one either", async () => {
-        await expect(pluginVault().mkdir(".obsidian/plugins/evil")).rejects.toThrow();
-    });
+  it("refuses to make a directory inside one either", async () => {
+    await expect(pluginVault().mkdir(".obsidian/plugins/evil")).rejects.toThrow();
+  });
 
-    it("still writes ordinary notes", async () => {
-        const vault = pluginVault();
-        await vault.write("Projects/note.md", body, times);
-        expect(await vault.read("Projects/note.md")).toEqual(body);
-    });
+  it("still writes ordinary notes", async () => {
+    const vault = pluginVault();
+    await vault.write("Projects/note.md", body, times);
+    expect(await vault.read("Projects/note.md")).toEqual(body);
+  });
 });
 
 /**
@@ -107,16 +113,18 @@ describe("the plugin refuses the same paths", () => {
  * refuses it: a file that can never sync, for the lifetime of the vault.
  */
 describe("what containment should and should not refuse", () => {
-    it("refuses real escapes", async () => {
-        const vault = await nodeVault();
-        for (const path of ["../escape.md", "a/../../escape.md", "/tmp/escape.md"]) {
-            await expect(vault.write(path, body, times), `accepted ${path}`).rejects.toThrow(/outside the vault/);
-        }
-    });
+  it("refuses real escapes", async () => {
+    const vault = await nodeVault();
+    for (const path of ["../escape.md", "a/../../escape.md", "/tmp/escape.md"]) {
+      await expect(vault.write(path, body, times), `accepted ${path}`).rejects.toThrow(
+        /outside the vault/,
+      );
+    }
+  });
 
-    it("accepts a note that starts with two dots", async () => {
-        const vault = await nodeVault();
-        await vault.write("..hidden.md", body, times);
-        expect(await vault.read("..hidden.md")).toEqual(body);
-    });
+  it("accepts a note that starts with two dots", async () => {
+    const vault = await nodeVault();
+    await vault.write("..hidden.md", body, times);
+    expect(await vault.read("..hidden.md")).toEqual(body);
+  });
 });
