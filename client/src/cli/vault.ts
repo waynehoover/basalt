@@ -17,10 +17,16 @@ import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts"
 /**
  * Names never synced.
  *
- * `.obsidian` is refused because plugin and settings sync is refused; see
- * docs/philosophy.md, and note that one device disabling every plugin on another
- * is where one of the durability rules came from. `.basalt` is this client's own
- * bookkeeping, and syncing it would sync the index to itself.
+ * The config folder is skipped because syncing plugins and settings is not
+ * done here. That is an open question rather than a closed refusal, and
+ * docs/philosophy.md now argues both sides of it; the short version is that
+ * Obsidian rewrites those files from memory, so an arriving change would be
+ * silently undone. One device disabling every plugin on another is also where
+ * one of the durability rules came from. Which folder it is comes from
+ * --config-dir, since only Obsidian knows for certain and this cannot ask.
+ *
+ * `.basalt` is this client's own bookkeeping, and syncing it would sync the
+ * index to itself.
  */
 /** Where a deletion arriving from another device goes, rather than away. */
 const TRASH_DIR = ".trash";

@@ -16,7 +16,7 @@ This is what differs, what was learned from each, and where theirs is better.
 | Editing one line of a 2 MiB note | 2 MiB | 494 B |
 | Encryption | optional | always |
 | Merge conflicts | merged silently, failures dropped | merged when provably safe, both kept otherwise |
-| Plugins, themes, config | syncs them | refuses to |
+| Plugins, themes, config | syncs them | does not, and that one is still open |
 | Mobile | works today | Android verified, iOS untested |
 | Version history | in the app | in the app, and restoring never overwrites |
 | Maturity | years in production | early |

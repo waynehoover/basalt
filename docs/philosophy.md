@@ -162,6 +162,43 @@ things with a right answer, and no settings screen. No web UI on the server,
 because anything it could show you, it would have to read. No merge of our own; two
 independent projects chose diff-match-patch. No silent conflict resolution.
 
+## The open one: plugins, themes and config
+
+Obsidian Sync syncs the config folder, with a toggle per category: settings,
+appearance, themes, snippets, core plugins, community plugins, plugin data.
+Basalt syncs none of it. That is not settled the way the refusals above are, so
+it sits here instead of there.
+
+The reason it has not been built is mechanical rather than tasteful. Obsidian
+holds the config folder in memory and writes it back, so a file changed
+underneath the running app is overwritten rather than read. A config change
+arriving from another device would land on disk and then be silently undone,
+which is a feature that appears to work and does not.
+
+Then, in order of weight:
+
+- **Durability rule 2 is this bug already.** It came from code that read a
+  config file, fell back to an empty list, and wrote the result back, disabling
+  every plugin on a device.
+- **The failure modes are the wrong way round.** A note conflict is safe: two
+  files, both visible. A broken config reaches every device including the one
+  that still worked, turning one failure into all of them.
+- **The pairing secret lives in there**, at
+  `.obsidian/plugins/basalt-sync/data.json`. Syncing the folder means the sync
+  tool syncing its own credentials, which is why `.basalt` is excluded already.
+- **`workspace.json` is rewritten when a pane moves.** Nothing to merge, and
+  nothing worth sending.
+
+**What would reopen it.** Snippets and themes are inert: Obsidian does not hold
+them open and rewrite them, so a slice limited to those avoids the problem
+above, and is the only slice worth building first. Anything with live state
+(`workspace.json`, plugin `data.json`, `core-plugins.json`) is where it breaks.
+
+**Choosing it is already possible.** Point the headless client's `--config-dir`
+at another folder and `.obsidian` becomes ordinary content. A person typing a
+flag is a different thing from a product inviting it, and that is left working
+on purpose.
+
 ## Notes first, and what that costs attachments
 
 This is a note-taking sync tool. Somebody writing prose is the case every
