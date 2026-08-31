@@ -30,7 +30,7 @@ import type { SyncReport } from "../core/engine.ts";
 import { formatPairing, normaliseUrl, parsePairing } from "../core/pairing.ts";
 
 export { normaliseUrl };
-import { JsonIndexStore, NodeVault } from "./vault.ts";
+import { DEFAULT_CONFIG_DIR, JsonIndexStore, NodeVault, configFolderName } from "./vault.ts";
 import { indexPath, loadConfig, removeState, saveConfig, type Config } from "./config.ts";
 
 /** Where output goes, so a test can read it. */
@@ -61,6 +61,8 @@ Options
   --uid N          restore one exact version, from basalt history
   --to PATH        restore somewhere other than where it came from
   --limit N        how many versions history shows (default: 20)
+  --config-dir DIR Obsidian's config folder, if it is not .obsidian
+  --ignore NAME    a top-level name never to sync, repeatable
 `;
 
 export async function run(argv: readonly string[], io: Console): Promise<number> {
@@ -439,7 +441,7 @@ async function clientOptions(config: Config, args: Args, io?: Console): Promise<
     const keys = await deriveKeys(config.secret);
     const derived = authToken(keys);
     return {
-        vault: new NodeVault(args.dir),
+        vault: new NodeVault(args.dir, { configDir: args.configDir, alsoIgnore: args.ignore }),
         store: new JsonIndexStore(indexPath(args.dir)),
         keys,
         url: config.url,
@@ -523,6 +525,8 @@ interface Args {
     verbose: boolean;
     help: boolean;
     timeout: number;
+    configDir: string;
+    ignore: string[];
 }
 
 export function parseArgs(argv: readonly string[]): Args {
@@ -537,9 +541,11 @@ export function parseArgs(argv: readonly string[]): Args {
         verbose: false,
         help: false,
         timeout: 30_000,
+        configDir: DEFAULT_CONFIG_DIR,
+        ignore: [],
     };
 
-    const takes = new Set(["--dir", "--device", "--vault-id", "--server", "--token", "--timeout", "--uid", "--to", "--limit"]);
+    const takes = new Set(["--dir", "--device", "--vault-id", "--server", "--token", "--timeout", "--uid", "--to", "--limit", "--config-dir", "--ignore"]);
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i]!;
         let value: string | undefined;
@@ -568,6 +574,13 @@ export function parseArgs(argv: readonly string[]): Args {
                 break;
             }
             case "--to": args.to = value!; break;
+            // Checked here rather than at the vault, so a name that cannot be
+            // one is refused before anything is opened.
+            case "--config-dir": args.configDir = configFolderName(value!); break;
+            // Repeatable. One name per flag rather than a separated list,
+            // because a filename may contain a comma and a vault is the wrong
+            // place to find out which separator was assumed.
+            case "--ignore": args.ignore.push(value!); break;
             case "--limit": {
                 const limit = Number(value);
                 if (!Number.isInteger(limit) || limit <= 0) throw new Error(`--limit wants a count, not ${value}`);

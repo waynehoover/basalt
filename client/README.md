@@ -56,6 +56,19 @@ command gives machine-readable output. State lives in `.basalt/` inside the
 vault, which is never synced: `config.json` (0600, holds the root secret) and
 `index.json`.
 
+`--config-dir` names Obsidian's config folder when it is not `.obsidian`. The
+plugin asks Obsidian for this and always gets it right; a headless client has
+nothing to ask, so it assumes `.obsidian` and has to be told otherwise. Until
+this flag existed there was no way to tell it, and a vault whose config folder
+had been renamed in the app had it synced here and refused by the plugin, which
+is one vault disagreeing with itself about the one thing this project will not
+sync. Naming a different folder also makes `.obsidian` ordinary content again,
+since by then it is just a folder.
+
+`--ignore NAME` leaves one more top-level name alone, and can be repeated. One
+name per flag rather than a separated list, because a filename may contain a
+comma and a vault is the wrong place to discover which separator was assumed.
+
 `cli.ts` takes an argv and two output functions and returns an exit code, so
 `cli.test.ts` drives the whole client against a real server with no subprocess.
 `bin.ts` is the six lines connecting that to a terminal, and the only part no

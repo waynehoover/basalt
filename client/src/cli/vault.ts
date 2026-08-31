@@ -25,11 +25,40 @@ import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts"
 /** Where a deletion arriving from another device goes, rather than away. */
 const TRASH_DIR = ".trash";
 
-const NEVER_SYNC = new Set([".obsidian", ".basalt", TRASH_DIR, ".git", ".DS_Store", "node_modules"]);
+const NEVER_SYNC = new Set([".basalt", TRASH_DIR, ".git", ".DS_Store", "node_modules"]);
+
+/** What Obsidian calls its config folder unless the user has overridden it. */
+export const DEFAULT_CONFIG_DIR = ".obsidian";
+
+/**
+ * The config folder as a single name at the vault root, or a refusal.
+ *
+ * The same rule the plugin applies, and for the same reason: Obsidian's config
+ * folder is one folder at the root, and if it were ever anything else then
+ * quietly ignoring the wrong thing is how a vault's settings get uploaded.
+ */
+export function configFolderName(configDir: string): string {
+    const name = configDir.replace(/^\/+|\/+$/g, "");
+    if (name === "" || name.includes("/")) {
+        throw new Error(`refusing to sync: the config folder ${JSON.stringify(configDir)} is not a plain name`);
+    }
+    return name;
+}
 
 export interface NodeVaultOptions {
     /** Extra top-level names to leave alone. */
     readonly alsoIgnore?: readonly string[];
+    /**
+     * Obsidian's config folder, which is `.obsidian` until somebody overrides
+     * it in the app.
+     *
+     * Defaulted here, where the plugin demands it. The plugin can ask Obsidian
+     * and get the right answer; this cannot ask anything, so refusing to run
+     * without being told would put a flag in front of every ordinary use. The
+     * cost of the default is that a vault with an overridden config folder
+     * syncs it until someone passes --config-dir, which is why the flag exists.
+     */
+    readonly configDir?: string;
 }
 
 export class NodeVault implements Vault {
@@ -38,7 +67,8 @@ export class NodeVault implements Vault {
 
     constructor(root: string, opts: NodeVaultOptions = {}) {
         this.root = resolve(root);
-        this.ignore = new Set([...NEVER_SYNC, ...(opts.alsoIgnore ?? [])]);
+        const configDir = configFolderName(opts.configDir ?? DEFAULT_CONFIG_DIR);
+        this.ignore = new Set([...NEVER_SYNC, configDir, ...(opts.alsoIgnore ?? [])]);
     }
 
     /**
