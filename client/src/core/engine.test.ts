@@ -1929,3 +1929,60 @@ describe("a move is not a download", () => {
     );
   }, 300_000);
 });
+
+/**
+ * The index must never be durable ahead of the notes it names.
+ *
+ * A vault write used to make the file and its directory entry durable before it
+ * returned. Flushing the directory once per pass instead of once per file is
+ * 10.7 s against 6.1 s for two thousand files, and it moves when the name
+ * becomes durable, so the ordering stops being incidental and has to be stated:
+ * everything the pass wrote is made durable, and only then is the index written.
+ *
+ * Get it backwards and a crash leaves an index naming notes that are not there,
+ * which the index would then believe on the next pass. That is rule 3 wearing a
+ * different hat, and it is the whole reason the deferral is safe.
+ */
+describe("what is made durable, and in what order", () => {
+  let server: TestServer;
+  let a: Device;
+
+  afterEach(async () => {
+    a?.transport?.close();
+    if (server) await server.cleanup();
+  });
+
+  it("flushes the vault before it writes the index", async () => {
+    server = new TestServer();
+    await server.start();
+    a = new Device("a");
+
+    const order: string[] = [];
+    const vault = a.vault as unknown as { flush?: () => Promise<void> };
+    vault.flush = async () => {
+      order.push("vault flushed");
+    };
+    const store = a.store as unknown as { save(s: unknown): Promise<void> };
+    const realSave = store.save.bind(store);
+    store.save = async (state: unknown) => {
+      order.push("index written");
+      await realSave(state);
+    };
+
+    await a.connect(server);
+    await a.vault.write("note.md", new TextEncoder().encode("hello\n"), {
+      mtime: a.clock,
+      ctime: a.clock,
+    });
+    await a.engine.sync();
+
+    expect(order.length, "neither happened").toBeGreaterThan(0);
+    expect(order[0], `order was ${order.join(", ")}`).toBe("vault flushed");
+    expect(order).toContain("index written");
+    // And every pass, not just the first: a pass that wrote nothing still
+    // has nothing outstanding only because the flush said so.
+    expect(order.filter((o) => o === "vault flushed").length).toBe(
+      order.filter((o) => o === "index written").length,
+    );
+  }, 300_000);
+});

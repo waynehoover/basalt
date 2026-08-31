@@ -744,6 +744,10 @@ export class Engine {
     this.blocked = nowBlocked;
 
     this.prune(onDisk);
+    // Before the index, always. The index names notes, so it must not be
+    // durable ahead of them; a vault that defers any part of a write makes it
+    // durable here. Rule 3 in another form.
+    await this.opts.vault.flush?.();
     await this.save();
     return report;
   }

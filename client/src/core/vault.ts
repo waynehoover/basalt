@@ -46,6 +46,15 @@ export interface Vault {
    * whole ArrayBuffer and there is no ranged or streaming read beside it, so
    * the plugin takes the buffered path and the headless client does not.
    */
+  /**
+   * Makes durable whatever the writes so far have left un-durable.
+   *
+   * Optional, because a vault whose writes are already durable when they return
+   * has nothing to do here. Called once at the end of a pass, before the index
+   * is saved, so that the index is never durable ahead of the notes it names.
+   */
+  flush?(): Promise<void>;
+
   readBlocks?(path: string, blockSize?: number): AsyncIterable<Uint8Array>;
   /**
    * One byte range. Needed with `readBlocks` and for the same reason.

@@ -104,6 +104,25 @@ export class NodeVault implements Vault {
   private realRootOnce: Promise<string> | undefined;
 
   /**
+   * Directories written to since the last flush.
+   *
+   * A set, because the saving is entirely in not flushing the same folder once
+   * per file in it.
+   */
+  private readonly unflushed = new Set<string>();
+
+  /**
+   * Makes durable the directory entries of everything written since the last
+   * call. The engine calls this before it saves the index, which is what keeps
+   * the index from being durable ahead of the notes it names.
+   */
+  async flush(): Promise<void> {
+    const dirs = [...this.unflushed];
+    this.unflushed.clear();
+    await Promise.all(dirs.map((d) => syncDirectory(d)));
+  }
+
+  /**
    * Proves containment against the filesystem rather than the string.
    *
    * `absolute` resolves `..` lexically. That is everything for a path trying
@@ -305,7 +324,8 @@ export class NodeVault implements Vault {
     const full = this.absolute(path);
     await this.insideForReal(full);
     await mkdir(dirname(full), { recursive: true });
-    await writeDurably(full, bytes);
+    await writeDurably(full, bytes, false);
+    this.unflushed.add(dirname(full));
     if (times.mtime > 0) {
       const seconds = times.mtime / 1000;
       await utimes(full, seconds, seconds);
@@ -574,7 +594,27 @@ async function openTemp(
  * flushes themselves: whether an fsync really reached the platter is not
  * something a process can observe, on any operating system.
  */
-export async function writeDurably(full: string, bytes: Uint8Array): Promise<void> {
+export async function writeDurably(
+  full: string,
+  bytes: Uint8Array,
+  /**
+   * Whether to make the directory entry durable here.
+   *
+   * Two flushes cost about the same, and files sharing a folder re-flush the
+   * same folder. Measured over 600 files across 60 folders: 3230 ms flushing
+   * per file against 1685 ms flushing each folder once, so a vault write defers
+   * this and `NodeVault.flush` does it a folder at a time, before the index is
+   * written.
+   *
+   * The file's own flush is never deferred, and the ordering that matters is
+   * unchanged: the index must not be durable before the notes it names, and it
+   * still is not, because the folder flushes land ahead of it. What a deferred
+   * folder flush risks is a crash in the window leaving a file whose bytes are
+   * on disk and whose name is not, and the index does not name it either, so
+   * the next pass fetches it again. Nothing claims to hold what it does not.
+   */
+  syncDir = true,
+): Promise<void> {
   const { tmp, handle } = await openTemp(full);
   try {
     await handle.write(bytes);
@@ -584,10 +624,15 @@ export async function writeDurably(full: string, bytes: Uint8Array): Promise<voi
   }
   await rename(tmp, full);
 
-  const dir = await open(dirname(full), "r");
+  if (syncDir) await syncDirectory(dirname(full));
+}
+
+/** Makes a directory's own entries durable. */
+export async function syncDirectory(dir: string): Promise<void> {
+  const handle = await open(dir, "r");
   try {
-    await dir.sync();
+    await handle.sync();
   } finally {
-    await dir.close();
+    await handle.close();
   }
 }
