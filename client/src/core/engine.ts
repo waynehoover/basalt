@@ -78,6 +78,39 @@ import {
 import { parents, type IndexStore, type Vault } from "./vault.ts";
 
 /**
+ * An index entry with its derivable fields left out.
+ *
+ * The entry holds a chunk name list, the same names joined as `hash`, and often
+ * the same string again as `synchash`, so a vault's chunk names were written to
+ * disk three times over. At two thousand files that is 6.96 MiB of index where
+ * 2.33 MiB says the same thing, and the whole of it is stringified and written
+ * whenever anything changes.
+ *
+ * Only the serialised form changes. In memory the entry keeps all three, which
+ * is what `decide` compares on a hot path, and neither field is recomputed
+ * while the engine is running.
+ *
+ * Left in place when they differ, because they genuinely can: `hash` is the
+ * content as of the last scan and `synchash` as of the last completed sync, and
+ * the difference between them is the merge base. Dropping that would not save
+ * space, it would lose the ancestor.
+ */
+function packed(e: IndexEntry): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...e };
+  if (e.hash === contentId(e.chunks)) delete out["hash"];
+  if (e.synchash === e.hash) delete out["synchash"];
+  return out;
+}
+
+/** The inverse, putting back what `packed` left to be derived. */
+function unpacked(path: string, raw: Record<string, unknown>): IndexEntry {
+  const e = { ...newEntry(path), ...raw } as IndexEntry;
+  if (raw["hash"] === undefined) e.hash = contentId(e.chunks);
+  if (raw["synchash"] === undefined) e.synchash = e.hash;
+  return e;
+}
+
+/**
  * The identity of a file's content, as both sides can compute it.
  *
  * The server holds no plaintext hash, so equality of content is equality of the
@@ -439,7 +472,7 @@ export class Engine {
     if (stored) {
       this.cursor = stored.cursor;
       for (const [path, raw] of Object.entries(stored.entries)) {
-        this.entries.set(path, { ...newEntry(path), ...(raw as object) });
+        this.entries.set(path, unpacked(path, raw as Record<string, unknown>));
       }
       for (const [path, raw] of Object.entries(stored.remote)) {
         this.remote.set(path, raw as RemoteState);
@@ -1864,8 +1897,8 @@ export class Engine {
   }
 
   private async save(): Promise<void> {
-    const entries: Record<string, IndexEntry> = {};
-    for (const [path, e] of this.entries) entries[path] = e;
+    const entries: Record<string, unknown> = {};
+    for (const [path, e] of this.entries) entries[path] = packed(e);
     const remote: Record<string, RemoteState> = {};
     for (const [path, r] of this.remote) remote[path] = r;
     await this.opts.store.save({

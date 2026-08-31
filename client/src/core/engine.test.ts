@@ -29,6 +29,7 @@ import { macEntry, sealChunks, sealPath } from "./crypto.ts";
 import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
 import { Transport, type WireEntry } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
+import type { IndexEntry } from "./index-state.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 
 const SECRET = new Uint8Array(20).fill(33);
@@ -1857,15 +1858,18 @@ describe("a version that is not the version it is offered as", () => {
       { chunks?: string[]; syncuid?: number; synchash?: string } | undefined;
     const chunks = entry?.chunks ?? [];
     expect(chunks.length).toBeGreaterThan(0);
+    // Derived rather than read: the stored form leaves out a hash it can work
+    // out from the chunk list, so the field is absent in the ordinary case.
+    const synchash = entry?.synchash ?? contentId(chunks);
 
     // The real chunks under the real uid still open.
-    await expect(
-      a.engine.contentOf(entry!.syncuid!, chunks, entry!.synchash!),
-    ).resolves.toBeInstanceOf(Uint8Array);
+    await expect(a.engine.contentOf(entry!.syncuid!, chunks, synchash)).resolves.toBeInstanceOf(
+      Uint8Array,
+    );
 
     // A different chunk list for the same uid does not.
     await expect(
-      a.engine.contentOf(entry!.syncuid!, [...chunks, chunks[0]!], entry!.synchash!),
+      a.engine.contentOf(entry!.syncuid!, [...chunks, chunks[0]!], synchash),
     ).rejects.toThrow(/not the version it is being offered as/);
   });
 });
@@ -1984,5 +1988,80 @@ describe("what is made durable, and in what order", () => {
     expect(order.filter((o) => o === "vault flushed").length).toBe(
       order.filter((o) => o === "index written").length,
     );
+  }, 300_000);
+});
+
+/**
+ * The index round trips through its stored form.
+ *
+ * A vault's chunk names were written to disk three times: as the list, joined
+ * as `hash`, and usually a third time as `synchash`. The stored form leaves out
+ * whatever it can derive, and an entry has to come back identical or the index
+ * is lying about what is on disk.
+ *
+ * The case that has to survive is the one where those fields genuinely differ:
+ * a file edited since its last sync, where `hash` is the new content and
+ * `synchash` is the merge base. Collapsing them would not save space, it would
+ * lose the ancestor.
+ */
+describe("what the index leaves out, and puts back", () => {
+  let server: TestServer;
+  let a: Device;
+
+  afterEach(async () => {
+    a?.transport?.close();
+    if (server) await server.cleanup();
+  });
+
+  it("comes back the same, for a settled file and an edited one", async () => {
+    server = new TestServer();
+    await server.start();
+    a = new Device("a");
+    await a.connect(server);
+
+    const enc = new TextEncoder();
+    await a.vault.write("settled.md", enc.encode("one\n"), { mtime: a.clock, ctime: a.clock });
+    await a.vault.write("edited.md", enc.encode("one\n"), { mtime: a.clock, ctime: a.clock });
+    await a.engine.sync();
+
+    // A completed sync always leaves the two agreeing, so the case where they
+    // differ is made directly: an entry scanned since its last sync, whose
+    // synchash is still the ancestor. That is the state a merge reads.
+    const entries = (a.engine as unknown as { entries: Map<string, IndexEntry> }).entries;
+    const edited = entries.get("edited.md")!;
+    edited.synchash = "an-older-content-id";
+    // And one with no chunk list at all, which is what an unscanned file looks
+    // like and the case where `hash` cannot be derived.
+    entries.get("settled.md")!.chunks = [];
+
+    const held = (d: Device) =>
+      new Map(
+        [...(d.engine as unknown as { entries: Map<string, unknown> }).entries].map(([k, v]) => [
+          k,
+          JSON.stringify(v),
+        ]),
+      );
+    await (a.engine as unknown as { save(): Promise<void> })["save"]();
+    const before = held(a);
+    const differ = [
+      ...(a.engine as unknown as { entries: Map<string, { hash: string; synchash: string }> })
+        .entries,
+    ].filter(([, e]) => e.hash !== e.synchash);
+    expect(
+      differ.length,
+      "no entry where the two hashes differ, so the hard case is untested",
+    ).toBeGreaterThan(0);
+
+    // A second engine over the same index must see exactly what the first held.
+    const b = new Device("a");
+    (b as unknown as { store: unknown }).store = a.store;
+    await b.connect(server);
+    const after = held(b);
+    b.transport.close();
+
+    expect(after.size, "the reloaded index is empty").toBe(before.size);
+    for (const [path, want] of before) {
+      expect(after.get(path), `${path} did not survive the round trip`).toBe(want);
+    }
   }, 300_000);
 });
