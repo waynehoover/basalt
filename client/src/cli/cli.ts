@@ -252,7 +252,10 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     let server: { reachable: boolean; cursor?: number; behind?: number; error?: string };
     try {
         const client = await open(config, args, io);
-        server = { reachable: true, cursor: client.serverCursor, behind: Math.max(0, client.serverCursor - local.cursor) };
+        // Signed, not clamped. Clamping at zero made a server behind its own
+        // clients, which is a restored backup or the wrong vault, read exactly
+        // like being up to date.
+        server = { reachable: true, cursor: client.serverCursor, behind: client.serverCursor - local.cursor };
         client.close();
     } catch (err) {
         server = { reachable: false, error: (err as Error).message };

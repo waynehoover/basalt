@@ -76,6 +76,54 @@ export function contentId(chunkNames: readonly string[]): string {
 }
 
 /**
+ * Refuses a server that is behind the device talking to it.
+ *
+ * The docs present the client-ahead case as what catches a server restored from
+ * an old backup or pointed at the wrong vault, and the refusal was implemented
+ * only in the server, so it was absent exactly when it was needed: against a
+ * server that is wrong. `ready.cursor` was parsed, logged, shown in the status
+ * line, and never compared. Worse, the status line computed `behind` as
+ * `max(0, server - local)`, so a server behind its clients displayed as zero
+ * and read as being up to date.
+ *
+ * Its own function because a real server refuses this case first, so nothing
+ * short of a lying transport reaches the check and the comparison is the part
+ * worth testing.
+ */
+export function refuseIfBehind(serverCursor: number, ownCursor: number): void {
+    if (serverCursor < ownCursor) {
+        throw new Error(
+            `this server is at version ${serverCursor} and this device has already seen ${ownCursor}: ` +
+                `refusing to sync, because a server behind its own clients is a restored backup or the wrong vault`
+        );
+    }
+}
+
+/**
+ * What this device accepts whatever the server says it stores.
+ *
+ * The inbound guards read their bounds from `ready`, which is the party they
+ * exist to bound. `numberOf()` maps a missing field to 0 and both guards read
+ * `if (max > 0)`, so a server that merely omitted `perFileMax` and `maxChunks`
+ * switched them both off, and a corrupt row did the same. Missing has to mean
+ * this device's own ceiling, never no ceiling.
+ *
+ * These are the protocol's own maxima, from the server's store package, so
+ * nothing a working server asks for is refused by them.
+ */
+export const OWN_LIMITS = {
+    /** 256 MiB, the largest file any server will store. */
+    perFileMax: 1 << 28,
+    /** 65536, the most chunks any server records for one entry. */
+    maxChunks: 1 << 16,
+} as const;
+
+/** The tighter of what the server asks for and what this device allows. */
+export function boundedBy(fromServer: number, own: number): number {
+    return fromServer > 0 ? Math.min(fromServer, own) : own;
+}
+
+/**
  * Refuses a batch entry that contradicts itself, before anything acts on it.
  *
  * Everything here except the sealed path arrives in the clear and unsigned, and
@@ -390,6 +438,13 @@ export class Engine {
             cursor: this.cursor,
             ...(this.opts.claim !== undefined ? { claim: this.opts.claim } : {}),
         });
+        // The docs present the client-ahead case as what catches a server
+        // restored from an old backup or pointed at the wrong vault, and the
+        // refusal lived only in the server, so it was missing exactly when it
+        // was needed. A server behind this device would answer no batches, and
+        // the status line reported `behind` clamped at zero, so it looked like
+        // being up to date.
+        refuseIfBehind(limits.cursor, this.cursor);
         this.limits = limits;
         this.log("connected", limits);
         return limits;
@@ -406,10 +461,20 @@ export class Engine {
      * the cursor advance and nothing to apply.
      */
     async acceptBatch(batch: { from: number; to: number; entries: WireEntry[] }): Promise<void> {
+        // Staged, then committed once every entry has unsealed and passed its
+        // checks. Applied entry by entry, a batch that failed part way through
+        // left the entries before the failure recorded and no way to undo them,
+        // and `save()` persists `remote` and `pending`, so they survived the
+        // session dying. `deleteLocal` needs no server, so a batch of
+        // [forged deletion, entry sealed under another vault's key] applied the
+        // deletion on the next pass while the connection died looking like a
+        // misconfiguration. "The session ended safely" is not "nothing was
+        // applied" unless the state is committed together.
+        const staged = new Map<string, RemoteState>();
         for (const e of batch.entries) {
             checkEntryShape(e);
             const path = await this.plaintextPath(e.path);
-            this.remote.set(path, {
+            staged.set(path, {
                 uid: e.uid,
                 folder: e.folder,
                 deleted: e.deleted,
@@ -417,7 +482,6 @@ export class Engine {
                 size: e.size,
                 hash: contentId(e.chunks),
             });
-            this.pending.add(path);
 
             if (e.prev) {
                 // A rename travels as one operation, so nothing tells this
@@ -427,7 +491,7 @@ export class Engine {
                 // old path was edited here since the last sync, a deletion loses
                 // to an edit and the file is kept and re-uploaded.
                 const old = await this.plaintextPath(e.prev);
-                this.remote.set(old, {
+                staged.set(old, {
                     uid: e.uid,
                     folder: false,
                     deleted: true,
@@ -435,8 +499,12 @@ export class Engine {
                     size: 0,
                     hash: "",
                 });
-                this.pending.add(old);
             }
+        }
+
+        for (const [path, state] of staged) {
+            this.remote.set(path, state);
+            this.pending.add(path);
         }
         this.cursor = batch.to;
     }
@@ -1269,8 +1337,8 @@ export class Engine {
      * declining to be told two different things.
      */
     private checkChunkCount(uid: number, count: number): void {
-        const maxChunks = this.limits?.maxChunks ?? 0;
-        if (maxChunks > 0 && count > maxChunks) {
+        const maxChunks = boundedBy(this.limits?.maxChunks ?? 0, OWN_LIMITS.maxChunks);
+        if (count > maxChunks) {
             throw new Error(
                 `version ${uid} names ${count} chunks, and this server said it stores at most ${maxChunks}`
             );
@@ -1282,11 +1350,11 @@ export class Engine {
         if (bodies.length === 0) return new Uint8Array(0);
         const opened: Uint8Array[] = [];
         let total = 0;
-        const perFileMax = this.limits?.perFileMax ?? 0;
+        const perFileMax = boundedBy(this.limits?.perFileMax ?? 0, OWN_LIMITS.perFileMax);
         for (const body of bodies) {
             const part = await openChunk(this.opts.keys, body);
             total += part.length;
-            if (perFileMax > 0 && total > perFileMax) {
+            if (total > perFileMax) {
                 throw new Error(
                     `version ${uid} is over ${total} bytes, and this server said it stores at most ${perFileMax}`
                 );

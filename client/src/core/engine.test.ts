@@ -13,7 +13,7 @@
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
-import { Engine, SEAL_WINDOW, contentId, firstFreeName, sealedNames, type SyncReport } from "./engine.ts";
+import { Engine, OWN_LIMITS, SEAL_WINDOW, boundedBy, contentId, refuseIfBehind, firstFreeName, sealedNames, type SyncReport } from "./engine.ts";
 import { chunkBytes, sizesFor } from "./chunk.ts";
 import { sealChunks, sealPath } from "./crypto.ts";
 import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
@@ -1440,6 +1440,37 @@ describe("a batch that contradicts itself", () => {
         expect(await a.vault.read(path)).toEqual(before);
     });
 
+    /**
+     * A batch is one unit. Applied entry by entry, everything before a failure
+     * stayed, `save()` persisted it, and `deleteLocal` needs no server to act on
+     * it later: a forged deletion followed by an entry sealed under another
+     * vault's key landed the deletion while the session died looking like a
+     * misconfiguration.
+     */
+    it("applies nothing from a batch whose later entry is not ours", async () => {
+        const { path, sealed, before } = await synced();
+        const uid = 1_000_000;
+
+        // A second vault's key, so its sealed path cannot be opened by this one.
+        const stranger = await deriveKeys(new Uint8Array(20).fill(9));
+        const foreign = await sealPath(stranger, "Notes/theirs.md");
+
+        await expect(
+            a.engine.acceptBatch({
+                from: uid,
+                to: uid + 1,
+                entries: [
+                    { uid, path: sealed, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: true, chunks: [], device: "b" },
+                    { uid: uid + 1, path: foreign, size: 0, ctime: 0, mtime: a.clock + 1000, folder: false, deleted: false, chunks: [], device: "b" },
+                ],
+            })
+        ).rejects.toThrow();
+
+        // The forged deletion in front of it must not survive the refusal.
+        await a.engine.sync();
+        expect(await a.vault.read(path)).toEqual(before);
+    });
+
     it("still accepts an ordinary empty note, which is a size of zero and no chunks", async () => {
         const { sealed } = await synced();
         const uid = 1_000_000;
@@ -1452,5 +1483,55 @@ describe("a batch that contradicts itself", () => {
                 ],
             })
         ).resolves.toBeUndefined();
+    });
+});
+
+/**
+ * Missing has to mean this device's own ceiling, never no ceiling.
+ *
+ * `numberOf()` maps an absent field to 0, and both inbound guards used to read
+ * `if (max > 0)`, so a server that simply left `perFileMax` and `maxChunks` out
+ * of `ready` turned off the only bounds on inbound work. A corrupt row does the
+ * same thing, which is what the guards were written for in the first place.
+ */
+describe("bounds taken from the party they exist to bound", () => {
+    it("falls back to this device's ceiling rather than to none", () => {
+        expect(boundedBy(0, 100)).toBe(100);
+    });
+
+    it("takes the server's when it is tighter", () => {
+        expect(boundedBy(50, 100)).toBe(50);
+    });
+
+    it("refuses to be talked upwards", () => {
+        expect(boundedBy(1_000_000, 100)).toBe(100);
+    });
+
+    it("has ceilings at the protocol's own maxima", () => {
+        expect(OWN_LIMITS.perFileMax).toBe(256 * 1024 * 1024);
+        expect(OWN_LIMITS.maxChunks).toBe(65536);
+    });
+});
+
+/**
+ * A server behind its own clients is a restored backup or the wrong vault, and
+ * the client used to sync against it happily, reporting "up to date" because the
+ * status line clamped the gap at zero.
+ */
+describe("a server that is behind this device", () => {
+    it("is refused", () => {
+        expect(() => refuseIfBehind(5, 9)).toThrow(/restored backup or the wrong vault/);
+    });
+
+    it("is fine when level, which is the ordinary case", () => {
+        expect(() => refuseIfBehind(9, 9)).not.toThrow();
+    });
+
+    it("is fine when ahead, which is every sync with something to fetch", () => {
+        expect(() => refuseIfBehind(90, 9)).not.toThrow();
+    });
+
+    it("is fine for a device that has never synced", () => {
+        expect(() => refuseIfBehind(0, 0)).not.toThrow();
     });
 });
