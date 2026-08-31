@@ -64,6 +64,20 @@ const (
 	// the session's own goroutine and blocks rather than buffering.
 	SendQueueDepth = 256
 
+	// SendQueueBytes bounds what one peer may have waiting in memory.
+	//
+	// The depth above bounds frames, and a frame carrying a chunk body can be a
+	// megabyte, so a peer that stopped reading held 256 of them: measured at
+	// 272 MB of heap for one stalled reader, and 2.2 GB at the default peer
+	// limit. Chunks average a few kilobytes, so this never bites on prose; a
+	// vault of incompressible attachments produces chunks at the ceiling, which
+	// is exactly the vault that would find it.
+	//
+	// Eight mebibytes mirrors the client's own bound on queued file bytes. A
+	// frame larger than this is still sent, because refusing it would be a
+	// deadlock rather than a limit.
+	SendQueueBytes = 8 << 20
+
 	// CatchupBufferMax bounds live changes held while a session drains its
 	// backlog. A session that cannot finish catch-up before this many commits
 	// land is dropped and recovers on reconnect, which costs it nothing: the

@@ -1088,3 +1088,64 @@ func TestAConnectionThatDoesNotAnswerAPingIsReaped(t *testing.T) {
 	}
 	t.Fatal("a session whose pings went unanswered was never closed")
 }
+
+// A peer that stops reading must not be able to make the server hold its whole
+// vault in memory.
+//
+// The send queue was bounded at 256 frames and a frame carrying a chunk body
+// can be a megabyte, so one stalled reader held a quarter of a gigabyte: the
+// benchmark doc holds the client to 291 MB for a 256 MiB file while the server
+// had an unmeasured 256 MiB per peer serving it back. Chunks average a few
+// kilobytes, so it never showed on prose; a vault of incompressible attachments
+// makes them at the ceiling.
+func TestAStalledPeerCannotQueueTheWholeVault(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("a")
+	cl.hello(0)
+
+	// One frame at a time, from another goroutine, so the test can watch the
+	// counter rather than wait on the peer.
+	// The one session in the hub is this client's.
+	var peer *Session
+	r.srv.hub.mu.RLock()
+	for p := range r.srv.hub.byVault[testVault] {
+		peer = p
+	}
+	r.srv.hub.mu.RUnlock()
+	if peer == nil {
+		t.Fatal("no session in the hub")
+	}
+
+	body := make([]byte, 1<<20)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 64; i++ {
+			if err := peer.send(websocket.MessageBinary, body); err != nil {
+				return
+			}
+		}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	peak := int64(0)
+	for time.Now().Before(deadline) {
+		if q := peer.queued.Load(); q > peak {
+			peak = q
+		}
+		select {
+		case <-done:
+			deadline = time.Now()
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// The budget, plus at most the one frame that is always allowed through.
+	if peak > SendQueueBytes+int64(len(body)) {
+		t.Fatalf("queued %d bytes, want at most %d", peak, SendQueueBytes+int64(len(body)))
+	}
+	if peak == 0 {
+		t.Fatal("nothing was ever queued, so this proved nothing")
+	}
+}

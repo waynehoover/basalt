@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,7 +27,12 @@ type Session struct {
 	// All writes funnel through one goroutine draining out, which keeps frame
 	// order without a mutex and stops a stalled peer from blocking whoever is
 	// broadcasting to it.
-	out       chan outFrame
+	out chan outFrame
+	// queued is the bytes sitting in out, and drained wakes a waiter when the
+	// writer has taken some away. Bytes as well as frames, because a frame can
+	// be a whole chunk body.
+	queued    atomic.Int64
+	drained   chan struct{}
 	dead      chan struct{}
 	closeOnce sync.Once
 
@@ -61,8 +67,9 @@ func (s *Server) Handle(ctx context.Context, conn *websocket.Conn, remote string
 	conn.SetReadLimit(ReadLimit)
 	sess := &Session{
 		srv: s, conn: conn, ctx: ctx, remote: remote,
-		out:  make(chan outFrame, SendQueueDepth),
-		dead: make(chan struct{}),
+		out:     make(chan outFrame, SendQueueDepth),
+		drained: make(chan struct{}, 1),
+		dead:    make(chan struct{}),
 	}
 	go sess.writeLoop()
 	go sess.keepalive()
@@ -90,6 +97,13 @@ func (s *Session) writeLoop() {
 			ctx, cancel := context.WithTimeout(s.ctx, WriteWait)
 			err := s.conn.Write(ctx, f.typ, f.data)
 			cancel()
+			s.queued.Add(-int64(len(f.data)))
+			// Non-blocking, and one pending wake is enough: a waiter rechecks
+			// the counter rather than trusting the signal.
+			select {
+			case s.drained <- struct{}{}:
+			default:
+			}
 			if err != nil {
 				s.kill(err)
 				return
@@ -135,12 +149,35 @@ func (s *Session) drain(timeout time.Duration) {
 // backpressure: a catch-up can be far larger than the queue, and dropping
 // frames there would leave the client with gaps it has been told to expect.
 func (s *Session) send(typ websocket.MessageType, data []byte) error {
+	// Waits on bytes as well as on frames.
+	//
+	// handleFetch reads a body and sends it, over and over, as fast as the
+	// queue accepts them. Bounded only by frame count that let one peer hold a
+	// quarter of a gigabyte of chunk bodies in memory. Waiting here is safe and
+	// is what already happens when the queue fills: send runs on the session's
+	// own goroutine, so the peer that is not reading is the one that waits.
+	//
+	// A frame bigger than the whole budget still goes, or a single large chunk
+	// would wait for room that can never appear.
+	for s.queued.Load() > 0 && s.queued.Load()+int64(len(data)) > SendQueueBytes {
+		select {
+		case <-s.drained:
+		case <-s.dead:
+			return errors.New("session closed")
+		case <-s.ctx.Done():
+			return s.ctx.Err()
+		}
+	}
+
+	s.queued.Add(int64(len(data)))
 	select {
 	case s.out <- outFrame{typ, data}:
 		return nil
 	case <-s.dead:
+		s.queued.Add(-int64(len(data)))
 		return errors.New("session closed")
 	case <-s.ctx.Done():
+		s.queued.Add(-int64(len(data)))
 		return s.ctx.Err()
 	}
 }
