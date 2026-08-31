@@ -376,6 +376,39 @@ describe("status", () => {
     expect(human.stdout).toMatch(/cannot reach the server/);
     expect(human.stdout).not.toMatch(/up to date/);
   }, 300_000);
+
+  /**
+   * The cursor says what has been seen, not what has been applied.
+   *
+   * A path that is a file here and a folder on the other device is applied by
+   * nobody and never will be, and the cursor moves past it regardless. Status
+   * printed "1 files with work outstanding" and "up to date with the server"
+   * on the same screen, and the second line is the one people read. Rule 7:
+   * "everything is here" and "everything I chose to look at is here" have to
+   * read differently.
+   */
+  it("does not call a vault up to date while work is outstanding", async () => {
+    await fresh();
+    const { a, b } = await twoDevices();
+    await write(a, "thing.md", "a file on a\n");
+    await cli("sync", "--dir", a);
+    await cli("sync", "--dir", b);
+
+    // The same name, a folder on a. b can never apply it: it holds the file.
+    await rm(join(a, "thing.md"));
+    await mkdir(join(a, "thing.md"), { recursive: true });
+    await write(a, "thing.md/inner.md", "inside\n");
+    for (let i = 0; i < 3; i++) await cli("sync", "--dir", a);
+    for (let i = 0; i < 3; i++) await cli("sync", "--dir", b);
+
+    const s = await cli("status", "--dir", b, "--json");
+    expect((s.json()["server"] as Record<string, unknown>)["behind"]).toBe(0);
+    expect(s.json()["pending"]).toBeGreaterThan(0);
+
+    const human = await cli("status", "--dir", b);
+    expect(human.stdout, human.all).toMatch(/work outstanding/);
+    expect(human.stdout, human.all).not.toMatch(/up to date/);
+  }, 300_000);
 });
 
 describe("unlinking", () => {

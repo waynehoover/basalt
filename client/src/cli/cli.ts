@@ -299,10 +299,17 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   io.out(`cursor   ${local.cursor}`);
   if (local.pending > 0) io.out(`pending  ${local.pending} files with work outstanding`);
   if (server.reachable) {
+    // The cursor says what this device has seen, not what it has applied. A
+    // path that is a file here and a folder elsewhere is applied by nobody and
+    // never will be, and the cursor moves past it regardless, so the two facts
+    // were printed on the same screen and only one of them was read. Rule 7:
+    // "everything is here" cannot look like "everything except that".
     io.out(
-      server.behind === 0
-        ? "state    up to date with the server"
-        : `state    ${server.behind} changes behind`,
+      server.behind !== 0
+        ? `state    ${server.behind} changes behind`
+        : local.pending > 0
+          ? `state    caught up with the server, with ${local.pending} still not applied here`
+          : "state    up to date with the server",
     );
     return 0;
   }
