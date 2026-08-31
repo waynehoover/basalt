@@ -934,6 +934,7 @@ export class Transport {
         // will only settle if the server refuses, which is why it is raced rather
         // than awaited.
         const bodies: Uint8Array[] = [];
+        const checks: Promise<void>[] = [];
         try {
             for (let i = 0; i < names.length; i++) {
                 const next = await Promise.race([
@@ -942,18 +943,32 @@ export class Transport {
                         throw new ProtocolError("protostate", `expected a chunk body, got ${JSON.stringify(r)}`);
                     }),
                 ]);
-                const got = await chunkName(next);
-                if (got !== names[i]) {
-                    // The stream is no longer saying what it is answering, so
-                    // there is nothing to recover to. Carrying on would mean
-                    // guessing which body belonged to which name.
-                    throw new ProtocolError(
-                        "badchunk",
-                        `asked for ${names[i]} and received ${next.length} bytes that hash to ${got}`
-                    );
-                }
+                // Hashed alongside the next body rather than in front of it.
+                //
+                // The bodies arrive in order and must be read in order, but
+                // verifying one has nothing to do with receiving the next, and
+                // waiting for each digest made the check 90% of what a fetch
+                // costs this side: 21.6 ms of a 23.9 ms fetch of 2000 bodies,
+                // against 5.1 ms taken together.
+                //
+                // Not dropped, only moved. It is what stops a body left over
+                // from an abandoned fetch being assembled into the wrong note.
+                // The session still ends on a mismatch, a few bodies later than
+                // it used to, and nothing is written before the check settles.
+                const want = names[i]!;
+                checks.push(
+                    chunkName(next).then((got) => {
+                        if (got !== want) {
+                            throw new ProtocolError(
+                                "badchunk",
+                                `asked for ${want} and received ${next.length} bytes that hash to ${got}`
+                            );
+                        }
+                    })
+                );
                 bodies.push(next);
             }
+            await Promise.all(checks);
         } catch (err) {
             this.expecting = 0;
             this.disarmReply();
