@@ -22,6 +22,13 @@ import (
 //	width  32        4737                 278
 //	width  64        4339                 269
 //
+// Re-taken later on one machine, five runs a width, medians: Linux 1273 / 3707
+// / 5231 / 5248 / 5189, macOS 183 / 277 / 295 / 270 / 280. Same shape, same
+// conclusion. Worth saying how nearly it went the other way: a single run per
+// width read 398 / 1182 / 1271 / 3372 / 4981, which looks exactly like a knee
+// past 64 and would have argued for widening this. It was the first widths
+// warming up. Rule 8, and one sample is not a measurement of an fsync.
+//
 // Linux is where this runs and macOS is where it is developed. The gap is
 // F_FULLFSYNC, which Go issues for File.Sync on darwin and which flushes the
 // drive's own cache; it barely overlaps at all, which is why the laptop figures

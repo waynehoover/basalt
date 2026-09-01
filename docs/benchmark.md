@@ -50,9 +50,10 @@ which the link carries in 4 s, and takes 14.7. Almost all the difference is
 ack must not precede either. Serially that was 29 of the first sync's 30 seconds.
 They now run sixteen at a time with one directory flush per batch.
 
-That last figure is a laptop's. On Linux the same 3000 chunks go at 4527/s
-against 307/s here, because Go issues `F_FULLFSYNC` on darwin. `go test
-./internal/chunks -bench WriterWidth` prints both.
+That last figure is a laptop's. On Linux the same 3000 chunks go at 5231/s
+against 295/s here, because Go issues `F_FULLFSYNC` on darwin. `go test
+./internal/chunks -bench WriterWidth` prints both, and "On Linux, which is where
+it runs" below has what that does to a whole sync.
 
 **The download column nearly stopped meaning anything.** Both devices used to be
 created before the vault was built, so the second one followed the first live
@@ -144,16 +145,43 @@ heap by 272 MB, measured, with an arithmetic bound of 256 MiB per peer. It is
 bounded in bytes now. A vault of incompressible attachments produces chunks at
 the 1 MiB ceiling, which is exactly when that bit.
 
+## On Linux, which is where it runs
+
+The same vault, the same machine, the same binaries. Only the kernel differs:
+the table above is macOS, this one is a Linux container on the same laptop,
+driven by `BASALT_TEST_BINARY` so it is the shipped server rather than a rebuild.
+
+| Round trip | Up, macOS | Up, Linux | Down, macOS | Down, Linux |
+|---|---|---|---|---|
+| loopback | 12.2 s | **2.8 s** | 0.60 s | 1.22 s |
+| 20 ms | 12.1 s | **2.1 s** | 0.64 s | 1.27 s |
+| 100 ms | 12.2 s | **2.8 s** | 0.81 s | 1.41 s |
+| 400 ms, 2.6 MiB/s | 15.0 s | **7.4 s** | 5.60 s | 6.26 s |
+
+Upload is four to six times faster, which is the `F_FULLFSYNC` prediction coming
+true rather than a surprise: Go issues it for `File.Sync` on darwin, it flushes
+the drive's own cache, and it barely overlaps. Everything else about the run is
+identical, 200 files arriving with 0 wrong on every row.
+
+The more useful reading is the 400 ms line. The link carries 10.7 MiB in about
+four seconds and the upload takes 7.4, where on the laptop it took 15. On Linux
+this is close to link-bound, which was the thing worth finding out: there is no
+large win left in the server for a vault of notes.
+
+Downloads are slightly slower here, and that is the container rather than the
+kernel: the client runs inside it too.
+
+Measured under OrbStack, so it is a Linux kernel on a virtualised disk rather
+than a server's. The direction and the size of the gap match the explanation and
+match `BenchmarkWriterWidth`, which on the same setup gives 5231 chunks/s at
+width 16 against 295 on the host. A real server is still a real server.
+
 ## What is next
 
-1. **Run it on Linux.** 108 of the 2000-file upload's 167 seconds are this
-   laptop's `F_FULLFSYNC`. Every upload figure above is a laptop's until then.
-2. **Then probably stop.** After that, upload is within seconds of what the link
-   can carry and download already is: 64 s against a 48 s floor.
-3. **What a large attachment costs on a phone.** A phone has synced a 320 file
+1. **What a large attachment costs on a phone.** A phone has synced a 320 file
    vault, so the platform is no longer the unknown; the memory curve below is a
    laptop's, and the file limit is set from it.
-4. **Measure their plugin on this machine.** It needs Obsidian, a WebDAV server,
+2. **Measure their plugin on this machine.** It needs Obsidian, a WebDAV server,
    and every candidate measured the same afternoon. Until then their numbers are
    theirs.
 
