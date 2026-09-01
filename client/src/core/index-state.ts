@@ -185,7 +185,7 @@ export function decide(input: DecideInput): Action {
   // Folders first: they carry no content, so most of the reasoning below has
   // nothing to work with.
   if (local?.folder || remote?.folder) {
-    return decideFolder(local, remote);
+    return decideFolder(local, remote, index);
   }
 
   if (local === undefined && (remote === undefined || remote.deleted)) {
@@ -245,7 +245,11 @@ export function decide(input: DecideInput): Action {
   return { kind: "merge", why: "changed on both sides since the last sync" };
 }
 
-function decideFolder(local: LocalState | undefined, remote: RemoteState | undefined): Action {
+function decideFolder(
+  local: LocalState | undefined,
+  remote: RemoteState | undefined,
+  index: IndexEntry,
+): Action {
   if (local !== undefined && local.folder) {
     if (remote === undefined) {
       return { kind: "upload", why: "new folder, the server has never held this path" };
@@ -272,6 +276,20 @@ function decideFolder(local: LocalState | undefined, remote: RemoteState | undef
       // return createLocalFolder, which a real filesystem refuses, so the
       // device retried an impossible mkdir for ever.
       return { kind: "clash", why: "a file here and a folder of the same name on another device" };
+    }
+    if (index.synctime > 0) {
+      // Known here once and gone now: somebody removed it. Creating it again
+      // would undo that on the device it was done on, a second after they did
+      // it. A folder deletion is still not propagated, so the other devices
+      // keep theirs; this is only about not resurrecting it here.
+      //
+      // `synctime` rather than content, because a folder has none. It is set
+      // when a folder entry syncs and survives `prune` while the server still
+      // holds the folder, which is exactly the window this has to cover.
+      return {
+        kind: "nothing",
+        why: "folder removed here, and deletions of folders do not travel",
+      };
     }
     return { kind: "createLocalFolder", why: "folder exists on the server and not here" };
   }

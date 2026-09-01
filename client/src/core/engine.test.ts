@@ -509,6 +509,36 @@ describe("deletions", () => {
 });
 
 describe("folders and renames", () => {
+  /**
+   * Deleting an empty folder and having it come straight back.
+   *
+   * A folder the server holds and this device does not was read as one that
+   * had arrived from elsewhere, so it was created. That is right for a folder
+   * this device has never seen and wrong for one it removed a second ago: the
+   * folder reappeared on the very device somebody deleted it on, which is not
+   * "a folder deletion is not propagated", it is the deletion being undone.
+   */
+  it("does not put back a folder this device removed", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+
+    await a.vault.mkdir("Archive");
+    await a.vault.edit("Archive/note.md", "something\n");
+    await convergeBoth(a, b);
+    expect(b.vault.text("Archive/note.md")).toBe("something\n");
+
+    // Empty it and remove it, the way somebody tidying up would.
+    await a.vault.remove("Archive/note.md");
+    await convergeBoth(a, b);
+    await a.vault.remove("Archive");
+    expect(await a.vault.exists("Archive")).toBe(false);
+
+    await a.engine.sync();
+    await a.engine.sync();
+    expect(await a.vault.exists("Archive"), "the folder came back").toBe(false);
+  }, 240_000);
+
   it("creates a folder the other device made", async () => {
     await fresh();
     const a = await device("a");
