@@ -305,10 +305,29 @@ export interface SyncReport {
    * different thing to tell a person and rule 7 says to tell them apart.
    */
   blocked: number;
+  /**
+   * Which paths, and what is standing in the way of each.
+   *
+   * The count on its own is not something anybody can act on, and this is the
+   * one refusal that never clears itself: it waits until a person renames one
+   * of the two things that disagree, and they cannot do that without being
+   * told which two. Bounded, because a folder converted to a file blocks
+   * everything under it and a list the length of a subtree is not a message.
+   */
+  inTheWay: { path: string; blockedBy: string }[];
   /** Chunk bodies actually sent, and their size. The measure that matters. */
   chunksSent: number;
   bytesSent: number;
 }
+
+/**
+ * How many blocked paths are named before the list stops being a message.
+ *
+ * One file where a folder belongs blocks every path beneath it, so the count
+ * can be a whole subtree while the *cause* is a single name. Naming a few is
+ * enough to act on; naming four hundred is a wall.
+ */
+const IN_THE_WAY_SHOWN = 5;
 
 function emptyReport(): SyncReport {
   return {
@@ -325,6 +344,7 @@ function emptyReport(): SyncReport {
     retrying: 0,
     skipped: 0,
     blocked: 0,
+    inTheWay: [],
     chunksSent: 0,
     bytesSent: 0,
   };
@@ -746,6 +766,9 @@ export class Engine {
           this.log("cannot be both", path, `${blockedBy} is a file here and a folder elsewhere`);
         }
         report.blocked++;
+        if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+          report.inTheWay.push({ path, blockedBy });
+        }
         continue;
       }
 
@@ -1937,7 +1960,11 @@ export class Engine {
 
 function add(a: SyncReport, b: SyncReport): SyncReport {
   const out = { ...a };
-  for (const k of Object.keys(out) as (keyof SyncReport)[]) out[k] = a[k] + b[k];
+  for (const k of Object.keys(out) as (keyof SyncReport)[]) {
+    if (k === "inTheWay") continue; // A list of names, not a number to sum.
+    out[k] = a[k] + b[k];
+  }
+  out.inTheWay = [...a.inTheWay, ...b.inTheWay].slice(0, IN_THE_WAY_SHOWN);
   return out;
 }
 

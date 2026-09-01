@@ -202,6 +202,18 @@ describe("a path that is a file here and a folder there", () => {
       reportA.skipped + reportA.blocked + reportB.skipped + reportB.blocked,
       `neither device reported the disagreement: A ${JSON.stringify(reportA)} B ${JSON.stringify(reportB)}`,
     ).toBeGreaterThan(0);
+
+    // And it says which name, because nothing here clears itself. It waits for
+    // a person to rename one of the two, and a count cannot tell them which.
+    // Whichever device is the blocked one has to name the blocker.
+    const named = [...reportA.inTheWay, ...reportB.inTheWay];
+    if (reportA.blocked + reportB.blocked > 0) {
+      expect(
+        named.map((b) => b.blockedBy),
+        `blocked but named nothing: A ${JSON.stringify(reportA.inTheWay)} B ${JSON.stringify(reportB.inTheWay)}`,
+      ).toContain("notes");
+      expect(named.every((b) => b.path.startsWith("notes/"))).toBe(true);
+    }
   }, 300_000);
 
   /**

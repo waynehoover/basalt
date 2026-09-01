@@ -556,6 +556,22 @@ function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): 
   } else {
     for (const line of lines) io.out(line);
   }
+
+  // Named, because this is the one refusal that never clears itself. It waits
+  // for somebody to rename one of the two things that disagree, and a count on
+  // its own does not tell them which two.
+  if (r.inTheWay.length > 0) {
+    io.out("");
+    const blockers = [...new Set(r.inTheWay.map((b) => b.blockedBy))];
+    for (const blocker of blockers) {
+      io.out(`  "${blocker}" is a file here and a folder on another device.`);
+    }
+    const waiting = r.inTheWay.map((b) => b.path);
+    io.out(
+      `  Waiting to be written: ${waiting.join(", ")}${r.blocked > waiting.length ? ", …" : ""}`,
+    );
+    io.out("  Rename one of them, on whichever device meant the other thing.");
+  }
   if (r.chunksSent > 0)
     io.out(`${String(r.chunksSent).padStart(5)}  chunks sent, ${bytes(r.bytesSent)}`);
   if (r.conflicted > 0)

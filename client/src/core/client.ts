@@ -569,6 +569,9 @@ export function accumulate(total: SyncReport, pass: SyncReport): SyncReport {
     retrying: pass.retrying,
     skipped: pass.skipped,
     blocked: pass.blocked,
+    // A state, like the four above it: the newest pass's answer, not every
+    // pass's answers concatenated.
+    inTheWay: pass.inTheWay,
   };
 }
 

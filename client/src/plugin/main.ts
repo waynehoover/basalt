@@ -441,6 +441,20 @@ export default class BasaltPlugin extends Plugin {
     if (report.skipped > 0) {
       new Notice(`Basalt cannot sync ${report.skipped} file(s) and has stopped trying.`, 10_000);
     }
+    // Named, and left up longer, because this is the one refusal that waits on
+    // a person. Nothing clears it until one of the two names changes, and a
+    // notice saying only that something is in the way cannot be acted on.
+    if (report.inTheWay.length > 0) {
+      const names = [...new Set(report.inTheWay.map((b) => b.blockedBy))];
+      new Notice(
+        `Basalt cannot write ${report.blocked} file(s): ` +
+          `${names.map((n) => `"${n}"`).join(", ")} ` +
+          `${names.length === 1 ? "is a file" : "are files"} here and ` +
+          `${names.length === 1 ? "a folder" : "folders"} on another device. ` +
+          `Rename one, on whichever device meant the other thing.`,
+        20_000,
+      );
+    }
   }
 
   /* ------------------------------------------------------------ *
