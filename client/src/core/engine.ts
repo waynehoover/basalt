@@ -1952,9 +1952,27 @@ export class Engine {
   noteRename(from: string, to: string): void {
     const entry = this.entries.get(from);
     if (!entry) return;
-    this.entries.delete(from);
-    renamed(entry, from, to);
-    this.entries.set(to, entry);
+
+    // The new path inherits the sync state, so the content is recognised as
+    // already on the server and the move costs no chunks, and `prev` tells the
+    // server which name this used to be.
+    const moved: IndexEntry = { ...entry, chunks: [...entry.chunks] };
+    renamed(moved, from, to);
+    this.entries.set(to, moved);
+
+    // The old path keeps its entry, and that is the whole correction.
+    //
+    // It used to be deleted here, which looked right: the file is not there
+    // any more. But an index with no entry for a path reads as a path this
+    // device has never synced, and the server still holds content at the old
+    // name until it is told otherwise, so `decideMissingLocally` saw
+    // `synchash === ""` and answered "new on the server". Every move in
+    // Obsidian downloaded its own source back, one pass later, and the person
+    // was left with the file in both places.
+    //
+    // Left in place, the next pass sees a path that was synced and is now gone
+    // locally, which is `deleteRemote`, which is what a move's old half is.
+    // The server suppresses it from the deleted list by matching `prev`.
   }
 }
 

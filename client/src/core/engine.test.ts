@@ -543,6 +543,17 @@ describe("folders and renames", () => {
     await convergeBoth(a, b, 6);
     expect(b.vault.text("after.md")).toBe("the same content throughout\n");
     expect(b.vault.text("before.md")).toBeUndefined();
+
+    // And the device that did the renaming does not get the old name back.
+    //
+    // This assertion was the missing half. Telling the engine about a rename
+    // removed the old path from the index, and an index with no entry for a
+    // path the server still has content at reads as "new on the server", so
+    // the very next pass downloaded the file the person had just moved. Every
+    // move in Obsidian left a copy behind, and checking only the receiving
+    // device could never see it.
+    expect(a.vault.text("before.md"), "the moved file came back").toBeUndefined();
+    expect(a.vault.text("after.md")).toBe("the same content throughout\n");
   }, 240_000);
 });
 
