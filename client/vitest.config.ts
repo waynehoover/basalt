@@ -33,5 +33,14 @@ export default defineConfig({
     minWorkers: 1,
     testTimeout: 60_000,
     hookTimeout: 180_000,
+    /**
+     * The stress suite is not part of `npm test`.
+     *
+     * It kills processes and builds vaults of hundreds of notes, and it takes
+     * minutes rather than seconds. A suite people stop running is worse than a
+     * smaller one they run every time, so this stays out of the fast path and
+     * `npm run stress` asks for it by name.
+     */
+    exclude: ["**/node_modules/**", "**/dist/**", "**/*.stress.ts"],
   },
 });

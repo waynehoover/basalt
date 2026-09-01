@@ -83,6 +83,35 @@ jobs:
         working-directory: client
         run: bun run build
 
+  # Its own job so that "the stress suite failed" is a sentence CI can say.
+  #
+  # Unit tests are necessary here and never sufficient: every real defect in the
+  # predecessor was a silent one that only appeared when the system ran, and the
+  # four found the week this was written were all of that kind. These kill the
+  # server mid-commit, let two devices disagree, and write the filenames people
+  # actually have. Linux as well as a laptop, which matters: the server's fsync
+  # behaviour is not the same on the two.
+  stress:
+    name: stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: install
+        working-directory: client
+        run: bun install --frozen-lockfile
+
+      - name: stress
+        working-directory: client
+        run: bun run stress
+
   docker:
     name: docker
     runs-on: ubuntu-latest

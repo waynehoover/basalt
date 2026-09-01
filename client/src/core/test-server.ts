@@ -134,11 +134,18 @@ export class TestServer {
    * There is still a gap between releasing the port and binding it, so this
    * retries rather than pretending the gap is closed.
    */
-  async start(): Promise<void> {
+  /**
+   * Starts the server, optionally back on the port it had.
+   *
+   * The port matters when a test restarts a server its clients are still
+   * pointed at, which is what recovering from a crash looks like from a
+   * device: the same address, the same data directory, a new process.
+   */
+  async start(samePort?: number): Promise<void> {
     let last: Error | undefined;
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
-        await this.startOnce();
+        await this.startOnce(samePort);
         return;
       } catch (err) {
         last = err as Error;
@@ -221,6 +228,28 @@ export class TestServer {
       await Promise.race([ended, new Promise((r) => setTimeout(r, 5000))]);
     }
     this.proc = undefined;
+  }
+
+  /**
+   * Kills the server outright, the way a power cut does.
+   *
+   * `stop` sends SIGTERM and the server shuts down: it finishes what it holds
+   * and closes the store. That is not the case durability rule 1 is about. An
+   * ack means the body and the entry are both committed, and the only way to
+   * find out whether that is true is to take the process away without asking.
+   */
+  async kill(): Promise<void> {
+    if (this.proc && this.proc.exitCode === null) {
+      const ended = new Promise<void>((resolve) => this.proc!.once("exit", () => resolve()));
+      this.proc.kill("SIGKILL");
+      await Promise.race([ended, new Promise((r) => setTimeout(r, 5000))]);
+    }
+    this.proc = undefined;
+  }
+
+  /** How many versions this server has committed, read from its own log. */
+  committed(): number {
+    return (this.stderr.join("").match(/msg=committed/g) ?? []).length;
   }
 
   async cleanup(): Promise<void> {

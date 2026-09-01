@@ -25,9 +25,18 @@ bun install
 bun run test         # everything, including against a real server
 bun run typecheck
 bun run format       # prettier, and CI fails on anything it would change
+bun run stress       # the hostile suite: kills, collisions, awkward names
 bun run bench        # throughput and bandwidth, reported not asserted
 bun run bench:sync   # a whole vault, timed and checked
 ```
+
+`src/stress/*.stress.ts` is excluded from `bun run test` and has its own config.
+It is not a slower copy of the unit tests: it kills the server while it is
+committing, lets two devices edit the same twenty notes without either seeing
+the other, and writes the filenames people actually have, emoji and right to
+left and combining marks included. Every defect this project has found in
+itself was silent and only appeared when the system ran, which is why this
+exists and why CI runs it as its own job.
 
 The benchmarks run under bun and the shipped CLI runs under node, which is not a
 detail: two of the largest wins in `docs/benchmark.md` were each invisible under

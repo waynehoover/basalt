@@ -38,7 +38,8 @@
     "format:check": "prettier --config ../.prettierrc --check \"src/**/*.ts\" \"*.ts\" \"*.mjs\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "stress": "vitest run --config vitest.stress.config.ts"
   },
   "devDependencies": {
     "@types/diff-match-patch": "^1.0.36",
