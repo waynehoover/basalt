@@ -26,6 +26,8 @@ bun run test         # everything, including against a real server
 bun run typecheck
 bun run format       # prettier, and CI fails on anything it would change
 bun run stress       # the hostile suite: kills, collisions, awkward names
+bun run scale        # what 10,000 notes cost, and where the cost sits
+bun run dedup        # what deduplication saves across versions, not across files
 bun run bench        # throughput and bandwidth, reported not asserted
 bun run bench:sync   # a whole vault, timed and checked
 ```

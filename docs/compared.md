@@ -18,6 +18,7 @@ This is what differs, what was learned from each, and where theirs is better.
 | A server forging a version | not tested here | refused: every entry is authenticated by the device that wrote it |
 | Merge conflicts | merged silently, failures dropped | merged when provably safe, both kept otherwise |
 | Plugins, themes, config | syncs them | does not, and that one is still open |
+| Deleting an empty folder | stays deleted, verified | stays deleted, since 0.2.2 |
 | Mobile | iOS and Android | Android in daily use, iOS untested |
 | Version history | in the app | in the app, and restoring never overwrites |
 | Maturity | years in production | early |
@@ -65,9 +66,14 @@ good, both are further along, and reading them found real defects here.
 
 **Chunks against streaming encryption.** Sync Engine encrypts as a stream with a
 per-file salt: conventional, never holds a whole file, and cannot deduplicate.
-Basalt seals deterministically, so an edit to a 2 MiB note costs one chunk and
-the same content in two files is stored once, at the cost of holding a file plus
-one chunk in memory, and of the server learning that two chunks are identical.
+Basalt seals deterministically, so an edit to a 2 MiB note costs one chunk, at
+the cost of holding a file plus one chunk in memory and of the server learning
+that two chunks are identical. This used to also claim that the same content in
+two files is stored once. It is true and it is worth 0.11%: ten thousand
+distinct notes collided twenty-four times. What the determinism actually buys is
+that today's version of a note shares chunks with yesterday's, which saves 73%
+to 90% of the storage a version history would otherwise cost and is what makes
+an edit cost one chunk on the wire.
 
 **Refusing a merge against merging better.** Theirs is a real diff3 that splits
 a document into regions first. Basalt applies diff-match-patch patches and adds

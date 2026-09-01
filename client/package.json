@@ -39,7 +39,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "stress": "vitest run --config vitest.stress.config.ts"
+    "stress": "vitest run --config vitest.stress.config.ts",
+    "scale": "bun run src/stress/scale.ts",
+    "dedup": "bun run src/stress/dedup.ts"
   },
   "devDependencies": {
     "@types/diff-match-patch": "^1.0.36",

@@ -296,6 +296,62 @@ anything larger from its stat, before opening it. `basaltd serve -max-file` rais
 it as far as 256 MiB, which is comfortable for a vault whose large files are only
 ever moved by the headless client.
 
+## Does any of this scale, and is deduplication earning its keep
+
+Ten thousand notes of distinct prose, 21.1 MiB, measured on Linux.
+
+| | 1,000 notes | 10,000 notes |
+|---|---|---|
+| Chunks | 2,198 | 21,641 |
+| Distinct chunks stored | 2,198 | 21,617 |
+| Sealed bodies | 0.8 MiB | 8.1 MiB |
+| Entry metadata | 0.5 MiB | 4.8 MiB |
+| Local index | 0.6 MiB | 5.6 MiB |
+| Server database | 0.8 MiB | 7.2 MiB |
+| A pass over an unchanged vault | 7 ms | 41 ms |
+| Twenty notes edited | 20 chunks, 8.0 KiB | 20 chunks, 8.0 KiB |
+
+Everything is linear in the note count and the idle pass is better than linear.
+Editing twenty notes costs the same 8 KiB whether the vault holds a thousand
+notes or ten thousand, which is the property that matters: the cost of a day's
+work does not grow with the vault.
+
+**Deduplication across files is worth 0.11%.** Ten thousand distinct notes
+produced 21,641 chunks of which 21,617 were distinct: twenty-four collisions in
+a whole vault. On a thousand notes it was zero. Two people's notes do not share
+kilobyte-aligned runs of prose, and the benchmark generator was fixed once
+already for pretending otherwise.
+
+**Deduplication across versions is worth 73% to 90%**, and it is the same
+mechanism. A note edited twenty times:
+
+| | Short note, 2 KB | Long note, 40 KB |
+|---|---|---|
+| Chunk references over 20 versions | 95 | 410 |
+| Distinct chunks stored | 26 | 41 |
+| Saved | 73% | 90% |
+
+So the machinery is not paying for itself by noticing that two files are alike.
+It pays by noticing that today's note is mostly yesterday's, which is also what
+makes an edit cost one chunk on the wire rather than a file. Chunking and
+deduplication are not two features to weigh separately: the wire saving *is*
+deduplication, because a client can only skip a chunk the server already holds,
+and the server only knows it holds it because chunks are named by content.
+
+What that costs is stated in `docs/security.md`: a server can see that two
+chunks are byte-identical. The 0.11% is the part of the benefit that concession
+buys, and it is not why the concession is worth making.
+
+**Entry metadata is 37% of a first sync**, at both sizes: 4.8 MiB of chunk names
+against 8.1 MiB of sealed bodies. That is the cost of naming 2.16 chunks per
+note, and it is a constant fraction rather than a growing one. It is also why
+chunk size is chosen by `sqrt(NAME_BYTES * size)` and not by what an edit costs
+alone; the tuning is already balancing these two against each other.
+
+The next limit is not the wire, it is the index: 5.6 MiB of JSON at ten thousand
+notes, parsed and held. That is comfortable on a laptop and is the number to
+watch on a phone, and nothing here has measured it on one.
+
 ## What a move costs
 
 Moving files was already free for the sender. Chunk names are hashes of
