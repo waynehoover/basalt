@@ -130,6 +130,8 @@ declarations.
 
 ## Libraries
 
-**diff-match-patch**, the merge, unmaintained since 2020 and a known risk.
+**diff-match-patch**, the merge, unmaintained since 2020 and a known risk,
+pinned to an exact version with its hash in a committed lockfile rather than
+left on a caret.
 **fflate** for deflate. **modernc.org/sqlite**, so the server is one static
 binary. **github.com/coder/websocket**.

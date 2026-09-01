@@ -101,6 +101,13 @@ That token is a bootstrap. The first device claims the vault with it and it
 stops working, and the server then prints that the vault is claimed rather than
 printing a string that would fail. See `docs/protocol.md`.
 
+## Rotating the vault secret
+
+The steps below are also what to do when a pairing string has been somewhere it
+should not have been. They are the same steps, because the vault key and the
+credential are the same thing. `docs/security.md` says what a rotation does and
+does not buy.
+
 ## Upgrading from 0.1
 
 0.2.0 is the first release where every version carries an authenticator, and a

@@ -101,6 +101,34 @@ What is enforced regardless:
 - **A path from the wire cannot climb out** with `..`, an absolute path, or by
   any lexical trick.
 
+## A lost or stolen device
+
+There is no per-device revocation, and this is the part of that sentence worth
+writing out. Every device holds the same root secret, because the vault key and
+the credential are the same thing: that is what makes a pairing string one
+string. So a device cannot be told apart from the vault, and a lost one cannot
+be singled out.
+
+What can be done is to give the vault a new secret, which is the same procedure
+as [upgrading from 0.1](running.md#upgrading-from-01): a fresh server store, one
+device paired to it with `unlink` and `init`, the rest paired from that one.
+
+Be clear about what that buys, because it is easy to overstate:
+
+- **It stops the old string writing.** The server's stored auth hash is the new
+  key's, so the old one is refused at `claim`.
+- **It stops the old string reading anything new.** Nothing after the rotation
+  is sealed under the old content key.
+- **It does not unread what has already been read.** Whoever held that string
+  could decrypt everything the server held while they had it, and a rotation
+  cannot reach back. Assume they have it.
+- **It costs the server's version history**, which the backup taken first is
+  there to keep.
+
+Do it if a pairing string has been somewhere it should not have been: a chat
+message, a screenshot, a repository, a device you no longer hold. The string is
+the vault.
+
 ## Provenance
 
 Every artifact a release hands you is rebuilt in CI from the tag and signed
@@ -114,6 +142,16 @@ over a file of unknown origin certifies only that the workflow saw it. It works
 because both builds are reproducible per commit, which was checked rather than
 assumed. `scripts/release.sh` refuses to build from a tree with uncommitted
 changes.
+
+Reproducible per commit requires the dependencies to be pinned per commit, and
+for a while they were not: `bun.lock` was in `.gitignore`, so CI's
+`--frozen-lockfile` had no lockfile to freeze and resolved the version ranges
+fresh on every build. The flag exits 0 in that state rather than complaining,
+which is why nothing noticed. The lockfile is committed now, and the two
+packages that end up inside the shipped bundles, `diff-match-patch` and
+`fflate`, are pinned to exact versions rather than carets. diff-match-patch has
+been unmaintained since 2020 and is the merge, which is the last place to accept
+whatever npm hands over today.
 
 The npm package is published from CI over OIDC, with no token stored anywhere.
 
@@ -145,6 +183,8 @@ machine.
 - **iOS is untested.** The plugin is not desktop-only and the bundle contains no
   Node built-in, so it should work. A phone has synced a 320 file vault, and
   that phone was an Android.
-- **A device holding the key is trusted.** There is no per-device revocation.
+- **A device holding the key is trusted.** There is no per-device revocation;
+  the remedy is a new vault secret, and what that does and does not buy is
+  under "A lost or stolen device" above.
 - **The server can always refuse to serve.** Availability is not a property
   anything here provides, and the answer to it is `basaltd backup`.
