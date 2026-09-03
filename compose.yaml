@@ -15,8 +15,8 @@ services:
     # the old protocol and the new one for a release, the clients speak one.
     #
     # The digest came from:
-    #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.2.1
-    image: ghcr.io/waynehoover/basalt-sync:0.2.1@sha256:8a29dea9d47899e070f23aef188197fb610b7cd390ee79f59533e5e5820add8e
+    #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.3.0
+    image: ghcr.io/waynehoover/basalt-sync:0.3.0@sha256:f42385920a453a8d29461a565f57ac56649f3af3138e7d3853fbc78a3639ab01
     container_name: basalt
     restart: unless-stopped
 

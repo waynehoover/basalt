@@ -421,7 +421,7 @@ job or whatever watches your machines, all readable without a key.
 The startup line is the other thing to grep for after a restart:
 
 ```
-msg=starting version=0.2.1 vault=default latest=9120 claimed=true
+msg=starting version=0.3.0 vault=default latest=9120 claimed=true
 ```
 
 `latest` is the uid every device compares itself against. If a device says it
