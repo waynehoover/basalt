@@ -1,6 +1,6 @@
 {
   "name": "basalt-sync",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Headless Obsidian vault sync for a Basalt server.",
   "keywords": [
     "obsidian",
