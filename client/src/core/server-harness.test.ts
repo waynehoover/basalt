@@ -57,6 +57,14 @@ const enc = new TextEncoder();
  * server holds no key: it checks that an entry carries an authenticator, never
  * what the authenticator says.
  */
+/**
+ * No authenticator, for the puts below that are about the transport rather
+ * than about the entry. `put` takes it rather than defaulting it, so that a
+ * caller that has one cannot forget to pass it; a test that deliberately has
+ * none says so here.
+ */
+const unsigned = { mac: "", parent: "" };
+
 const shapedMac = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const dec = new TextDecoder();
 
@@ -696,6 +704,7 @@ describe("refusals that the session survives", () => {
           { size: 4096, ctime: 1, mtime: 1 },
           [],
           async () => new Uint8Array(0),
+          unsigned,
         ),
       ).rejects.toMatchObject({ code: "badentry" });
 

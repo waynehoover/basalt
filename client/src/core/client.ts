@@ -17,6 +17,7 @@
 
 import {
   Engine,
+  checkEntryShape,
   combinePasses,
   contentId,
   firstFreeName,
@@ -165,16 +166,20 @@ export class Client {
   }
 
   /**
-   * One thing at a time on the wire.
+   * One operation at a time on the wire.
    *
-   * The transport allows a single request in flight and throws otherwise, on
-   * purpose: replies carry no request id, so a second question would resolve
-   * into the first one's slot. The engine is single-flight and so never trips
-   * it, which was the whole story until recovery arrived.
+   * Not because replies could be confused with one another: protocol 3 gives
+   * every request an id and the transport keeps a map of what is outstanding,
+   * so two questions in flight resolve into their own slots. That was the
+   * original reason and it is gone, and the queue is still needed.
    *
-   * Recovery is not part of the engine. Somebody browsing deleted notes while
-   * the background sync ticks is two callers, and they collide. So everything
-   * here that touches the wire queues behind everything else that does.
+   * What it protects is the state either side of the wire. A pass reads the
+   * vault, decides, writes and saves an index; a restore fetches a version
+   * and writes it into the same vault; a rebase rewrites the cursor. Two of
+   * those interleaving is two callers deciding from the same starting state
+   * and one of them acting on a vault the other has already changed. Somebody
+   * browsing deleted notes while the background sync ticks is exactly that,
+   * and it is ordinary rather than rare.
    *
    * The granularity is one engine pass, not one settle, so a question does
    * not wait behind eight of them.
@@ -414,9 +419,16 @@ export class Client {
    * recovery did not run at all (C32); `mustBeOurs` in the engine holds the
    * reason. What is added here is the tail of the sentence: nothing forged is
    * acted on, and nothing forged is put in front of somebody either.
+   *
+   * Both of the sync path's checks, not one. A signature says who wrote an
+   * entry and not that the entry makes sense, and the two are separate
+   * failures: an entry declaring 500 bytes and naming no chunks is signed by
+   * this vault's key and restores as an empty file, which is a note lost to a
+   * recovery tool. `acceptBatch` has always refused that shape.
    */
-  private recoveryIsOurs(entries: readonly WireEntry[]): Promise<void> {
-    return mustBeOurs(this.keys, entries, ", and it is not shown");
+  private async recoveryIsOurs(entries: readonly WireEntry[]): Promise<void> {
+    await mustBeOurs(this.keys, entries, ", and it is not shown");
+    for (const e of entries) checkEntryShape(e);
   }
 
   /**
@@ -453,7 +465,7 @@ export class Client {
    */
   async contentAt(version: Version): Promise<Uint8Array> {
     if (version.deleted || version.folder) return new Uint8Array(0);
-    return this.serial(() => this.engine.contentOf(version.uid, version.contentId));
+    return this.serial(() => this.engine.contentOf(version.uid, version.contentId, version.size));
   }
 
   /**
@@ -487,7 +499,9 @@ export class Client {
     // requests and a sync starting in the middle of them would collide. The
     // chunk list the signed history entry named is what `get` must answer
     // with; anything else is not this version (C32).
-    const content = await this.serial(() => this.engine.contentOf(version.uid, version.contentId));
+    const content = await this.serial(() =>
+      this.engine.contentOf(version.uid, version.contentId, version.size),
+    );
     const wanted = to ?? version.path;
     const vault = this.opts.vault;
     const exists = (p: string) => vault.exists(p);
@@ -1032,7 +1046,16 @@ export async function redeemInvite(
   }
 }
 
-/** Whether a pass did anything that could produce more work. */
+/**
+ * Whether a pass did anything that could produce more work.
+ *
+ * `waiting` is not on the list, and used to be. A waiting file is one whose
+ * write debounce has not run out, which is tens of seconds; counting it here
+ * had `settle` re-stat the whole vault eight times at 60 ms intervals to find
+ * the same file still waiting, and then return anyway. The follow-on work that
+ * is real is handled inside a pass by `again`, which reruns while there is
+ * something to do rather than while there is something to wait for.
+ */
 export function didSomething(r: SyncReport): boolean {
   return (
     r.uploaded +
@@ -1042,8 +1065,7 @@ export function didSomething(r: SyncReport): boolean {
       r.deletedLocally +
       r.deletedRemotely +
       r.restored +
-      r.foldersCreated +
-      r.waiting >
+      r.foldersCreated >
     0
   );
 }

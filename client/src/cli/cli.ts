@@ -130,6 +130,7 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
   }
 
   try {
+    refuseExtras(args);
     // Anything that changes the vault, its config or its index takes the
     // vault's lock for as long as it runs. Reading commands do not: they
     // load the index once and talk to the server, and holding a lock for
@@ -175,6 +176,33 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
     else io.err(`basalt: ${message}`);
     return 1;
   }
+}
+
+/**
+ * How many positional arguments each command takes. Everything else takes none.
+ *
+ * `basalt sync ~/vault` used to be accepted and the path silently ignored, so
+ * it synced the current directory and said it had synced: a wrong vault
+ * reported as a right one, which is rule 7. The vault is chosen with `--dir`,
+ * and the mistake is common enough that the refusal says so.
+ */
+const POSITIONALS: Record<string, number> = {
+  init: 1,
+  pair: 1,
+  history: 1,
+  restore: 1,
+};
+
+function refuseExtras(args: Args): void {
+  const takes = POSITIONALS[args.command ?? ""] ?? 0;
+  if (args.rest.length <= takes) return;
+  const extra = args.rest.slice(takes);
+  const what = extra.map((e) => JSON.stringify(e)).join(", ");
+  throw new Error(
+    takes === 0
+      ? `${args.command} takes no arguments, so ${what} was not used. The vault is chosen with --dir.`
+      : `${args.command} takes one argument, so ${what} was not used.`,
+  );
 }
 
 /* ---------------------------------------------------------------- *
@@ -888,7 +916,7 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
           sync: report,
         }),
       );
-      return 0;
+      return exitCodeFor(report);
     }
     io.out(
       `Restored version ${version.uid} of ${path} (${bytes(done.bytes)}, from ${when(version.mtime)}).`,
@@ -897,7 +925,11 @@ async function cmdRestore(args: Args, io: Console): Promise<number> {
       io.out(`Written to ${done.path}, because something is already at ${args.to ?? path}.`);
     }
     if (report.uploaded > 0) io.out("Sent to the server, so your other devices will pick it up.");
-    return 0;
+    // The restore itself succeeded, and the sync after it is a sync: a file
+    // that can never sync, or one still failing when the pass gave up, is
+    // the same unsuccessful run here as it is under `sync` and `rebase`. The
+    // note is on this device either way, and the line above says so.
+    return exitCodeFor(report);
   } finally {
     await client.close();
   }
@@ -1064,8 +1096,15 @@ function candidates(config: Config): Config[] {
 }
 
 async function clientOptions(config: Config, args: Args, io?: Console): Promise<ClientOptions> {
+  const vault = new NodeVault(args.dir, { configDir: args.configDir, alsoIgnore: args.ignore });
+  // Once, here, before anything canonicalises a path. Until the probe has run
+  // `canonical` folds case, which is the safe default and the wrong answer on
+  // Linux: two files that differ only in case are one file as far as the alias
+  // check is concerned, both are refused, and every sync exits 1 over a pair
+  // the disk is perfectly happy with. The probe existed and nothing called it.
+  await vault.probeCase();
   return {
-    vault: new NodeVault(args.dir, { configDir: args.configDir, alsoIgnore: args.ignore }),
+    vault,
     store: new JsonIndexStore(indexPath(args.dir)),
     // Which key authenticates and what the vault is bound to, worked out in
     // core so that both shells cannot answer it differently.

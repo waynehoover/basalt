@@ -755,6 +755,16 @@ export class NodeVault implements Vault {
  * all: no index re-reads the vault and recovers, while a half-written one is
  * read as fact and quietly disagrees with the server about what has been synced.
  */
+/** Whether a path is still on disk, for the skip that assumes it is. */
+async function stillThere(file: string): Promise<boolean> {
+  try {
+    await access(file, constants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class JsonIndexStore implements IndexStore {
   constructor(private readonly file: string) {}
 
@@ -772,6 +782,12 @@ export class JsonIndexStore implements IndexStore {
    * 10.7 ms of fsync, so it pays for itself the first time it matches. And a
    * write skipped because the bytes on disk are already those bytes cannot
    * lose anything: the failure it would cause is the failure it prevents.
+   *
+   * That last sentence holds only while the bytes are still there, which is
+   * why `save` asks for the file as well as comparing the string. An index
+   * removed from outside while a watcher is running would otherwise be
+   * skipped by every unchanged pass after it, and the next start would read
+   * a vault it has already synced as one it has never seen.
    */
   private lastWritten: string | undefined;
 
@@ -786,13 +802,19 @@ export class JsonIndexStore implements IndexStore {
       // back disabled every plugin on a device. Unreadable must stop.
       throw new Error(`cannot read the index at ${this.file}: ${(err as Error).message}`);
     }
+    let state: StoredState;
     try {
-      return JSON.parse(text) as StoredState;
+      state = JSON.parse(text) as StoredState;
     } catch (err) {
       throw new Error(
         `the index at ${this.file} is not valid JSON, so it cannot be trusted: ${(err as Error).message}`,
       );
     }
+    // What is on disk is what was last written, so the first pass of a vault
+    // with nothing to do writes nothing rather than serialising the whole
+    // index and fsyncing it twice to say so.
+    this.lastWritten = text;
+    return state;
   }
 
   /**
@@ -811,7 +833,7 @@ export class JsonIndexStore implements IndexStore {
    */
   async save(state: StoredState): Promise<void> {
     const text = JSON.stringify(state);
-    if (text === this.lastWritten) return;
+    if (text === this.lastWritten && (await stillThere(this.file))) return;
     await mkdir(dirname(this.file), { recursive: true });
     await writeDurably(this.file, new TextEncoder().encode(text), true, {
       stageIn: join(dirname(this.file), "tmp"),

@@ -223,6 +223,16 @@ function isDesktopAdapter(adapter: DataAdapter): adapter is DesktopAdapter {
   return typeof (adapter as Partial<DesktopAdapter>).getFullPath === "function";
 }
 
+/** Opens one path for reading and fsyncs it, leaving no handle behind. */
+async function fsyncPath(fs: FsyncFs, adapter: DesktopAdapter, path: string): Promise<void> {
+  const handle = await fs.promises.open(adapter.getFullPath(path), "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
 export class ObsidianVault implements Vault {
   /**
    * Normalized path to the adapter's own name for it, where they differ.
@@ -541,6 +551,11 @@ export class ObsidianVault implements Vault {
   /** Remembers a file whose bytes or name changed, for `flush`. */
   private wrote(normalized: string): void {
     this.unsynced.files.add(normalized);
+    this.entryChanged(normalized);
+  }
+
+  /** Remembers the directory a path lives in, whose entries have changed. */
+  private entryChanged(normalized: string): void {
     const cut = normalized.lastIndexOf("/");
     this.unsynced.dirs.add(cut === -1 ? "" : normalized.slice(0, cut));
   }
@@ -566,33 +581,44 @@ export class ObsidianVault implements Vault {
    * raised. Windows refuses it, and a note that is itself synced with its
    * directory entry pending is a far better state than a pass that cannot
    * finish.
+   *
+   * A file is forgotten when it has been synced and not before. This used to
+   * empty both sets first and stop at the first file that would not open, so
+   * one transient failure skipped every later file in the pass and then lost
+   * the record of all of them: the retry found nothing to flush, and the
+   * index could be saved over notes that had never been made durable. Now
+   * every file is attempted, the ones that failed stay for the next pass, and
+   * the first failure is what the pass fails with.
    */
   async flush(): Promise<void> {
     const files = [...this.unsynced.files];
     const dirs = [...this.unsynced.dirs];
-    this.unsynced.files.clear();
-    this.unsynced.dirs.clear();
     if (this.fsync === null) {
       this.fsync = this.fsOverride ?? (isDesktopAdapter(this.adapter) ? electronFs() : undefined);
     }
     const fs = this.fsync;
-    if (fs === undefined || !isDesktopAdapter(this.adapter)) return;
+    if (fs === undefined || !isDesktopAdapter(this.adapter)) {
+      // Nothing here can ever sync them, so holding on to the names is a set
+      // that grows for the life of the session and syncs nothing.
+      this.unsynced.files.clear();
+      this.unsynced.dirs.clear();
+      return;
+    }
+    const adapter = this.adapter;
+    let failure: unknown;
     for (const path of files) {
-      const handle = await fs.promises.open(this.adapter.getFullPath(path), "r");
       try {
-        await handle.sync();
-      } finally {
-        await handle.close();
+        await fsyncPath(fs, adapter, path);
+        // Deleted one at a time rather than cleared, so a write that landed
+        // while this was running is still waiting for the next flush.
+        this.unsynced.files.delete(path);
+      } catch (err) {
+        failure ??= err;
       }
     }
     for (const dir of dirs) {
       try {
-        const handle = await fs.promises.open(this.adapter.getFullPath(dir), "r");
-        try {
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
+        await fsyncPath(fs, adapter, dir);
       } catch (err) {
         if (!this.saidNoDirSync) {
           this.saidNoDirSync = true;
@@ -602,7 +628,11 @@ export class ObsidianVault implements Vault {
           );
         }
       }
+      // Dropped either way: this failure is tolerated rather than retried,
+      // and a platform that refuses would refuse for ever.
+      this.unsynced.dirs.delete(dir);
     }
+    if (failure !== undefined) throw failure;
   }
 
   /**
@@ -749,6 +779,9 @@ export class ObsidianVault implements Vault {
     if (actual === undefined || actual === normalized) return;
     await this.adapter.rename(actual, normalized);
     this.actualName.delete(actual);
+    // A rename is a changed entry in the directory holding it, and durable
+    // only when that directory is. The write that follows records the file.
+    this.entryChanged(normalized);
   }
 
   /**
@@ -792,14 +825,20 @@ export class ObsidianVault implements Vault {
   async remove(path: string): Promise<void> {
     const normalized = this.resolve(path);
     if (!(await this.adapter.exists(normalized))) return;
+    // Either way it left its directory, and a pass that only deleted used to
+    // save the index without ever fsyncing the directory it changed.
     try {
-      if (await this.adapter.trashSystem(normalized)) return;
+      if (await this.adapter.trashSystem(normalized)) {
+        this.entryChanged(normalized);
+        return;
+      }
     } catch {
       // No system trash here, or it refused. The local one is next, and a
       // failure to reach the recycle bin is not a reason to give up on the
       // deletion.
     }
     await this.adapter.trashLocal(normalized);
+    this.entryChanged(normalized);
   }
 
   async mkdir(path: string): Promise<void> {
@@ -808,8 +847,7 @@ export class ObsidianVault implements Vault {
     await this.ensureParents(normalized);
     await this.adapter.mkdir(normalized);
     // A new directory is an entry in its parent, durable when the parent is.
-    const cut = normalized.lastIndexOf("/");
-    this.unsynced.dirs.add(cut === -1 ? "" : normalized.slice(0, cut));
+    this.entryChanged(normalized);
   }
 
   async exists(path: string): Promise<boolean> {
@@ -831,8 +869,7 @@ export class ObsidianVault implements Vault {
       at = at === "" ? part : `${at}/${part}`;
       if (!(await this.adapter.exists(at))) {
         await this.adapter.mkdir(at);
-        const cut = at.lastIndexOf("/");
-        this.unsynced.dirs.add(cut === -1 ? "" : at.slice(0, cut));
+        this.entryChanged(at);
       }
     }
   }
@@ -904,6 +941,10 @@ export class ObsidianIndexStore implements IndexStore {
       // from; an older index is always safe, because notes are durable
       // before the index that names them.
       if (await this.adapter.exists(this.temp)) await this.adapter.remove(this.temp);
+      // What is on disk is what was last written, so a first pass that
+      // changes nothing writes nothing. Only from the live file: a state
+      // read out of the staging copy is not what the live file holds.
+      this.lastWritten = live.text;
       return live.state;
     }
     const staged = await this.readIndex(this.temp);
@@ -920,11 +961,11 @@ export class ObsidianIndexStore implements IndexStore {
   /** One index file: its state, or the reason it has none. */
   private async readIndex(
     path: string,
-  ): Promise<{ state?: StoredState; error?: string; absent?: true }> {
+  ): Promise<{ state?: StoredState; text?: string; error?: string; absent?: true }> {
     if (!(await this.adapter.exists(path))) return { absent: true };
     const text = await this.adapter.read(path);
     try {
-      return { state: JSON.parse(text) as StoredState };
+      return { state: JSON.parse(text) as StoredState, text };
     } catch (err) {
       return { error: (err as Error).message };
     }
@@ -944,13 +985,18 @@ export class ObsidianIndexStore implements IndexStore {
    * 10.7 ms of fsync, so it pays for itself the first time it matches. And a
    * write skipped because the bytes on disk are already those bytes cannot
    * lose anything: the failure it would cause is the failure it prevents.
+   *
+   * That last sentence is only true while the bytes are still there, which is
+   * why the file is asked for as well. An index removed from outside during a
+   * session used to be skipped by every later unchanged pass, and the restart
+   * after it started cold over a vault this device had already synced.
    */
   private lastWritten: string | undefined;
 
   async save(state: StoredState): Promise<void> {
     const text = JSON.stringify(state);
-    if (text === this.lastWritten) return;
     const live = this.live;
+    if (text === this.lastWritten && (await this.adapter.exists(live))) return;
     const parts = live.split("/");
     parts.pop();
     if (parts.length > 0) {

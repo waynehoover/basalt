@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 
 import { combinePasses, type SyncReport } from "./engine.ts";
+import { didSomething } from "./client.ts";
 
 function report(over: Partial<SyncReport>): SyncReport {
   return {
@@ -66,5 +67,34 @@ describe("two passes of one sync, combined (C35)", () => {
     expect(both.skipped).toBe(1);
     expect(both.blocked).toBe(0);
     expect(both.inTheWay).toEqual([]);
+  });
+});
+
+/**
+ * C-D6 in the 0.3.0 review. `settle` runs another pass while the last one did
+ * something, and a file whose write debounce has not run out is not something
+ * done: the debounce is tens of seconds and the retry is 60 ms, so eight full
+ * scans of the vault happened to find the same file still waiting, and then it
+ * returned anyway. Real follow-on work inside a pass is what `again` is for.
+ */
+describe("what counts as work worth another pass (C-D6)", () => {
+  it("does not count a file that is only waiting for its debounce", () => {
+    expect(didSomething(report({ waiting: 3, unchanged: 100 }))).toBe(false);
+    expect(didSomething(report({}))).toBe(false);
+  });
+
+  it("still counts everything a pass actually did", () => {
+    for (const key of [
+      "uploaded",
+      "downloaded",
+      "merged",
+      "conflicted",
+      "deletedLocally",
+      "deletedRemotely",
+      "restored",
+      "foldersCreated",
+    ] as const) {
+      expect(didSomething(report({ [key]: 1 })), key).toBe(true);
+    }
   });
 });

@@ -59,7 +59,10 @@ export function validateStoredState(raw: unknown): StoredState | undefined {
   // Cross-field: the remote index is what pending refers to, and a pending
   // path with no remote state is work that can never be done.
   for (const p of pending as string[]) {
-    if (!(p in remote)) {
+    // `hasOwn` rather than `in`: a pending entry named `constructor` or
+    // `toString` is on every object ever made and would pass a check that
+    // walks the prototype chain.
+    if (!Object.hasOwn(remote, p)) {
       throw refuse(`pending names ${JSON.stringify(p)}, which remote does not hold`);
     }
   }

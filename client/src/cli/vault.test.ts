@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -319,6 +319,32 @@ describe("the index on disk", () => {
   it("reports nothing when there is nothing yet", async () => {
     const store = new JsonIndexStore(join(root, ".basalt", "index.json"));
     expect(await store.load()).toBeUndefined();
+  });
+
+  /**
+   * The skip that keeps a settled vault from rewriting its whole index on
+   * every pass. It is safe because the bytes on disk are already those bytes,
+   * so both halves have to be true: the same string, and a file still there.
+   */
+  it("does not write an index it has just read, and does write one that has gone", async () => {
+    const file = join(root, ".basalt", "index.json");
+    await new JsonIndexStore(file).save(state(7));
+
+    // A restart over a settled vault: the first pass produces the state that
+    // is already on disk, and writing it back is a serialisation and two
+    // fsyncs to record that nothing happened.
+    const store = new JsonIndexStore(file);
+    expect(await store.load()).toEqual(state(7));
+    const before = (await stat(file)).mtimeMs;
+    await new Promise((r) => setTimeout(r, 10));
+    await store.save(state(7));
+    expect((await stat(file)).mtimeMs, "an identical index was written again").toBe(before);
+
+    // And if it goes from under the session, the next save puts it back
+    // rather than skipping for ever and starting cold next time.
+    await rm(file);
+    await store.save(state(7));
+    expect(await new JsonIndexStore(file).load()).toEqual(state(7));
   });
 
   /**

@@ -63,7 +63,7 @@ async function device(): Promise<{ adapter: FakeAdapter; client: Client; source:
   const source: HistorySource = {
     history: (path, opts) => client.history(path, opts),
     contentAt: async (v) => new TextDecoder().decode(await client.contentAt(v)),
-    restoreVersion: async (v) => (await client.restore(v)).path,
+    restoreVersion: async (v) => ({ path: (await client.restore(v)).path, sent: true }),
     currentText: async (path) => adapter.text(path),
   };
   return { adapter, client, source };
@@ -109,12 +109,12 @@ describe("version history", () => {
 
     const versions = await source.history("note.md", { limit: PAGE });
     const oldest = versions[versions.length - 1]!;
-    const at = await source.restoreVersion(oldest);
+    const done = await source.restoreVersion(oldest);
 
     // The point of the whole thing: the note you have open is untouched.
-    expect(at).not.toBe("note.md");
+    expect(done.path).not.toBe("note.md");
     expect(adapter.text("note.md")).toBe("second\n");
-    expect(adapter.text(at)).toBe("first\n");
+    expect(adapter.text(done.path)).toBe("first\n");
   });
 
   it("shows the version you picked, and a diff against what is on disk", async () => {
@@ -303,7 +303,12 @@ describe("the line diff (P6)", () => {
     expect(diff).not.toMatch(/No difference/);
     expect(diff).toContain("- one");
     expect(diff).toContain("+ one");
-    expect(diff).not.toContain("two");
+    // The whole swapped region, not the one line that strictly had to move.
+    // Semantic cleanup groups a rewritten stretch into what came out and
+    // what went in, which is what a pane that hides unchanged lines needs:
+    // the alternative reads as a stutter with invisible context between the
+    // halves. Minimality is not the property here, seeing the change is.
+    expect(diff).toBe("- one\n- two\n+ two\n+ one");
   });
 
   it("still shows an appended line as the one addition", () => {
@@ -345,7 +350,7 @@ describe("selections that finish out of order (P19)", () => {
         new Promise<string>((resolve) => {
           pending.set(v.uid, resolve);
         }),
-      restoreVersion: async (v) => `restored ${v.uid}`,
+      restoreVersion: async (v) => ({ path: `restored ${v.uid}`, sent: true }),
       currentText: async () => "",
     };
     return {
@@ -394,5 +399,56 @@ describe("selections that finish out of order (P19)", () => {
     await settle();
     expect(calls(), "two presses became two requests for the same page").toBe(2);
     expect(rows(modal).length).toBe(PAGE + 1);
+  });
+});
+
+/**
+ * P-D7 in the 0.3.0 review. A page that could not be fetched used to set
+ * `exhausted`, which is what removes Load more, so an offline moment while the
+ * modal was opening left a window with nothing in it and no way to ask again.
+ * Closing and reopening is not a recovery, it is a workaround somebody has to
+ * be told about.
+ */
+describe("a history page that does not arrive (P-D7)", () => {
+  it("can be asked for again", async () => {
+    let fail = true;
+    const version: Version = {
+      uid: 7,
+      path: "note.md",
+      contentId: "c7",
+      size: 1,
+      ctime: 0,
+      mtime: 1_700_000_000_000,
+      folder: false,
+      deleted: false,
+      device: "laptop",
+      chunks: 1,
+    };
+    const source: HistorySource = {
+      history: async () => {
+        if (fail) throw new Error("the server could not be reached");
+        return [version];
+      },
+      contentAt: async () => "the text",
+      restoreVersion: async () => ({ path: "note.md", sent: true }),
+      currentText: async () => "",
+    };
+
+    const modal = new HistoryModal(new App() as never, source, "note.md");
+    modal.open();
+    await settle();
+
+    // Not "the server holds no history for this note": that is an answer,
+    // and no answer was given.
+    expect(rendered(modal)).toMatch(/could not be read/);
+    const again = () => buttons(modal).find((b) => b.text.includes("Try again"));
+    expect(again(), "no way to ask again after a failed page").toBeDefined();
+
+    fail = false;
+    again()!.click();
+    await settle();
+    expect(rows(modal).length).toBe(1);
+    expect(rendered(modal)).toContain("the text");
+    expect(rendered(modal)).not.toMatch(/could not be read/);
   });
 });

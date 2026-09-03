@@ -820,6 +820,19 @@ export class Transport {
           `batch ${from}..${to} contains uid ${e.uid} with no chunks array`,
         );
       }
+      // Each name's shape, which history, deleted and get all check and this
+      // did not. A name that is not a name is fetched as one, and the reply
+      // to that is refused much later and by something with less to say
+      // about where it came from.
+      for (const name of e.chunks as unknown[]) {
+        if (!isChunkName(name)) {
+          throw new ProtocolError(
+            "protostate",
+            `batch ${from}..${to} contains uid ${e.uid} naming ${JSON.stringify(name)}, ` +
+              `which is not a chunk name`,
+          );
+        }
+      }
       if (e.uid < from || e.uid > to) {
         throw new ProtocolError("protostate", `batch ${from}..${to} contains uid ${e.uid}`);
       }
@@ -1109,8 +1122,16 @@ export class Transport {
      * chunk again, which is deterministic and so gives the same bytes.
      */
     bodyOf: (name: string) => Promise<Uint8Array>,
-    /** The authenticator and parent this entry travels with. */
-    auth: { mac: string; parent: string } = { mac: "", parent: "" },
+    /**
+     * The authenticator and parent this entry travels with.
+     *
+     * Required, with no default. It had one, an empty mac and an empty
+     * parent, so that transport tests need not build a real entry; what a
+     * default also does is let a caller that forgot send an unsigned put,
+     * which every device on the vault would then refuse to act on and
+     * nothing here would have said so.
+     */
+    auth: { mac: string; parent: string },
   ): Promise<{ uid: number; uploaded: number; bytes: number }> {
     const reply = await this.request(
       {

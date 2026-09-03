@@ -109,6 +109,15 @@ export const corpus: [string, (s: Record<string, unknown>) => unknown, RegExp][]
     (s) => ({ ...s, pending: ["nowhere.md"] }),
     /which remote does not hold/,
   ],
+  [
+    // C-D9. The cross-check was `p in remote`, which walks the prototype
+    // chain, so every name Object.prototype has passed it: the entry is
+    // "held" by an object that does not hold it, and the pass then works
+    // from a remote state that is not there.
+    "pending naming a path only Object.prototype holds",
+    (s) => ({ ...s, pending: ["constructor"] }),
+    /which remote does not hold/,
+  ],
 ];
 
 describe("what a saved index must look like (C23)", () => {

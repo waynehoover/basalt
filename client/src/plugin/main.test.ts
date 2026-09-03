@@ -20,8 +20,18 @@ import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
-import { App, Platform, Plugin as StubPlugin, built, modals, notices, resetStub } from "./stub.ts";
+import {
+  App,
+  type FakeEl,
+  Platform,
+  Plugin as StubPlugin,
+  built,
+  modals,
+  notices,
+  resetStub,
+} from "./stub.ts";
 import BasaltPlugin, { describeDeleted } from "./main.ts";
+import { describeRestore } from "./history.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -1701,6 +1711,171 @@ describe("a restore whose upload fails (P31)", () => {
     expect(done.sent).toBe(false);
     expect(done.why).toMatch(/EACCES/);
     expect(app.vault.adapter.text("gone.md")).toBe("bring me back");
+  }, 300_000);
+});
+
+/**
+ * P-D1 in the 0.3.0 review. The plugin handed the modal a finished sentence and
+ * the modal wrapped it in a second one, so every restore from History read
+ * "Restored to Restored note.md. Sent to your other devices., because something
+ * is already at note.md." The fakes in history.test.ts hand back paths, so
+ * nothing pinned the shape the plugin itself produces: this does, through the
+ * modal, by pressing the button a person presses.
+ */
+describe("what History says after a restore (P-D1)", () => {
+  /** The buttons the newest modal drew, in the order it drew them. */
+  function buttons(): { text: string; click(): void }[] {
+    const found: { text: string; click(): void }[] = [];
+    const visit = (n: FakeEl): void => {
+      if (n.tag === "button") found.push({ text: n.allText(), click: () => n.fire("click") });
+      for (const c of n.children) visit(c);
+    };
+    visit(modals[modals.length - 1]!.contentEl);
+    return found;
+  }
+
+  async function restoreFromHistory(plugin: Testable): Promise<string> {
+    notices.length = 0;
+    plugin.openHistory("note.md");
+    await until("a Restore button", () => buttons().some((b) => b.text.includes("Restore")));
+    buttons()
+      .find((b) => b.text.includes("Restore"))!
+      .click();
+    await until("a notice about the restore", () => notices.length > 0);
+    return notices.map((n) => n.message).join(" ");
+  }
+
+  it("says it once, and still says when the copy has not been sent", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("note.md", "first");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+
+    const said = await restoreFromHistory(plugin);
+    expect(said, "the notice was built from another notice").not.toMatch(/Restored to Restored/);
+    expect(said).toMatch(
+      /^Restored to note \(restored \d+\)\.md, because something is already at note\.md\. Sent to your other devices\.$/,
+    );
+
+    // The other half: a restore that landed here and could not be uploaded
+    // has to say so from this path too, which is what returning a path
+    // rather than the outcome would have thrown away.
+    app.vault.adapter.fault = (op, path) =>
+      op === "writeBinary" && path.includes("/plugins/basalt/")
+        ? new Error("EACCES: index")
+        : undefined;
+    const stuck = await restoreFromHistory(plugin);
+    expect(stuck).toMatch(/will be sent when the next sync succeeds: .*EACCES/);
+  }, 300_000);
+});
+
+/**
+ * P-D2 and P-D3 in the 0.3.0 review. Three things carry on running across an
+ * unlink: the settle save started by a connection, a Sync now the person asked
+ * for, and a restore waiting for its upload. All three used to speak for a
+ * vault that had already been removed.
+ */
+describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => {
+  /** Holds the next call to `settle`, so an unlink can happen underneath it. */
+  function holdSettle(plugin: Testable): { reached: () => boolean; release: () => void } {
+    const client = (plugin as unknown as { client: { settle(o: unknown): Promise<unknown> } })
+      .client;
+    const real = client.settle.bind(client);
+    let reached = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    client.settle = async (o: unknown) => {
+      reached = true;
+      await gate;
+      return real(o);
+    };
+    return { reached: () => reached, release };
+  }
+
+  it("does not put the pairing back on disk after unlink (P-D2)", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    expect(plugin.savedData).not.toBe(null);
+
+    // The state a first device is in for one connection: a spent bootstrap
+    // still in the config, and a settle save on its way to remove it.
+    const { decodeConfig } = await import("../core/pairing.ts");
+    const inner = plugin as unknown as {
+      config: unknown;
+      generation: number;
+      settleConfig(wrapped: string | undefined, mine: number): Promise<void>;
+    };
+    const config = decodeConfig(plugin.savedData, "test") as { wrapped?: string };
+    inner.config = { ...config, bootstrap: "spent" };
+
+    // The settle save is slow, as a save on a phone can be, and slower than
+    // the whole of unlink. Only the first one: unlink's own write of null
+    // must not be held with it, or nothing would land at all.
+    let saves = 0;
+    const realSave = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data: unknown) => {
+      if (++saves === 1) await sleep(300);
+      return realSave(data);
+    };
+
+    const settling = inner.settleConfig(config.wrapped, inner.generation);
+    await until("the settle save to start", () => saves === 1);
+    const unlinking = plugin.unlink();
+    await Promise.all([settling, unlinking]);
+
+    // The one that matters: what a restart would read. A pairing here means
+    // the next start syncs a vault the person removed.
+    expect(plugin.savedData, "the settle save landed on top of the unlink").toBe(null);
+    expect(plugin.paired).toBe(false);
+    expect(plugin.currentState.kind).toBe("unpaired");
+  }, 300_000);
+
+  it("does not report a pass into a vault that is no longer there (P-D3)", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("note.md", "text");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+
+    const gate = holdSettle(plugin);
+    const pass = plugin.syncNow();
+    await until("the pass to reach settle", gate.reached);
+    await plugin.unlink();
+    notices.length = 0;
+    gate.release();
+    await pass;
+
+    // Unpaired is the truth. "Basalt has stopped" or a summary of a pass
+    // over a vault that is gone are both louder than the truth and wrong.
+    expect(plugin.currentState.kind).toBe("unpaired");
+    expect(notices.map((n) => n.message).join(" ")).toBe("");
+  }, 300_000);
+
+  it("does not promise a next sync to a restore after unlink (P-D3)", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("gone.md", "bring me back");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await app.vault.adapter.remove("gone.md");
+    await plugin.syncNow();
+    const deletion = (await plugin.deletedNotes()).notes.find((n) => n.path === "gone.md")!;
+
+    const gate = holdSettle(plugin);
+    const restoring = plugin.recover(deletion);
+    await until("the restore to reach its upload", gate.reached);
+    await plugin.unlink();
+    gate.release();
+    const done = await restoring;
+
+    expect(app.vault.adapter.text("gone.md")).toBe("bring me back");
+    expect(done.sent).toBe(false);
+    const said = describeRestore(deletion, done);
+    expect(said, "promised a sync that cannot happen").not.toMatch(/next sync succeeds/);
+    expect(said).toMatch(/on this device and nowhere else/);
   }, 300_000);
 });
 

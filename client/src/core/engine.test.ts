@@ -624,6 +624,50 @@ describe("a case-only rename on a receiving device (C2)", () => {
 });
 
 /**
+ * C-D1 in the 0.3.0 review. `wouldUndoAWrite` asks the vault, and where the
+ * vault cannot answer it falls back to comparing the spellings. That keeps the
+ * note, which is the right side to err on, and on a vault that does hold both
+ * spellings apart it never converges: the deletion is refused on every pass,
+ * for ever, and the report said nothing at all about it.
+ */
+describe("a case-only rename onto a vault that cannot say what one file is (C-D1)", () => {
+  it("says so, rather than repeating a clean pass for ever", async () => {
+    await fresh();
+    const a = await device("a", undefined, new FoldingVault());
+    // No sameFile and no folding: two spellings really are two files here.
+    const b = await device("b", undefined, new MemoryVault());
+
+    await a.vault.edit("Note.md", "the only copy of this text\n");
+    await convergeBoth(a, b);
+    expect(b.vault.text("Note.md")).toBe("the only copy of this text\n");
+
+    await a.vault.remove("Note.md");
+    await a.vault.edit("NOTE.md", "the only copy of this text\n");
+    await a.settle();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const report = await b.engine.sync();
+    // The note is kept, both times: nothing here is allowed to lose it.
+    expect(b.vault.text("NOTE.md")).toBe("the only copy of this text\n");
+    expect(report.deletedLocally).toBe(0);
+    // And the refusal is said out loud. A silent refusal is a vault that
+    // never settles reporting that it has settled, which is rule 7.
+    expect(report.blocked, "the refusal was silent").toBeGreaterThan(0);
+    expect(report.inTheWay.map((w) => w.path)).toContain("Note.md");
+
+    // What the count is warning about. This vault holds both spellings, so
+    // the next pass finds the old one with no entry behind it and sends it
+    // back up as a note of its own: the rename undone for every device, and
+    // on one that does fold case the two are then blocked for ever. Pinned
+    // rather than asserted as right, so that fixing it fails here and is
+    // read.
+    const again = await b.engine.sync();
+    expect(again.uploaded).toBe(1);
+    expect(b.vault.paths().sort()).toEqual(["NOTE.md", "Note.md"]);
+  }, 240_000);
+});
+
+/**
  * A conflict copy is the only surviving record of one side of a divergence, so
  * overwriting one is the same failure the copy exists to prevent, one level up.
  *

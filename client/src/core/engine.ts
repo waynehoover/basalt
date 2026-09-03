@@ -240,7 +240,7 @@ export async function mustBeOurs(
 }
 
 /**
- * Refuses a batch entry that contradicts itself, before anything acts on it.
+ * Refuses an entry that contradicts itself, before anything acts on it.
  *
  * Everything here except the sealed path arrives in the clear and unsigned, and
  * the server holds every sealed path in the vault, so it can name any file. The
@@ -257,7 +257,7 @@ export async function mustBeOurs(
  * A corrupt row does this as readily as a hostile server, which is the same
  * reason the size and chunk-count limits exist.
  */
-function checkEntryShape(e: WireEntry): void {
+export function checkEntryShape(e: WireEntry): void {
   if (!e.folder && !e.deleted && e.size > 0 && e.chunks.length === 0) {
     throw new Error(
       `version ${e.uid} declares ${e.size} bytes and names no chunks, which cannot both be true`,
@@ -1841,13 +1841,23 @@ export class Engine {
    * The vault answers where it can, because the filesystem is the only thing
    * that actually knows. Where it cannot, two paths equal under case folding
    * are treated as one file, which keeps the note.
+   *
+   * `sure` is which of the two answered. The fallback keeps the note and does
+   * not converge: on a disk that does keep the two spellings apart, the
+   * deletion is refused again on every pass, for ever, and the caller reports
+   * that rather than returning a clean report over a vault that never settles.
    */
-  private async wouldUndoAWrite(path: string): Promise<string | undefined> {
+  private async wouldUndoAWrite(
+    path: string,
+  ): Promise<{ wrote: string; sure: boolean } | undefined> {
     const vault = this.opts.vault;
     for (const wrote of this.wroteThisPass) {
       if (wrote === path) continue;
-      const same = vault.sameFile ? await vault.sameFile(wrote, path) : foldsTogether(wrote, path);
-      if (same) return wrote;
+      if (vault.sameFile) {
+        if (await vault.sameFile(wrote, path)) return { wrote, sure: true };
+        continue;
+      }
+      if (foldsTogether(wrote, path)) return { wrote, sure: false };
     }
     return undefined;
   }
@@ -1857,14 +1867,35 @@ export class Engine {
     this.pendingDeletes = [];
     for (const { path, why } of deletes) {
       try {
-        const wrote = await this.wouldUndoAWrite(path);
-        if (wrote !== undefined) {
+        const same = await this.wouldUndoAWrite(path);
+        if (same !== undefined) {
           // Not a failure and not retried: the file is where it should be,
           // under the name the server asked for. Only the deletion of its old
           // name has nowhere to land, because that name was never a second
           // file here.
           this.entries.delete(path);
-          this.log("kept", path, `deleting it would remove ${wrote}, which is the same file`);
+          if (same.sure) {
+            this.log(
+              "kept",
+              path,
+              `deleting it would remove ${same.wrote}, which is the same file`,
+            );
+            continue;
+          }
+          // Guessed from the spelling, because this vault cannot say. The
+          // note is kept, which is the right side to err on, and it is
+          // counted, because on a disk that holds both spellings the
+          // deletion comes back every pass and never lands: a report that
+          // said nothing happened described a vault that never settles.
+          report.blocked++;
+          if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+            report.inTheWay.push({ path, blockedBy: same.wrote });
+          }
+          this.log(
+            "kept",
+            path,
+            `deleting it might remove ${same.wrote}, and this vault cannot say whether they are one file`,
+          );
           continue;
         }
         await this.opts.vault.remove(path);
@@ -2019,7 +2050,7 @@ export class Engine {
    * its content and writing it back, and there is no reason for a second copy
    * of the reassembly to exist for that.
    */
-  async contentOf(uid: number, expected?: string): Promise<Uint8Array> {
+  async contentOf(uid: number, expected?: string, signedSize?: number): Promise<Uint8Array> {
     const meta = await this.opts.transport.get(uid);
     // `expected` is a content id the caller already holds for this uid, and
     // the one that matters is the merge ancestor's. A three-way merge
@@ -2041,10 +2072,43 @@ export class Engine {
           `so it is not the version it is being offered as`,
       );
     }
-    if (meta.chunks.length === 0) return new Uint8Array(0);
+    // The size, the same way, which this did not check at all. `land` does
+    // (an assembled file must match its declared size) and the restore path
+    // is the one that writes into somebody's vault on the worst afternoon.
+    //
+    // Substituted bodies are not the hole here: `fetch` hashes every body
+    // against the name it asked for, so a server cannot answer one name with
+    // another chunk's bytes. What this catches is an entry that contradicts
+    // itself, from a signing bug or a corrupt row: 500 bytes made of chunks
+    // holding five restored as five bytes and said nothing.
+    //
+    // `signedSize` is the size off an entry whose authenticator this device
+    // checked, where the caller has one; `meta.size` is the server's own word
+    // for the same number, which it is free to choose. Where both exist they
+    // have to agree, and the signed one is what the assembly is held to.
+    if (signedSize !== undefined && signedSize !== meta.size) {
+      throw new Error(
+        `version ${uid} is offered as ${meta.size} bytes and was signed as ${signedSize} bytes`,
+      );
+    }
+    const declared = signedSize ?? meta.size;
+    if (meta.chunks.length === 0) {
+      if (declared !== 0) {
+        throw new Error(
+          `version ${uid} declares ${declared} bytes and names no chunks, which cannot both be true`,
+        );
+      }
+      return new Uint8Array(0);
+    }
     this.checkChunkCount(uid, meta.chunks.length);
     const each = perChunkBudget(meta.size, meta.chunks.length);
-    return this.assemble(uid, await this.fetchAll(meta.chunks, () => each));
+    const content = await this.assemble(uid, await this.fetchAll(meta.chunks, () => each));
+    if (content.length !== declared) {
+      throw new Error(
+        `version ${uid} assembled to ${content.length} bytes, not the ${declared} it declares`,
+      );
+    }
+    return content;
   }
 
   /**
@@ -2136,7 +2200,7 @@ export class Engine {
       return;
     }
     const mineBytes = await this.opts.vault.read(path);
-    const theirsBytes = await this.contentOf(remote.uid, remote.hash);
+    const theirsBytes = await this.contentOf(remote.uid, remote.hash, remote.size);
 
     const dec = new TextDecoder("utf-8", { fatal: true });
     let base: string;
@@ -2174,6 +2238,13 @@ export class Engine {
     // acknowledged for this path before the ancestor can move.
     observe(entry, { folder: false, mtime: this.now(), ctime: entry.ctime, size: text.length });
     await this.upload(path, entry, report, remote.uid);
+    // Counted here, where the merge happened, and not where the put commits.
+    // `uploaded` is the other way round, so a flush that fails reports merges
+    // whose new version never reached the server. Deliberate: the merge is a
+    // fact about this device either way, the text is written and durable, and
+    // the pass that failed says so through `retrying`. Moving it into the
+    // commit would mean threading a callback per queued file through the
+    // flush for a counter.
     report.merged++;
     this.log("merged", path, outcome.kind === "merged" ? "three-way" : outcome.why);
   }
@@ -2216,7 +2287,7 @@ export class Engine {
     why: string,
   ): Promise<void> {
     if (!remote) return;
-    const incoming = await this.contentOf(remote.uid, remote.hash);
+    const incoming = await this.contentOf(remote.uid, remote.hash, remote.size);
     const copyPath = await placeBeside(
       () => this.freeConflictPath(path),
       incoming,
@@ -2234,6 +2305,8 @@ export class Engine {
     await this.upload(copyPath, copyEntry, report, this.remote.get(copyPath)?.uid);
     await this.upload(path, entry, report, remote.uid);
 
+    // On the queue, not on the commit, for the reason `merged` gives above:
+    // both copies are on this disk whatever the flush then does.
     report.conflicted++;
     this.log("kept both", path, { copy: copyPath, why });
   }

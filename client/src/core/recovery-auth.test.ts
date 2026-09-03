@@ -151,11 +151,91 @@ describe("recovery against a server that answers with entries nobody wrote (C32)
     const [v] = await asking;
     socket.autoReply = (frame, s) => {
       if (frame["op"] === "get") {
-        s.reply({ res: "chunks", uid: 7, size: real.body.bytes.length, chunks: [real.body.name] });
+        // The size the real server answers with is the entry's own, which is
+        // the plaintext length, not the sealed body's.
+        s.reply({ res: "chunks", uid: 7, size: real.entry.size, chunks: [real.body.name] });
       } else if (frame["op"] === "fetch") s.bodies(real.body.bytes);
     };
     const done = await client.restore(v!);
     expect(done.path).toBe("note.md");
     expect(vault.text("note.md")).toBe("what was written");
+  });
+});
+
+/**
+ * C-D4 and C-D5 in the 0.3.0 review. `land` checks an assembly against the size
+ * its entry declares, and refuses an entry whose shape contradicts itself. The
+ * recovery path, which is the one somebody takes on the worst afternoon, made
+ * neither check: it verified the chunk list against the signed one and then
+ * wrote whatever came back.
+ */
+describe("recovery against a server that answers with the right names (C-D4, C-D5)", () => {
+  it("refuses to restore a version that assembles to a length it does not declare", async () => {
+    const { socket, keys, client, vault } = await rig();
+    const short = await version(keys, 7, "note.md", "short");
+    // Signed, and self-contradictory: 500 bytes made of one chunk holding
+    // five. Everything the recovery path checked passed, and the note came
+    // back five bytes long with nothing saying so.
+    const facts = {
+      path: short.entry.path,
+      size: 500,
+      ctime: 1000,
+      mtime: 1000,
+      folder: false,
+      deleted: false,
+      chunks: [short.body.name],
+      parent: "",
+    };
+    const entry = { uid: 7, ...facts, device: "other", mac: await macEntry(keys, facts) };
+    const asking = client.history("note.md");
+    await sent(socket, "history");
+    socket.reply({ res: "history", path: facts.path, entries: [entry] });
+    const [v] = await asking;
+
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "get") {
+        s.reply({ res: "chunks", uid: 7, size: 500, chunks: [short.body.name] });
+      } else if (frame["op"] === "fetch") s.bodies(short.body.bytes);
+    };
+    await expect(client.restore(v!)).rejects.toThrow(/assembled to 5 bytes, not the 500/);
+    expect(vault.paths(), "a truncated note was written as the restore").toEqual([]);
+  });
+
+  it("refuses to restore a version whose declared size is not the server's", async () => {
+    const { socket, keys, client, vault } = await rig();
+    const real = await version(keys, 7, "note.md", "what was written");
+    const asking = client.history("note.md");
+    await sent(socket, "history");
+    socket.reply({ res: "history", path: real.entry.path, entries: [real.entry] });
+    const [v] = await asking;
+
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "get") {
+        s.reply({ res: "chunks", uid: 7, size: 4, chunks: [real.body.name] });
+      } else if (frame["op"] === "fetch") s.bodies(real.body.bytes);
+    };
+    await expect(client.restore(v!)).rejects.toThrow(/signed as 16 bytes/);
+    expect(vault.paths()).toEqual([]);
+  });
+
+  it("refuses a signed history entry that declares bytes and names no chunks", async () => {
+    const { socket, keys, client } = await rig();
+    const facts = {
+      path: await sealPath(keys, "note.md"),
+      size: 500,
+      ctime: 1000,
+      mtime: 1000,
+      folder: false,
+      deleted: false,
+      chunks: [] as string[],
+      parent: "",
+    };
+    // Signed by this vault's key, so `mustBeOurs` is happy with it, and it
+    // still cannot be true: restoring it wrote a 500 byte note as 0 bytes.
+    const entry = { uid: 9, ...facts, device: "other", mac: await macEntry(keys, facts) };
+    const asking = client.history("note.md");
+    await sent(socket, "history");
+    socket.reply({ res: "history", path: facts.path, entries: [entry] });
+    await expect(asking).rejects.toThrow(/declares 500 bytes and names no chunks/);
   });
 });

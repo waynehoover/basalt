@@ -32,14 +32,54 @@ import { Modal, Notice, type App } from "obsidian";
 
 import type { Version } from "../core/client.ts";
 
+/** Where a restore landed, and whether it went any further. */
+export interface Restored {
+  readonly path: string;
+  /** The upload afterwards succeeded. When false, `why` says what stopped it. */
+  readonly sent: boolean;
+  readonly why?: string;
+  /**
+   * Whether a later pass will send it. Absent means yes, which is every
+   * ordinary failure. False is for a vault unlinked under the restore: the
+   * note is on this device and there is no next pass to promise it to.
+   */
+  readonly willRetry?: boolean;
+}
+
+/**
+ * One sentence for a restore: where it landed, and whether it went further.
+ *
+ * Lives here, next to the modal, because both restore surfaces say it and both
+ * used to say it their own way. The modal's producer returned this sentence and
+ * the modal then wrapped it in a second one, so a restore read "Restored to
+ * Restored note.md. Sent to your other devices., because something is already
+ * at note.md." One sentence, written once, from the structured outcome.
+ */
+export function describeRestore(version: Version, done: Restored): string {
+  const where =
+    done.path === version.path
+      ? `Restored ${done.path}.`
+      : `Restored to ${done.path}, because something is already at ${version.path}.`;
+  if (done.sent) return `${where} Sent to your other devices.`;
+  return done.willRetry === false
+    ? `${where} It is on this device and nowhere else: ${done.why}`
+    : `${where} It is on this device and will be sent when the next sync succeeds: ${done.why}`;
+}
+
 /** What the modal needs from the plugin, so this file needs no plugin type. */
 export interface HistorySource {
   /** Versions of one path, newest first. `before` pages backwards by uid. */
   history(path: string, opts: { before?: number; limit?: number }): Promise<Version[]>;
   /** The text of one version, without writing anything. */
   contentAt(version: Version): Promise<string>;
-  /** Writes a version back, never over the top of something already there. */
-  restoreVersion(version: Version): Promise<string>;
+  /**
+   * Writes a version back, never over the top of something already there.
+   *
+   * The outcome, not a sentence about it: where it landed and whether the
+   * upload afterwards succeeded are two facts, and a string that has already
+   * been through `describeRestore` cannot be asked either question.
+   */
+  restoreVersion(version: Version): Promise<Restored>;
   /** What is on disk now, for the diff. Undefined when the note is gone. */
   currentText(path: string): Promise<string | undefined>;
 }
@@ -53,6 +93,8 @@ export class HistoryModal extends Modal {
   private text = "";
   private showDiff = false;
   private exhausted = false;
+  /** Why the last page did not arrive, while that is the case. */
+  private failed: string | undefined;
   /**
    * Which selection the pane is loading for.
    *
@@ -112,9 +154,16 @@ export class HistoryModal extends Modal {
       if (page.length < PAGE) this.exhausted = true;
       this.versions.push(...page);
     } catch (err) {
-      this.exhausted = true;
+      // Not exhausted: the server was not asked, it was unreachable. Setting
+      // it here took the Load more button away, so an offline moment while
+      // the modal opened left a window whose only recovery was closing it
+      // and opening it again.
       new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+      this.failed = (err as Error).message;
+      this.render();
+      return;
     }
+    this.failed = undefined;
     // Open on the newest version rather than on an empty pane. This used to
     // ask instead, on the grounds that it should not guess which version
     // somebody meant; but the pane is two thirds of the modal, "select a
@@ -138,7 +187,16 @@ export class HistoryModal extends Modal {
 
   private renderList(): void {
     this.listEl.empty();
-    if (this.versions.length === 0) {
+    if (this.versions.length === 0 && this.failed !== undefined) {
+      // "The server holds no history for this note" over an ask that never
+      // reached the server is rule 7's mistake in miniature: it describes the
+      // question rather than the vault. This says what happened, and the
+      // button under it asks again.
+      this.listEl.createEl("p", {
+        cls: "basalt-history-empty",
+        text: `The history could not be read: ${this.failed}`,
+      });
+    } else if (this.versions.length === 0) {
       this.listEl.createEl("p", {
         cls: "basalt-history-empty",
         text: "The server holds no history for this note.",
@@ -164,7 +222,7 @@ export class HistoryModal extends Modal {
     if (!this.exhausted) {
       const more = this.listEl.createEl("button", {
         cls: "basalt-history-button",
-        text: "Load more",
+        text: this.failed === undefined ? "Load more" : "Try again",
       });
       more.addEventListener("click", () => void this.load());
     }
@@ -250,12 +308,11 @@ export class HistoryModal extends Modal {
 
   private async restore(version: Version): Promise<void> {
     try {
-      const at = await this.source.restoreVersion(version);
-      new Notice(
-        at === version.path
-          ? `Restored ${at}.`
-          : `Restored to ${at}, because something is already at ${version.path}.`,
-      );
+      const done = await this.source.restoreVersion(version);
+      // Longer on screen when the note is here but not yet on the other
+      // devices, because that half-outcome is the one worth reading. The
+      // recovery list says it the same way.
+      new Notice(describeRestore(version, done), done.sent ? undefined : 10_000);
       this.close();
     } catch (err) {
       new Notice(`Basalt: ${(err as Error).message}`, 10_000);
@@ -319,6 +376,12 @@ export function diffLines(older: string, current: string): string {
   const { chars1, chars2, lineArray } = dmp.diff_linesToChars_(older, current);
   const diffs = dmp.diff_main(chars1, chars2, false);
   dmp.diff_charsToLines_(diffs, lineArray);
+  // Coalesces the runs the line encoding leaves behind, so an edited
+  // paragraph reads as one removal and one addition rather than as a stutter
+  // of single lines with unchanged ones wedged between them. Cosmetic, and
+  // this is the one place in the project where cosmetic is the whole job:
+  // somebody is reading it to decide whether to restore.
+  dmp.diff_cleanupSemantic(diffs);
 
   const out: string[] = [];
   for (const [op, text] of diffs) {

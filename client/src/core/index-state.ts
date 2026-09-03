@@ -329,6 +329,12 @@ function decideMissingLocally(remote: RemoteState, index: IndexEntry): Action {
  * whole files and re-deriving that list means redoing all of the above.
  */
 export function needsRehash(entry: IndexEntry, mtime: number, size: number): boolean {
+  // An empty file is made of no chunks, so "no chunks" cannot mean "not
+  // hashed yet" for one: `contentId([])` is `-empty-`, and a synced empty
+  // note was re-read, re-chunked and re-sealed on every pass for the life of
+  // the vault, which is the one file where that work is certain to produce
+  // nothing. The stat still decides, as it does for every other file.
+  if (entry.hash === "-empty-" && entry.size === 0) return entry.mtime !== mtime || size !== 0;
   if (entry.hash === "" || entry.chunks.length === 0) return true;
   return entry.mtime !== mtime || entry.size !== size;
 }

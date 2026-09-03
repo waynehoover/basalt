@@ -19,6 +19,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 import { PAIRING_PREFIX } from "../core/pairing.ts";
 import { run, normaliseUrl, parseArgs, type Console } from "./cli.ts";
+import { NodeVault } from "./vault.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -746,6 +747,35 @@ describe("what counts as a successful run", () => {
     }
   }, 300_000);
 
+  /**
+   * C-D10 in the 0.3.0 review. `sync` and `rebase` return `exitCodeFor` and
+   * `restore` returned 0 whatever the sync after it found. The note is on this
+   * device either way; whether the vault is in the state the command claims is
+   * the other half, and a cron job reading the exit code was told yes.
+   */
+  it("exits non-zero from a restore whose sync could not finish", async () => {
+    await fresh();
+    const dir = await vaultDir("a");
+    await cli("init", server.setup, "--dir", dir, "--device", "a", "--json");
+    await write(dir, "note.md", "the first version\n");
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+    await write(dir, "note.md", "the second version\n");
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+
+    const { chmod } = await import("node:fs/promises");
+    await write(dir, "locked.md", "cannot be read\n");
+    await chmod(join(dir, "locked.md"), 0o000);
+    try {
+      const r = await cli("restore", "note.md", "--dir", dir, "--json");
+      // The restore itself worked, and says so.
+      expect(r.json()["ok"], r.all).toBe(true);
+      expect((r.json()["sync"] as Record<string, number>)["retrying"]).toBe(1);
+      expect(r.code, "a restore over a vault that cannot sync reported success").toBe(1);
+    } finally {
+      await chmod(join(dir, "locked.md"), 0o644);
+    }
+  }, 300_000);
+
   it("still exits zero when there is simply nothing to do", async () => {
     await fresh();
     const dir = await vaultDir("a");
@@ -1266,4 +1296,92 @@ describe("rebasing onto a server that lost history (I10)", () => {
     // And a is an ordinary device again.
     expect((await cli("sync", "--dir", a)).code).toBe(0);
   }, 120_000);
+});
+
+/**
+ * C-D2 in the 0.3.0 review. `NodeVault` has a case probe: it writes a name into
+ * the state folder and looks for it under the other spelling, so `canonical`
+ * answers for this disk rather than for the worst one. Nothing in the CLI ever
+ * called it. Until it runs the answer is "yes, this disk folds case", which is
+ * the safe default and the wrong answer on Linux: two notes that differ only in
+ * case are then one file to the alias check, both are refused, and every sync
+ * exits 1 over a pair the disk is perfectly happy with.
+ */
+describe("what the disk says about case (C-D2)", () => {
+  it("is asked, and is what the vault then goes by", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+
+    // What this disk actually does, found the way the vault has to find it.
+    await writeFile(join(a, "probe-case.md"), "x");
+    const folds = await stat(join(a, "PROBE-CASE.md")).then(
+      () => true,
+      () => false,
+    );
+    await rm(join(a, "probe-case.md"));
+
+    const probed: string[] = [];
+    let asked = 0;
+    const real = NodeVault.prototype.probeCase;
+    NodeVault.prototype.probeCase = function (this: NodeVault): Promise<void> {
+      probed.push("asked");
+      return real.call(this);
+    };
+    let vault: NodeVault;
+    try {
+      await write(a, "note.md", "one\n");
+      // Two files on a case-sensitive disk, one file on a folding one. Either
+      // way the sync has to agree with the disk about which it is.
+      if (!folds) await write(a, "NOTE.md", "two\n");
+      const synced = await cli("sync", "--dir", a);
+      expect(synced.code, synced.all).toBe(0);
+      expect(synced.all).not.toMatch(/in the way|blocked/i);
+      // Counted before this test asks for itself, or the spy would be
+      // satisfied by the line below it.
+      asked = probed.length;
+      vault = new NodeVault(a, {});
+      await vault.probeCase();
+    } finally {
+      NodeVault.prototype.probeCase = real;
+    }
+
+    expect(
+      asked,
+      "nothing asked the disk, so canonical folds case whatever the disk does",
+    ).toBeGreaterThan(0);
+    // And the probe agrees with the disk it just probed.
+    expect(vault.canonical("NOTE.md")).toBe(folds ? "note.md" : "NOTE.md");
+  }, 240_000);
+});
+
+/**
+ * C-D15 in the 0.3.0 review. `parseArgs` collects everything that is not an
+ * option into `rest`, and the commands that take no positional never looked.
+ * `basalt sync ~/notes` synced the current directory and reported that it had
+ * synced, which is a wrong vault reported as a right one.
+ */
+describe("an argument the command does not take", () => {
+  it("is refused, rather than ignored", async () => {
+    const dir = await vaultDir("a");
+    const r = await cli("sync", "/somewhere/else", "--dir", dir);
+    expect(r.code).toBe(1);
+    expect(r.all).toMatch(/takes no arguments/);
+    // And says how the vault is actually chosen, because that is the mistake.
+    expect(r.all).toMatch(/--dir/);
+  });
+
+  it("is refused past the one a command does take", async () => {
+    const dir = await vaultDir("a");
+    const r = await cli("restore", "note.md", "also-note.md", "--dir", dir);
+    expect(r.code).toBe(1);
+    expect(r.all).toMatch(/takes one argument/);
+  });
+
+  it("leaves the commands that take one alone", async () => {
+    // Not paired, so this gets as far as the argument check and no further:
+    // what matters is which complaint comes back.
+    const dir = await vaultDir("a");
+    const r = await cli("history", "note.md", "--dir", dir);
+    expect(r.all).toMatch(/not paired/);
+  });
 });

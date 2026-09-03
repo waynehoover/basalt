@@ -57,6 +57,14 @@ async function helloed(cursor = 0, opts: Parameters<typeof connected>[0] = {}) {
   return rig;
 }
 
+/**
+ * No authenticator, for the puts below that are about the transport rather
+ * than about the entry. `put` takes it rather than defaulting it, so that a
+ * caller that has one cannot forget to pass it; a test that deliberately has
+ * none says so here.
+ */
+const unsigned = { mac: "", parent: "" };
+
 /** A body and the name it travels under, which is a hash of exactly its bytes. */
 async function named(body: Uint8Array): Promise<{ body: Uint8Array; name: string }> {
   return { body, name: await chunkName(body) };
@@ -92,6 +100,23 @@ describe("batches from a server that skips one", () => {
     socket.reply({ op: "batch", from: 1, to: 3, entries: [{ uid: 77, path: "p", chunks: [] }] });
     await settle();
     expect(t.isClosed).toBe(true);
+  });
+
+  it("refuses a chunk name that is not one (C-D3)", async () => {
+    // history, deleted and get all check the shape of every name they are
+    // given, and this did not: a name that is not a name went on to be
+    // fetched as one, and the refusal came much later from somewhere with
+    // nothing to say about where it had come from.
+    const { t, socket, batches } = await helloed(0);
+    socket.reply({
+      op: "batch",
+      from: 1,
+      to: 1,
+      entries: [{ uid: 1, path: "p", chunks: ["../../etc/passwd"] }],
+    });
+    await settle();
+    expect(t.isClosed).toBe(true);
+    expect(batches).toHaveLength(0);
   });
 
   it("refuses an empty range", async () => {
@@ -396,6 +421,7 @@ describe("put, against a server that answers oddly", () => {
       { size: 3, ctime: 0, mtime: 0 },
       chunks.map((c) => c.name),
       async (n) => chunks.find((c) => c.name === n)!.bytes,
+      unsigned,
     );
     await settle();
     // Asked for out of order, and only two of the three.
@@ -414,6 +440,7 @@ describe("put, against a server that answers oddly", () => {
       { size: 1, ctime: 0, mtime: 0 },
       ["a".repeat(64)],
       async () => new Uint8Array([1]),
+      unsigned,
     );
     await settle();
     socket.reply({ res: "want", chunks: ["z".repeat(64)] });
@@ -427,6 +454,7 @@ describe("put, against a server that answers oddly", () => {
       { size: 1, ctime: 0, mtime: 0 },
       ["a".repeat(64)],
       async () => new Uint8Array([1]),
+      unsigned,
     );
     await settle();
     socket.reply({ res: "have", uid: 9 });
@@ -436,7 +464,13 @@ describe("put, against a server that answers oddly", () => {
 
   it("refuses a reply that is neither want nor have", async () => {
     const { t, socket } = await helloed(0);
-    const put = t.put("p", { size: 0, ctime: 0, mtime: 0 }, [], async () => new Uint8Array(0));
+    const put = t.put(
+      "p",
+      { size: 0, ctime: 0, mtime: 0 },
+      [],
+      async () => new Uint8Array(0),
+      unsigned,
+    );
     await settle();
     socket.reply({ res: "chunks", uid: 1, size: 0, chunks: [] });
     await expect(put).rejects.toBeInstanceOf(ProtocolError);
@@ -445,7 +479,7 @@ describe("put, against a server that answers oddly", () => {
   it("carries prev only when there is a rename", async () => {
     const { t, socket } = await helloed(0);
     void t
-      .put("new", { size: 0, ctime: 0, mtime: 0 }, [], async () => new Uint8Array(0))
+      .put("new", { size: 0, ctime: 0, mtime: 0 }, [], async () => new Uint8Array(0), unsigned)
       .catch(() => {});
     await settle();
     expect(socket.sentText.at(-1)?.["meta"]).not.toHaveProperty("prev");
@@ -453,7 +487,13 @@ describe("put, against a server that answers oddly", () => {
     socket.reply({ res: "have", uid: 1 });
     await settle();
     void t
-      .put("new", { size: 0, ctime: 0, mtime: 0, prev: "old" }, [], async () => new Uint8Array(0))
+      .put(
+        "new",
+        { size: 0, ctime: 0, mtime: 0, prev: "old" },
+        [],
+        async () => new Uint8Array(0),
+        unsigned,
+      )
       .catch(() => {});
     await settle();
     expect(socket.sentText.at(-1)?.["meta"]).toMatchObject({ prev: "old" });
@@ -527,8 +567,12 @@ describe("an acknowledgement that arrives as fast as a loopback server sends it"
     socket.answer = { res: "ack", uid: 7 };
     socket.after = 2;
     const t = await rig(socket);
-    const put = t.put("p", { size: 2, ctime: 0, mtime: 0 }, [one.name, two.name], async (n) =>
-      n === one.name ? one.bytes : two.bytes,
+    const put = t.put(
+      "p",
+      { size: 2, ctime: 0, mtime: 0 },
+      [one.name, two.name],
+      async (n) => (n === one.name ? one.bytes : two.bytes),
+      unsigned,
     );
     await settle();
     socket.reply({ res: "want", chunks: [one.name, two.name] });
@@ -566,7 +610,13 @@ describe("an acknowledgement that arrives as fast as a loopback server sends it"
     socket.stepMs = 5;
     const t = await rig(socket);
     const body = new Uint8Array(20);
-    const put = t.put("p", { size: 20, ctime: 0, mtime: 0 }, [one.name], async () => body);
+    const put = t.put(
+      "p",
+      { size: 20, ctime: 0, mtime: 0 },
+      [one.name],
+      async () => body,
+      unsigned,
+    );
     await settle();
     socket.reply({ res: "want", chunks: [one.name] });
     expect(await put).toMatchObject({ uid: 8, uploaded: 1, bytes: 20 });
@@ -583,7 +633,13 @@ describe("an acknowledgement that arrives as fast as a loopback server sends it"
     socket.stepMs = 10;
     const t = await rig(socket, 100);
     const body = new Uint8Array(40); // 400 ms of drain against a 100 ms timeout
-    const put = t.put("p", { size: 40, ctime: 0, mtime: 0 }, [one.name], async () => body);
+    const put = t.put(
+      "p",
+      { size: 40, ctime: 0, mtime: 0 },
+      [one.name],
+      async () => body,
+      unsigned,
+    );
     await settle();
     socket.reply({ res: "want", chunks: [one.name] });
     expect(await put).toMatchObject({ uid: 9, uploaded: 1 });
@@ -601,6 +657,7 @@ describe("an acknowledgement that arrives as fast as a loopback server sends it"
       { size: 4, ctime: 0, mtime: 0 },
       [one.name],
       async () => new Uint8Array(4),
+      unsigned,
     );
     await settle();
     socket.reply({ res: "want", chunks: [one.name] });
@@ -834,6 +891,7 @@ describe("errors", () => {
       { size: 1, ctime: 0, mtime: 0 },
       [name],
       async () => new Uint8Array([1]),
+      unsigned,
     );
     await settle();
     const id = socket.sentText.at(-1)!["id"];
@@ -1037,6 +1095,7 @@ describe("a success reply that is not the shape it should be", () => {
         { size: 1, ctime: 0, mtime: 0 },
         [name],
         async () => new Uint8Array(1),
+        unsigned,
       );
       await settle();
       socket.reply({ res: "have", ...(uid === undefined ? {} : { uid }) });
@@ -1053,6 +1112,7 @@ describe("a success reply that is not the shape it should be", () => {
         { size: 1, ctime: 0, mtime: 0 },
         [name],
         async () => new Uint8Array(1),
+        unsigned,
       );
       await settle();
       socket.reply({ res: "want", chunks: [name] });
@@ -1071,6 +1131,7 @@ describe("a success reply that is not the shape it should be", () => {
         { size: 1, ctime: 0, mtime: 0 },
         [name],
         async () => new Uint8Array(1),
+        unsigned,
       );
       await settle();
       socket.reply({ res: "want", ...(chunks === undefined ? {} : { chunks }) });

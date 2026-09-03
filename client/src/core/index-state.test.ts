@@ -257,6 +257,21 @@ describe("the content cache, which is the whole cost of a routine scan", () => {
     expect(needsRehash(e, 500, 42)).toBe(true);
   });
 
+  /**
+   * C-D13 in the 0.3.0 review. An empty file is made of no chunks, so for one
+   * file in the vault "no chunk list" is never going to become "a chunk list"
+   * and the rule above read it, chunked it and sealed it on every single pass,
+   * for ever, to learn that it is empty.
+   */
+  it("does not re-read a synced empty file every pass", () => {
+    const e = entry({ mtime: 500, size: 0, hash: "-empty-", chunks: [] });
+    expect(needsRehash(e, 500, 0)).toBe(false);
+    // The stat still decides, as it does for everything else: a file that is
+    // no longer empty, or was touched, is read again.
+    expect(needsRehash(e, 500, 42)).toBe(true);
+    expect(needsRehash(e, 501, 0)).toBe(true);
+  });
+
   it("drops the cache when observing a moved file", () => {
     const e = entry({ mtime: 500, size: 42, hash: "cached", chunks: ["a", "b"] });
     observe(e, { folder: false, mtime: 600, ctime: 1, size: 42 });

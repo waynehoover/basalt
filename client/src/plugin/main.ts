@@ -32,7 +32,13 @@ import {
   type TextComponent,
 } from "obsidian";
 
-import { HistoryModal, when, type HistorySource } from "./history.ts";
+import {
+  HistoryModal,
+  describeRestore,
+  when,
+  type HistorySource,
+  type Restored,
+} from "./history.ts";
 
 import {
   Client,
@@ -100,14 +106,6 @@ type State =
   | { kind: "offline"; why: string; retryAt: number; refused: boolean }
   | { kind: "stopped"; why: string };
 
-/** Where a restore landed, and whether it went any further. */
-export interface Restored {
-  readonly path: string;
-  /** The upload afterwards succeeded. When false, `why` says what stopped it. */
-  readonly sent: boolean;
-  readonly why?: string;
-}
-
 export default class BasaltPlugin extends Plugin {
   private config: DeviceConfig | undefined;
   /** The connected client, or undefined between connections. */
@@ -150,6 +148,8 @@ export default class BasaltPlugin extends Plugin {
   private announced = { skipped: 0, inTheWay: "" };
   /** What `onunload` started and could not wait for, for anything that can. */
   closing: Promise<void> | undefined;
+  /** The settle save in flight, so `unlink` cannot be overtaken by it. */
+  private settling: Promise<void> | undefined;
 
   override async onload(): Promise<void> {
     // Obsidian mobile has no status bar, and the declaration says so:
@@ -388,7 +388,7 @@ export default class BasaltPlugin extends Plugin {
         // written back: the token is a second secret that no longer opens
         // anything, and the blob is the thing every later `ready` is checked
         // against.
-        void this.settleConfig(client.wrapped);
+        void this.settleConfig(client.wrapped, mine);
       },
       onDisconnected: (cause, retryIn) => {
         if (!current()) return;
@@ -478,10 +478,26 @@ export default class BasaltPlugin extends Plugin {
    * The pin is what stops a server choosing the key schedule. Until it is
    * written down, whatever `ready` says is the vault's data key; afterwards a
    * different blob is refused. The CLI's `settle` is the same step.
+   *
+   * Numbered like every other run, and checked again on the far side of every
+   * await, because this save is started and not waited for. Unlinking between
+   * the start and the write put the pairing back on disk over the `null`
+   * unlink had just written: memory said unpaired, the file said paired, and
+   * the next restart synced a vault the person had removed. `unlink` waits
+   * for whatever is already past this check.
    */
-  private async settleConfig(wrapped: string | undefined): Promise<void> {
+  private settleConfig(wrapped: string | undefined, mine: number): Promise<void> {
+    // Recorded here rather than at the call site, so that however this comes
+    // to be called there is one save for `unlink` to wait for. The catch is
+    // what `void` used to do: the write below reports its own failure.
+    const saving = this.writeSettledConfig(wrapped, mine).catch(() => undefined);
+    this.settling = saving;
+    return saving;
+  }
+
+  private async writeSettledConfig(wrapped: string | undefined, mine: number): Promise<void> {
     const config = this.config;
-    if (!config) return;
+    if (!config || mine !== this.generation) return;
     const learned = wrapped !== undefined && config.wrapped === undefined;
     if (!learned && config.bootstrap === undefined && config.claimWrapped === undefined) return;
     const {
@@ -489,6 +505,7 @@ export default class BasaltPlugin extends Plugin {
       claimWrapped: _candidate,
       ...rest
     } = { ...config, ...(learned ? { wrapped } : {}) };
+    if (mine !== this.generation) return;
     try {
       await this.saveData(encodeConfig(rest));
     } catch (err) {
@@ -624,6 +641,11 @@ export default class BasaltPlugin extends Plugin {
       new Notice(`Basalt: ${this.whyNoClient()}`);
       return;
     }
+    // Numbered like every other run. A pass takes as long as it takes, and
+    // unlinking during one used to leave its result speaking for a vault
+    // that is no longer paired: a summary notice over an unpaired panel, or
+    // `failed` painted over `unpaired` when the closed client rejected.
+    const mine = this.generation;
     // The write debounce is off for this one. It exists so that somebody
     // typing does not cause a push per keystroke, and the person who just
     // chose "sync now" has said otherwise. Reporting "up to date" while
@@ -632,12 +654,14 @@ export default class BasaltPlugin extends Plugin {
     try {
       report = await client.settle({ coalesceWrites: false });
     } catch (err) {
+      if (mine !== this.generation) return;
       // Both callers discarded this promise, so a pass that threw was a
       // person pressing a button and nothing happening.
       this.passFailed((err as Error).message);
       new Notice(`Basalt: sync failed: ${(err as Error).message}`, 10_000);
       return;
     }
+    if (mine !== this.generation) return;
     // The state was set by onPass, once per pass. This is the feedback the
     // command owes.
     new Notice(`Basalt: ${summarise(report)}`);
@@ -877,15 +901,31 @@ export default class BasaltPlugin extends Plugin {
    * second copy beside the first.
    */
   private async restoreAndSend(version: Version): Promise<Restored> {
-    if (!this.client) throw new Error(`${this.whyNoClient()} There is nothing to restore from.`);
-    const done = await this.client.restore(version);
+    const client = this.client;
+    if (!client) throw new Error(`${this.whyNoClient()} There is nothing to restore from.`);
+    const mine = this.generation;
+    const done = await client.restore(version);
     try {
       // Sent now rather than at the next pass, so the other devices get it
       // without anybody having to know that they would not have.
-      await this.client.settle({ coalesceWrites: false });
+      await client.settle({ coalesceWrites: false });
     } catch (err) {
+      // "It will be sent when the next sync succeeds" is only true while
+      // there is a next sync. Unlinked mid-restore there is not one, and the
+      // note is on this device and nowhere else, which is what it says.
+      if (mine !== this.generation) {
+        return {
+          path: done.path,
+          sent: false,
+          willRetry: false,
+          why: "this vault is no longer paired",
+        };
+      }
       return { path: done.path, sent: false, why: (err as Error).message };
     }
+    // No staleness check on this side on purpose: the upload happened, so
+    // "sent to your other devices" is true whatever became of the pairing
+    // afterwards, and saying otherwise would be the same lie reversed.
     return { path: done.path, sent: true };
   }
 
@@ -915,8 +955,9 @@ export default class BasaltPlugin extends Plugin {
         if (!this.client) throw new Error(this.whyNoClient());
         return new TextDecoder().decode(await this.client.contentAt(version));
       },
-      restoreVersion: async (version) =>
-        describeRestore(version, await this.restoreAndSend(version)),
+      // The outcome, not a sentence: the modal says it with the same
+      // describeRestore every other restore surface uses.
+      restoreVersion: (version) => this.restoreAndSend(version),
       currentText: async (path) => {
         // The note can go between the look and the read: somebody deleting
         // it while its history is loading. That is a diff against nothing,
@@ -1043,6 +1084,9 @@ export default class BasaltPlugin extends Plugin {
     const { live, client } = this.retireClients();
     await live?.close();
     await client?.close();
+    // A settle save already past its generation check is a write to the same
+    // file this is about to empty. It is waited for here rather than raced.
+    await this.settling;
 
     try {
       await this.indexStore().remove();
@@ -1135,17 +1179,6 @@ function deviceName(typed: string): string {
   const bytes = new Uint8Array(2);
   crypto.getRandomValues(bytes);
   return `obsidian-${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
-}
-
-/** One sentence for a restore: where it landed, and whether it went further. */
-function describeRestore(version: Version, done: Restored): string {
-  const where =
-    done.path === version.path
-      ? `Restored ${done.path}.`
-      : `Restored to ${done.path}, because something is already at ${version.path}.`;
-  return done.sent
-    ? `${where} Sent to your other devices.`
-    : `${where} It is on this device and will be sent when the next sync succeeds: ${done.why}`;
 }
 
 /**

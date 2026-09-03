@@ -1030,42 +1030,51 @@ describe("a dotfile of the user's where a staging copy would go (P30)", () => {
  * On a phone there is no fs to reach and the flush is a no-op, which
  * docs/plugin.md calls best effort.
  */
-describe("making a pass durable on desktop (P25)", () => {
-  /** Electron's adapter, as far as the vault can tell: it knows the disk path. */
-  class DesktopAdapter extends FakeAdapter {
-    getBasePath(): string {
-      return "/home/me/vault";
-    }
-    getFullPath(normalizedPath: string): string {
-      return normalizedPath === "" ? this.getBasePath() : `${this.getBasePath()}/${normalizedPath}`;
-    }
+/** Electron's adapter, as far as the vault can tell: it knows the disk path. */
+class DesktopAdapter extends FakeAdapter {
+  getBasePath(): string {
+    return "/home/me/vault";
   }
+  getFullPath(normalizedPath: string): string {
+    return normalizedPath === "" ? this.getBasePath() : `${this.getBasePath()}/${normalizedPath}`;
+  }
+}
 
-  /** A Node fs that records what was opened and synced. */
-  function recordingFs(failDirs = false) {
-    const synced: string[] = [];
-    const open: string[] = [];
-    const fs = {
-      promises: {
-        async open(path: string, flags: string) {
-          if (flags !== "r")
-            throw new Error(`opened ${path} with ${flags}, and a sync needs only r`);
-          if (failDirs && !path.includes(".")) throw new Error("EISDIR");
-          open.push(path);
-          return {
-            async sync() {
-              synced.push(path);
-            },
-            async close() {
-              open.splice(open.indexOf(path), 1);
-            },
-          };
-        },
+/** The same, on a filesystem that folds case: macOS and Windows. */
+class FoldingDesktopAdapter extends FoldingAdapter {
+  getBasePath(): string {
+    return "/home/me/vault";
+  }
+  getFullPath(normalizedPath: string): string {
+    return normalizedPath === "" ? this.getBasePath() : `${this.getBasePath()}/${normalizedPath}`;
+  }
+}
+
+/** A Node fs that records what was opened and synced. */
+function recordingFs(failDirs = false) {
+  const synced: string[] = [];
+  const open: string[] = [];
+  const fs = {
+    promises: {
+      async open(path: string, flags: string) {
+        if (flags !== "r") throw new Error(`opened ${path} with ${flags}, and a sync needs only r`);
+        if (failDirs && !path.includes(".")) throw new Error("EISDIR");
+        open.push(path);
+        return {
+          async sync() {
+            synced.push(path);
+          },
+          async close() {
+            open.splice(open.indexOf(path), 1);
+          },
+        };
       },
-    };
-    return { fs, synced, open };
-  }
+    },
+  };
+  return { fs, synced, open };
+}
 
+describe("making a pass durable on desktop (P25)", () => {
   it("fsyncs every file written this pass and the directories their entries changed in", async () => {
     const desktop = new DesktopAdapter();
     const { fs, synced, open } = recordingFs();
@@ -1169,5 +1178,142 @@ describe("making a pass durable on desktop (P25)", () => {
       if (had === undefined) delete g.require;
       else g.require = had;
     }
+  });
+});
+
+/**
+ * P-D4 and P-D5 in the 0.3.0 review, both of them rule 3 in the form the header
+ * of core/vault.ts gives it: the index must never be durable ahead of the notes
+ * it names. `flush` is the whole of how that holds in the plugin, so anything it
+ * forgets is a note the index can be saved over.
+ */
+describe("what flush must not forget (P-D4, P-D5)", () => {
+  const times = { mtime: 1, ctime: 1 };
+
+  it("syncs the rest of the pass, and keeps what it could not sync (P-D4)", async () => {
+    const desktop = new DesktopAdapter();
+    const synced: string[] = [];
+    let failing: string | undefined = "/home/me/vault/a.md";
+    const fs = {
+      promises: {
+        async open(path: string) {
+          if (path === failing) throw new Error("EMFILE");
+          return {
+            async sync() {
+              synced.push(path);
+            },
+            async close() {},
+          };
+        },
+      },
+    };
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+    await v.write("a.md", enc.encode("one"), times);
+    await v.write("b.md", enc.encode("two"), times);
+
+    // The pass still fails, which is the point: the index is not saved over
+    // a note that is not durable.
+    await expect(v.flush!()).rejects.toThrow(/EMFILE/);
+    // But one file that would not open is not a reason to leave every later
+    // file in the pass unsynced.
+    expect(synced, "the files after the failure were skipped").toContain("/home/me/vault/b.md");
+
+    // And the one that failed is still owed. Forgetting it let the next pass
+    // flush nothing and save the index over a note never made durable.
+    failing = undefined;
+    synced.length = 0;
+    await expect(v.flush!()).resolves.toBeUndefined();
+    expect(synced, "the file that failed was forgotten").toContain("/home/me/vault/a.md");
+  });
+
+  it("syncs the directory a deletion changed (P-D5)", async () => {
+    for (const systemTrash of [true, false]) {
+      const desktop = new DesktopAdapter();
+      desktop.systemTrashWorks = systemTrash;
+      const { fs, synced } = recordingFs();
+      const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+        fs,
+      });
+      desktop.seed("daily/note.md", "text");
+
+      await v.remove("daily/note.md");
+      await v.flush!();
+      // A pass that only deleted used to flush nothing at all and then save
+      // the index, so the name could come back after a crash while the index
+      // said it was gone.
+      expect(synced, `system trash ${systemTrash}`).toContain("/home/me/vault/daily");
+    }
+  });
+
+  it("syncs the directory a case-fixing rename changed even when the write fails (P-D5)", async () => {
+    const desktop = new FoldingDesktopAdapter();
+    const { fs, synced } = recordingFs();
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+    // Through the vault, because the fake only folds the spellings it has
+    // been given: this is the file already on disk, already flushed.
+    await v.write("daily/Note.md", enc.encode("old"), times);
+    await v.flush!();
+    synced.length = 0;
+
+    // The other device renamed it to NOTE.md. The rename lands, the bytes
+    // after it do not, and the directory entry that moved is the one thing
+    // that changed on disk.
+    desktop.fault = (op, path) =>
+      op === "writeBinary" && path.includes("basalt-tmp") ? new Error("ENOSPC") : undefined;
+    await expect(v.write("daily/NOTE.md", enc.encode("new"), times)).rejects.toThrow(/ENOSPC/);
+    desktop.fault = undefined;
+
+    await v.flush!();
+    expect(synced).toContain("/home/me/vault/daily");
+  });
+});
+
+/**
+ * P-D6 in the 0.3.0 review, and the seeding beside it. The skip is what keeps a
+ * settled vault from rewriting nine megabytes every thirty seconds, and it is
+ * safe only while what it remembers is what is on disk.
+ */
+describe("the index write that is skipped because nothing changed (P-D6)", () => {
+  const INDEX = ".obsidian/plugins/basalt/index.json";
+  const state = (cursor: number) => ({
+    cursor,
+    entries: { "note.md": { path: "note.md", hash: `h${cursor}` } },
+    remote: {},
+    pending: [],
+  });
+
+  it("writes again when the index has gone from under it", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+
+    // Removed from outside the session: a tidy-up script, a sync tool, a
+    // person in a file manager.
+    await adapter.remove(INDEX);
+    await store.save(state(1));
+
+    expect(await adapter.exists(INDEX), "the index stayed gone for the session").toBe(true);
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
+  });
+
+  it("does not rewrite an index it has just read", async () => {
+    await new ObsidianIndexStore(adapter, INDEX).save(state(1));
+
+    // A restart. The first pass of a settled vault produces the state that
+    // is already on disk, and writing it back is two fsyncs to record that
+    // nothing happened.
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    expect(await store.load()).toEqual(state(1));
+    let writes = 0;
+    const realWrite = adapter.writeBinary.bind(adapter);
+    adapter.writeBinary = async (path, data, options) => {
+      writes++;
+      return realWrite(path, data, options);
+    };
+    await store.save(state(1));
+    expect(writes, "an identical index was written again on the first pass").toBe(0);
   });
 });
