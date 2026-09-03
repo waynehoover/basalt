@@ -43,17 +43,33 @@ inverts one.
 ```
 -> {op:"hello", id, proto:3, vault, token, device, crypto:"basalt/hkdf-aes-gcm/1",
     cursor, claim?, wrapped?}
-<- {res:"ready", id, proto:3, minProto:2, serverVersion, cursor,
-    perFileMax, chunkMax, maxChunks, maxBatchBytes, maxFetchBytes, wrapped?}
+<- {res:"ready", id, proto:3, minProto:3, serverVersion, cursor,
+    perFileMax, chunkMax, maxChunks, maxBatchBytes, maxFetchBytes, wrapped}
 ```
 
 `cursor` is the last uid the client applied, or 0. The server speaks every
 version from `minProto` to `proto` and answers in the version the client asked
-for, so the upgrade order is the server first, then each client. A `proto`
-outside that range, or a `crypto` it does not implement, is refused with
-`{res:"err", code:"proto"}` naming both numbers and `serverVersion`. `proto`
-and `crypto` move separately: `crypto` names how a chunk is sealed, which has
-not changed since protocol 1, so every chunk ever written still opens.
+for, so the upgrade order is the server first, then each client. Today that
+range is one version wide: protocol 3 is the only protocol there has ever
+been, and anything else, or a `crypto` the server does not implement, is
+refused with `{res:"err", code:"proto"}` naming both numbers and
+`serverVersion`. The range stays in the handshake because it is how the next
+version is introduced, and protocol 4's compatibility gets written then,
+against a protocol 3 that has actually run.
+
+`claim` and `wrapped` travel together, and a hello carrying a claim without a
+valid `wrapped` is refused with `badentry` and ends, whatever state the vault
+is in. Every claimed vault therefore has a data key and every `ready` carries
+one.
+
+A device sends the pair only while it is still claiming, which is while it
+holds the server's first-run token, and sends the same `wrapped` every time: a
+claim retried after a lost reply must offer the key it offered before, or the
+vault can be bound to one candidate while the device goes on proposing another.
+It stops once the token is spent. A claim on a claimed vault changes nothing on
+the server, but it hands a wrapping of a data key to a server that has no
+honest use for it, and a dishonest one can return that wrapping in `ready` as
+the vault's own; see **The data key** for the other half of that.
 
 `vault` and `device` are at most 64 characters and contain no control
 characters; either fault is `badname` and ends the session, because both land
@@ -73,8 +89,8 @@ holds. `wrapped` is the vault's wrapped data key when it has one; see
 Every request that expects a reply carries `id`, a client-chosen integer from 1
 to 2^32-1, unique among the requests in flight: `hello`, `put`, `putmany`,
 `get`, `fetch`, `history`, `deleted`, `invite`, `rotate`. The reply echoes it,
-and so does an `err` refusing that request. A protocol 3 request with no `id`,
-or one outside that range, is `protostate` and ends the session. `batch`, `caught-up` and pings are
+and so does an `err` refusing that request. A request with no `id`, or one
+outside that range, is `protostate` and ends the session. `batch`, `caught-up` and pings are
 unsolicited and carry no `id`. The server never sends an `id` it was not given.
 A client ends the session on a reply whose `id` it does not recognise, and
 treats an `err` with no `id` as the reason the connection is about to close.
@@ -244,8 +260,8 @@ random 256-bit key, where there is nothing to guess and nothing for a slow hash
 to slow down, and it must never be reused for anything a person chose. A stolen
 disk yields ciphertext without the ability to add to it. Claiming is one-time
 and cannot be undone over the wire, or a second device could lock the first
-out. A device sends `claim` on every hello, so it never has to work out whether
-it is first.
+out. A device sends `claim` while it still holds the bootstrap token and not
+after, so it never has to work out whether it is first.
 
 ### The data key, and rotating a leaked secret
 
@@ -255,6 +271,15 @@ stored on the server as an opaque blob. Every key that touches content derives
 from the data key; only the auth key and the wrapping key derive from the root.
 The server returns the blob in `ready` so every device that holds the root
 secret can unwrap it. The server cannot: it holds neither key.
+
+A device remembers the blob after its first successful connect and refuses a
+`ready` carrying a different one. Unwrapping under the root is not enough of a
+check: a server handed a claim can return that wrapping as the vault's own,
+and the device would install a key schedule no other device on the vault
+derives, with both ends reporting success. The one legitimate change is a
+rotation, and neither side of one reaches the check: the device that rotates
+stores the new blob it just sent, and every other device is evicted with `auth`
+and pairs again.
 
 That indirection is what makes a leaked pairing string survivable:
 
@@ -269,13 +294,30 @@ closes every other session on the vault with `{res:"err", code:"auth"}`, and
 from then on only the new root opens the vault. History is untouched, because
 nothing sealed under the data key changed. The device that rotated prints a
 new pairing string and every other device pairs again with it. `rotate` is
-refused with `auth` on a session that authenticated with the bootstrap token
-and with `badentry` on a vault that has no data key.
+refused with `auth` on a session that authenticated with the bootstrap token.
 
-A vault claimed under protocol 2 has no data key: its content keys derive from
-the root directly, and the only rotation is a new vault, which loses the
-server's history. `ready` carries no `wrapped` for such a vault and the CLI
-says so before it does anything.
+The swap is conditional on the credential the session authenticated under, so
+two devices connected under one root that both rotate cannot both succeed: the
+second is refused with `rotated` and its session ends. Closing a socket does
+not stop a request already in flight, so an unconditional swap let the loser
+overwrite the winner, and the device the winner was revoking ended up owning
+the vault.
+
+A vault also carries a rotation generation, which the same transaction moves. A
+session captures it with the auth hash it authenticated under and checks it
+again once it has joined the vault's fan-out; if it moved, the session is
+refused with `auth`. The eviction above is a snapshot of who is connected, and a
+device that passed authentication under the old root and joined just after that
+snapshot is in nobody's list: it would keep reading and writing valid entries,
+because the data key did not change.
+
+A client that has a rotation outstanding, sent with no reply, keeps both
+secrets and tries the new one first on its next connect, falling back to the
+old one. The server commits before it answers, so a lost reply is otherwise a
+vault whose new root exists only in the process that made it.
+
+Every vault has a data key, so rotation always works in place and never costs
+the history.
 
 ### Adding a device with a single-use invite
 
@@ -302,11 +344,14 @@ The new device redeems it at hello, in place of a token:
 
 ```
 -> {op:"hello", id, proto:3, vault, device, crypto, invite}
-<- {res:"redeemed", id, sealed, wrapped?}
+<- {res:"redeemed", id, sealed, wrapped}
 ```
 
 The server marks the invite used before it answers, so it can be redeemed once
-even if the reply is lost, and then closes the session. The new device unseals
+even if the reply is lost, and then closes the session. `wrapped` is echoed
+here for symmetry and a client ignores it: the vault's data key is taken from
+the first `ready` like every other device's, so there is one place the key
+schedule is decided. The new device unseals
 the root secret with the invite key, stores it, and connects again with the
 derived auth key like any other device. An unknown, expired or already used
 invite is `auth`, never saying which. `rotate` deletes every outstanding
@@ -327,12 +372,12 @@ refused handshake logs the origin and the flag that would admit it.
 
 ## Crypto
 
-`basalt/hkdf-aes-gcm/1` names the sealing construction, unchanged since
-protocol 1.
+`basalt/hkdf-aes-gcm/1` names the sealing construction. It is versioned
+separately from the wire, because how a chunk is sealed and how two ends talk
+change for different reasons.
 
 ```
-S                                       root secret: 256 bits in a basalt3_ pairing
-                                        string, 160 bits in a basalt2_ one, both accepted
+S                                       root secret, 256 bits, in a basalt3_ recovery key
 K_auth    = HKDF(S, "basalt/auth/1")    the server stores only H(K_auth)
 K_wrap    = HKDF(S, "basalt/wrap/1")
 D         = 32 random bytes             the data key, generated once by the first device
@@ -347,9 +392,12 @@ nonce(p)  = HMAC-SHA-256(K_nonce, p)[:12]
 seal(K,p) = nonce(p) || AES-GCM-256(K, nonce(p), p)
 ```
 
-A vault claimed under protocol 2 has no `D`; its four content keys derive from
-`S` with the same info strings. Which schedule applies is decided by whether
-`ready` carries `wrapped`, never by the pairing string's version.
+There is one schedule and every content key hangs off `D`. That is not a
+simplification, it is the reason a leaked `S` can be retired: nothing sealed
+depends on it. It also removes a state a server could otherwise choose. When a
+vault might or might not have had a data key, a server could pick the schedule
+a device used by leaving `wrapped` out of `ready`, and the device had no way to
+know it had been moved onto keys no other device could read.
 
 Paths and chunks use the same construction under different keys. The nonce is
 derived from the plaintext, so sealing is deterministic. Equal paths must seal
@@ -389,10 +437,13 @@ watching client backs off and reconnects on a retryable error and stops on any
 other, with nothing to interpret. `retryAfterMs` is a hint on `busy`, so a
 device refused for the device limit does not hot-loop.
 
-An error sent before the server knows which protocol the client speaks, such
-as a refusal at admission during shutdown or at the pre-auth cap, a first frame
-that is not a hello, or a `proto` below the minimum, has the protocol 2 shape:
-no `id` and no `retryable`. A client treats those by code.
+Every error carries `retryable`, including the ones sent before a hello has
+been read. A client still keeps a default by code for a frame that arrives
+without the field, which is a defence against a malformed answer rather than a
+second shape to support: a refusal at admission during shutdown or at the pre-auth cap, a
+first frame that is not a hello, or an unsupported `proto`. What such an error
+lacks is an `id`, because it answers no request, and so do the shutdown and
+rotation notices.
 
 The session **continues** after a code that rejects one request, and **ends**
 after one that means the connection should not have been opened or the two ends
@@ -400,13 +451,14 @@ no longer agree how many frames are outstanding.
 
 | code | meaning | retryable | session |
 |---|---|---|---|
-| `proto` | unsupported `proto` or `crypto` | no | ends; it is only sent at hello |
+| `proto` | unsupported `proto` or `crypto`, or a vault an older build claimed with no data key | no | ends; it is only sent at hello |
 | `auth` | bad token or vault, never saying which | no | ends |
 | `cursor` | the client is ahead of the server | no | ends |
+| `rotated` | a rotate whose credential is no longer the vault's, because another device rotated first | no | ends |
 | `busy` | the vault's device limit, or the server is shutting down | yes, with `retryAfterMs` | ends |
 | `protostate` | a message that does not belong in the current state | no | ends, except an unknown op or a negative `before` on a `history`, which reject that one request and continue |
 | `badchunk` | a body that does not hash to the name asked for, or a malformed chunk name | no | continues, except a bad body arriving mid-upload, which ends because the two ends no longer agree how many frames remain |
-| `badentry` | a structurally invalid put | no | continues |
+| `badentry` | a structurally invalid put | no | continues, except a claim at hello carrying no valid `wrapped`, which ends |
 | `badname` | a path the server cannot store | no | continues, except an over-long device name at hello, which ends |
 | `toolarge` | above an advertised ceiling, or more ciphertext than the size allows | no | continues, except uploads passing the declared size mid-put, which ends |
 | `nospace` | refused for want of disk | yes | ends; it can only arise mid-upload, where the frame count is no longer agreed |
@@ -414,15 +466,3 @@ no longer agree how many frames are outstanding.
 | `nocontent` | the entry is a folder or a deletion | no | continues |
 | `nochunk` | the server does not hold that chunk | no | continues, except a body found unreadable mid-fetch, which ends |
 | `internal` | a server-side fault; the put is not committed | yes | ends during handshake or catch-up, otherwise continues |
-
-## Protocol 2 sessions
-
-The server accepts `proto: 2` for one release, on vaults that have no data
-key. A protocol 2 hello on a vault claimed under protocol 3 is refused with
-`proto`, because that client would seal under the root-derived schedule and
-nothing else on the vault could read what it wrote. Such a session has no ids, no
-`bodies` header, no `retryable` field, no `wrapped`, and no `invite` or
-`rotate`; it is
-answered exactly as protocol 2 was, and `ready` still carries the new ceilings,
-which a protocol 2 client ignores. A protocol 3 client against a protocol 2
-server is refused at hello with both numbers. Upgrade the server first.

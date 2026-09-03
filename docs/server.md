@@ -85,24 +85,27 @@ name, so a mismatch never half-works.
 
 ### Upgrade order
 
-The server first, then each client. A server speaks the newest protocol and
-the one before it for a release, and answers each device in the version it
-asked for; a client speaks one. A device on the new protocol against an old
-server is refused at hello with both numbers and the server's version, which is
-the message to read as "upgrade the server".
+The server first, then each client. The handshake carries the range of
+protocol versions a server speaks, and a device outside it is refused at hello
+with both numbers and the server's version, which is the message to read as
+"upgrade the server".
 
-One matrix for what speaks what. The plugin, the headless client and the server
-are released on their own tags and move on their own clocks; the protocol
-version is what decides whether two of them can talk.
+Today that range is one version wide. Protocol 3 is the only protocol: the two
+before it were removed rather than carried, because nothing had been deployed
+under them and a compatibility path nobody would use is a second set of code
+paths through the part of the system that must not be wrong. The range stays in
+the handshake for the next version, whose compatibility gets written then,
+against a protocol 3 that has actually run.
 
 | Release | Protocol | Notes |
 |---|---|---|
-| plugin 0.1.x, `basalt` 0.1.x, `basaltd` 0.1.x | 1 | no entry authenticator; refused by everything newer |
-| plugin 0.2.0 to 0.2.2, `basalt` 0.2.0 to 0.2.2, `basaltd` 0.2.0 to 0.2.1 | 2 | the current releases |
-| next `basaltd` | 2 and 3 | serves both for one release, refuses protocol 2 on a vault claimed under 3 |
-| next plugin and `basalt` | 3 | request ids, retryable errors, data key, invites |
+| plugin, `basalt` and `basaltd` 0.1.x and 0.2.x | 1 and 2 | withdrawn before deployment; a data directory from one of these cannot be served |
+| current | 3 | request ids, retryable errors, the data key, invites |
 
-Every plugin release needs Obsidian 1.7.2 or newer (`versions.json`).
+The plugin, the headless client and the server are released on their own tags
+and move on their own clocks, and the protocol version is what decides whether
+two of them can talk. Every plugin release needs Obsidian 1.7.2 or newer
+(`versions.json`).
 `basaltd version` prints the server's release, and the plugin's is in its
 manifest.
 
@@ -432,9 +435,8 @@ Every device holds the same root secret, and that secret is also the
 credential. There is no per-device revocation. If a pairing string has been
 somewhere it should not have been, give the vault a new secret.
 
-A vault claimed under protocol 3 has a data key wrapped under the root, so the
-root can change without the history changing. From any device that has the
-vault:
+Every vault has a data key wrapped under the root, so the root can change
+without the history changing. From any device that has the vault:
 
 ```bash
 basalt rotate
@@ -443,42 +445,27 @@ basalt rotate
 The server replaces the auth hash and the wrapped key in one transaction,
 deletes every outstanding invite, closes every other device's session with
 `code:"auth"`, and from then on only the new secret opens the vault. The device
-that rotated prints the new recovery key, to write down in place of the old one,
-and every other device is added again with a fresh `basalt invite`. Nothing on
-the server is re-encrypted and no history is lost. It cannot
-unread what was already read. [design.md](design.md#a-lost-or-stolen-device)
-says more.
+that rotated prints the new recovery key, to write down in place of the old
+one, and every other device is added again with a fresh `basalt invite`.
+Nothing on the server is re-encrypted and no history is lost. It cannot unread
+what was already read. [design.md](design.md#a-lost-or-stolen-device) says more.
 
-A vault claimed under protocol 2 has no data key, and `basalt rotate` says so
-before it does anything. For such a vault the rotation is a new vault, and the
-server's version history does not carry over:
+The new secret is written into the device's config before the request goes out,
+so a reply lost on the way cannot leave a vault whose new root nobody holds.
+`basalt rotate` prints the key and exits non-zero if that happens, saying it may
+have committed; the next `basalt sync` here tries the new secret first and
+settles which one the vault has. Keep both keys until it has. If two devices
+rotate at once, one is refused with `rotated` and pairs again with the string
+the other printed.
 
-```bash
-# on the server
-systemctl stop basalt
-basaltd backup -data /var/lib/basalt -to /backups/basalt-before-rotation
-mv /var/lib/basalt /var/lib/basalt-old
-systemctl start basalt                 # a fresh store and a new bootstrap token
+## A data directory from before protocol 3
 
-# on the one device that has the whole vault
-basalt unlink
-basalt init 'wss://...#<the new token>'
-basalt sync
-```
-
-Then add every other device again with `basalt invite` from that one. The old data directory still opens
-with an old binary, so keep it until every device is across.
-
-## Upgrading from 0.1
-
-0.2 is the first release where every version carries an authenticator, and
-devices check it before writing anything. Versions written by a 0.1 server
-carry none, so a new device refuses at the first one. There is no migration:
-signing history after the fact would mean the server producing authenticators,
-which is the thing they exist to prevent.
-
-The upgrade is a rotation, above. Your notes are on your devices; what is left
-behind is the server's history of them.
+The 0.1 and 0.2 releases spoke protocols 1 and 2 and were withdrawn before
+anyone deployed them. A vault claimed by one of those builds has no data key,
+and this server refuses every session on it at hello, naming the reason, rather
+than serving it under a key schedule that no longer exists. Start a fresh data
+directory and pair the first device again. Your notes are on your devices in
+plaintext; what does not carry over is the server's history of them.
 
 ## Phones
 

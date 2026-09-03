@@ -159,13 +159,13 @@ device. The server holds no key and nothing in it needs one. What it can tell
 about the ciphertext is its length, and that two chunks are byte-identical,
 which is what deduplication is made of.
 
-**It cannot write anything either, since protocol 2.** Before that, the bytes
-of a file were sealed but the fields deciding what a client did with them were
-not. The server holds every sealed path, so it could have set `deleted` on one
-and every device would have deleted that note, or emptied a note by declaring a
-size with no chunks, or handed one file another's chunk list. Every entry now
-carries an HMAC under a key the server never sees, and a device refuses an entry
-it cannot verify. Clients also check what the server used to be trusted with: an
+**It cannot write anything either.** An early draft sealed the bytes of a file
+and left the fields deciding what a client did with them in the clear. The
+server holds every sealed path, so it could have set `deleted` on one and every
+device would have deleted that note, or emptied a note by declaring a size with
+no chunks, or handed one file another's chunk list. Every entry carries an HMAC
+under a key the server never sees, and a device refuses an entry it cannot
+verify. Clients also check what the server used to be trusted with: an
 assembled file must match its declared size, the merge ancestor must match the
 local `synchash`, a cursor never moves backwards, and a missing limit means this
 device's own ceiling rather than no ceiling.
@@ -185,7 +185,7 @@ serialise, one round trip per collision.
 
 ## The keys
 
-One root secret, 160 random bits, generated on the first device. Everything
+One root secret, 256 random bits, generated on the first device. Everything
 else is derived with HKDF-SHA256, one key per purpose: `auth` to prove a device
 may connect, of which the server stores only a hash; `path` for filenames;
 `content` for chunk bodies; `nonce` for synthetic nonces; `meta` for the entry
@@ -225,9 +225,6 @@ Rotation does not unread what was already read. Whoever held the old string
 could decrypt everything the server held while they had it. Do it anyway if a
 pairing string has been in a chat, a screenshot, a shell history, a repository,
 or on a device you no longer hold.
-
-A vault claimed under protocol 2 has no data key, so for it rotation is a new
-vault and the server's history is lost; the CLI says so before doing anything.
 
 ## Provenance
 
