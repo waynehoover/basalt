@@ -27,8 +27,10 @@ once produced a successful backup of nothing.
 
 ### Docker
 
-The image is the binary on an empty filesystem: 12 MB, no shell, nothing to
-update.
+The image is the binary on an empty filesystem: about 5 MB to pull, 12 MB on
+disk, no shell, nothing to update. `latest` is for trying it out; pin the tag
+and its digest for a server you keep, the way `compose.yaml` does, so a pull
+cannot move you to an image nobody tested against your devices.
 
 ```bash
 docker run -d --name basalt -p 127.0.0.1:3003:3003 \
@@ -207,7 +209,9 @@ verified, and only then is the snapshot renamed over the last good database and
 the directory flushed to disk. So a run that fails partway, for a missing body,
 a full disk, or a crash, leaves the previous backup exactly as it was: it still
 opens and still verifies, and the failed run has changed none of what it needs.
-Stale bodies are never deleted. Once the source purges old versions the next
+When the backup holds more bodies than the source, the report says so as
+history it kept rather than as bodies that were not copied. Stale bodies are
+never deleted. Once the source purges old versions the next
 snapshot stops referencing their bodies, but those bodies are the history the
 backup exists to keep and the source no longer has them, so they are retained
 and the report says how many. The token is written the same careful way as
@@ -320,8 +324,14 @@ systemctl start basalt
 
 A device that has already seen versions newer than the backup is refused with
 `code:"cursor"`. That is deliberate. Continuing would reissue version numbers
-for different content and the two would silently diverge. Unlink that device
-and pair it again; its notes are on the device and come back as new versions.
+for different content and the two would silently diverge.
+
+On the headless client the way back is `basalt rebase --backup-taken`, which
+prints both cursors, rejoins from the server's, and re-uploads what only that
+device holds as new versions, deleting nothing. See
+[the client README](../client/README.md#commands). The plugin has no rebase,
+so a plugin device is unlinked and paired again; its notes are on the device
+and come back as new versions either way.
 
 ### After a purge: the bodies the backup keeps
 
@@ -340,7 +350,7 @@ purged is the tool that gets run with the wrong path.
 
 An Obsidian vault is a directory of Markdown. Time Machine, restic, rsync, or a
 git repository in the vault give you a readable copy that needs no Basalt and
-no passphrase. If you only do one backup, do that one. The server backup is
+no recovery key. If you only do one backup, do that one. The server backup is
 what holds the history.
 
 ## Purge
@@ -355,6 +365,19 @@ systemctl stop basalt
 basaltd backup -data /var/lib/basalt -to /srv/basalt-backup
 basaltd purge -data /var/lib/basalt -confirm default -backup /srv/basalt-backup -grace 0
 systemctl start basalt
+```
+
+Under Docker the same thing needs the container stopped, so it cannot go
+through `docker exec`: purge takes the data directory exclusively and refuses
+while a server holds it. Run it as its own container against the same volume.
+
+```bash
+docker compose stop basalt
+docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.0 \
+  backup -data /data -to /data/backup
+docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.0 \
+  purge -data /data -confirm default -backup /data/backup -grace 0
+docker compose start basalt
 ```
 
 `-confirm` must be the vault's name exactly. `-backup` names a backup
@@ -386,6 +409,8 @@ the way and fails at once rather than waiting.
 
 ## What is in there
 
+The numbers below are an example of the shape, not a measurement of anything.
+
 ```
 $ basaltd stats
 vault "default"
@@ -401,10 +426,19 @@ purge spares bodies newer than 1h0m0s unless -grace says otherwise
 The numbers are separate rather than totalled, because a total does not say
 whether a purge would help.
 
-`stats -json` prints the same numbers as one object, for scripts: per vault
-`files`, `folders`, `bytes`, `deleted`, `recoverable`, `purged`, `versions`,
-`history`, `chunkRefs`, `latestUid`, `allocatedTo`, `claimed`, `invites`, and
-at the top `version`, `bodies` and `graceMs`.
+`stats -json` prints the same numbers as one object, for scripts. The vaults
+are an array, so the shape is worth having in front of you:
+
+```json
+{ "version": "0.3.0", "bodies": 21117, "graceMs": 3600000,
+  "vaults": [ { "vault": "default", "claimed": true, "files": 1834,
+                "folders": 212, "bytes": 64193000, "deleted": 17,
+                "recoverable": 17, "purged": 0, "versions": 9120,
+                "history": 7057, "chunkRefs": 22384, "latestUid": 9120,
+                "allocatedTo": "laptop", "invites": 0 } ] }
+```
+
+The numbers above are an example, not a measurement of anything.
 
 ## What to alert on
 
@@ -415,7 +449,7 @@ job or whatever watches your machines, all readable without a key.
 |---|---|---|
 | Health failing | `basaltd health` exits non-zero | The server is down or not answering. systemd restarts it; if it keeps failing, `journalctl -u basalt` has the reason. |
 | Cursor stuck | `latestUid` from `stats -json` unchanged for days while you have been writing | Devices are not reaching the server, or one device's `basalt status` shows a server cursor ahead of its own and nothing arriving. Check the device before the server. |
-| Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not. Each one needs to be unlinked and paired again; the log names the device. |
+| Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, which is the expected state after restoring an older backup. On the headless client, `basalt rebase --backup-taken` rejoins without losing what only that device holds. The plugin has no rebase, so those devices are unlinked and paired again. The log names the device. |
 | `nospace` | `journalctl -u basalt | grep nospace` | The disk is full. Nothing is lost, uploads are refused until it is not. Purge after a backup, or give it a bigger disk. |
 
 The startup line is the other thing to grep for after a restart:
@@ -436,7 +470,9 @@ credential. There is no per-device revocation. If a pairing string has been
 somewhere it should not have been, give the vault a new secret.
 
 Every vault has a data key wrapped under the root, so the root can change
-without the history changing. From any device that has the vault:
+without the history changing. Rotation is a headless-client command; the
+plugin has no rotate, so run it from a machine with the CLI paired to the
+vault:
 
 ```bash
 basalt rotate
@@ -533,6 +569,7 @@ next to their reasoning in the source; these are the numbers.
 | one frame, before hello | 64 KiB | a hello is a few hundred bytes |
 | devices per vault | 8 | refused with `busy`, `retryAfterMs` 30 s |
 | connections waiting to say hello | 32 in all | refused with `busy` |
+| shutting down | | every idle session gets `busy`, `retryAfterMs` 5 s |
 | time allowed to say hello | 10 s | closed with `protostate` |
 | `vault` and `device` names | 64 bytes, no control characters | `badname`, ends the session |
 | wrapped data key, sealed invite | 256 bytes of base64url | |

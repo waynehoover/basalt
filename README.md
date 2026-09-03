@@ -59,7 +59,7 @@ Basalt is the narrow version. One backend, one transport, one person's devices. 
 ## Self-hosting
 
 > [!NOTE]
-> **Requirements:** any always-on machine that runs Docker or a single binary. Linux or macOS, amd64 or arm64. No database, no message broker, no accounts. The image is 12 MB, and the data directory is one folder you can copy.
+> **Requirements:** any always-on machine that runs Docker or a single binary. Linux or macOS, amd64 or arm64. No database, no message broker, no accounts. The image is about 5 MB to pull and 12 MB on disk, and the data directory is one folder you can copy.
 
 **1. Run the server.**
 
@@ -71,11 +71,13 @@ docker logs basalt
 
 The log prints one line for your first device, `host:3003#TOKEN`. The server speaks plain HTTP on purpose, so that no key material lives in it. Put TLS in front before anything else can reach it: `tailscale serve --bg 3003` is one line, and [docs/server.md](docs/server.md) covers Compose, systemd, Caddy and every flag.
 
+`latest` is for trying it. For the box you keep, pin the tag and its digest, as [`compose.yaml`](compose.yaml) does, so a pull cannot move you to an image nobody tested against your devices.
+
 **2. Install the plugin.** Put `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/waynehoover/basalt-sync/releases/latest) into `<vault>/.obsidian/plugins/basalt-sync/`, then enable Basalt Sync under Community plugins.
 
 **3. Start the vault.** Click the Basalt icon and paste that line under **Start a new vault**. It shows the vault's recovery key once. Write it down and keep it offline: it is the only way back if every device is lost, and anyone holding it has the vault.
 
-**4. Add your other devices.** On a device that already has the vault, press **Add another device**, then paste the invite it gives you into Basalt on the new one. An invite works once, expires in ten minutes, and carries no secret the server can read.
+**4. Add your other devices.** On a device that already has the vault, press **Add another device**, then **Create invite**, and paste what it shows into Basalt on the new one. An invite works once, expires in ten minutes, and carries no secret the server can read.
 
 ### Without Obsidian
 
@@ -119,7 +121,7 @@ basalt sync --watch
   <img src="docs/assets/wire.svg" alt="Editing one line of a 2 MiB note: whole-file sync sends 2.0 MiB, Basalt sends 21.7 KiB, of which 12.7 KiB is the chunk that changed and 9.0 KiB is the entry naming every chunk of the new version.">
 </picture>
 
-Notes are cut into content-defined chunks, so an edit sends the chunk that moved rather than the file. Chunks are compressed before they are encrypted, which takes a vault's text from 108% of plaintext on the wire down to about 60%. Two thousand files reach a second device in tens of round trips rather than thousands, and a pass over a vault where nothing changed is too fast to measure. Every number here was measured, including a run against a real 3,751-file vault, and [docs/compared.md](docs/compared.md) shows them.
+Notes are cut into content-defined chunks, so an edit sends the chunk that moved rather than the file. Chunks are compressed before they are encrypted, which takes a vault's text from 108% of plaintext on the wire down to about 60%, or nearer 69% once attachments are in the mix. Two thousand files reach a second device in tens of round trips rather than thousands, and a pass over a vault where nothing changed is too fast to measure. Every number here was measured, including a run against a real 3,751-file vault, and [docs/compared.md](docs/compared.md) shows them.
 
 ## Features and roadmap
 

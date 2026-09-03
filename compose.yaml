@@ -11,8 +11,10 @@ services:
   basalt:
     # Pinned to a release and to its digest, so `docker compose pull` cannot
     # quietly move you to an image nobody tested against your devices. To
-    # upgrade, change both, and change the server before the clients: it speaks
-    # the old protocol and the new one for a release, the clients speak one.
+    # upgrade, change both, and change the server before the clients. The
+    # server speaks one protocol version today and refuses anything else at
+    # hello, naming both numbers, so a client upgraded first simply cannot
+    # connect until the server catches up.
     #
     # The digest came from:
     #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.3.0

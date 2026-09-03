@@ -50,8 +50,9 @@ inverts one.
 `cursor` is the last uid the client applied, or 0. The server speaks every
 version from `minProto` to `proto` and answers in the version the client asked
 for, so the upgrade order is the server first, then each client. Today that
-range is one version wide: protocol 3 is the only protocol there has ever
-been, and anything else, or a `crypto` the server does not implement, is
+range is one version wide: protocol 3 is the only protocol that has ever been
+in the wild, since the two before it were withdrawn before anyone deployed
+them, and anything else, or a `crypto` the server does not implement, is
 refused with `{res:"err", code:"proto"}` naming both numbers and
 `serverVersion`. The range stays in the handshake because it is how the next
 version is introduced, and protocol 4's compatibility gets written then,
@@ -354,7 +355,12 @@ the first `ready` like every other device's, so there is one place the key
 schedule is decided. The new device unseals
 the root secret with the invite key, stores it, and connects again with the
 derived auth key like any other device. An unknown, expired or already used
-invite is `auth`, never saying which. `rotate` deletes every outstanding
+invite is `auth`, never saying which. A hello carrying both a token and an
+invite is refused with `badentry`, because an invite stands in for a token and
+sending both leaves the server choosing which credential was meant. Issuing an
+invite under an identifier the vault already holds is `badentry` too, rather
+than a retryable `internal` a client would repeat for ever.
+`rotate` deletes every outstanding
 invite on the vault, because they seal the root that was just retired.
 `invite` is refused with `auth` on a session that authenticated with the
 bootstrap token.
@@ -435,7 +441,10 @@ structure.
 reconnecting later can succeed where retrying the same request cannot: a
 watching client backs off and reconnects on a retryable error and stops on any
 other, with nothing to interpret. `retryAfterMs` is a hint on `busy`, so a
-device refused for the device limit does not hot-loop.
+device refused for the device limit does not hot-loop. The two causes carry
+different hints: 30 seconds at the device limit, where a slot frees when
+somebody closes a laptop, and 5 seconds on shutdown, where the server is
+expected straight back.
 
 Every error carries `retryable`, including the ones sent before a hello has
 been read. A client still keeps a default by code for a frame that arrives
@@ -464,5 +473,5 @@ no longer agree how many frames are outstanding.
 | `nospace` | refused for want of disk | yes | ends; it can only arise mid-upload, where the frame count is no longer agreed |
 | `nouid` | no such entry | no | continues |
 | `nocontent` | the entry is a folder or a deletion | no | continues |
-| `nochunk` | the server does not hold that chunk | no | continues, except a body found unreadable mid-fetch, which ends |
+| `nochunk` | the server does not hold that chunk | no | continues; a body that fails its own hash is found before the header, quarantined, and refused with no bodies sent |
 | `internal` | a server-side fault; the put is not committed | yes | ends during handshake or catch-up, otherwise continues |

@@ -79,8 +79,9 @@ not ask for should never rewrite the file you are editing.
 Notes are chunked on a rolling hash and only the chunks the server lacks are
 sent. One line inserted into a 2 MiB note costs about 22 KB, most of it the
 entry naming the new version's chunks. Chunks are compressed after chunking and
-before encryption, which takes a vault's text from 108% of plaintext on the wire
-to 67%. That order is forced: compressing first would move every boundary on
+before encryption, which takes a vault's text from 108% of plaintext on the
+wire to about 60%, or nearer 69% for a real vault that also holds attachments,
+because a photograph does not compress. That order is forced: compressing first would move every boundary on
 any edit, and ciphertext does not compress.
 
 Every size and threshold came from a measurement on a real vault.

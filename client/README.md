@@ -89,6 +89,13 @@ invite`. It always keeps the history, because the content is sealed under a
 data key that the root only wraps, so a new root re-wraps the same key and
 nothing on the server is re-encrypted.
 
+The new secret is written down locally before the request goes out, so a reply
+lost in flight cannot leave a vault whose new root nobody holds: the next
+connection tries the new secret first and falls back to the old, keeping
+whichever the server accepts. If another device rotated first, this one is
+refused by name and told to reconnect with the new string rather than
+overwriting it.
+
 `basalt rebase` is for a server restored from an older backup, which refuses
 this device with `cursor`. It prints both cursors and refuses without
 `--backup-taken`; with it, it forgets the local index, rejoins from the server's
@@ -115,6 +122,13 @@ and the config folder, `.obsidian` unless `--config-dir` says otherwise. The
 plugin asks Obsidian which folder that is; the headless client has to be told.
 The same rule applies in both directions, so a name this client would never
 upload is one it will never write when a peer sends it.
+
+Pointing `--config-dir` at some other folder makes `.obsidian` ordinary
+content on this device, which is the one way to sync it. It also makes this
+device disagree with the plugin, which will keep refusing that folder, so the
+files travel to the server and no plugin device will write them. That is left
+working on purpose, but it is a flag to type deliberately rather than a
+supported arrangement.
 
 `--ignore NAME` adds one more name, matched at any depth. One name per flag
 rather than a comma-separated list, because a filename can contain a comma.
@@ -246,6 +260,8 @@ repository that do not apply to the plugin:
   `Vault` to ask, and in test doubles.
 - **One `console` call**, in the engine's failure path. A note that fails to
   send is exactly the silent failure this project exists to avoid.
+- **Vault enumeration.** It is a sync engine. It cannot sync a vault it is not
+  allowed to list.
 
 ## More
 
