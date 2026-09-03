@@ -134,13 +134,10 @@ func (r *rig) seed(path string, bodies ...string) store.Entry {
 // client that assumed the next frame was its reply would be testing a client
 // nobody can write.
 //
-// It speaks protocol 3 unless a test lowers proto to 2. In protocol 3 every
-// request it sends gets a fresh id, the ids of requests still awaiting their
-// final reply are kept in order in pending, and every reply is checked against
-// the oldest: a reply carrying an id the client did not issue, or none where
-// one is owed, is a protocol violation and fails the test. In protocol 2 the
-// checks invert, and any id or `retryable` in a reply fails the test, because a
-// protocol 2 session must be answered exactly as protocol 2 was.
+// Every request it sends gets a fresh id, the ids of requests still awaiting
+// their final reply are kept in order in pending, and every reply is checked
+// against the oldest: a reply carrying an id the client did not issue, or none
+// where one is owed, is a protocol violation and fails the test.
 type client struct {
 	t       *testing.T
 	conn    *websocket.Conn
@@ -148,23 +145,11 @@ type client struct {
 	cancel  context.CancelFunc
 	name    string
 	batches []wire.Batch
-	proto   int
 	nextID  int64
 	pending []int64
-	// ready is set once the handshake reply has arrived. Before it the server
-	// may not know which protocol this client speaks, so an error refusing the
-	// connection outright is allowed to be plain; after it, never.
-	ready bool
 }
 
 func (r *rig) dial(name string) *client { return r.dialWith(name, nil) }
-
-// dialProto is dial for a client speaking an older protocol.
-func (r *rig) dialProto(name string, proto int) *client {
-	c := r.dialWith(name, nil)
-	c.proto = proto
-	return c
-}
 
 // dialWith is dial with the library's options exposed, for the tests that need
 // to see a ping arrive or to act before the pong goes back.
@@ -177,23 +162,23 @@ func (r *rig) dialWith(name string, opts *websocket.DialOptions) *client {
 		r.t.Fatalf("dial: %v", err)
 	}
 	conn.SetReadLimit(ReadLimit)
-	c := &client{t: r.t, conn: conn, ctx: ctx, cancel: cancel, name: name, proto: wire.Proto}
+	c := &client{t: r.t, conn: conn, ctx: ctx, cancel: cancel, name: name}
 	r.t.Cleanup(func() { conn.CloseNow(); cancel() })
 	return c
 }
 
 // sendJSON writes one frame. A wire.In with no id gets the next one when the
-// client speaks protocol 3 and the op expects a reply; a test that wants to
-// send a particular id, or none, sets ID itself and uses sendRaw.
+// op expects a reply; a test that wants to send a particular id, or none, sets
+// ID itself and uses sendRaw.
 func (c *client) sendJSON(v any) {
 	c.t.Helper()
 	if in, ok := v.(wire.In); ok {
-		if c.proto >= 3 && in.Op != "ping" && in.ID == 0 {
+		if in.Op != "ping" && in.ID == 0 {
 			c.nextID++
 			in.ID = c.nextID
 		}
 		if in.Proto == 0 && in.Op == "hello" {
-			in.Proto = c.proto
+			in.Proto = wire.Proto
 		}
 		if in.ID != 0 {
 			c.pending = append(c.pending, in.ID)
@@ -229,15 +214,6 @@ func (c *client) check(data []byte) {
 	if err := json.Unmarshal(data, &probe); err != nil || probe.Res == "" {
 		return
 	}
-	if c.proto < 3 {
-		if probe.ID != nil {
-			c.t.Fatalf("%s: a protocol %d session was sent an id: %s", c.name, c.proto, data)
-		}
-		if probe.Retryable != nil {
-			c.t.Fatalf("%s: a protocol %d session was sent retryable: %s", c.name, c.proto, data)
-		}
-		return
-	}
 	switch probe.Res {
 	case "pong":
 		if probe.ID != nil {
@@ -245,14 +221,15 @@ func (c *client) check(data []byte) {
 		}
 		return
 	case "err":
-		if probe.Retryable == nil && (c.ready || probe.ID != nil) {
-			c.t.Fatalf("%s: a protocol 3 error carries no retryable: %s", c.name, data)
+		// Every error carries the verdict, including the ones sent before the
+		// handshake got far enough to say anything else.
+		if probe.Retryable == nil {
+			c.t.Fatalf("%s: an error carries no retryable: %s", c.name, data)
 		}
 		if probe.ID == nil {
 			return // unsolicited: the reason the connection is closing
 		}
 	case "ready":
-		c.ready = true
 		if probe.ID == nil {
 			c.t.Fatalf("%s: ready carries no id: %s", c.name, data)
 		}
@@ -369,8 +346,8 @@ func (c *client) recvBinary() []byte {
 }
 
 // fetch asks for the named chunks and returns their bodies in the order asked,
-// consuming the `bodies` header a protocol 3 session is sent first and checking
-// it promises exactly as many frames as were asked for.
+// consuming the `bodies` header sent first and checking it promises exactly as
+// many frames as were asked for.
 func (c *client) fetch(names ...string) [][]byte {
 	c.t.Helper()
 	c.sendJSON(wire.In{Op: "fetch", Chunks: names})
@@ -382,13 +359,9 @@ func (c *client) fetch(names ...string) [][]byte {
 	return out
 }
 
-// expectBodies reads the `bodies` header a protocol 3 fetch is answered with,
-// and reads nothing in protocol 2, where there is none.
+// expectBodies reads the `bodies` header a fetch is answered with.
 func (c *client) expectBodies(n int) {
 	c.t.Helper()
-	if c.proto < 3 {
-		return
-	}
 	var b wire.Bodies
 	c.recvInto("bodies", &b)
 	if b.Count != n {

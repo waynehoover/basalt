@@ -114,7 +114,7 @@ func cmdStats(args []string, out io.Writer) error {
 		}
 		fmt.Fprintf(out, "vault %q\n", v)
 		fmt.Fprintf(out, "  %d files, %d folders, %s of notes as the devices see them\n",
-			s.Files, s.Folders, human(s.Bytes))
+			s.Files, s.Folders, humanBytes(s.Bytes))
 		// Deleted and recoverable are two facts, and conflating them told
 		// people a purged note was safe. Only spelled out when they differ, so
 		// the ordinary line stays one number.
@@ -204,17 +204,4 @@ func writeStatsJSON(out io.Writer, st *store.Store, vaults []string, bodies int)
 	enc := json.NewEncoder(out)
 	enc.SetIndent("", "  ")
 	return enc.Encode(rep)
-}
-
-func human(n int64) string {
-	switch {
-	case n < 1024:
-		return fmt.Sprintf("%d B", n)
-	case n < 1024*1024:
-		return fmt.Sprintf("%.1f KiB", float64(n)/1024)
-	case n < 1024*1024*1024:
-		return fmt.Sprintf("%.1f MiB", float64(n)/(1024*1024))
-	default:
-		return fmt.Sprintf("%.2f GiB", float64(n)/(1024*1024*1024))
-	}
 }

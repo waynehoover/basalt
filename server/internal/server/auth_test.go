@@ -36,10 +36,10 @@ func authRig(t *testing.T) (*store.Store, Authenticator) {
 func TestAnUnclaimedVaultIsOpenedOnlyByTheBootstrapToken(t *testing.T) {
 	_, auth := authRig(t)
 
-	if _, err := auth(Credentials{VaultID: "v", Token: "not-the-bootstrap", Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: "not-the-bootstrap", Claim: longKey, Wrapped: testWrapped}); err == nil {
 		t.Fatal("an unclaimed vault accepted a token that was not the bootstrap")
 	}
-	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey, Wrapped: testWrapped}); err != nil {
 		t.Fatalf("the bootstrap token did not open an unclaimed vault: %v", err)
 	}
 }
@@ -49,11 +49,11 @@ func TestAnUnclaimedVaultIsOpenedOnlyByTheBootstrapToken(t *testing.T) {
 // this exists to remove.
 func TestTheBootstrapStopsWorkingOnceTheVaultIsClaimed(t *testing.T) {
 	_, auth := authRig(t)
-	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey, Wrapped: testWrapped}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
-	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey, Wrapped: testWrapped}); err == nil {
 		t.Fatal("the bootstrap token still opens the vault after it was claimed")
 	}
 	if _, err := auth(Credentials{VaultID: "v", Token: longKey}); err != nil {
@@ -68,13 +68,13 @@ func TestTheBootstrapStopsWorkingOnceTheVaultIsClaimed(t *testing.T) {
 // offers, or the first device would be locked out of its own notes.
 func TestAClaimedVaultCannotBeReclaimed(t *testing.T) {
 	_, auth := authRig(t)
-	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey, Wrapped: testWrapped}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey + "-two"}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey + "-two", Wrapped: testWrapped}); err == nil {
 		t.Fatal("a second device re-claimed the vault with the bootstrap")
 	}
-	if _, err := auth(Credentials{VaultID: "v", Token: longKey + "-two", Claim: longKey + "-two"}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: longKey + "-two", Claim: longKey + "-two", Wrapped: testWrapped}); err == nil {
 		t.Fatal("a second device claimed the vault by offering its own key as both")
 	}
 	if _, err := auth(Credentials{VaultID: "v", Token: longKey}); err != nil {
@@ -98,7 +98,7 @@ func TestClaimingNeedsAKey(t *testing.T) {
 func TestTheServerStoresAHashAndNotTheKey(t *testing.T) {
 	st, auth := authRig(t)
 	const key = longKey
-	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: key}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: key, Wrapped: testWrapped}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
@@ -121,7 +121,7 @@ func TestTheServerStoresAHashAndNotTheKey(t *testing.T) {
 // which is what claiming does if it is allowed to invent what it claims.
 func TestOnlyTheServedVaultCanBeClaimed(t *testing.T) {
 	st, auth := authRig(t)
-	if _, err := auth(Credentials{VaultID: "typo", Token: bootstrap, Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "typo", Token: bootstrap, Claim: longKey, Wrapped: testWrapped}); err == nil {
 		t.Fatal("a vault this server does not serve was claimed")
 	}
 	vaults, err := st.Vaults()
@@ -140,12 +140,35 @@ func TestOnlyTheServedVaultCanBeClaimed(t *testing.T) {
 func TestAVaultWillNotBeBoundToAGuessableKey(t *testing.T) {
 	_, auth := authRig(t)
 	for _, claim := range []string{"", "x", "short", strings.Repeat("a", MinClaimLength-1)} {
-		if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: claim}); err == nil {
+		if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: claim, Wrapped: testWrapped}); err == nil {
 			t.Fatalf("the vault was bound to a %d character key", len(claim))
 		}
 	}
-	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey, Wrapped: testWrapped}); err != nil {
 		t.Fatalf("a proper key was refused: %v", err)
+	}
+}
+
+// A vault is claimed with a data key, and the authenticator is the layer that
+// writes the row, so it refuses a claim without one even though the session
+// already did. While a vault could be claimed without a data key, a server
+// could choose which key schedule a client used by leaving `wrapped` out of
+// `ready`. There is no longer a vault for it to choose between.
+func TestAVaultIsNotClaimedWithoutADataKey(t *testing.T) {
+	st, auth := authRig(t)
+	for _, w := range []string{"", "not base64url!", strings.Repeat("A", store.MaxWrappedLen+1)} {
+		if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey, Wrapped: w}); err == nil {
+			t.Fatalf("a vault was claimed with a %d byte wrapped key", len(w))
+		}
+		if hash, _ := st.AuthHash("v"); hash != "" {
+			t.Fatal("a refused claim bound the vault anyway")
+		}
+	}
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey, Wrapped: testWrapped}); err != nil {
+		t.Fatalf("a claim carrying a data key was refused: %v", err)
+	}
+	if w, _ := st.Wrapped("v"); w != testWrapped {
+		t.Fatalf("the claimed vault stored wrapped %q", w)
 	}
 }
 
@@ -160,7 +183,7 @@ func TestAServerWithNoBootstrapClaimsNothing(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	auth := DerivedAuth(st, "v", "", func() int64 { return 1 })
 
-	if _, err := auth(Credentials{VaultID: "v", Token: "", Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: "", Claim: longKey, Wrapped: testWrapped}); err == nil {
 		t.Fatal("an empty token claimed a vault from a server with no bootstrap")
 	}
 }

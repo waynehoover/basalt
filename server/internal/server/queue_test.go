@@ -18,7 +18,7 @@ import (
 )
 
 // The send queue, the keepalive that has to live alongside it, and the
-// handover from catch-up to live delivery. TODO.md S1, S2, S8 and S10.
+// handover from catch-up to live delivery. Review findings S1, S2, S8 and S10.
 
 // seedBodies puts n one-mebibyte bodies in the vault and returns their names,
 // so a fetch can be made to carry several times the send budget.

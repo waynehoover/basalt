@@ -36,6 +36,10 @@ import (
 // authenticate is refused by every reader for ever.
 const testMac = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
+// A wrapped data key of the shape a client produces: 60 bytes in base64url.
+// Every claim carries one, because every claimed vault has a data key.
+const testWrapped = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
 // seeded builds a data directory with some history in it, the way a server
 // would have, and returns its path.
 func seeded(t *testing.T) string {
@@ -1150,7 +1154,8 @@ func TestI25TheCapFlagsReachReady(t *testing.T) {
 		defer conn.CloseNow()
 		cl := &wsClient{t: t, conn: conn, ctx: wsCtx}
 		cl.write(wire.In{Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
-			Token: bootstrapToken(t, out.String()), Claim: strings.Repeat("k", 43), Device: "probe"})
+			Token: bootstrapToken(t, out.String()), Claim: strings.Repeat("k", 43),
+			Wrapped: testWrapped, Device: "probe"})
 		ready := cl.readJSON()
 		if ready["res"] != "ready" {
 			t.Fatalf("wanted ready, got %v", ready)

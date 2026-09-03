@@ -21,7 +21,10 @@ import (
 func newBareSession(t *testing.T, depth int) *Session {
 	t.Helper()
 	return &Session{
-		out:  make(chan outFrame, depth),
+		out: make(chan outFrame, depth),
+		// A real server, because every s.srv dereference in the session is
+		// unguarded: an overflow in deliver calls kill, and kill logs.
+		srv:  &Server{log: testLogger()},
 		dead: make(chan struct{}),
 	}
 }
@@ -365,10 +368,10 @@ func TestCommitAndAnnounceCannotBeInterleaved(t *testing.T) {
 		wg.Add(1)
 		go func(i int, s *Session) {
 			defer wg.Done()
-			if _, _, err := s.commit(store.Entry{
+			if _, refusal := s.commit(store.Entry{
 				Path: fmt.Sprintf("f%d.md", i), MTime: 1, Device: "d", Mac: testMac,
-			}); err != nil {
-				t.Errorf("commit: %v", err)
+			}); refusal != nil {
+				t.Errorf("commit refused: %s: %s", refusal.Code, refusal.Msg)
 			}
 		}(i, s)
 	}

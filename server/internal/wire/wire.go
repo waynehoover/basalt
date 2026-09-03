@@ -19,23 +19,24 @@ import "github.com/waynehoover/basalt-sync/server/internal/store"
 // negotiated: interoperating with a version we have not seen is how a silent
 // incompatibility gets shipped.
 //
-// Protocol 2 added the per-entry authenticator. A client older than that sends
-// entries nothing can verify, and one newer refuses them, which is a refusal
-// rather than a negotiation for the usual reason.
+// Both are 3, and 3 is the only protocol there has ever been in the wild.
+// Protocols 1 and 2 were removed before anything was deployed, so there is no
+// vault and no device that speaks them, and a session either speaks 3 or was
+// refused at hello.
 //
-// Protocol 3 added request ids, the `bodies` header on a fetch, `retryable` on
-// every error, the batch and fetch caps in `ready`, and the wrapped data key
-// with `rotate`. The server answers a session in the version the client asked
-// for, so a protocol 2 device keeps working for one release while the others
-// are upgraded. docs/protocol.md, "Protocol 2 sessions".
+// The two constants, the range check at hello and the refusal that names the
+// client's number, the server's range and `serverVersion` are kept anyway.
+// They are about ten lines, and they are how the next protocol bump is done:
+// when protocol 4 arrives its compatibility shim gets written then, against a
+// protocol 3 that has actually run. Do not delete them as dead weight.
 const (
 	Proto    = 3
-	MinProto = 2
+	MinProto = 3
 )
 
 // MaxRequestID bounds a client-chosen request id: an integer from 1 to 2^32-1.
-// Zero is "no id", which is what a protocol 2 request carries, so the two are
-// never confused.
+// Zero is not a legal id, which is what makes a request that carries none
+// detectable rather than indistinguishable from one that carries id 0.
 const MaxRequestID = 1<<32 - 1
 
 // Crypto names the client-side scheme. It is a string rather than an integer
@@ -95,6 +96,16 @@ const (
 	// with both sides reporting success. It is refused instead, because a
 	// refusal is reversible and silent divergence is not.
 	CodeCursor = "cursor"
+	// CodeRotated is a rotate that lost the race: the vault's credential is no
+	// longer the one this session authenticated under, because another device
+	// rotated first.
+	//
+	// Distinct from `auth` because it answers a request rather than the
+	// connection, and distinct from `internal` because nothing went wrong: the
+	// vault has a new owner and this device is not it. Retrying the same rotate
+	// cannot succeed, so it is not retryable, and the session ends, because the
+	// credential it is holding no longer opens the vault.
+	CodeRotated = "rotated"
 )
 
 /* ---------------------------------------------------------------- *
@@ -111,9 +122,10 @@ type In struct {
 	Op string `json:"op"`
 
 	// ID is the client's request id, echoed on the reply and on any error
-	// refusing it. Zero on a protocol 2 request, which carries none. Before
-	// ids, a reply was matched to the one request in flight by position, and
-	// three separate client defects came from that; see docs/protocol.md.
+	// refusing it. Every request that expects a reply carries one; a request
+	// that does not ends the session. Before ids, a reply was matched to the
+	// one request in flight by position, and three separate client defects
+	// came from that; see docs/protocol.md.
 	ID int64 `json:"id,omitempty"`
 
 	// hello
@@ -129,9 +141,11 @@ type In struct {
 	// and a device that never sends it can still be the first.
 	Claim string `json:"claim,omitempty"`
 	// Wrapped is the vault's data key, wrapped under a key derived from the
-	// root secret, sent beside Claim by a protocol 3 device and stored with the
-	// auth hash. Opaque here: the server holds neither key. On a rotate it is
-	// the same data key wrapped under the new root.
+	// root secret, sent beside Claim and stored with the auth hash. Opaque
+	// here: the server holds neither key. A claim without a valid one is
+	// refused, so every claimed vault has a data key and no session can be
+	// steered onto a schedule that derives content keys from the root. On a
+	// rotate it is the same data key wrapped under the new root.
 	Wrapped string `json:"wrapped,omitempty"`
 
 	// rotate: the new auth key, whose hash replaces the stored one.
@@ -251,7 +265,13 @@ type PutMeta struct {
 
 // Entry converts a put into the store's record. The uid is assigned on commit
 // and is deliberately not settable by a client.
-func (in In) Entry() store.Entry {
+//
+// The device is the session's and is passed in, exactly as it is for one entry
+// of a batch. Reading it off the message would let a device write under another
+// device's name, and a device name is what a person reads next to a version to
+// work out where it came from. Taking it as an argument makes that unwritable
+// rather than something the caller has to remember to overwrite.
+func (in In) Entry(device string) store.Entry {
 	return store.Entry{
 		Path:    in.Path,
 		Size:    in.Meta.Size,
@@ -259,7 +279,7 @@ func (in In) Entry() store.Entry {
 		MTime:   in.Meta.MTime,
 		Folder:  in.Meta.Folder,
 		Deleted: in.Meta.Deleted,
-		Device:  in.Device,
+		Device:  device,
 		Prev:    in.Meta.Prev,
 		Chunks:  in.Chunks,
 		Mac:     in.Mac,
@@ -281,10 +301,10 @@ func (in In) Entry() store.Entry {
 // announces what it has, the server answers with what it has, and neither
 // remembers a verdict from last time.
 //
-// Proto is the version this session speaks, which is the one the client asked
-// for. MinProto and ServerVersion are there so a refused or puzzled client can
-// name both ends in its error. The two caps and Wrapped are new in protocol 3;
-// a protocol 2 client ignores the caps and is never sent Wrapped.
+// Proto is the version this session speaks and MinProto the oldest this server
+// answers. Both are wire.Proto today, and they are sent anyway so a puzzled
+// client can name both ends in its error, and so the next protocol bump has
+// something to negotiate with.
 type Ready struct {
 	Res           string `json:"res"` // "ready"
 	ID            int64  `json:"id,omitempty"`
@@ -297,9 +317,11 @@ type Ready struct {
 	MaxChunks     int    `json:"maxChunks"`
 	MaxBatchBytes int64  `json:"maxBatchBytes"`
 	MaxFetchBytes int64  `json:"maxFetchBytes"`
-	// Wrapped is the vault's wrapped data key when it has one. Absent for a
-	// vault claimed under protocol 2, which is how a client learns which key
-	// schedule applies; docs/protocol.md, "The data key".
+	// Wrapped is the vault's wrapped data key. Every claimed vault has one,
+	// because a claim without one is refused, so this is always present on a
+	// session the server let through; docs/protocol.md, "The data key". It is
+	// omitted only for a vault nothing has claimed, which no device can reach
+	// past the handshake.
 	Wrapped string `json:"wrapped,omitempty"`
 }
 
@@ -375,12 +397,11 @@ type Chunks struct {
 	Chunks []string `json:"chunks"`
 }
 
-// Bodies answers a protocol 3 fetch and says exactly how many binary frames
-// follow, in the order asked. A fetch is answered by this or by an Err, never
-// by bodies and then an error: a client that received three frames and then a
-// refusal could not tell which three, and stale bodies from a refused fetch
-// used to be consumed as the answer to the next one. A protocol 2 session
-// gets the bodies with no header, as it always did.
+// Bodies answers a fetch and says exactly how many binary frames follow, in
+// the order asked. A fetch is answered by this or by an Err, never by bodies
+// and then an error: a client that received three frames and then a refusal
+// could not tell which three, and stale bodies from a refused fetch used to be
+// consumed as the answer to the next one.
 type Bodies struct {
 	Res   string `json:"res"` // "bodies"
 	ID    int64  `json:"id,omitempty"`
@@ -487,38 +508,31 @@ type AckResult struct {
 
 // Err is every rejection.
 //
-// ID is present when the error answers a request, and absent on the one
-// unsolicited error the server sends, the shutdown or rotation notice, which a
-// client reads as the reason the connection is about to close.
+// ID is present when the error answers a request, and absent on the errors the
+// server sends unasked, the shutdown and rotation notices, which a client reads
+// as the reason the connection is about to close.
 //
-// Retryable is a pointer so that a protocol 2 session, which never had the
-// field, is sent exactly the shape it always was. In a protocol 3 session it
-// is always set, from the table in Retryable below, so a client has nothing to
-// interpret: back off and reconnect on true, stop on false. RetryAfterMs is a
-// hint that travels with `busy`.
+// Retryable is always sent, from the table in Retryable below, so a client has
+// nothing to interpret: back off and reconnect on true, stop on false. It is a
+// plain bool with no omitempty precisely so that an error without it cannot be
+// built; an error a client has to guess about is how a watching device ends up
+// either giving up or hot-looping. RetryAfterMs is a hint that travels with
+// `busy`.
 type Err struct {
 	Res          string `json:"res"` // "err"
 	ID           int64  `json:"id,omitempty"`
 	Code         string `json:"code"`
 	Msg          string `json:"msg"`
-	Retryable    *bool  `json:"retryable,omitempty"`
+	Retryable    bool   `json:"retryable"`
 	RetryAfterMs int64  `json:"retryAfterMs,omitempty"`
 }
 
-// Error is a protocol 2 shaped rejection: code and message and nothing else.
-func Error(code, msg string) Err { return Err{Res: "err", Code: code, Msg: msg} }
-
-// ForProto3 fills in what a protocol 3 client expects: the id of the request
-// being refused, or zero for an unsolicited error, and the retryable verdict
-// for the code. retryAfterMs is sent only when positive.
-func (e Err) ForProto3(id, retryAfterMs int64) Err {
-	r := Retryable(e.Code)
-	e.ID = id
-	e.Retryable = &r
-	if retryAfterMs > 0 {
-		e.RetryAfterMs = retryAfterMs
-	}
-	return e
+// Error is a rejection: the code, the message for the human, and the retryable
+// verdict the code implies. The id and any retryAfterMs hint are filled in by
+// whoever is about to send it, which is the only place that knows whether a
+// request is being answered.
+func Error(code, msg string) Err {
+	return Err{Res: "err", Code: code, Msg: msg, Retryable: Retryable(code)}
 }
 
 // Retryable says whether reconnecting later can succeed where retrying the same

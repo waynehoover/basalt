@@ -133,20 +133,6 @@ func TestI23InviteRefusals(t *testing.T) {
 		a.sendJSON(wire.In{Op: "ping"})
 		a.recvInto("pong", &wire.Pong{})
 	})
-	t.Run("a protocol 2 session has no invite", func(t *testing.T) {
-		r := newRigDerived(t)
-		claimedNoKey(t, r, "a").conn.CloseNow()
-		cl := r.dialProto("old", 2)
-		cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "old"})
-		cl.recvInto("ready", &wire.Ready{})
-		cl.recvInto("caught-up", &wire.CaughtUp{})
-		cl.sendJSON(wire.In{Op: "invite", Invite: testInvite, Sealed: testSealed})
-		cl.expectErr(wire.CodeProtoState)
-		// And a protocol 2 hello carrying an invite is an ordinary auth failure.
-		old := r.dialProto("old2", 2)
-		old.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Invite: testInvite, Device: "old2"})
-		old.expectErr(wire.CodeAuth)
-	})
 	t.Run("an unclaimed vault has nothing to redeem", func(t *testing.T) {
 		r := newRigDerived(t)
 		if f := redeem(t, r, testInvite); f["code"] != wire.CodeAuth {

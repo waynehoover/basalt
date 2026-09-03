@@ -171,7 +171,7 @@ func dialFirstDevice(t *testing.T, url, token string) *wsClient {
 	cl := &wsClient{t: t, conn: conn, ctx: ctx}
 	cl.write(wire.In{
 		Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
-		Token: token, Claim: strings.Repeat("k", 43), Device: "test-device",
+		Token: token, Claim: strings.Repeat("k", 43), Wrapped: testWrapped, Device: "test-device",
 	})
 	if res := cl.readJSON(); res["res"] != "ready" {
 		t.Fatalf("wanted ready, got %v", res)

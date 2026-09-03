@@ -15,6 +15,8 @@ const (
 	sealed1  = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 	hash1    = "0000000000000000000000000000000000000000000000000000000000000001"
 	hash2    = "0000000000000000000000000000000000000000000000000000000000000002"
+	hash3    = "0000000000000000000000000000000000000000000000000000000000000003"
+	wrapped3 = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCD"
 )
 
 func TestI5ClaimStoresHashAndWrappedTogether(t *testing.T) {
@@ -54,7 +56,7 @@ func TestI5RotateSwapsBothOrNeither(t *testing.T) {
 	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Rotate("v1", hash2, wrapped2); err != nil {
+	if err := h.Rotate("v1", hash1, hash2, wrapped2); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 	gotHash, _ := h.AuthHash("v1")
@@ -63,29 +65,19 @@ func TestI5RotateSwapsBothOrNeither(t *testing.T) {
 		t.Fatalf("after rotate hash=%q wrapped=%q", gotHash, gotWrapped)
 	}
 
-	// No data key: refused, and nothing changed.
-	if _, err := h.ClaimVault("v2", hash1, "", 1); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.Rotate("v2", hash2, wrapped2); !errors.Is(err, ErrNoDataKey) {
-		t.Fatalf("err = %v, want ErrNoDataKey", err)
-	}
-	if got, _ := h.AuthHash("v2"); got != hash1 {
-		t.Fatalf("a refused rotate changed the hash to %q", got)
-	}
 	// Unclaimed: refused.
-	if err := h.Rotate("v3", hash2, wrapped2); !errors.Is(err, ErrUnknownVault) {
+	if err := h.Rotate("v3", hash1, hash2, wrapped2); !errors.Is(err, ErrUnknownVault) {
 		t.Fatalf("err = %v, want ErrUnknownVault", err)
 	}
 	// Malformed: refused.
-	if err := h.Rotate("v1", hash1, "nope!"); !errors.Is(err, ErrBadEntry) {
+	if err := h.Rotate("v1", hash2, hash1, "nope!"); !errors.Is(err, ErrBadEntry) {
 		t.Fatalf("err = %v, want ErrBadEntry", err)
 	}
 }
 
 // The wrapped key is a row in the database, so a backup carries it and a
 // restore hands it to every device. Checked rather than assumed, because a
-// backup without it is one every protocol 3 device would find unopenable.
+// backup without it is one every device would find unopenable.
 func TestI5TheWrappedKeySurvivesBackupAndRestore(t *testing.T) {
 	h := newTestStore(t)
 	h.file(t, "note.md", "content")
@@ -196,5 +188,106 @@ func TestI23InvitesTravelInTheBackup(t *testing.T) {
 	sealed, ok, err := restored.RedeemInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", 2000)
 	if err != nil || !ok || sealed != sealed1 {
 		t.Fatalf("redeem from the restored store: %q %v %v", sealed, ok, err)
+	}
+}
+
+// Rotation is a compare-and-swap against the hash the caller authenticated
+// under, so two devices connected under one root cannot both rotate.
+//
+// The old condition was `auth_hash != ”`, which any claimed vault meets. Both
+// callers here would have succeeded under it, and the vault would have ended up
+// with whichever hash was written last, which is how a device that was being
+// revoked came to own the vault.
+func TestRotateIsACompareAndSwapAgainstTheCallersHash(t *testing.T) {
+	h := newTestStore(t)
+	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Both devices hold hash1 and both rotate. Started together, so which one
+	// reaches the write lock first is the operating system's choice.
+	type attempt struct {
+		hash, wrapped string
+		err           error
+	}
+	results := make(chan attempt, 2)
+	start := make(chan struct{})
+	for _, a := range []attempt{{hash2, wrapped2, nil}, {hash3, wrapped3, nil}} {
+		go func(a attempt) {
+			<-start
+			a.err = h.Rotate("v1", hash1, a.hash, a.wrapped)
+			results <- a
+		}(a)
+	}
+	close(start)
+
+	var winners, losers int
+	var won attempt
+	for range 2 {
+		a := <-results
+		switch {
+		case a.err == nil:
+			winners++
+			won = a
+		case errors.Is(a.err, ErrRotated):
+			losers++
+		default:
+			t.Fatalf("rotating to %s failed with %v, want nil or ErrRotated", a.hash, a.err)
+		}
+	}
+	if winners != 1 || losers != 1 {
+		t.Fatalf("%d rotations succeeded and %d were refused, want one of each", winners, losers)
+	}
+
+	// And the row is the winner's, both columns, with the generation moved once.
+	gotHash, _ := h.AuthHash("v1")
+	gotWrapped, _ := h.Wrapped("v1")
+	if gotHash != won.hash || gotWrapped != won.wrapped {
+		t.Fatalf("the vault holds hash=%q wrapped=%q, and %q won", gotHash, gotWrapped, won.hash)
+	}
+	if n, err := h.Rotations("v1"); err != nil || n != 1 {
+		t.Fatalf("rotations = %d, %v, want 1", n, err)
+	}
+
+	// The loser retrying with the same stale hash is refused again, for ever:
+	// it is not the vault's credential any more.
+	if err := h.Rotate("v1", hash1, hash2, wrapped2); !errors.Is(err, ErrRotated) {
+		t.Fatalf("err = %v, want ErrRotated", err)
+	}
+}
+
+// The generation moves with the credential and only with it, so a session can
+// tell a vault that was rotated under it from one that was not.
+func TestRotationsCountsRotationsAndNothingElse(t *testing.T) {
+	h := newTestStore(t)
+	if n, err := h.Rotations("never-claimed"); err != nil || n != 0 {
+		t.Fatalf("an unknown vault has generation %d, %v", n, err)
+	}
+	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := h.Rotations("v1"); n != 0 {
+		t.Fatalf("claiming moved the generation to %d", n)
+	}
+	if err := h.Rotate("v1", hash1, hash2, wrapped2); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Rotate("v1", hash2, hash3, wrapped3); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := h.Rotations("v1"); n != 2 {
+		t.Fatalf("after two rotations the generation is %d", n)
+	}
+	// A refused rotation does not move it.
+	if err := h.Rotate("v1", hash1, hash2, wrapped2); !errors.Is(err, ErrRotated) {
+		t.Fatalf("err = %v, want ErrRotated", err)
+	}
+	if n, _ := h.Rotations("v1"); n != 2 {
+		t.Fatalf("a refused rotation moved the generation to %d", n)
+	}
+	// VaultKeys reads all three from one row.
+	hash, wrapped, gen, err := h.VaultKeys("v1")
+	if err != nil || hash != hash3 || wrapped != wrapped3 || gen != 2 {
+		t.Fatalf("VaultKeys = %q %q %d, %v", hash, wrapped, gen, err)
 	}
 }

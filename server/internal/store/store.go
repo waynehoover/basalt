@@ -91,8 +91,8 @@ const (
 	// vault name is the same kind of thing.
 	MaxVaultLen = 64
 
-	// MaxWrappedLen bounds the wrapped data key a protocol 3 device stores at
-	// claim. The real thing is 60 bytes of nonce and AES-GCM output, 80
+	// MaxWrappedLen bounds the wrapped data key a device stores at claim. The
+	// real thing is 60 bytes of nonce and AES-GCM output, 80
 	// characters in base64url; 256 leaves room for a scheme that pads without
 	// letting an authenticated client park kilobytes in a row the server hands
 	// to every device at hello.
@@ -154,6 +154,19 @@ var (
 	// ErrOverBudget is an entry referencing more ciphertext than its declared
 	// plaintext size can account for. See CiphertextBudget.
 	ErrOverBudget = errors.New("entry references more ciphertext than its declared size allows")
+
+	// ErrRotated is a rotation whose compare-and-swap found another hash in
+	// the row: somebody else rotated the vault between this session's
+	// authentication and its rotate.
+	//
+	// It is a distinct error rather than ErrUnknownVault because the two mean
+	// opposite things to the caller. An unknown vault is nothing to replace; a
+	// lost race is a vault that now belongs to a credential this session does
+	// not hold, and the one thing it must not do is replace it anyway. That is
+	// exactly what an unconditional update did: two devices connected under one
+	// root both rotated, the second overwrote the first, and the device the
+	// first was revoking owned the vault.
+	ErrRotated = errors.New("the vault was rotated by another device")
 )
 
 // Entry is one version of one file.
@@ -180,8 +193,8 @@ type Entry struct {
 	// names the version it was written on top of. Both are the client's, both
 	// are opaque here, and the server can check neither: it holds no key. It
 	// stores them and hands them back so that the devices can, which is the
-	// whole point. Before protocol 2 an entry had neither and a server could say
-	// anything about a file it had never been told about.
+	// whole point. An entry without them is one a server could say anything
+	// about: which is why every entry has them.
 	// Always sent, never omitted. An absent field arrives as undefined rather
 	// than as the empty string, and a parent of "" is a real value: the first
 	// version of a file, written on top of nothing.
@@ -228,11 +241,25 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- yields every byte of ciphertext without also handing over the credential.
   auth_hash  TEXT    NOT NULL DEFAULT '',
   -- The vault's data key, wrapped by the first device under a key derived
-  -- from the root secret, or empty for a vault claimed under protocol 2. The
-  -- server cannot open it and never needs to; it stores it so every device
-  -- holding the root secret can, and so a rotate can swap hash and blob in
-  -- one statement without any device losing the history sealed under it.
-  wrapped    TEXT    NOT NULL DEFAULT ''
+  -- from the root secret, and empty only before a device has claimed the
+  -- vault. The server cannot open it and never needs to; it stores it so
+  -- every device holding the root secret can, and so a rotate can swap hash
+  -- and blob in one statement without any device losing the history sealed
+  -- under it.
+  wrapped    TEXT    NOT NULL DEFAULT '',
+  -- How many times the vault's secret has been rotated. Bumped inside the
+  -- rotation transaction, so it moves at exactly the moment the credential
+  -- and the blob do.
+  --
+  -- It exists because authenticating, reading the blob, joining the fan-out
+  -- and rotating are four steps, not one. A device that passed auth under the
+  -- old root and paused before joining would join after the rotation's
+  -- eviction had already swept the hub, and go on reading and writing under a
+  -- credential the vault no longer knows. A session captures this number with
+  -- the hash it authenticated under and checks it again after joining; if it
+  -- moved, the session is refused. Reading hash and blob in one query does not
+  -- close that, because the window is after the read.
+  rotations  INTEGER NOT NULL DEFAULT 0
 );
 
 -- Single-use invites for adding a device without showing the root secret
@@ -374,9 +401,6 @@ func (s *Store) Chunks() *chunks.Store { return s.chunks }
 
 // EnsureVault creates the vault row if it is absent. now is milliseconds.
 func (s *Store) EnsureVault(vaultID string, now int64) error {
-	if vaultID == "" {
-		return fmt.Errorf("%w: empty vault id", ErrBadEntry)
-	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	return s.ensureVaultLocked(vaultID, now)
@@ -397,8 +421,6 @@ func (s *Store) ensureVaultLocked(vaultID string, now int64) error {
  * Writing
  * ---------------------------------------------------------------- */
 
-// Validate checks an entry's shape. Exported so the session can reject a put
-// before reading any body, and so the reason is the same one in both places.
 // isHex64 is the shape of a SHA-256 digest written out, which is what both the
 // authenticator and the parent name are.
 func isHex64(v string) bool {
@@ -414,6 +436,8 @@ func isHex64(v string) bool {
 	return true
 }
 
+// Validate checks an entry's shape. Exported so the session can reject a put
+// before reading any body, and so the reason is the same one in both places.
 func (e Entry) Validate() error {
 	if e.Path == "" {
 		return fmt.Errorf("%w: empty path", ErrBadEntry)
@@ -686,32 +710,6 @@ func (s *Store) HistoryForPath(vaultID, path string, beforeUID int64, limit int)
 	return s.manyEntries(vaultID, q, args...)
 }
 
-// Deleted returns paths whose newest version is a deletion.
-//
-// suppressRenames drops deletions that were really the source side of a rename.
-// Without it every rename shows up as a phantom deletion of a file that still
-// exists under another name, and a recovery list that is mostly noise is one
-// nobody reads.
-//
-// # Recognising the tail of a rename
-//
-// A rename is two entries: the new path carrying prev, and the old path
-// retired. The test for "this deletion is a rename" cannot be "some later entry
-// names this path as its prev", because a client does the two halves in
-// whichever order its scan reaches them, and the natural order is to publish
-// the new path first. That version of this query suppressed one order and not
-// the other, and the only test it had used the order clients do not produce.
-//
-// Nor can the ordering be dropped altogether. A path can be renamed away and
-// then used again by a new file, and the deletion of *that* file is real and
-// must be listed; a bare "anything ever named this as its prev" would hide it
-// forever.
-//
-// So the test is whether the rename happened after the version of this path
-// that is now being deleted, rather than after the deletion record itself:
-// there is no intervening incarnation of the path between the rename and the
-// deletion. That holds for both orders of the two halves, and stops holding as
-// soon as the path is reused.
 // DeletedMax is the most deletions one call will return.
 //
 // Bounded because a vault accumulates deletions for as long as it exists, and
@@ -737,6 +735,31 @@ type Deletion struct {
 
 // Deleted returns paths whose newest version is a deletion, newest first, and
 // whether there were more than it returned.
+//
+// suppressRenames drops deletions that were really the source side of a rename.
+// Without it every rename shows up as a phantom deletion of a file that still
+// exists under another name, and a recovery list that is mostly noise is one
+// nobody reads.
+//
+// # Recognising the tail of a rename
+//
+// A rename is two entries: the new path carrying prev, and the old path
+// retired. The test for "this deletion is a rename" cannot be "some later entry
+// names this path as its prev", because a client does the two halves in
+// whichever order its scan reaches them, and the natural order is to publish
+// the new path first. That version of this query suppressed one order and not
+// the other, and the only test it had used the order clients do not produce.
+//
+// Nor can the ordering be dropped altogether. A path can be renamed away and
+// then used again by a new file, and the deletion of *that* file is real and
+// must be listed; a bare "anything ever named this as its prev" would hide it
+// forever.
+//
+// So the test is whether the rename happened after the version of this path
+// that is now being deleted, rather than after the deletion record itself:
+// there is no intervening incarnation of the path between the rename and the
+// deletion. That holds for both orders of the two halves, and stops holding as
+// soon as the path is reused.
 func (s *Store) Deleted(vaultID string, suppressRenames bool, limit int) ([]Deletion, bool, error) {
 	q := `SELECT e.uid, e.path, e.size, e.ctime, e.mtime, e.folder, e.deleted, e.device, e.prev_path, e.mac, e.parent,
 	             COALESCE((SELECT MAX(r.uid) FROM entries r
@@ -820,15 +843,15 @@ func (s *Store) manyEntries(vaultID, query string, args ...any) ([]Entry, error)
 	return out, nil
 }
 
-// attachChunks fills in Chunks for every entry, in one query.
-//
-// It reads the whole uid span rather than one query per entry so that a batch of
-// 200 entries is two round trips, not 201.
 // listedUIDsMax bounds the IN list, because a parameter list is not free and
 // SQLite has its own ceiling on how many it will take. Above it the range read
 // is the better shape anyway: that many entries at once is a batch.
 const listedUIDsMax = 500
 
+// attachChunks fills in Chunks for every entry, in one query.
+//
+// It reads the whole uid span rather than one query per entry so that a batch of
+// 200 entries is two round trips, not 201.
 func attachChunks(tx *sql.Tx, vaultID string, entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
@@ -1148,6 +1171,13 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 // inTx runs fn in a transaction, committing if it returns nil and rolling back
 // otherwise. It is the shape a purge needs: an irreversible delete and the
 // checks that prove it right have to stand or fall together.
+//
+// The two key-material writes now rely on it for the same all-or-nothing
+// reason. AddInvite checks that the vault is claimed, sweeps the expired rows
+// and inserts; Rotate swaps the auth hash and the wrapped data key in one
+// statement and then deletes every outstanding invite, because they seal the
+// root being retired. Half of either is a vault whose credential and whose key
+// material disagree.
 func (s *Store) inTx(fn func(*sql.Tx) error) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1354,9 +1384,11 @@ func migrate(db *sql.DB) error {
 		return nil
 	}
 
-	// auth_hash arrived with the one-secret model, wrapped with protocol 3. A
-	// vault claimed before either keeps the empty string: it is unclaimed, or
-	// it has no data key, and both are states the code above understands.
+	// auth_hash arrived with the one-secret model, wrapped with the data key. A
+	// database written before either keeps the empty string in the new column.
+	// An unclaimed vault is an ordinary state; a claimed one with no data key
+	// is a vault an older build wrote, and the server refuses that session at
+	// hello rather than guessing at a key schedule that no longer exists.
 	for _, col := range []string{"auth_hash", "wrapped"} {
 		has, err := hasColumn(db, "vaults", col)
 		if err != nil {
@@ -1369,6 +1401,19 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// The rotation generation. A database written before it starts at zero,
+	// which is right: the count is only ever compared with itself, within one
+	// handshake, so where it starts does not matter and only that it moves
+	// does.
+	if has, err := hasColumn(db, "vaults", "rotations"); err != nil {
+		return err
+	} else if !has {
+		if _, err := db.Exec(
+			`ALTER TABLE vaults ADD COLUMN rotations INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+
 	// The index behind Deleted()'s rename suppression. CREATE INDEX IF NOT
 	// EXISTS in the schema covers a new database; this covers one that already
 	// existed.
@@ -1377,9 +1422,9 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 
-	// Entries carry their own authenticator from protocol 2 on. An older row
-	// has none and cannot be given one here, because the server has no key: it
-	// keeps the empty string, and a client refuses it.
+	// Every entry carries its own authenticator. A row written before the
+	// columns existed has none and cannot be given one here, because the server
+	// has no key: it keeps the empty string, and a client refuses it.
 	for _, col := range []string{"mac", "parent"} {
 		has, err := hasColumn(db, "entries", col)
 		if err != nil {
@@ -1538,8 +1583,9 @@ func (s *Store) InviteRows(vaultID string) (int, error) {
 	return n, err
 }
 
-// Wrapped returns the vault's wrapped data key, or empty for an unclaimed vault
-// and for one claimed under protocol 2, which has none.
+// Wrapped returns the vault's wrapped data key, or empty for a vault nothing
+// has claimed. A claimed vault with no key can only have come from an older
+// build, and the server refuses such a session at hello rather than serving it.
 func (s *Store) Wrapped(vaultID string) (string, error) {
 	var w string
 	err := s.db.QueryRow(`SELECT wrapped FROM vaults WHERE vault_id = ?`, vaultID).Scan(&w)
@@ -1549,17 +1595,58 @@ func (s *Store) Wrapped(vaultID string) (string, error) {
 	return w, err
 }
 
-// ClaimVault records the auth key hash, and the wrapped data key when the
-// device offered one, for a vault that has no hash yet, and reports whether
-// this call is the one that did it.
+// VaultKeys returns the vault's auth hash, its wrapped data key and how many
+// times it has been rotated. Hash and blob are empty for a vault nothing has
+// claimed.
+//
+// One query for the three, because they are three columns of the same row and
+// a hello wants all of them. It does not read the row for the whole hello,
+// though: a first device's claim writes hash and blob while it authenticates,
+// so the row is read once on each side of authentication rather than once
+// before it. Reading earlier would send that device an empty wrapped in ready.
+//
+// One query is also not on its own enough to keep a rotation from cutting
+// across a handshake. The window that matters is between this read and the
+// join, so the caller re-reads Rotations after joining; see the column's
+// comment in the schema.
+func (s *Store) VaultKeys(vaultID string) (hash, wrapped string, rotations int64, err error) {
+	err = s.db.QueryRow(
+		`SELECT auth_hash, wrapped, rotations FROM vaults WHERE vault_id = ?`,
+		vaultID).Scan(&hash, &wrapped, &rotations)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", 0, nil
+	}
+	return hash, wrapped, rotations, err
+}
+
+// Rotations is the vault's rotation generation on its own, for the re-read a
+// session does after joining the fan-out. Zero for a vault with no row, which
+// is also where a vault starts, so a vault that disappeared mid-handshake
+// reads as unrotated and is caught by the hash check instead.
+func (s *Store) Rotations(vaultID string) (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT rotations FROM vaults WHERE vault_id = ?`, vaultID).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return n, err
+}
+
+// ClaimVault records the auth key hash and the wrapped data key for a vault
+// that has no hash yet, and reports whether this call is the one that did it.
 //
 // The write is conditional in SQL rather than checked and then written, so two
 // devices arriving at once cannot both believe they claimed it. The loser is
 // told no and can decide what that means; silently accepting the second would
 // hand the vault to whichever connection happened to finish last. Hash and
-// blob go in one statement, because a vault with a hash and no blob would
-// read to every protocol 3 device as one claimed under protocol 2, and they
-// would seal under the wrong key schedule for ever.
+// blob go in one statement, because a vault with a hash and no blob is a vault
+// no device can open.
+//
+// An empty wrapped is not refused here, because this is the primitive and the
+// rule about what a claim must carry belongs where the claim arrives: the
+// session refuses one without a data key and DerivedAuth refuses it again.
+// Leaving the primitive able to write the row is also what lets a test build
+// the one an older build could have left behind, to check it is refused.
 func (s *Store) ClaimVault(vaultID, hash, wrapped string, now int64) (bool, error) {
 	if hash == "" {
 		return false, errors.New("refusing to claim a vault with an empty auth hash")
@@ -1584,23 +1671,31 @@ func (s *Store) ClaimVault(vaultID, hash, wrapped string, now int64) (bool, erro
 	return n == 1, err
 }
 
-// ErrNoDataKey is a rotate against a vault that has no wrapped data key: one
-// claimed under protocol 2, whose content keys derive from the root directly.
-// Swapping its auth hash would lock every device out of history nothing can
-// re-seal, so the only rotation such a vault has is a new vault.
-var ErrNoDataKey = errors.New("this vault has no data key, so its secret cannot be rotated in place")
-
-// Rotate replaces a claimed vault's auth hash and wrapped data key, and
-// deletes every invite on the vault, in one transaction, so there is no moment
-// at which the new credential opens a vault whose blob the new root cannot
-// unwrap, or the other way round, and no invite survives that would hand out
-// the root just retired.
+// Rotate replaces a claimed vault's auth hash and wrapped data key, bumps its
+// rotation generation, and deletes every invite on the vault, in one
+// transaction, so there is no moment at which the new credential opens a vault
+// whose blob the new root cannot unwrap, or the other way round, and no invite
+// survives that would hand out the root just retired.
 //
-// It refuses a vault with no blob (ErrNoDataKey) and an unclaimed one
-// (ErrUnknownVault), because both are states in which "rotate" does not mean
-// anything: the first has nothing to re-wrap and the second nothing to
-// replace.
-func (s *Store) Rotate(vaultID, hash, wrapped string) error {
+// It is a compare-and-swap, not an update: prevHash is the hash the caller
+// authenticated under, and the row is only replaced while it still holds that
+// hash. Zero rows affected on a claimed vault means somebody rotated first, and
+// the answer is ErrRotated rather than a quiet success.
+//
+// The condition used to be `auth_hash != ”`, which any claimed vault meets.
+// Two devices connected under one root both sent rotate; the first committed
+// and evicted the second, but closing a socket does not stop a database call
+// already in flight, so the second's unconditional update replaced the first's
+// and the revoked device owned the vault. A caller may only replace the
+// credential it proved it holds.
+//
+// An unclaimed vault, or one with no row, is refused with ErrUnknownVault,
+// because there is nothing to replace. There is no case for a vault with no
+// data key: a claim without one is refused, so every claimed vault has one.
+func (s *Store) Rotate(vaultID, prevHash, hash, wrapped string) error {
+	if prevHash == "" {
+		return errors.New("refusing to rotate without the hash the caller authenticated under")
+	}
 	if hash == "" {
 		return errors.New("refusing to rotate to an empty auth hash")
 	}
@@ -1612,20 +1707,10 @@ func (s *Store) Rotate(vaultID, hash, wrapped string) error {
 	defer s.writeMu.Unlock()
 
 	return s.inTx(func(tx *sql.Tx) error {
-		var current string
-		err := tx.QueryRow(`SELECT wrapped FROM vaults WHERE vault_id = ?`, vaultID).Scan(&current)
-		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: %q", ErrUnknownVault, vaultID)
-		}
-		if err != nil {
-			return err
-		}
-		if current == "" {
-			return ErrNoDataKey
-		}
 		res, err := tx.Exec(
-			`UPDATE vaults SET auth_hash = ?, wrapped = ? WHERE vault_id = ? AND auth_hash != '' AND wrapped != ''`,
-			hash, wrapped, vaultID)
+			`UPDATE vaults SET auth_hash = ?, wrapped = ?, rotations = rotations + 1
+			  WHERE vault_id = ? AND auth_hash = ?`,
+			hash, wrapped, vaultID, prevHash)
 		if err != nil {
 			return err
 		}
@@ -1634,7 +1719,17 @@ func (s *Store) Rotate(vaultID, hash, wrapped string) error {
 			return err
 		}
 		if n != 1 {
-			return fmt.Errorf("%w: %q", ErrUnknownVault, vaultID)
+			// Which of the two it is, read inside the same transaction so the
+			// answer describes the row the swap was refused against.
+			var current string
+			switch err := tx.QueryRow(
+				`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&current); {
+			case errors.Is(err, sql.ErrNoRows), err == nil && current == "":
+				return fmt.Errorf("%w: %q", ErrUnknownVault, vaultID)
+			case err != nil:
+				return err
+			}
+			return fmt.Errorf("%w: %q", ErrRotated, vaultID)
 		}
 		_, err = tx.Exec(`DELETE FROM invites WHERE vault_id = ?`, vaultID)
 		return err

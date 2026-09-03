@@ -37,21 +37,24 @@ func TestI2RetryableMatchesTheProtocolDoc(t *testing.T) {
 	}
 }
 
-// A protocol 2 error is code and message only; a protocol 3 error always
-// carries retryable and only carries id and retryAfterMs when they mean
-// something.
+// Every error carries retryable, whatever else it carries: id only when it
+// answers a request, retryAfterMs only when there is a hint to give.
 func TestI2ErrShapes(t *testing.T) {
-	old, _ := json.Marshal(Error(CodeBusy, "m"))
-	if string(old) != `{"res":"err","code":"busy","msg":"m"}` {
-		t.Fatalf("protocol 2 shape: %s", old)
+	answering := Error(CodeNoUID, "m")
+	answering.ID = 7
+	if b, _ := json.Marshal(answering); string(b) != `{"res":"err","id":7,"code":"nouid","msg":"m","retryable":false}` {
+		t.Fatalf("the shape of an error answering a request: %s", b)
 	}
-	answering, _ := json.Marshal(Error(CodeNoUID, "m").ForProto3(7, 0))
-	if string(answering) != `{"res":"err","id":7,"code":"nouid","msg":"m","retryable":false}` {
-		t.Fatalf("protocol 3 answering shape: %s", answering)
+	unsolicited := Error(CodeBusy, "m")
+	unsolicited.RetryAfterMs = 5000
+	b, _ := json.Marshal(unsolicited)
+	if strings.Contains(string(b), `"id"`) || !strings.Contains(string(b), `"retryAfterMs":5000`) ||
+		!strings.Contains(string(b), `"retryable":true`) {
+		t.Fatalf("the shape of an unsolicited error: %s", b)
 	}
-	unsolicited, _ := json.Marshal(Error(CodeBusy, "m").ForProto3(0, 5000))
-	if strings.Contains(string(unsolicited), `"id"`) || !strings.Contains(string(unsolicited), `"retryAfterMs":5000`) ||
-		!strings.Contains(string(unsolicited), `"retryable":true`) {
-		t.Fatalf("protocol 3 unsolicited shape: %s", unsolicited)
+	// Nothing can build an error without the verdict, because the field is not
+	// omitted and not a pointer: the zero value is a stated "do not retry".
+	if b, _ := json.Marshal(Err{Res: "err", Code: CodeAuth, Msg: "m"}); !strings.Contains(string(b), `"retryable":false`) {
+		t.Fatalf("an error was built with no retryable: %s", b)
 	}
 }

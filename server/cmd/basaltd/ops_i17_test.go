@@ -107,7 +107,7 @@ func TestI11StartupLogsVersionLatestUIDAndClaimed(t *testing.T) {
 	}
 
 	// Claimed, and a vault the server is not serving is called out.
-	if _, err := st.ClaimVault("default", strings.Repeat("ab", 32), "", 1); err != nil {
+	if _, err := st.ClaimVault("default", strings.Repeat("ab", 32), testWrapped, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.EnsureVault("other", 1); err != nil {

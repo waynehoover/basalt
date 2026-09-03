@@ -56,13 +56,6 @@ type Session struct {
 	remote  string
 	joined  bool
 
-	// proto is the protocol version this session speaks, which is the one the
-	// client asked for at hello, and zero until then. Every reply is shaped by
-	// it: a protocol 2 client gets the frames it always did, a protocol 3 client
-	// gets ids, `retryable` and the `bodies` header. Atomic because shutdown
-	// builds its notice on another goroutine.
-	proto atomic.Int32
-
 	// reqID is the id of the request being served, echoed on its reply and on
 	// any error refusing it, and zero between requests so that an error sent
 	// then, the shutdown notice, is recognisably unsolicited. Only the session
@@ -73,6 +66,18 @@ type Session struct {
 	// first-run token rather than a derived key. Such a session may not rotate
 	// the vault; see Grant.
 	bootstrap bool
+
+	// authHash is the vault's stored auth hash that this session's credential
+	// matched, and rotations the vault's rotation generation when it did. Both
+	// are captured before the session joins the fan-out.
+	//
+	// authHash is what a rotation compare-and-swaps against, so this session
+	// can only replace the credential it proved it holds. rotations is checked
+	// again after joining, because the eviction a rotation performs is a
+	// snapshot of the hub and a session that joins just after it is not in it.
+	// Only the session goroutine touches either.
+	authHash  string
+	rotations int64
 
 	// counted is true while this session is in the server's pre-auth count,
 	// guarded by Server.sessMu (S19).
@@ -128,9 +133,9 @@ func (s *Server) Handle(ctx context.Context, conn *websocket.Conn, remote string
 	// applied here too. A connection accepted between the listener closing and
 	// the sessions being told, or one arriving while too many others have not
 	// yet said hello, is refused with a reason rather than admitted. The
-	// refusal is in the protocol 2 shape, because nothing has said which
-	// protocol it speaks yet; a client reads an error before `ready` as the
-	// reason the connection is closing, and `busy` is the code.
+	// refusal carries no id, because it answers no request; a client reads an
+	// error before `ready` as the reason the connection is closing, and `busy`
+	// is the code.
 	if err := s.admit(sess); err != nil {
 		s.log.Info("session refused", "remote", remote, "why", err)
 		_ = sess.fatalWith(wire.CodeBusy, err, ShutdownRetryAfter)
@@ -297,15 +302,19 @@ func (s *Session) writeBinary(b []byte) error {
 	return s.send(websocket.MessageBinary, b)
 }
 
-// errFrame shapes an error for this session's protocol. A protocol 3 client
-// gets the id of the request being refused, or none for an unsolicited error,
-// and the retryable verdict; a protocol 2 client gets code and message only,
-// which is exactly what it always got. retryAfter is sent only when positive,
+// errFrame builds an error for this session: the id of the request being
+// refused, or none for an unsolicited error, and the retryable verdict, which
+// wire.Error fills in from the code. retryAfter is sent only when positive,
 // which in practice means `busy`.
+//
+// Every error leaves here in one shape, including the ones sent before hello,
+// so there is no moment in a connection's life when a client has to work out
+// which fields an error will have.
 func (s *Session) errFrame(id int64, code, msg string, retryAfter time.Duration) wire.Err {
 	e := wire.Error(code, msg)
-	if s.proto.Load() >= 3 {
-		return e.ForProto3(id, retryAfter.Milliseconds())
+	e.ID = id
+	if ms := retryAfter.Milliseconds(); ms > 0 {
+		e.RetryAfterMs = ms
 	}
 	return e
 }
@@ -326,9 +335,8 @@ func (s *Session) refuse(e *wire.Err) error {
 }
 
 // fatal reports a refusal that ends the session, writing the reason first. The
-// id is the request's when one is being served, so a protocol 3 client can
-// tell "your put was refused and the connection is closing" from "the
-// connection is closing".
+// id is the request's when one is being served, so a client can tell "your put
+// was refused and the connection is closing" from "the connection is closing".
 func (s *Session) fatal(code string, cause error) error {
 	return s.fatalWith(code, cause, 0)
 }
@@ -339,22 +347,21 @@ func (s *Session) fatalWith(code string, cause error, retryAfter time.Duration) 
 	return cause
 }
 
-// takeID records the request id a protocol 3 message carries, or refuses one
-// that has none or one out of range. A protocol 2 message has no id and the
-// field stays zero. Pings carry none in either version, because they are
-// answered by position and nothing else ever is.
+// takeID records the request id a message carries, or refuses one that has
+// none or one out of range. Pings carry none, because they are answered by
+// position and nothing else ever is.
 //
 // A missing id ends the session rather than refusing the one request: the
 // client could not match the refusal to anything, and would read an error with
 // no id as the connection closing anyway.
 func (s *Session) takeID(m wire.In) error {
 	s.reqID = 0
-	if s.proto.Load() < 3 || m.Op == "ping" {
+	if m.Op == "ping" {
 		return nil
 	}
 	if m.ID < 1 || m.ID > wire.MaxRequestID {
 		return s.fatal(wire.CodeProtoState, fmt.Errorf(
-			"%s request carries id %d; protocol 3 requests carry an id from 1 to %d", m.Op, m.ID, wire.MaxRequestID))
+			"%s request carries id %d; every request carries an id from 1 to %d", m.Op, m.ID, wire.MaxRequestID))
 	}
 	s.reqID = m.ID
 	return nil
@@ -609,16 +616,10 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		return s.handleHistory(m)
 	case "deleted":
 		return s.handleDeleted(m)
-	case "rotate", "invite":
-		if s.proto.Load() < 3 {
-			// A protocol 2 session has neither. They are unknown ops to it,
-			// and answered as such, so the session continues.
-			break
-		}
-		if m.Op == "invite" {
-			return s.handleInvite(m)
-		}
+	case "rotate":
 		return s.handleRotate(m)
+	case "invite":
+		return s.handleInvite(m)
 	case "hello":
 		return s.fatal(wire.CodeProtoState, errors.New("hello sent twice"))
 	}
@@ -630,17 +631,13 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 func (s *Session) handleHello(m wire.In) error {
 	// Version before credentials: refusing on proto is not a security answer
 	// and a client on the wrong version deserves to be told so plainly. The
-	// refusal is shaped for the version asked for where that is known: a
-	// client newer than this server understands ids, one older does not.
-	if m.Proto >= 3 {
-		s.proto.Store(3)
-	}
+	// range is one version wide today and the check is written as a range on
+	// purpose; see wire.Proto.
 	if m.Proto < wire.MinProto || m.Proto > wire.Proto {
 		return s.fatal(wire.CodeProto, fmt.Errorf(
 			"protocol %d not supported, this server (version %s) speaks %d to %d",
 			m.Proto, s.srv.version, wire.MinProto, wire.Proto))
 	}
-	s.proto.Store(int32(m.Proto))
 	if err := s.takeID(m); err != nil {
 		return err
 	}
@@ -665,11 +662,25 @@ func (s *Session) handleHello(m wire.In) error {
 	if m.Cursor < 0 {
 		return s.fatal(wire.CodeProtoState, fmt.Errorf("negative cursor %d", m.Cursor))
 	}
+	// A vault is claimed with a data key, always. The check is on the request's
+	// own fields, so it happens before authentication and leaks nothing about
+	// the vault: a device that offers a claim and no usable wrapped key is
+	// refused whether or not the vault was there to be claimed.
+	//
+	// This is what makes the downgrade attack unexpressible. While a vault
+	// could exist either with a data key or without one, a server could choose
+	// which key schedule a client used by leaving `wrapped` out of `ready`,
+	// and the client had no way to tell that from a vault that genuinely had
+	// none. Every claimed vault having one removes the choice rather than
+	// defending against it.
+	if m.Claim != "" && !store.ValidWrapped(m.Wrapped) {
+		return s.fatal(wire.CodeBadEntry, fmt.Errorf(
+			"a vault is claimed with a data key, and the wrapped key offered with this claim is %d bytes; "+
+				"it must be base64url of at most %d", len(m.Wrapped), store.MaxWrappedLen))
+	}
 	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped}
-	if m.Proto >= 3 && m.Token == "" {
-		// An invite stands in for the token, and only in protocol 3: a
-		// protocol 2 hello has no such field, so one that carries it is
-		// authenticated on its empty token and refused like any other.
+	if m.Token == "" {
+		// An invite stands in for the token.
 		creds.Invite = m.Invite
 	}
 	grant, err := s.srv.auth(creds)
@@ -679,15 +690,40 @@ func (s *Session) handleHello(m wire.In) error {
 		s.srv.log.Warn("auth failed", "remote", s.remote, "vault", m.Vault, "err", err)
 		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
 	}
+	// The vault's key material, one read for both columns, used by both paths
+	// below. After auth and never before it: a first device's claim writes both
+	// columns while it authenticates, so reading any earlier would send that
+	// device an empty wrapped in ready.
+	//
+	// A vault with a hash and no wrapped key cannot be produced by this build,
+	// because a claim without one is refused above. A data directory written by
+	// an older build can hold one, and there is no key schedule left to serve
+	// it under: every content key derives from the data key now. Serving it
+	// would mean handing a device a vault it can neither read nor safely add
+	// to, so the session is refused with something an operator can act on.
+	hash, wrapped, rotations, err := s.srv.st.VaultKeys(m.Vault)
+	if err != nil {
+		return s.fatal(wire.CodeInternal, err)
+	}
+	// The vault must still be the one that was just authenticated against. A
+	// rotation committed between the authenticator's read and this one would
+	// otherwise hand this device the new blob, which the root it holds cannot
+	// unwrap, under a credential the vault no longer knows.
+	if grant.AuthHash != "" && hash != grant.AuthHash {
+		return s.fatal(wire.CodeAuth, errors.New(
+			"the vault's secret was rotated while this session was authenticating; pair again with the new string"))
+	}
+	if hash != "" && wrapped == "" {
+		return s.fatal(wire.CodeProto, fmt.Errorf(
+			"vault %q was claimed by an older build and has no data key, which this server (version %s) "+
+				"cannot serve: start a fresh data directory and pair the first device again", m.Vault, s.srv.version))
+	}
+
 	if grant.Redeemed {
 		// The invite is already marked used. Hand over the sealed secret and
 		// the wrapped key, then close: this connection proved nothing about
 		// holding the root and is not a device yet. It connects again with
 		// the derived key like any other.
-		wrapped, err := s.srv.st.Wrapped(m.Vault)
-		if err != nil {
-			return s.fatal(wire.CodeInternal, err)
-		}
 		s.srv.log.Info("invite redeemed", "remote", s.remote, "vault", m.Vault, "device", m.Device)
 		if err := s.writeJSON(wire.Redeemed{Res: "redeemed", ID: s.reqID, Sealed: grant.Sealed, Wrapped: wrapped}); err != nil {
 			return err
@@ -695,6 +731,8 @@ func (s *Session) handleHello(m wire.In) error {
 		return errRedeemed
 	}
 	s.bootstrap = grant.Bootstrap
+	s.authHash = grant.AuthHash
+	s.rotations = rotations
 
 	s.vaultID = m.Vault
 	s.device = m.Device
@@ -710,22 +748,6 @@ func (s *Session) handleHello(m wire.In) error {
 	if err != nil {
 		return s.fatal(wire.CodeInternal, err)
 	}
-	wrapped, err := s.srv.st.Wrapped(m.Vault)
-	if err != nil {
-		return s.fatal(wire.CodeInternal, err)
-	}
-	// A vault with a data key is a protocol 3 vault. A protocol 2 client on it
-	// would seal every path and chunk under keys derived from the root, and
-	// nothing else on the vault could read what it wrote or be read by it:
-	// nothing lost, everything unreadable. Refused as `proto`, after auth so
-	// that an attacker learns nothing about the vault from it, and before
-	// ready so the client never starts.
-	if m.Proto < 3 && wrapped != "" {
-		return s.fatal(wire.CodeProto, fmt.Errorf(
-			"this vault was claimed under protocol 3 and needs a protocol 3 client; "+
-				"protocol %d cannot read or write it (server version %s)", m.Proto, s.srv.version))
-	}
-
 	// A client ahead of the server is refused, loudly.
 	//
 	// It means the server lost history the client has already applied: restored
@@ -747,6 +769,9 @@ func (s *Session) handleHello(m wire.In) error {
 	// therefore no interval in which an entry is neither in the backlog query
 	// nor in the fan-out, which is the window a check-then-join ordering leaves
 	// open and which loses exactly one file when it is hit.
+	if s.srv.beforeJoin != nil {
+		s.srv.beforeJoin()
+	}
 	peers, admitted := s.srv.hub.joinIfRoom(m.Vault, s, s.srv.maxPeers)
 	if !admitted {
 		return s.fatalWith(wire.CodeBusy, fmt.Errorf(
@@ -754,9 +779,27 @@ func (s *Session) handleHello(m wire.In) error {
 	}
 	s.joined = true
 
+	// Joined, so the generation is read again.
+	//
+	// A rotation evicts the sessions that are in the hub when it commits, which
+	// is a snapshot. A device that passed auth under the old root and paused
+	// anywhere before this join was in no snapshot, and went on reading and
+	// writing valid entries afterwards, because the data key did not change and
+	// nothing else ever re-checked the credential. Now the rotation moves a
+	// number, and a session whose number moved is refused with `auth` instead
+	// of being served. Joining first is still right, because it is what closes
+	// the window in which a commit is in neither the backlog nor the fan-out;
+	// this check is what makes joining first safe.
+	if now, err := s.srv.st.Rotations(m.Vault); err != nil {
+		return s.fatal(wire.CodeInternal, err)
+	} else if now != s.rotations {
+		return s.fatal(wire.CodeAuth, errors.New(
+			"the vault's secret was rotated while this session was joining; pair again with the new string"))
+	}
+
 	// Limits first, so a client knows every ceiling before its first put rather
 	// than discovering one by being rejected.
-	if err := s.writeJSON(s.srv.ready(m.Proto, s.reqID, latest, wrapped)); err != nil {
+	if err := s.writeJSON(s.srv.ready(s.reqID, latest, wrapped)); err != nil {
 		return err
 	}
 	s.srv.log.Info("session ready", "remote", s.remote, "vault", m.Vault,
@@ -927,7 +970,7 @@ func (s *Session) flushPending(cursor int64) int64 {
 			return cursor
 		}
 	}
-	if s.srv != nil && s.srv.afterFlush != nil {
+	if s.srv.afterFlush != nil {
 		s.srv.afterFlush()
 	}
 	return cursor
@@ -1046,7 +1089,6 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 	type prepared struct {
 		entry   store.Entry
 		refusal *wire.Err
-		spend   int64
 	}
 	items := make([]prepared, len(m.Entries))
 
@@ -1059,28 +1101,16 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 
 	for i, in := range m.Entries {
 		e := in.Entry(s.device)
-		if refusal := s.checkEntry(e); refusal != nil {
+		missing, spend, refusal := s.prepare(e)
+		if refusal != nil {
+			// One entry's refusal is one entry's result in the acks, and the
+			// rest of the batch still commits, so it is carried rather than
+			// written. Unlike handlePut, nothing is logged here.
 			items[i] = prepared{entry: e, refusal: refusal}
 			continue
 		}
 
-		missing, sizes, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
-		if err != nil {
-			refusal := wire.Error(wire.CodeBadChunk, err.Error())
-			items[i] = prepared{entry: e, refusal: &refusal}
-			continue
-		}
-		budget := store.CiphertextBudget(e.Size, len(e.Chunks))
-		held := heldBytes(e.Chunks, missing, sizes)
-		if held > budget {
-			refusal := wire.Error(wire.CodeToolarge, fmt.Sprintf(
-				"the chunks named already hold %d bytes for a declared size of %d, budget %d",
-				held, e.Size, budget))
-			items[i] = prepared{entry: e, refusal: &refusal}
-			continue
-		}
-
-		items[i] = prepared{entry: e, spend: budget - held}
+		items[i] = prepared{entry: e}
 		for _, name := range missing {
 			if _, seen := asked[name]; seen {
 				continue
@@ -1088,7 +1118,7 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 			asked[name] = struct{}{}
 			want = append(want, name)
 		}
-		allowance += budget - held
+		allowance += spend
 	}
 
 	if len(want) > 0 {
@@ -1106,10 +1136,7 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 			results[i] = wire.AckResult{Code: item.refusal.Code, Msg: item.refusal.Msg}
 			continue
 		}
-		uid, refusal, err := s.commit(item.entry)
-		if err != nil {
-			return err
-		}
+		uid, refusal := s.commit(item.entry)
 		if refusal != nil {
 			results[i] = wire.AckResult{Code: refusal.Code, Msg: refusal.Msg}
 			continue
@@ -1119,26 +1146,28 @@ func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 	return s.writeJSON(wire.Acks{Res: "acks", ID: s.reqID, Results: results})
 }
 
-func (s *Session) handlePut(m wire.In) error {
-	e := m.Entry()
-	// The session's device, never the message's. A device name is what a person
-	// reads next to a version to work out where it came from, so a client that
-	// could put another device's name on its own write would make that answer a
-	// lie. The batched put has always taken it from the session; this one asked
-	// the client and only corrected an empty answer.
-	e.Device = s.device
-
-	// The same refusals, in the same order, as one entry of a batch. One list,
-	// so the two puts cannot drift apart on what they refuse (S6).
-	if refusal := s.checkEntry(e); refusal != nil {
-		return s.reject(refusal.Code, errors.New(refusal.Msg))
+// prepare runs every refusal a put makes before a single body is read, and
+// returns the chunks the server lacks along with what this entry is still
+// allowed to upload.
+//
+// The same refusals, in the same order, for a single put and for one entry of a
+// batch. One list, so the two puts cannot drift apart on what they refuse (S6).
+//
+// The refusal is returned rather than written, because the two callers report
+// differently and deliberately: handlePut sends an error frame and logs it,
+// while one entry of a batch is only a result in the acks and the rest of the
+// batch still commits.
+func (s *Session) prepare(e store.Entry) (missing []string, allowance int64, refusal *wire.Err) {
+	if r := s.checkEntry(e); r != nil {
+		return nil, 0, r
 	}
 
 	missing, sizes, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
 	if err != nil {
 		// The only failure Missing has is a malformed name, which Validate
 		// should already have caught. Reported rather than assumed away.
-		return s.reject(wire.CodeBadChunk, err)
+		r := wire.Error(wire.CodeBadChunk, err.Error())
+		return nil, 0, &r
 	}
 
 	// What this entry may reference in total, and what it already accounts for.
@@ -1150,16 +1179,29 @@ func (s *Session) handlePut(m wire.In) error {
 	budget := store.CiphertextBudget(e.Size, len(e.Chunks))
 	held := heldBytes(e.Chunks, missing, sizes)
 	if held > budget {
-		return s.reject(wire.CodeToolarge, fmt.Errorf(
+		r := wire.Error(wire.CodeToolarge, fmt.Sprintf(
 			"the chunks named already hold %d bytes for a declared size of %d, budget %d",
 			held, e.Size, budget))
+		return nil, 0, &r
+	}
+	return missing, budget - held, nil
+}
+
+func (s *Session) handlePut(m wire.In) error {
+	// The session's device, never the message's, and the same call the batched
+	// put makes. wire.In.Entry has no way to reach the message's device now, so
+	// a put under another device's name is unexpressible rather than commented.
+	e := m.Entry(s.device)
+
+	missing, allowance, refusal := s.prepare(e)
+	if refusal != nil {
+		// reject rather than refuse: a single put's refusal is logged, where one
+		// entry of a batch is only a line in the acks.
+		return s.reject(refusal.Code, errors.New(refusal.Msg))
 	}
 
 	if len(missing) == 0 {
-		uid, refusal, err := s.commit(e)
-		if err != nil {
-			return err
-		}
+		uid, refusal := s.commit(e)
 		if refusal != nil {
 			return s.refuse(refusal)
 		}
@@ -1169,14 +1211,11 @@ func (s *Session) handlePut(m wire.In) error {
 	if err := s.writeJSON(wire.Want{Res: "want", ID: s.reqID, Chunks: missing}); err != nil {
 		return err
 	}
-	if err := s.readBodies(missing, budget-held); err != nil {
+	if err := s.readBodies(missing, allowance); err != nil {
 		return err
 	}
 
-	uid, refusal, err := s.commit(e)
-	if err != nil {
-		return err
-	}
+	uid, refusal := s.commit(e)
 	if refusal != nil {
 		return s.refuse(refusal)
 	}
@@ -1337,7 +1376,7 @@ func putErrorCode(err error) string {
 // the handshake and catch-up, where there is nothing to continue with. Ending
 // it here used to cost a reconnect and a replayed handshake for a fault the
 // next put might not even see.
-func (s *Session) commit(e store.Entry) (int64, *wire.Err, error) {
+func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
 	s.srv.commitMu.Lock()
 	defer s.srv.commitMu.Unlock()
 
@@ -1354,11 +1393,11 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err, error) {
 			s.srv.log.Warn("refused at commit",
 				"vault", s.vaultID, "path", len(e.Path), "code", code, "err", err)
 			refusal := wire.Error(code, err.Error())
-			return 0, &refusal, nil
+			return 0, &refusal
 		}
 		s.srv.log.Error("commit failed", "vault", s.vaultID, "err", err)
 		refusal := wire.Error(wire.CodeInternal, "the entry could not be committed: "+err.Error())
-		return 0, &refusal, nil
+		return 0, &refusal
 	}
 	e.UID = uid
 	if s.srv.afterAppend != nil {
@@ -1369,7 +1408,7 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err, error) {
 		"folder", e.Folder, "deleted", e.Deleted)
 
 	s.srv.hub.broadcast(s.vaultID, e, s)
-	return uid, nil, nil
+	return uid, nil
 }
 
 /* ---------------------------------------------------------------- *
@@ -1412,7 +1451,7 @@ func (s *Session) handleDeleted(m wire.In) error {
 		s.srv.log.Error("deleted", "vault", s.vaultID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("could not list deletions"))
 	}
-	return s.writeJSON(wire.Deleted{Res: "deleted", ID: s.reqID, Entries: nonNilDeletions(entries), More: more})
+	return s.writeJSON(wire.Deleted{Res: "deleted", ID: s.reqID, Entries: nonNil(entries), More: more})
 }
 
 // nonNil keeps an empty result an empty array rather than JSON null.
@@ -1420,16 +1459,9 @@ func (s *Session) handleDeleted(m wire.In) error {
 // The same reasoning as Batch's entries, and the same bug: a client iterating
 // null crashes on exactly the answers it exists to handle, and "no deleted
 // notes" is the answer it will see most often.
-func nonNil(entries []store.Entry) []store.Entry {
+func nonNil[T any](entries []T) []T {
 	if entries == nil {
-		return []store.Entry{}
-	}
-	return entries
-}
-
-func nonNilDeletions(entries []store.Deletion) []store.Deletion {
-	if entries == nil {
-		return []store.Deletion{}
+		return []T{}
 	}
 	return entries
 }
@@ -1500,15 +1532,13 @@ func (s *Session) handleFetch(m wire.In) error {
 			len(m.Chunks), total, s.srv.maxFetchBytes))
 	}
 
-	// A protocol 3 client is told how many frames follow before the first one,
-	// so the answer to a fetch is either this header and exactly that many
-	// bodies or an error, never bodies and then an error. A body found
-	// unreadable below still ends the session, which is the one way a count
-	// once promised may fall short, and the close is what tells the client.
-	if s.proto.Load() >= 3 {
-		if err := s.writeJSON(wire.Bodies{Res: "bodies", ID: s.reqID, Count: len(m.Chunks)}); err != nil {
-			return err
-		}
+	// The client is told how many frames follow before the first one, so the
+	// answer to a fetch is either this header and exactly that many bodies or
+	// an error, never bodies and then an error. A body found unreadable below
+	// still ends the session, which is the one way a count once promised may
+	// fall short, and the close is what tells the client.
+	if err := s.writeJSON(wire.Bodies{Res: "bodies", ID: s.reqID, Count: len(m.Chunks)}); err != nil {
+		return err
 	}
 
 	for i, n := range m.Chunks {
@@ -1551,11 +1581,18 @@ func (s *Session) handleFetch(m wire.In) error {
 // without the server's history going with it. docs/protocol.md, "The data key,
 // and rotating a leaked secret".
 //
+// The swap is conditional on the hash this session authenticated under, so two
+// devices connected under one root that both rotate cannot both succeed. The
+// loser is refused with `rotated` and its session ends: the credential it is
+// holding is not the vault's any more, and the alternative is what used to
+// happen, which is that the second rotation overwrote the first and the device
+// the first was revoking owned the vault.
+//
 // Refused with `auth` on a session that authenticated with the bootstrap token,
-// which proved nothing about holding the old root; with `badentry` on a vault
-// that has no data key, whose content keys derive from the root directly and
-// could not be re-wrapped; and with `badentry` on a malformed request. Each
-// refusal leaves the session usable, because none of them changed anything.
+// which proved nothing about holding the old root, and with `badentry` on a
+// malformed request. Either refusal leaves the session usable, because neither
+// changed anything. Every claimed vault has a data key, so there is no such
+// thing here as a vault with nothing to re-wrap.
 func (s *Session) handleRotate(m wire.In) error {
 	if s.bootstrap {
 		return s.reject(wire.CodeAuth, errors.New(
@@ -1569,14 +1606,35 @@ func (s *Session) handleRotate(m wire.In) error {
 		return s.reject(wire.CodeBadEntry, fmt.Errorf(
 			"the wrapped data key is %d bytes and must be base64url of at most %d", len(m.Wrapped), store.MaxWrappedLen))
 	}
+	if s.authHash == "" {
+		// No authenticator this build ships leaves it empty for a session that
+		// got this far, and a swap with nothing to compare against is the hole
+		// this whole path exists to close, so it is refused rather than guessed.
+		return s.reject(wire.CodeAuth, errors.New(
+			"this session has no credential to rotate away from"))
+	}
 	hash := sha256.Sum256([]byte(m.Auth))
-	if err := s.srv.st.Rotate(s.vaultID, hex.EncodeToString(hash[:]), m.Wrapped); err != nil {
-		if errors.Is(err, store.ErrNoDataKey) || errors.Is(err, store.ErrBadEntry) {
+	next := hex.EncodeToString(hash[:])
+	if s.srv.beforeRotate != nil {
+		s.srv.beforeRotate()
+	}
+	if err := s.srv.st.Rotate(s.vaultID, s.authHash, next, m.Wrapped); err != nil {
+		if errors.Is(err, store.ErrRotated) {
+			s.srv.log.Warn("rotate lost the race", "vault", s.vaultID, "device", s.device)
+			return s.fatal(wire.CodeRotated, errors.New(
+				"the vault was rotated by another device, so this rotation was refused; "+
+					"reconnect with the new string and try again"))
+		}
+		if errors.Is(err, store.ErrBadEntry) {
 			return s.reject(wire.CodeBadEntry, err)
 		}
 		s.srv.log.Error("rotate failed", "vault", s.vaultID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("the vault's secret could not be replaced: "+err.Error()))
 	}
+	// This session's credential is the new one now, so a second rotate from it
+	// swaps against the hash it just wrote rather than the one it arrived with.
+	s.authHash = next
+	s.rotations++
 	// Committed. Every other device on the vault is holding a credential that
 	// no longer opens it; told so and closed, from this goroutine, before this
 	// device is told it succeeded, so "rotated" also means "and nobody else is

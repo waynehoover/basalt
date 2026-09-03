@@ -32,7 +32,6 @@ var ErrHeld = errors.New("the data directory is locked")
 // neither. A caller that wants a name in that case can ask Holder about the
 // server lock instead, and knowing the field is empty is how it knows to.
 type HeldError struct {
-	File   string
 	Holder string
 }
 
@@ -48,7 +47,6 @@ func (e *HeldError) Unwrap() error { return ErrHeld }
 // Lock is a held flock on one file. Release, or let the process exit.
 type Lock struct {
 	f         *os.File
-	path      string
 	exclusive bool
 }
 
@@ -95,11 +93,11 @@ func take(dir, name string, how int) (*Lock, error) {
 		holder := readHolder(f)
 		f.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, &HeldError{File: name, Holder: holder}
+			return nil, &HeldError{Holder: holder}
 		}
 		return nil, err
 	}
-	return &Lock{f: f, path: path}, nil
+	return &Lock{f: f}, nil
 }
 
 // Holder reports who last took the named lock exclusively, without taking it.

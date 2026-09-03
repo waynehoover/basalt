@@ -9,7 +9,7 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
-// Graceful shutdown. TODO.md S16: http.Server.Shutdown stops the listener and
+// Graceful shutdown, review finding S16: http.Server.Shutdown stops the listener and
 // waits for ordinary requests, but a hijacked WebSocket is not its connection
 // any more, so the server used to return from shutdown with every session
 // still open and then close the store under them. These pin what Shutdown does

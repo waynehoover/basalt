@@ -1,8 +1,11 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
@@ -10,7 +13,7 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
-// Protocol 3, server side. docs/protocol.md is the contract; every test here
+// The protocol, server side. docs/protocol.md is the contract; every test here
 // reads a shape off the wire rather than trusting a struct, because the point
 // of most of them is which fields are and are not present.
 
@@ -111,7 +114,7 @@ func TestI1UnsolicitedFramesCarryNoId(t *testing.T) {
 	}
 }
 
-// A protocol 3 request with no id, or one out of range, cannot be answered in a
+// A request with no id, or one out of range, cannot be answered in a
 // way the client could match, so the session ends with a reason.
 func TestI1AProto3RequestWithoutAnIdEndsTheSession(t *testing.T) {
 	for _, tc := range []struct {
@@ -138,7 +141,7 @@ func TestI1AProto3RequestWithoutAnIdEndsTheSession(t *testing.T) {
 	}
 }
 
-// A protocol 3 fetch is answered by a `bodies` header saying exactly how many
+// A fetch is answered by a `bodies` header saying exactly how many
 // frames follow, or by an error and no frames, never bodies then an error.
 func TestI1FetchIsAnsweredByABodiesHeaderOrAnError(t *testing.T) {
 	r := newRig(t)
@@ -175,7 +178,7 @@ func TestI1FetchIsAnsweredByABodiesHeaderOrAnError(t *testing.T) {
  * I2: retryable
  * ---------------------------------------------------------------- */
 
-// Every protocol 3 error says whether reconnecting later can help, per the
+// Every error says whether reconnecting later can help, per the
 // table in docs/protocol.md, and `busy` says how long to wait.
 func TestI2ErrorsCarryRetryablePerTheTable(t *testing.T) {
 	t.Run("busy at the device limit is retryable with a hint", func(t *testing.T) {
@@ -326,20 +329,25 @@ func TestI5ClaimStoresTheWrappedKeyAndReadyReturnsIt(t *testing.T) {
 	}
 }
 
-// A vault claimed without a wrapped key, as a protocol 2 device does, has no
-// `wrapped` in ready at all: absent, not empty, because that is how a client
-// decides which key schedule applies.
-func TestI5AVaultWithNoDataKeyHasNoWrappedInReady(t *testing.T) {
+// A claim with no wrapped key is refused, and the vault stays unclaimed. This
+// is the rule the removal of the second key schedule rests on: a vault that
+// might or might not have a data key let a server pick which schedule a client
+// used, by leaving `wrapped` out of `ready`, with nothing on the client able
+// to tell that from a vault that genuinely had none.
+func TestI5AClaimWithoutADataKeyIsRefused(t *testing.T) {
 	r := newRigDerived(t)
 	cl := r.dial("first")
 	cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
 		Token: testToken, Claim: longKey, Device: "first"})
-	f := rawFields(t, cl.recvRaw())
-	if f["res"] != "ready" {
-		t.Fatalf("got %v", f)
+	msg := cl.expectErr(wire.CodeBadEntry)
+	if !strings.Contains(msg, "data key") {
+		t.Fatalf("the refusal does not say why: %q", msg)
 	}
-	if _, has := f["wrapped"]; has {
-		t.Fatalf("ready carries a wrapped for a vault that has none: %v", f)
+	if !cl.closed() {
+		t.Fatal("a hello refused at the claim left the session open")
+	}
+	if hash, _ := r.st.AuthHash(testVault); hash != "" {
+		t.Fatal("the vault was claimed without a data key")
 	}
 }
 
@@ -351,10 +359,80 @@ func TestI5AMalformedWrappedKeyIsRefusedAtClaim(t *testing.T) {
 		cl := r.dial("first")
 		cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
 			Token: testToken, Claim: longKey, Wrapped: bad, Device: "first"})
-		cl.expectErr(wire.CodeAuth)
+		cl.expectErr(wire.CodeBadEntry)
+		if !cl.closed() {
+			t.Fatalf("a hello offering %q left the session open", bad)
+		}
 	}
 	if hash, _ := r.st.AuthHash(testVault); hash != "" {
 		t.Fatal("the vault was claimed despite the refused key")
+	}
+}
+
+// Every claimed vault has a data key, so ready always carries it: to the device
+// that claimed the vault, to every device after it, and after a rotation. A
+// client never has to decide which key schedule it is on, because there is one.
+//
+// The vault is driven through its whole life here, starting with the attempt
+// that used to produce a keyless vault, because that attempt succeeding is the
+// only way a later ready could arrive without a wrapped key.
+func TestI5ReadyAlwaysCarriesWrappedForAClaimedVault(t *testing.T) {
+	r := newRigDerived(t)
+	keyless := r.dial("keyless")
+	keyless.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
+		Token: testToken, Claim: longKey, Device: "keyless"})
+	if f := rawFields(t, keyless.recvRaw()); f["res"] != "err" {
+		t.Fatalf("a claim with no data key was answered %v", f)
+	}
+
+	first := r.dial("first")
+	first.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
+		Token: testToken, Claim: longKey, Wrapped: testWrapped, Device: "first"})
+	if f := rawFields(t, first.recvRaw()); f["res"] != "ready" || f["wrapped"] != testWrapped {
+		t.Fatalf("the claiming device's ready was %v", f)
+	}
+	first.recvInto("caught-up", &wire.CaughtUp{})
+
+	// A second device, which sends its claim on every hello and is ignored.
+	second := r.dial("second")
+	second.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
+		Token: longKey, Claim: longKey, Wrapped: testWrapped, Device: "second"})
+	if f := rawFields(t, second.recvRaw()); f["res"] != "ready" || f["wrapped"] != testWrapped {
+		t.Fatalf("a later device's ready was %v", f)
+	}
+	second.recvInto("caught-up", &wire.CaughtUp{})
+
+	second.sendJSON(wire.In{Op: "rotate", Auth: newKey, Wrapped: newWrapped})
+	second.recvInto("rotated", &wire.Rotated{})
+	after := r.dial("after")
+	after.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: newKey, Device: "after"})
+	if f := rawFields(t, after.recvRaw()); f["res"] != "ready" || f["wrapped"] != newWrapped {
+		t.Fatalf("ready after a rotation was %v", f)
+	}
+}
+
+// A vault claimed with no data key cannot be produced by this build, but a data
+// directory an older one wrote can hold the row. There is no key schedule left
+// to serve it under, so the session is refused at hello with something an
+// operator can act on, rather than falling into a schedule that no longer
+// exists. The row is built straight through the store, which is the only thing
+// that can still make one.
+func TestI5AVaultClaimedWithNoDataKeyIsRefusedAtHello(t *testing.T) {
+	r := newRigDerived(t)
+	r.srv.SetVersion("4.5.6")
+	hash := sha256.Sum256([]byte(longKey))
+	ok, err := r.st.ClaimVault(testVault, hex.EncodeToString(hash[:]), "", 1)
+	if err != nil || !ok {
+		t.Fatalf("seeding a vault with no data key: ok=%v err=%v", ok, err)
+	}
+	cl := r.dial("a")
+	cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "a"})
+	msg := cl.expectErr(wire.CodeProto)
+	if !strings.Contains(msg, "data key") || !strings.Contains(msg, "fresh data directory") {
+		t.Fatalf("the refusal does not tell the operator what to do: %q", msg)
+	}
+	if !cl.closed() {
+		t.Fatal("the session was refused and left open")
 	}
 }
 
@@ -365,20 +443,6 @@ func claimed(t *testing.T, r *rig, name string) *client {
 	first := r.dial("claimer")
 	first.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
 		Token: testToken, Claim: longKey, Wrapped: testWrapped, Device: "claimer"})
-	first.recvInto("ready", &wire.Ready{})
-	first.recvInto("caught-up", &wire.CaughtUp{})
-	first.conn.CloseNow()
-	waitFor(t, "the claimer to leave", func() bool { return r.srv.Peers(testVault) == 0 })
-	return derived(t, r, name, longKey)
-}
-
-// claimedNoKey is claimed for a vault with no data key, as a protocol 2 device
-// claims one. It is the vault a protocol 2 client is still allowed on.
-func claimedNoKey(t *testing.T, r *rig, name string) *client {
-	t.Helper()
-	first := r.dial("claimer")
-	first.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
-		Token: testToken, Claim: longKey, Device: "claimer"})
 	first.recvInto("ready", &wire.Ready{})
 	first.recvInto("caught-up", &wire.CaughtUp{})
 	first.conn.CloseNow()
@@ -458,27 +522,6 @@ func TestI5RotateRefusals(t *testing.T) {
 			t.Fatalf("the refused rotate changed the stored key to %q", w)
 		}
 	})
-	t.Run("a vault with no data key cannot be rotated in place", func(t *testing.T) {
-		r := newRigDerived(t)
-		first := r.dial("first")
-		first.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
-			Token: testToken, Claim: longKey, Device: "first"})
-		first.recvInto("ready", &wire.Ready{})
-		first.recvInto("caught-up", &wire.CaughtUp{})
-		first.conn.CloseNow()
-		waitFor(t, "the claimer to leave", func() bool { return r.srv.Peers(testVault) == 0 })
-		cl := derived(t, r, "a", longKey)
-		cl.sendJSON(wire.In{Op: "rotate", Auth: newKey, Wrapped: newWrapped})
-		msg := cl.expectErr(wire.CodeBadEntry)
-		if !strings.Contains(msg, "no data key") {
-			t.Fatalf("the refusal does not say why: %q", msg)
-		}
-		if hash, _ := r.st.AuthHash(testVault); hash == "" {
-			t.Fatal("the vault lost its hash")
-		}
-		cl.sendJSON(wire.In{Op: "ping"})
-		cl.recvInto("pong", &wire.Pong{})
-	})
 	t.Run("a malformed request", func(t *testing.T) {
 		r := newRigDerived(t)
 		cl := claimed(t, r, "a")
@@ -493,19 +536,6 @@ func TestI5RotateRefusals(t *testing.T) {
 		}
 		cl.sendJSON(wire.In{Op: "ping"})
 		cl.recvInto("pong", &wire.Pong{})
-	})
-	t.Run("a protocol 2 session has no rotate", func(t *testing.T) {
-		r := newRigDerived(t)
-		claimedNoKey(t, r, "a").conn.CloseNow()
-		cl := r.dialProto("old", 2)
-		cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "old"})
-		cl.recvInto("ready", &wire.Ready{})
-		cl.recvInto("caught-up", &wire.CaughtUp{})
-		cl.sendJSON(wire.In{Op: "rotate", Auth: newKey, Wrapped: newWrapped})
-		cl.expectErr(wire.CodeProtoState)
-		if w, _ := r.st.Wrapped(testVault); w != "" {
-			t.Fatalf("a protocol 2 rotate stored a key: %q", w)
-		}
 	})
 }
 
@@ -547,123 +577,200 @@ func TestS24VaultAndDeviceAreBoundedAndFreeOfControlCharacters(t *testing.T) {
 }
 
 /* ---------------------------------------------------------------- *
- * I9: the upgrade window
+ * I9: version negotiation
  * ---------------------------------------------------------------- */
 
-// A protocol 2 client against this server gets exactly the protocol 2 session
-// it always had, end to end: no ids, no bodies header, no retryable, no
-// wrapped, no rotate. ready still carries the new ceilings, which it ignores.
-// The harness fails the test on any id or retryable it sees in this mode.
-func TestI9AProto2ClientGetsAProto2SessionEndToEnd(t *testing.T) {
-	r := newRigDerived(t)
-	claimedNoKey(t, r, "setup").conn.CloseNow()
-	waitFor(t, "the setup client to leave", func() bool { return r.srv.Peers(testVault) == 0 })
-
-	cl := r.dialProto("old-phone", 2)
-	cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "old-phone"})
-	f := rawFields(t, cl.recvRaw())
-	if f["res"] != "ready" || f["proto"] != float64(2) {
-		t.Fatalf("ready was %v", f)
-	}
-	for _, absent := range []string{"id", "wrapped"} {
-		if _, has := f[absent]; has {
-			t.Fatalf("a protocol 2 ready carries %s: %v", absent, f)
-		}
-	}
-	for _, present := range []string{"maxBatchBytes", "maxFetchBytes", "minProto", "serverVersion"} {
-		if _, has := f[present]; !has {
-			t.Fatalf("a protocol 2 ready lacks %s: %v", present, f)
-		}
-	}
-	cl.recvInto("caught-up", &wire.CaughtUp{})
-
-	uid := cl.put("note.md", "head", "tail")
-	cl.sendJSON(wire.In{Op: "get", UID: uid})
-	var got wire.Chunks
-	cl.recvInto("chunks", &got)
-	// No header: the first frame after a fetch is a body.
-	bodies := cl.fetch(got.Chunks...)
-	if string(bodies[0]) != "head" || string(bodies[1]) != "tail" {
-		t.Fatalf("fetched %q", bodies)
-	}
-	cl.sendJSON(wire.In{Op: "history", Path: "note.md"})
-	cl.recvInto("history", &wire.History{})
-	cl.sendJSON(wire.In{Op: "deleted"})
-	cl.recvInto("deleted", &wire.Deleted{})
-	cl.sendJSON(wire.In{Op: "get", UID: 999})
-	f = rawFields(t, cl.recvRaw())
-	if f["code"] != wire.CodeNoUID {
-		t.Fatalf("got %v", f)
-	}
-	if _, has := f["retryable"]; has {
-		t.Fatalf("a protocol 2 error carries retryable: %v", f)
-	}
-	// An id sent by a protocol 2 client is not echoed: the shape is fixed.
-	cl.sendRaw(wire.In{Op: "deleted", ID: 5})
-	if f := rawFields(t, cl.recvRaw()); f["res"] != "deleted" || f["id"] != nil {
-		t.Fatalf("a protocol 2 reply echoed an id: %v", f)
-	}
-	cl.sendJSON(wire.In{Op: "ping"})
-	cl.recvInto("pong", &wire.Pong{})
-}
-
-// A protocol 3 client against the same server, in the same test, so the two
-// shapes are visibly two answers from one server.
-func TestI9AProto3ClientGetsIdsAgainstTheSameServer(t *testing.T) {
-	r := newRigDerived(t)
-	claimedNoKey(t, r, "setup").conn.CloseNow()
-	waitFor(t, "the setup client to leave", func() bool { return r.srv.Peers(testVault) == 0 })
-
-	old := r.dialProto("old", 2)
-	old.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "old"})
-	old.recvInto("ready", &wire.Ready{})
-	old.recvInto("caught-up", &wire.CaughtUp{})
-
-	cur := derived(t, r, "new", longKey)
-	// Both push; both see the other's change; the harness checks ids on every
-	// reply for the new one and their absence for the old one.
-	a := old.put("a.md", "from the old client")
-	b := cur.put("b.md", "from the new client")
-	if got := cur.nextBatch(); got.From != a || len(got.Entries) != 1 {
-		t.Fatalf("the new client saw %+v for the old client's write", got)
-	}
-	// The old client sees its own write as an empty range first, then the
-	// new client's with the payload.
-	if echo := old.nextBatch(); echo.To != a || len(echo.Entries) != 0 {
-		t.Fatalf("the old client's echo was %+v", echo)
-	}
-	if got := old.nextBatch(); got.To != b || len(got.Entries) != 1 {
-		t.Fatalf("the old client saw %+v for the new client's write", got)
-	}
-}
-
-// A vault claimed under protocol 3 has a data key, and a protocol 2 client on
-// it would seal under the root-derived schedule that nothing else on the vault
-// can read. It is refused with proto, naming what the vault needs and the
-// server's version, after auth and before ready. Protocol 2 stays accepted on
-// a vault with no data key, and protocol 3 proceeds on this one.
-func TestI9AProto2HelloOnAProto3VaultIsRefused(t *testing.T) {
-	r := newRigDerived(t)
+// Protocol 3 is the only protocol. A client asking for 2 is refused at hello
+// with both numbers and the server's version in the message, which is the
+// whole of what the negotiation machinery is kept for: when protocol 4 lands,
+// this is how an old client learns which end to upgrade.
+func TestI9AProto2HelloIsRefusedNamingBothNumbers(t *testing.T) {
+	r := newRig(t)
 	r.srv.SetVersion("4.5.6")
+	cl := r.dial("old-phone")
+	cl.sendRaw(wire.In{Op: "hello", ID: 1, Proto: 2, Crypto: wire.Crypto,
+		Vault: testVault, Token: testToken, Device: "old-phone"})
+	msg := cl.expectErr(wire.CodeProto)
+	for _, want := range []string{"protocol 2", "4.5.6", "3 to 3"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("the refusal does not name %q: %q", want, msg)
+		}
+	}
+	if !cl.closed() {
+		t.Fatal("a client on an unsupported protocol was refused and left open")
+	}
+}
+
+// Two devices against one server: each sees the other's write with its payload
+// and its own as an empty range, and the harness checks the id on every reply
+// either of them gets.
+func TestI9TwoClientsAgainstTheSameServer(t *testing.T) {
+	r := newRigDerived(t)
 	claimed(t, r, "setup").conn.CloseNow()
 	waitFor(t, "the setup client to leave", func() bool { return r.srv.Peers(testVault) == 0 })
 
-	old := r.dialProto("old-phone", 2)
-	old.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "old-phone"})
-	msg := old.expectErr(wire.CodeProto)
-	if !strings.Contains(msg, "protocol 3") || !strings.Contains(msg, "4.5.6") {
-		t.Fatalf("the refusal names neither the protocol the vault needs nor the server version: %q", msg)
+	one := derived(t, r, "one", longKey)
+	two := derived(t, r, "two", longKey)
+	a := one.put("a.md", "from one")
+	b := two.put("b.md", "from two")
+	if got := two.nextBatch(); got.From != a || len(got.Entries) != 1 {
+		t.Fatalf("two saw %+v for one's write", got)
 	}
-	if !old.closed() {
-		t.Fatal("the protocol 2 session was refused and left open")
+	// one sees its own write as an empty range first, then two's with the
+	// payload: a device never has to recognise its own echo.
+	if echo := one.nextBatch(); echo.To != a || len(echo.Entries) != 0 {
+		t.Fatalf("one's echo of its own write was %+v", echo)
 	}
-	// Wrong key first, so the refusal cannot be used to probe the vault: a bad
-	// credential is auth, not proto.
-	probe := r.dialProto("probe", 2)
-	probe.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: "guess", Device: "probe"})
-	probe.expectErr(wire.CodeAuth)
+	if got := one.nextBatch(); got.To != b || len(got.Entries) != 1 {
+		t.Fatalf("one saw %+v for two's write", got)
+	}
+}
 
-	cur := derived(t, r, "new-phone", longKey)
-	cur.sendJSON(wire.In{Op: "ping"})
-	cur.recvInto("pong", &wire.Pong{})
+/* ---------------------------------------------------------------- *
+ * Rotation is a compare-and-swap, and it has a generation
+ * ---------------------------------------------------------------- */
+
+// hashOf is the hex sha256 the server stores for an auth key.
+func hashOf(key string) string {
+	h := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(h[:])
+}
+
+const thirdKey = "a-third-derived-auth-key-after-rotation-12"
+const thirdWrapped = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+
+// A rotate from a session whose credential is no longer the vault's is refused
+// with `rotated`, and changes nothing.
+//
+// The rotation here is done straight through the store, which is the same thing
+// another device's rotate does to this session's view of the world without the
+// eviction that would close the socket first. Before the compare-and-swap this
+// session's rotate simply overwrote what the other device had just written, and
+// the retired credential owned the vault.
+func TestRotateIsRefusedWhenAnotherDeviceRotatedFirst(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+
+	if err := r.st.Rotate(testVault, hashOf(longKey), hashOf(newKey), newWrapped); err != nil {
+		t.Fatalf("the other device's rotation: %v", err)
+	}
+
+	a.sendJSON(wire.In{Op: "rotate", ID: 7, Auth: thirdKey, Wrapped: thirdWrapped})
+	m := a.recv()
+	if m["res"] != "err" || m["code"] != wire.CodeRotated || m["id"] != float64(7) {
+		t.Fatalf("the losing rotate was answered %v, want a rotated error carrying its id", m)
+	}
+	msg, _ := m["msg"].(string)
+	if !strings.Contains(msg, "rotated by another device") || !strings.Contains(msg, "reconnect") {
+		t.Fatalf("the refusal does not say what happened or what to do: %q", msg)
+	}
+	if m["retryable"] != false {
+		t.Fatalf("rotated is not retryable, got %v", m["retryable"])
+	}
+	if hash, _ := r.st.AuthHash(testVault); hash != hashOf(newKey) {
+		t.Fatal("the refused rotate replaced the credential of the device that won")
+	}
+	if w, _ := r.st.Wrapped(testVault); w != newWrapped {
+		t.Fatalf("the refused rotate replaced the wrapped key with %q", w)
+	}
+	if !a.closed() {
+		t.Fatal("a session holding a credential the vault no longer knows was left open")
+	}
+}
+
+// Two sessions on one vault both rotate, with the first parked inside the store
+// call while the second commits underneath it. Exactly one wins.
+//
+// This is the sequence the review described: the winner evicts the loser, but
+// closing a socket does not cancel the handler or the database call already in
+// flight, so the loser's write still lands. It landed unconditionally before,
+// and the vault ended up belonging to whichever call finished last.
+func TestTwoConcurrentRotationsAndOnlyOneWins(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+	b := derived(t, r, "b", longKey)
+
+	// a's rotate stops here until b's has committed and evicted it.
+	// A one-shot gate rather than a sync.Once: Once serialises its callers, so
+	// b's rotate would have waited on a's rather than racing it.
+	parked := make(chan struct{})
+	release := make(chan struct{})
+	first := make(chan struct{}, 1)
+	first <- struct{}{}
+	r.srv.beforeRotate = func() {
+		select {
+		case <-first:
+			close(parked)
+			<-release
+		default:
+		}
+	}
+	a.sendJSON(wire.In{Op: "rotate", Auth: newKey, Wrapped: newWrapped})
+	<-parked
+
+	// b rotates while a is parked. b's own beforeRotate is the same hook and
+	// has already fired once, so it runs straight through.
+	b.sendJSON(wire.In{Op: "rotate", Auth: thirdKey, Wrapped: thirdWrapped})
+	b.recvInto("rotated", &wire.Rotated{})
+	close(release)
+
+	// a is evicted, so its refusal has nowhere to go; what has to hold is the
+	// row. Both columns are b's, and the generation moved exactly once.
+	// The evicted session leaves the hub only after its handler has unwound,
+	// so one peer left means a's rotate has already had its turn at the store.
+	// The second condition is what keeps this from being a ten second timeout
+	// when the swap is not conditional: a's write lands, and the assertions
+	// below get to say so.
+	waitFor(t, "the losing rotation to finish", func() bool {
+		hash, _ := r.st.AuthHash(testVault)
+		return r.srv.Peers(testVault) == 1 || hash != hashOf(thirdKey)
+	})
+	if hash, _ := r.st.AuthHash(testVault); hash != hashOf(thirdKey) {
+		t.Fatal("the evicted device's rotation overwrote the one that won")
+	}
+	if w, _ := r.st.Wrapped(testVault); w != thirdWrapped {
+		t.Fatalf("the vault's wrapped key is %q, not the winner's", w)
+	}
+	if n, _ := r.st.Rotations(testVault); n != 1 {
+		t.Fatalf("the generation moved %d times for one rotation", n)
+	}
+	// And the old string opens nothing, which is the point of rotating at all.
+	old := r.dial("old")
+	old.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "old"})
+	old.expectErr(wire.CodeAuth)
+}
+
+// A hello that passes auth under the old root and pauses before joining is
+// refused, not served.
+//
+// The eviction a rotation performs is a snapshot of the hub, and this session
+// is in no snapshot: it joins afterwards. Without the generation it was handed
+// the old wrapping and went on reading and writing valid entries under a
+// credential the vault no longer knew, because the data key had not changed.
+func TestAStaleHelloThatJoinsAfterARotationIsRefused(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+	_ = a
+
+	var once sync.Once
+	r.srv.beforeJoin = func() {
+		once.Do(func() {
+			if err := r.st.Rotate(testVault, hashOf(longKey), hashOf(newKey), newWrapped); err != nil {
+				t.Errorf("rotating between auth and join: %v", err)
+			}
+		})
+	}
+
+	stale := r.dial("stale")
+	stale.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Token: longKey, Device: "stale"})
+	msg := stale.expectErr(wire.CodeAuth)
+	if !strings.Contains(msg, "rotated") {
+		t.Fatalf("the refusal does not say why: %q", msg)
+	}
+	if !stale.closed() {
+		t.Fatal("a session that joined after the rotation was left open")
+	}
+	if r.srv.Peers(testVault) > 1 {
+		t.Fatalf("%d peers, so the refused session is still in the fan-out", r.srv.Peers(testVault))
+	}
 }

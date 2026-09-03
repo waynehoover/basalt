@@ -172,10 +172,16 @@ type Credentials struct {
 //
 // Redeemed is true when the hello carried an invite that was just marked used;
 // Sealed is then the root secret the issuing device sealed for the new one.
+//
+// AuthHash is the vault's stored hash that this credential matched, or the one
+// a claim just bound the vault to. The session keeps it and rotation swaps
+// against it, so a device can only replace the credential it proved it holds;
+// see store.Rotate. It is empty on a redeemed grant, which is not a device.
 type Grant struct {
 	Bootstrap bool
 	Redeemed  bool
 	Sealed    string
+	AuthHash  string
 }
 
 // Authenticator decides whether a token may use a vault.
@@ -254,6 +260,22 @@ type Server struct {
 	// fan-out first.
 	afterReplayBatch func(n int)
 	afterReplay      func()
+
+	// beforeJoin runs inside a hello, after the vault's key material has been
+	// read and before the session joins the fan-out, and is nil in every
+	// non-test build. It exists for the same reason as the two above: the
+	// window between authenticating and joining is a few microseconds wide, and
+	// a rotation landing in it used to leave a session holding a retired
+	// credential serving happily. A test that tried to hit it by timing would
+	// be a test that passes when the machine is busy.
+	beforeJoin func()
+
+	// beforeRotate runs inside a rotate, just before the store is asked to swap
+	// the credential, and is nil in every non-test build. It is how a test
+	// parks one device's rotation inside the store call while another device's
+	// rotation commits underneath it, which is the sequence that let a revoked
+	// device take the vault back.
+	beforeRotate func()
 
 	// afterFlush runs once flushPending has released its lock, and is nil in
 	// every non-test build. By then caught-up is already queued, so a broadcast
@@ -364,14 +386,6 @@ func (s *Server) forget(sess *Session) {
 		sess.counted = false
 		s.preAuth--
 	}
-}
-
-// PreAuth is how many connections are waiting to say hello, for tests and for
-// the operator's own curiosity.
-func (s *Server) PreAuth() int {
-	s.sessMu.Lock()
-	defer s.sessMu.Unlock()
-	return s.preAuth
 }
 
 // Sessions is how many connections are being handled, joined or not.
@@ -543,21 +557,20 @@ func (s *Server) MaxFetchBytes() int64 { return s.maxFetchBytes }
 // do rather than opening the database a second time.
 func (s *Server) Store() *store.Store { return s.st }
 
-// Peers is the number of devices currently connected to a vault.
-func (s *Server) Peers(vaultID string) int { return s.hub.peerCount(vaultID) }
-
 // ready is the handshake reply, built from the same constants the store and
 // the session enforce. Advertising a limit that is not enforced, or enforcing
 // one that is not advertised, is how a client ends up retrying a put that can
 // never succeed.
 //
-// proto is the client's, echoed, and wrapped is sent only to a protocol 3
-// client: a protocol 2 session is answered exactly as protocol 2 was, and
-// carries the new caps because a client that ignores a field costs nothing.
-func (s *Server) ready(proto int, id, cursor int64, wrapped string) wire.Ready {
-	r := wire.Ready{
+// wrapped is the vault's data key, which every claimed vault has, so a client
+// always learns it here. The protocol range is sent whole even though it is one
+// version wide, because that is what a client names when the next bump refuses
+// it; see wire.Proto.
+func (s *Server) ready(id, cursor int64, wrapped string) wire.Ready {
+	return wire.Ready{
 		Res:           "ready",
-		Proto:         proto,
+		ID:            id,
+		Proto:         wire.Proto,
 		MinProto:      wire.MinProto,
 		ServerVersion: s.version,
 		Cursor:        cursor,
@@ -566,17 +579,21 @@ func (s *Server) ready(proto int, id, cursor int64, wrapped string) wire.Ready {
 		MaxChunks:     store.MaxChunksPerEntry,
 		MaxBatchBytes: s.maxBatchBytes,
 		MaxFetchBytes: s.maxFetchBytes,
+		Wrapped:       wrapped,
 	}
-	if proto >= 3 {
-		r.ID = id
-		r.Wrapped = wrapped
-	}
-	return r
 }
 
 /* ---------------------------------------------------------------- *
  * One secret
  * ---------------------------------------------------------------- */
+
+// MinClaimLength is the shortest auth key a vault may be bound to.
+//
+// A derived key is 43 characters of base64url. Anything much shorter came from
+// a client that is not deriving it, and binding a vault to a guessable
+// credential is worse than refusing to bind it at all: the refusal is visible
+// and the weak key is not.
+const MinClaimLength = 32
 
 // DerivedAuth authenticates against a key the client derives from the vault's
 // root secret, with a one-time bootstrap token for the very first device.
@@ -597,14 +614,7 @@ func (s *Server) ready(proto int, id, cursor int64, wrapped string) wire.Ready {
 // sends the auth key it wants the vault bound to, and from then on the
 // bootstrap opens nothing. Trust on first connection would be simpler and would
 // mean whoever reached the port first owned the vault.
-// MinClaimLength is the shortest auth key a vault may be bound to.
 //
-// A derived key is 43 characters of base64url. Anything much shorter came from
-// a client that is not deriving it, and binding a vault to a guessable
-// credential is worse than refusing to bind it at all: the refusal is visible
-// and the weak key is not.
-const MinClaimLength = 32
-
 // # Why the hash is a bare, unsalted SHA-256, and must stay one
 //
 // The auth key is 256 random bits derived by HKDF from a random root. There is
@@ -629,7 +639,7 @@ func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int
 			return Grant{}, errors.New("this server has no bootstrap token, so no vault can be claimed")
 		}
 
-		hash, err := st.AuthHash(c.VaultID)
+		hash, _, _, err := st.VaultKeys(c.VaultID)
 		if err != nil {
 			return Grant{}, fmt.Errorf("reading the vault's auth hash: %w", err)
 		}
@@ -664,7 +674,9 @@ func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int
 			if subtle.ConstantTimeCompare(offered[:], want) != 1 {
 				return Grant{}, errors.New("auth key mismatch")
 			}
-			return Grant{}, nil
+			// The hash this credential matched travels with the grant, because
+			// it is what a later rotation compare-and-swaps against.
+			return Grant{AuthHash: hash}, nil
 		}
 
 		// Unclaimed. The bootstrap token is the only thing that opens it, and
@@ -677,12 +689,19 @@ func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int
 				"this vault has not been claimed, and the key offered to claim it with is %d characters, which is too few",
 				len(c.Claim))
 		}
-		if c.Wrapped != "" && !store.ValidWrapped(c.Wrapped) {
+		// A vault is claimed with a data key. The session refuses a claim
+		// without a usable one before it ever reaches an authenticator, and
+		// this is the same rule at the layer that does the writing, so no
+		// authenticator can bind a vault whose content keys would derive from
+		// the root secret.
+		if !store.ValidWrapped(c.Wrapped) {
 			return Grant{}, fmt.Errorf(
-				"the wrapped data key offered with the claim is %d bytes and not base64url", len(c.Wrapped))
+				"a vault is claimed with a data key, and the wrapped key offered with this claim is %d bytes and not base64url",
+				len(c.Wrapped))
 		}
 		claimed := sha256.Sum256([]byte(c.Claim))
-		ok, err := st.ClaimVault(c.VaultID, hex.EncodeToString(claimed[:]), c.Wrapped, now())
+		claimedHash := hex.EncodeToString(claimed[:])
+		ok, err := st.ClaimVault(c.VaultID, claimedHash, c.Wrapped, now())
 		if err != nil {
 			return Grant{}, fmt.Errorf("claiming vault %q: %w", c.VaultID, err)
 		}
@@ -691,6 +710,6 @@ func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int
 			// is the vault's key now, and this one is not it.
 			return Grant{}, errors.New("the vault was claimed by another device a moment ago")
 		}
-		return Grant{Bootstrap: true}, nil
+		return Grant{Bootstrap: true, AuthHash: claimedHash}, nil
 	}
 }
