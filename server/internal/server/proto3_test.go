@@ -4,9 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
@@ -172,6 +174,52 @@ func TestI1FetchIsAnsweredByABodiesHeaderOrAnError(t *testing.T) {
 	}
 	cl.sendJSON(wire.In{Op: "ping"})
 	cl.recvInto("pong", &wire.Pong{})
+}
+
+// A body that rotted on disk is found before the header, not halfway through
+// the stream.
+//
+// Presence was checked with a stat, which a rotted body passes, and each body
+// was verified as it was read. So the third of five going bad meant a header
+// promising five, two bodies, and then a fatal refusal: a client that had
+// pre-allocated five is left waiting for frames that are not coming, and the
+// count in the header was a promise the server had already broken. Every body
+// is read and checked before the header now, so this is a refusal the session
+// survives and the client can act on.
+func TestI1AFetchWithARottedBodyIsRefusedBeforeTheHeader(t *testing.T) {
+	r := newRig(t)
+	e := r.seed("note.md", "one", "two", "three")
+	cl := r.dial("a")
+	cl.hello(0)
+
+	// The middle body rots. It still stats, so nothing short of reading it
+	// notices.
+	p, err := r.st.Chunks().Path(testVault, e.Chunks[1])
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	if err := os.WriteFile(p, []byte("bytes this name does not describe"), 0o600); err != nil {
+		t.Fatalf("rot the body: %v", err)
+	}
+
+	cl.sendJSON(wire.In{Op: "fetch", ID: 9, Chunks: e.Chunks})
+	f := rawFields(t, cl.recvRaw())
+	if f["res"] != "err" || f["code"] != wire.CodeNoChunk || f["id"] != float64(9) {
+		t.Fatalf("a fetch over a rotted body was answered %v, want an error and no bodies", f)
+	}
+
+	// The session survives it, so the client can ask for what it can still have.
+	cl.sendJSON(wire.In{Op: "ping"})
+	cl.recvInto("pong", &wire.Pong{})
+
+	// And the bad body is set aside, so the next put asks for it again.
+	if r.st.Chunks().Has(testVault, e.Chunks[1]) {
+		t.Fatal("the rotted body is still present under its name, so no device will ever be asked for it")
+	}
+	got := cl.fetch(e.Chunks[0], e.Chunks[2])
+	if string(got[0]) != "one" || string(got[1]) != "three" {
+		t.Fatalf("the chunks that are still good fetched as %q and %q", got[0], got[1])
+	}
 }
 
 /* ---------------------------------------------------------------- *
@@ -501,6 +549,58 @@ func TestI5RotateReplacesTheSecretAndClosesOtherSessions(t *testing.T) {
 	}
 	if ready.Cursor != before {
 		t.Fatalf("history was lost: cursor %d, the note was uid %d", ready.Cursor, before)
+	}
+}
+
+// The peers a rotation retires are evicted at the same time, not one after
+// another.
+//
+// Each eviction gives its peer up to a second to read the notice before the
+// connection is closed, and they ran in series, before the rotating device was
+// told anything. Seven other devices meant about seven seconds of silence on a
+// request that had already committed. The device limit is eight, so that is a
+// real vault, not a contrived one.
+func TestI5RotateEvictsEveryPeerAtOnce(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+	peers := []*client{
+		derived(t, r, "b", longKey),
+		derived(t, r, "c", longKey),
+		derived(t, r, "d", longKey),
+	}
+
+	// Each eviction reports in and waits for the others. In series the first
+	// one waits for peers that have not started, so nothing but the timeout
+	// gets past this.
+	arrived := make(chan struct{}, len(peers))
+	together := make(chan struct{})
+	var once sync.Once
+	r.srv.beforeEvict = func() {
+		arrived <- struct{}{}
+		if len(arrived) == len(peers) {
+			once.Do(func() { close(together) })
+		}
+		select {
+		case <-together:
+		case <-time.After(3 * time.Second):
+		}
+	}
+
+	start := time.Now()
+	a.sendJSON(wire.In{Op: "rotate", ID: 41, Auth: newKey, Wrapped: newWrapped})
+	if m := a.recv(); m["res"] != "rotated" || m["id"] != float64(41) {
+		t.Fatalf("rotate was answered %v", m)
+	}
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("the rotate took %s: the evictions did not overlap", took.Round(time.Millisecond))
+	}
+	if n := len(arrived); n != len(peers) {
+		t.Fatalf("%d of %d peers were evicted", n, len(peers))
+	}
+	for _, p := range peers {
+		if !p.closed() {
+			t.Fatal("a peer stayed open under a retired credential")
+		}
 	}
 }
 

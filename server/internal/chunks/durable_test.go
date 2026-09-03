@@ -6,7 +6,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // S17 and S25: the two ways a body could be on disk and not be durable, or be
@@ -129,5 +132,86 @@ func TestS25AShortWriteIsRefusedAndStoresNothing(t *testing.T) {
 	s.write = func(*os.File, []byte) error { return errors.New("disk on fire") }
 	if err := s.Put("v1", name, body); err == nil || !strings.Contains(err.Error(), "fire") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// Two sessions storing the first chunk of one vault at the same time: the one
+// that loses the Mkdir race must not report its body stored before the
+// directory holding it has a durable name.
+//
+// The loser used to get ErrExist, take that as "whoever created it is flushing
+// it", flush only its leaf and return. The winner's flush of <vault>/ had not
+// necessarily happened, so a crash in between lost both bodies with one of them
+// already acknowledged to a client that will never send it again (rule 1).
+func TestS17AConcurrentFirstChunkWaitsForTheDirectoryToBeDurable(t *testing.T) {
+	s := newTestStore(t)
+
+	first := []byte("the body that wins the race")
+	second := []byte("the body that loses it")
+	// Both into the same fan-out directory, so they race on the same Mkdir.
+	for Name(second)[:2] != Name(first)[:2] {
+		second = append(second, 'x')
+	}
+	vaultDir := s.VaultDir("v1")
+
+	var vaultFlushed atomic.Bool
+	rootFlushed := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	s.sync = func(dir string) error {
+		if dir == s.dir {
+			// The store root is flushed first, which is after both directories
+			// have been created: the moment the loser can see them.
+			once.Do(func() { close(rootFlushed) })
+			return syncDir(dir)
+		}
+		if dir == vaultDir {
+			// A slow fsync, which is what an fsync is.
+			<-release
+			err := syncDir(dir)
+			vaultFlushed.Store(true)
+			return err
+		}
+		return syncDir(dir)
+	}
+
+	winner := make(chan error, 1)
+	go func() { winner <- s.Put("v1", Name(first), first) }()
+	<-rootFlushed
+
+	// What the loser saw when it returned: was the directory its body is named
+	// in durable yet?
+	loser := make(chan bool, 1)
+	go func() {
+		if err := s.Put("v1", Name(second), second); err != nil {
+			t.Errorf("put by the second writer: %v", err)
+		}
+		loser <- vaultFlushed.Load()
+	}()
+
+	early := false
+	select {
+	case durable := <-loser:
+		// It got all the way through while the winner is still inside the
+		// fsync. Only acceptable if the directory was already durable.
+		early = !durable
+	case <-time.After(500 * time.Millisecond):
+		// Still waiting, which is the point.
+	}
+	close(release)
+
+	if err := <-winner; err != nil {
+		t.Fatalf("put by the first writer: %v", err)
+	}
+	if early {
+		t.Fatal("the second body was reported stored while the directory holding its name was still unflushed")
+	}
+	if durable := <-loser; !durable {
+		t.Fatal("the second writer returned before the directory holding its name was flushed")
+	}
+	for _, b := range [][]byte{first, second} {
+		if !s.Has("v1", Name(b)) {
+			t.Fatalf("body %q is not stored", b)
+		}
 	}
 }

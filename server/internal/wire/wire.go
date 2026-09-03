@@ -154,7 +154,9 @@ type In struct {
 	// invite: Invite is the random identifier and Sealed the root secret sealed
 	// under the invite key, which never reaches the server. TTLMs is how long
 	// the invite lives; zero is the default. At hello, Invite in place of a
-	// token redeems one.
+	// token redeems one, and a hello carrying both is refused: "in place of"
+	// is the rule, and a server that picked one for you would be redeeming or
+	// discarding an invite the client did not decide about.
 	Invite string `json:"invite,omitempty"`
 	Sealed string `json:"sealed,omitempty"`
 	TTLMs  int64  `json:"ttlMs,omitempty"`

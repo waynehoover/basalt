@@ -159,3 +159,78 @@ func TestI23RotateDeletesOutstandingInvites(t *testing.T) {
 		t.Fatalf("an invite sealing the retired root was answered %v", f)
 	}
 }
+
+// The same invite identifier twice is refused as a bad request, and the session
+// carries on.
+//
+// AddInvite was a bare insert, so the second one met the primary key and came
+// back as `internal`. `internal` is retryable, and retrying an invite under the
+// identifier it was issued under is exactly what a device does when the reply
+// goes missing, so the pair of them made a loop that could not end. It is the
+// request that is wrong, and `badentry` says so once.
+func TestI23AnInviteIdentifierIsRefusedTheSecondTime(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+
+	a.sendJSON(wire.In{Op: "invite", ID: 1, Invite: testInvite, Sealed: testSealed})
+	a.recvInto("invited", &wire.Invited{})
+
+	a.sendJSON(wire.In{Op: "invite", ID: 2, Invite: testInvite, Sealed: testSealed})
+	f := rawFields(t, a.recvRaw())
+	if f["res"] != "err" || f["code"] != wire.CodeBadEntry {
+		t.Fatalf("a repeated invite identifier was answered %v, want badentry", f)
+	}
+	if f["retryable"] != false {
+		t.Fatalf("the refusal is retryable, so a client retrying the same identifier never stops: %v", f)
+	}
+	if f["id"] != float64(2) {
+		t.Fatalf("the refusal answers request %v, not the one that was made", f["id"])
+	}
+
+	// One invite, and it is the one that was issued first: the refusal changed
+	// nothing.
+	if n, _ := r.st.InviteRows(testVault); n != 1 {
+		t.Fatalf("%d invite rows, want 1", n)
+	}
+	if fr := redeem(t, r, testInvite); fr["res"] != "redeemed" || fr["sealed"] != testSealed {
+		t.Fatalf("the invite that was stored first is not the one redeemed: %v", fr)
+	}
+	a.sendJSON(wire.In{Op: "ping"})
+	a.recvInto("pong", &wire.Pong{})
+}
+
+// A hello carrying both a token and an invite is refused.
+//
+// The authenticator treats an invite as standing in for the token, and it
+// triggers on the invite alone, so the session used to hand it only the token:
+// authenticated as an ordinary device with the invite neither redeemed nor
+// refused. The invite stayed live and the person holding the string was told
+// nothing, which is the quiet half of a pairing that never happens.
+func TestI23AHelloWithBothATokenAndAnInviteIsRefused(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+	a.sendJSON(wire.In{Op: "invite", Invite: testInvite, Sealed: testSealed})
+	a.recvInto("invited", &wire.Invited{})
+
+	cl := r.dial("confused")
+	cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
+		Token: longKey, Invite: testInvite, Device: "confused"})
+	f := rawFields(t, cl.recvRaw())
+	if f["res"] != "err" || f["code"] != wire.CodeBadEntry {
+		t.Fatalf("a hello with both was answered %v, want badentry", f)
+	}
+	if msg, _ := f["msg"].(string); !strings.Contains(msg, "both") {
+		t.Fatalf("the refusal does not say what was wrong with it: %q", msg)
+	}
+	if !cl.closed() {
+		t.Fatal("the session survived a hello that was refused")
+	}
+
+	// And the invite is untouched: neither redeemed nor burned by the refusal.
+	if n, _ := r.st.OutstandingInvites(testVault, r.srv.now().UnixMilli()); n != 1 {
+		t.Fatalf("%d outstanding invites after the refusal, want the one that was issued", n)
+	}
+	if fr := redeem(t, r, testInvite); fr["res"] != "redeemed" {
+		t.Fatalf("the invite no longer redeems: %v", fr)
+	}
+}

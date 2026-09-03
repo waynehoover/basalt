@@ -291,3 +291,33 @@ func TestRotationsCountsRotationsAndNothingElse(t *testing.T) {
 		t.Fatalf("VaultKeys = %q %q %d, %v", hash, wrapped, gen, err)
 	}
 }
+
+// The base64url shape check, which is what stands between a client bug and a
+// wrapped key, a sealed secret or an invite identifier nothing can decode.
+//
+// It used to allow "=" anywhere in the last two positions, so "ab=c" passed:
+// padding is the end of a base64 string, not a character that may appear near
+// it. Nothing here is ever decoded by the server, so this cost nothing today;
+// it is a shape check, and one that admits a shape no encoder produces is not
+// doing its job.
+func TestValidBase64URLTakesPaddingOnlyAtTheEnd(t *testing.T) {
+	good := []string{"abc", "ab-_", "abc=", "ab==", "abcd", "a==", "ab="}
+	for _, s := range good {
+		if !validBase64URL(s, 80) {
+			t.Errorf("%q was refused and is base64url", s)
+		}
+	}
+	bad := []string{"", "ab=c", "a=bc", "a=b", "===a", "ab=_", "ab c", "ab+c", "ab/c", "ab==x"}
+	for _, s := range bad {
+		if validBase64URL(s, 80) {
+			t.Errorf("%q was accepted and is not base64url", s)
+		}
+	}
+	if validBase64URL("aaaa", 3) {
+		t.Error("a string over the maximum was accepted")
+	}
+	// And through the three callers, which differ only in their ceiling.
+	if ValidWrapped("ab=c") || ValidSealed("ab=c") || ValidInvite("ab=c") {
+		t.Error("padding in the middle passed one of the named checks")
+	}
+}

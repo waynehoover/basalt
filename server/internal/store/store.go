@@ -1101,6 +1101,10 @@ type PurgeReport struct {
 // sweep is not reversible SQL and a body it removes is unreferenced by the
 // committed result; a chunk link goes with its entry by ON DELETE CASCADE, so
 // the live set read inside the transaction is exactly what survives.
+//
+// The report describes what committed. A transaction that rolls back returns a
+// zeroed one, because its counts were read inside a delete that no longer
+// stands.
 func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -1160,7 +1164,13 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 		return err
 	})
 	if err != nil {
-		return rep, err
+		// Nothing was removed: the delete rolled back with everything else in
+		// the transaction. The counts were filled in inside it, and
+		// VersionsRemoved comes from RowsAffected on a statement that no longer
+		// stands, so reporting them would print history as gone that is still
+		// there. A destructive command's own arithmetic has to describe what
+		// committed (rule 8), and on this path nothing did.
+		return PurgeReport{}, err
 	}
 
 	rep.ChunksLive = len(live)
@@ -1489,11 +1499,24 @@ func validBase64URL(s string, max int) bool {
 	if s == "" || len(s) > max {
 		return false
 	}
+	padded := false
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		switch {
+		case c == '=':
+			// Padding is the end of the string and at most two characters of
+			// it. Allowing "=" anywhere in the last two positions accepted
+			// "ab=c", which is not base64 of anything. Nothing here is ever
+			// decoded, so this is shape only, but a shape check that admits a
+			// string no encoder produces is not checking the shape.
+			if i < len(s)-2 {
+				return false
+			}
+			padded = true
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
-		case c == '=' && i >= len(s)-2:
+			if padded {
+				return false
+			}
 		default:
 			return false
 		}
@@ -1507,6 +1530,10 @@ func validBase64URL(s string, max int) bool {
 // what was issued since the last issue, with no goroutine to forget to start;
 // a vault that never issues another invite keeps a handful of dead rows, which
 // redeem refuses anyway.
+//
+// An identifier that is already there is ErrBadEntry, which the session turns
+// into `badentry`: a refusal a retry cannot fix, so the device stops rather
+// than retrying an identifier this vault will never accept again.
 func (s *Store) AddInvite(vaultID, invite, sealed string, expiresAt, now int64) error {
 	if !ValidInvite(invite) {
 		return fmt.Errorf("%w: invite identifier is %d bytes and must be base64url of at most %d",
@@ -1532,6 +1559,26 @@ func (s *Store) AddInvite(vaultID, invite, sealed string, expiresAt, now int64) 
 			return err
 		}
 		if _, err := tx.Exec(`DELETE FROM invites WHERE vault_id = ? AND expires_at < ?`, vaultID, now); err != nil {
+			return err
+		}
+		// An identifier already in use is refused as the client's mistake, not
+		// as a server fault. It used to reach the primary key as a bare insert
+		// and come back as `internal`, which is retryable, so a device that
+		// retried the same invite after a lost reply retried it for ever.
+		//
+		// Refused rather than answered as a success, because the row that is
+		// already there may have been redeemed a moment ago: the sweep above
+		// has just removed the expired ones, and used is not a thing this can
+		// see without racing the redeem. Reporting `invited` for an invite that
+		// is already spent is a success nothing verified, and the device
+		// holding the string would find out only when it failed to pair.
+		var exists int
+		switch err := tx.QueryRow(
+			`SELECT 1 FROM invites WHERE vault_id = ? AND invite = ?`, vaultID, invite).Scan(&exists); {
+		case err == nil:
+			return fmt.Errorf("%w: this vault already has an invite under that identifier; issue a new one", ErrBadEntry)
+		case errors.Is(err, sql.ErrNoRows):
+		default:
 			return err
 		}
 		_, err = tx.Exec(

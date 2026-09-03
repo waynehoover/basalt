@@ -119,7 +119,7 @@ func dataFlags(fs *flag.FlagSet) *string {
 }
 
 // tokenFileName is the device auth token. It is not the encryption key: the
-// vault passphrase is generated on the first device and this server never sees
+// vault's recovery key is generated on the first device and this server never sees
 // it.
 const tokenFileName = "auth-token"
 
@@ -858,7 +858,9 @@ func cmdPurge(args []string, out io.Writer) error {
 	// Print the report before returning any error. The versions were deleted
 	// before the sweep ran, so a sweep that fails still leaves work done, and
 	// swallowing the numbers would hide both what went and what a quarantined
-	// body cost. rule 8: trust the numbers.
+	// body cost. rule 8: trust the numbers. A failure inside the transaction is
+	// the other case, and Purge zeroes the report there, so what is printed is
+	// what committed rather than rows that were rolled back.
 	fmt.Fprintf(out, "versions %d -> %d (removed %d)\n",
 		rep.VersionsBefore, rep.VersionsAfter, rep.VersionsRemoved)
 	fmt.Fprintf(out, "chunks %d live, %d deleted, %d spared as too recent to collect\n",
@@ -992,12 +994,24 @@ func cmdBackup(args []string, out io.Writer) error {
 		rep.Vaults, rep.Refs, rep.Copied, humanBytes(rep.Bytes))
 	fmt.Fprintf(out, "  %d bodies at source, %d in the backup\n", rep.SourceBodies, rep.DestBodies)
 	fmt.Fprintf(out, "  verified %d chunk references in the backup, all present\n", rep.Verified)
-	if rep.SourceBodies != rep.DestBodies {
+	// Either side can be the larger, and the difference means something
+	// different each way, so it is subtracted in the direction that is
+	// actually positive. Printing source minus destination unconditionally
+	// went negative as soon as the backup held retained history, and a
+	// negative count of bodies "not copied" reads as a fault in the one
+	// command whose numbers are all anybody has to go on.
+	switch {
+	case rep.SourceBodies > rep.DestBodies:
 		// Expected, and explained rather than left as a discrepancy: the backup
 		// holds what committed entries reference, and the source may also hold
 		// bodies from a push that never committed.
 		fmt.Fprintf(out, "  (%d source bodies are referenced by no entry and were not copied)\n",
 			rep.SourceBodies-rep.DestBodies)
+	case rep.DestBodies > rep.SourceBodies:
+		// The other direction, and it is the backup working: a purge dropped
+		// old versions at the source, and their bodies stay here.
+		fmt.Fprintf(out, "  (the backup holds %d bodies the source no longer has, which is history it kept)\n",
+			rep.DestBodies-rep.SourceBodies)
 	}
 	if rep.Retained > 0 {
 		// The backup holds history the newest snapshot no longer references,
@@ -1012,10 +1026,12 @@ func cmdBackup(args []string, out io.Writer) error {
 	}
 
 	// The copy is ciphertext. Saying so every time is the point: a backup
-	// without the passphrase restores nothing, and that is the one part of this
-	// no command can check.
+	// without the recovery key restores nothing, and that is the one part of
+	// this no command can check. The name matters: the plugin, the CLI and the
+	// docs all call it the recovery key, and a person reading this line has to
+	// know it means the thing they were told to write down.
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "This backup is ciphertext. Restoring it needs your vault passphrase,")
+	fmt.Fprintln(out, "This backup is ciphertext. Restoring it needs the vault's recovery key,")
 	fmt.Fprintln(out, "which this server has never seen. Keep that written down somewhere")
 	fmt.Fprintln(out, "else, or the backup is a pile of bytes nobody can read.")
 	fmt.Fprintf(out, "\nTo restore: point the server at it, or copy it back.\n")

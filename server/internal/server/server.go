@@ -289,6 +289,13 @@ type Server struct {
 	// much the kernel buffers, which differs by platform.
 	beforePing func()
 
+	// beforeEvict runs at the top of each eviction a rotation causes, and is
+	// nil in every non-test build. A test uses it to see that the evictions
+	// overlap, which is the whole of what parallelising them buys and is not
+	// otherwise observable: how long an eviction takes depends on whether the
+	// peer is reading, which a test cannot arrange honestly.
+	beforeEvict func()
+
 	// beforeAppend runs just before an entry is committed, and is nil in every
 	// non-test build. An error from it stands in for the database failing the
 	// commit, which no test can arrange honestly on a working disk, so that the
@@ -405,6 +412,9 @@ func (s *Server) Sessions() int {
 // expires is killed, which a client experiences as a dropped connection with
 // nothing acknowledged, and retries. Call this before closing the store; a
 // session that outlives the store would fail its commit and could not say why.
+//
+// It returns only once no session is left, deadline or no deadline. The error
+// says how many were cut off; it does not mean any of them is still running.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.sessMu.Lock()
 	s.closing = true
@@ -435,8 +445,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 		}
 		// Out of time. What is left is mid-request; it is cut off, unacked, and
-		// the client retries. Then a short wait for Handle to unwind, so the
-		// store is not closed under a session that is still using it.
+		// the client retries. The count is taken here, under the lock and at
+		// the moment of the kill, so what is reported is what was actually
+		// still running rather than a number from before the wait.
 		s.sessMu.Lock()
 		left := make([]*Session, 0, len(s.sessions))
 		for sess := range s.sessions {
@@ -446,13 +457,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		for _, sess := range left {
 			sess.kill(errors.New("shutdown deadline reached with a request in flight"))
 		}
-		grace := time.After(time.Second)
+		// Then wait for every one of them to unwind, with no second deadline.
+		// The kill has already closed the socket, so what remains is a request
+		// finishing, usually a commit, and this is the one thing the caller
+		// cannot be allowed to race: main closes the store as soon as this
+		// returns, and a commit that meets a closed store fails with `internal`
+		// on a put the client was told nothing about. Returning after a second
+		// whether or not the sessions had gone is what made that possible.
+		//
+		// A session that never unwinds hangs the stop, which systemd ends with
+		// SIGKILL; that leaves the database to recover from its journal, which
+		// it is built to do, and is the safer of the two failures.
 		for s.Sessions() > 0 {
-			select {
-			case <-tick.C:
-			case <-grace:
-				return fmt.Errorf("shutdown: %d sessions cut off mid-request", len(left))
-			}
+			<-tick.C
 		}
 		return fmt.Errorf("shutdown: %d sessions cut off mid-request", len(left))
 	}

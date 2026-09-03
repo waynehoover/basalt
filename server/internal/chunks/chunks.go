@@ -85,6 +85,11 @@ type Store struct {
 	dir string
 	max int64
 
+	// mkdirMu serialises directory creation, so that a directory another
+	// writer can see is a directory whose own name is already durable. See
+	// mkdirAll for the race it closes.
+	mkdirMu sync.Mutex
+
 	// sync flushes one directory and is syncDir in every non-test build. A
 	// test replaces it to see which directories were flushed, because the one
 	// fault this package guards against, a name that is not durable, leaves
@@ -278,10 +283,9 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 	return nil
 }
 
-// place does everything Put does except the directory fsyncs, and returns the
-// directories that still need one: the one the body landed in, and every
-// directory whose entry was created on the way to it. Nothing means the chunk
-// was already there and nothing was written.
+// place does everything Put does except the fsync of the directory the body
+// landed in, which it returns. Nothing means the chunk was already there and
+// nothing was written.
 //
 // Split out because a batch of chunks landing in the same directory needs that
 // fsync once rather than once each, and because the file fsyncs in a batch can
@@ -289,12 +293,13 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 // every body durable, every name durable. It changes only how many times the
 // same directory is flushed to make that so.
 //
-// The ancestors are in the list because of S17. The first chunk of a vault
-// creates <root>/<vault>/<ab>/, and flushing <ab>/ makes the body's name
-// durable inside a directory whose own name was not: a crash could lose the
+// The directories on the way to it are flushed by mkdirAll, as they are
+// created, rather than being returned here. That is S17: the first chunk of a
+// vault creates <root>/<vault>/<ab>/, and flushing <ab>/ makes the body's name
+// durable inside a directory whose own name was not, so a crash could lose the
 // <ab> entry from <vault>/, or <vault>/ from the root, and take the flushed
 // body with it. A directory entry is durable when its parent is flushed, the
-// same rule the body follows, so every newly created level is flushed too.
+// same rule the body follows.
 func (s *Store) place(vaultID, name string, body []byte) ([]string, error) {
 	// Re-hashed here rather than trusted from the caller, because in a batch the
 	// caller and the writer are different goroutines: whoever handed this over
@@ -317,8 +322,7 @@ func (s *Store) place(vaultID, name string, body []byte) ([]string, error) {
 		return nil, nil
 	}
 	dir := filepath.Dir(p)
-	created, err := s.mkdirAll(dir)
-	if err != nil {
+	if err := s.mkdirAll(dir); err != nil {
 		return nil, err
 	}
 	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
@@ -352,23 +356,36 @@ func (s *Store) place(vaultID, name string, body []byte) ([]string, error) {
 	if err := os.Rename(tmp.Name(), p); err != nil {
 		return nil, err
 	}
-	// The leaf last: a caller flushing in order flushes the parents whose
-	// entries were just created before the directory the body's name is in,
-	// though for durability before an ack the order does not matter, only
-	// that every one of them is flushed.
-	return append(created, dir), nil
+	// Only the leaf: every directory above it was flushed by mkdirAll before
+	// this body was written into it.
+	return []string{dir}, nil
 }
 
 // mkdirAll creates dir and any missing ancestors under the store root, and
-// returns the directories that gained a new entry and so need flushing: for
-// each level created, its parent. Nothing is returned for a path that already
-// existed, which is every chunk after the first in its fan-out directory.
-func (s *Store) mkdirAll(dir string) ([]string, error) {
+// flushes the parent of every level it creates before it returns. Once it has
+// returned, every directory on the path has a durable name, so the caller has
+// nothing left to flush but the one its body lands in.
+//
+// The creation is serialised, and the flush happens inside that section,
+// because "whoever created it is flushing it" was not something the loser of
+// the race could rely on. Two sessions each storing the first chunk of a vault
+// race on the same Mkdir: the loser got ErrExist, had nothing to flush, flushed
+// its leaf and acked, while the winner had not necessarily reached its own
+// fsync of <vault>/. A crash in that window loses both bodies with one of them
+// acknowledged, which is the one server-side fault a client cannot detect
+// (rule 1). Doing the flush before the directory is visible to anyone else
+// makes the loser's assumption true instead of hopeful.
+//
+// The cost is one mutex around two or three syscalls per body, and one fsync
+// per directory ever created, which for a vault is its own directory plus 256
+// fan-out directories, once each in its life.
+func (s *Store) mkdirAll(dir string) error {
 	rel, err := filepath.Rel(s.dir, dir)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var toSync []string
+	s.mkdirMu.Lock()
+	defer s.mkdirMu.Unlock()
 	cur := s.dir
 	for _, part := range strings.Split(rel, string(filepath.Separator)) {
 		if part == "" || part == "." {
@@ -378,18 +395,20 @@ func (s *Store) mkdirAll(dir string) ([]string, error) {
 		err := os.Mkdir(next, 0o700)
 		switch {
 		case err == nil:
-			// A new entry in cur, which is durable only once cur is flushed.
-			toSync = append(toSync, cur)
+			// A new entry in cur, which is durable only once cur is flushed,
+			// and that happens here rather than being left to the caller.
+			if err := s.sync(cur); err != nil {
+				return err
+			}
 		case errors.Is(err, os.ErrExist):
-			// Already there, whether from an earlier chunk or a moment ago
-			// from another writer in the same batch. Either way its parent
-			// was, or is being, flushed by whoever created it.
+			// Already there, and whoever created it flushed its parent before
+			// releasing this lock, so there is nothing to do for it.
 		default:
-			return nil, err
+			return err
 		}
 		cur = next
 	}
-	return toSync, nil
+	return nil
 }
 
 // Writers is how many chunks a batch fsyncs at once.

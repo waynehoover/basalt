@@ -504,6 +504,9 @@ func (s *Session) shutdown() {
 // credential this session connected with no longer opens the vault, and the
 // device pairs again with the new string.
 func (s *Session) evict() {
+	if s.srv.beforeEvict != nil {
+		s.srv.beforeEvict()
+	}
 	if b, err := json.Marshal(s.errFrame(0, wire.CodeAuth,
 		"the vault's secret was rotated by another device; pair again with the new string", 0)); err == nil {
 		s.trySend(websocket.MessageText, b)
@@ -678,11 +681,18 @@ func (s *Session) handleHello(m wire.In) error {
 			"a vault is claimed with a data key, and the wrapped key offered with this claim is %d bytes; "+
 				"it must be base64url of at most %d", len(m.Wrapped), store.MaxWrappedLen))
 	}
-	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped}
-	if m.Token == "" {
-		// An invite stands in for the token.
-		creds.Invite = m.Invite
+	// An invite stands in for the token, so a hello carrying both is refused
+	// rather than resolved. The authenticator triggers on the invite alone, so
+	// a both-present hello used to get token authentication with the invite
+	// silently ignored: neither redeemed nor refused, and the device that was
+	// handed that invite would wait for a pairing that had already been used
+	// up by nothing. One credential per hello, and the refusal says which two
+	// were sent.
+	if m.Token != "" && m.Invite != "" {
+		return s.fatal(wire.CodeBadEntry, errors.New(
+			"this hello carries both a token and an invite, and an invite stands in for a token; send one"))
 	}
+	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped, Invite: m.Invite}
 	grant, err := s.srv.auth(creds)
 	if err != nil {
 		// Logged in full, reported as one word. Telling a caller whether the
@@ -1499,10 +1509,19 @@ func kindOf(e store.Entry) string {
 // handleFetch streams the requested chunk bodies as binary frames, in the order
 // requested.
 //
-// Every chunk is checked to be present before any frame is sent. Discovering
-// the third of five is missing halfway through leaves the client unable to tell
-// which bodies it received; refusing the whole fetch up front leaves it able to
-// ask again for a smaller set.
+// Every chunk is checked to be present, and then read and checked against its
+// own name, before any frame is sent. Discovering the third of five is missing
+// halfway through leaves the client unable to tell which bodies it received;
+// refusing the whole fetch up front leaves it able to ask again for a smaller
+// set.
+//
+// Reading every body twice is what that costs, once to verify and once to send.
+// Measured warm, a full 64 MiB fetch of 16 KiB chunks spends about 78 ms on the
+// extra pass and one of 1 MiB chunks about 28 ms; a note is a handful of chunks
+// and spends tens of microseconds. The pages are in cache for the second read,
+// so what is doubled is the hashing rather than the disk. That buys a header
+// whose count is the number of bodies that follow, which is the only thing a
+// client can pre-allocate against.
 func (s *Session) handleFetch(m wire.In) error {
 	if len(m.Chunks) == 0 {
 		return s.reject(wire.CodeBadChunk, errors.New("fetch names no chunks"))
@@ -1531,12 +1550,25 @@ func (s *Session) handleFetch(m wire.In) error {
 			"the %d chunks asked for hold %d bytes, limit for one fetch is %d; ask in smaller sets",
 			len(m.Chunks), total, s.srv.maxFetchBytes))
 	}
+	// Then every body is read and checked against its name, before the header
+	// promises how many are coming. A chunk that rotted on disk passes the stat
+	// above, so without this the failure was found mid-stream, after some
+	// bodies had gone out under a count that could no longer be met. Checking
+	// here turns that into a refusal the session survives and the client can
+	// act on: it asks again for a smaller set, or for the ones it still needs
+	// once a device has resent the bad one. After the size cap, so a fetch that
+	// is refused for being too large is refused without reading anything.
+	for i, n := range m.Chunks {
+		if err := s.srv.st.Chunks().Check(s.vaultID, n); err != nil {
+			s.quarantineIfCorrupt(n, err)
+			return s.reject(wire.CodeNoChunk,
+				fmt.Errorf("chunk %d of %d (%s): %w", i+1, len(m.Chunks), n, err))
+		}
+	}
 
 	// The client is told how many frames follow before the first one, so the
 	// answer to a fetch is either this header and exactly that many bodies or
-	// an error, never bodies and then an error. A body found unreadable below
-	// still ends the session, which is the one way a count once promised may
-	// fall short, and the close is what tells the client.
+	// an error, never bodies and then an error.
 	if err := s.writeJSON(wire.Bodies{Res: "bodies", ID: s.reqID, Count: len(m.Chunks)}); err != nil {
 		return err
 	}
@@ -1547,21 +1579,11 @@ func (s *Session) handleFetch(m wire.In) error {
 		// to decrypt it for reasons it cannot diagnose.
 		body, err := s.srv.st.Chunks().Get(s.vaultID, n)
 		if err != nil {
-			// A body that fails its own hash is not a body. Left in place it
-			// would keep satisfying the presence check, so every client would
-			// keep being told the server already holds it and none would ever
-			// send it again. Moved aside, the next put asks for it and a device
-			// that still has the note heals the vault.
-			if errors.Is(err, chunks.ErrCorrupt) {
-				s.srv.log.Error("quarantining a corrupt chunk",
-					"vault", s.vaultID, "chunk", n, "err", err)
-				if qerr := s.srv.st.Chunks().Quarantine(s.vaultID, n); qerr != nil {
-					s.srv.log.Error("could not quarantine it",
-						"vault", s.vaultID, "chunk", n, "err", qerr)
-				}
-			}
-			// Present a moment ago, unreadable now. Frames may already be on
-			// the wire, so there is no clean way to continue.
+			s.quarantineIfCorrupt(n, err)
+			// It verified a moment ago and cannot be read now, so the disk went
+			// bad between the two passes. Frames are already on the wire under
+			// a count this fetch can no longer meet, so the session ends: the
+			// close is what tells the client the count was not kept.
 			return s.fatal(wire.CodeNoChunk,
 				fmt.Errorf("chunk %d of %d (%s): %w", i+1, len(m.Chunks), n, err))
 		}
@@ -1570,6 +1592,24 @@ func (s *Session) handleFetch(m wire.In) error {
 		}
 	}
 	return nil
+}
+
+// quarantineIfCorrupt sets aside a body that failed its own hash.
+//
+// A body that is not the body its name says is not a body. Left in place it
+// would keep satisfying the presence check, so every client would keep being
+// told the server already holds it and none would ever send it again. Moved
+// aside, the next put asks for it and a device that still has the note heals
+// the vault. Anything else, a permission or an IO error, is left alone: it is
+// the disk's problem and the body may be perfectly good.
+func (s *Session) quarantineIfCorrupt(name string, err error) {
+	if !errors.Is(err, chunks.ErrCorrupt) {
+		return
+	}
+	s.srv.log.Error("quarantining a corrupt chunk", "vault", s.vaultID, "chunk", name, "err", err)
+	if qerr := s.srv.st.Chunks().Quarantine(s.vaultID, name); qerr != nil {
+		s.srv.log.Error("could not quarantine it", "vault", s.vaultID, "chunk", name, "err", qerr)
+	}
 }
 
 /* ---------------------------------------------------------------- *
@@ -1639,10 +1679,21 @@ func (s *Session) handleRotate(m wire.In) error {
 	// no longer opens it; told so and closed, from this goroutine, before this
 	// device is told it succeeded, so "rotated" also means "and nobody else is
 	// still writing under the old string".
+	//
+	// In parallel, because each peer is given up to a second to read its
+	// notice before it is closed, and in series seven other devices spent
+	// seven seconds of that before this one was told anything. Shutdown fans
+	// its notices out the same way, for the same reason.
 	others := s.srv.hub.others(s.vaultID, s)
+	var wg sync.WaitGroup
 	for _, peer := range others {
-		peer.evict()
+		wg.Add(1)
+		go func(peer *Session) {
+			defer wg.Done()
+			peer.evict()
+		}(peer)
 	}
+	wg.Wait()
 	s.srv.log.Info("vault secret rotated", "vault", s.vaultID, "device", s.device, "evicted", len(others))
 	return s.writeJSON(wire.Rotated{Res: "rotated", ID: s.reqID})
 }

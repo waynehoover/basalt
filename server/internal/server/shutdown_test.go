@@ -3,9 +3,11 @@ package server
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/waynehoover/basalt-sync/server/internal/store"
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
@@ -136,4 +138,72 @@ func TestS16ShutdownDeadlineCutsOffAStalledUploadUnacked(t *testing.T) {
 	if st := r.mustStats(); st.Versions != 0 {
 		t.Fatalf("%d versions committed from an upload that never completed", st.Versions)
 	}
+}
+
+// A commit still running at the deadline holds the shutdown until it is done.
+//
+// Shutdown used to kill what was left and then wait one second, returning an
+// error whether or not the sessions had gone. main closes the store on the
+// next line, so a commit that outlived that second met a closed database: the
+// put failed with `internal` on a request the client had been told nothing
+// about, and the reason was a race rather than anything the client did. The
+// wait is now for the sessions themselves.
+func TestS16ShutdownWaitsForACommitThatOutlivesTheDeadline(t *testing.T) {
+	r := newRig(t)
+	cl := r.dial("committing")
+	cl.hello(0)
+
+	// The commit is held open from inside, standing in for a database that is
+	// simply slow: the session is mid-request, past its bodies, and cannot be
+	// hurried.
+	committing := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	r.srv.beforeAppend = func(store.Entry) error {
+		once.Do(func() { close(committing) })
+		<-release
+		return nil
+	}
+
+	bodies := []string{"a body worth committing"}
+	names, size := chunkNames(bodies)
+	cl.sendJSON(wire.In{
+		Op: "put", Path: "note.md", Chunks: names, Mac: testMac,
+		Meta: wire.PutMeta{Size: size, MTime: 5},
+	})
+	cl.recvInto("want", &wire.Want{})
+	cl.sendBinary([]byte(bodies[0]))
+	<-committing
+
+	done := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		done <- r.srv.Shutdown(ctx)
+	}()
+
+	// Well past the deadline and past the second the old grace allowed. The
+	// session is killed by now; what must not have happened is Shutdown
+	// returning, because the store closes as soon as it does.
+	select {
+	case err := <-done:
+		t.Fatalf("shutdown returned (%v) with a commit still running, and main closes the store next", err)
+	case <-time.After(1500 * time.Millisecond):
+	}
+	if n := r.srv.Sessions(); n != 1 {
+		t.Fatalf("%d sessions registered while one is still committing, want 1", n)
+	}
+
+	close(release)
+	err := <-done
+	if err == nil {
+		t.Fatal("shutdown reported a clean stop after cutting off a request")
+	}
+	if !strings.Contains(err.Error(), "1 sessions") {
+		t.Fatalf("shutdown reported %v, which does not say how many were cut off", err)
+	}
+	if n := r.srv.Sessions(); n != 0 {
+		t.Fatalf("%d sessions still registered after shutdown returned", n)
+	}
+	r.mustVerify()
 }

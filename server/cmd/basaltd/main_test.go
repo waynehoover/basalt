@@ -1181,3 +1181,34 @@ func TestI25TheCapFlagsReachReady(t *testing.T) {
 		t.Fatalf("a batch cap at the read limit was advertised as %v, want half the read limit", raised["maxBatchBytes"])
 	}
 }
+
+// A backup that has kept history the source purged holds more bodies than the
+// source does, and the line about the difference has to survive that.
+//
+// It used to print source minus destination with the words "were not copied",
+// which is a negative number of bodies as soon as retention is doing its job.
+// The backup's numbers are the only evidence anyone has that a backup is
+// sound, so one of them reading as nonsense costs more than the line is worth.
+func TestBackupNeverPrintsANegativeBodyCount(t *testing.T) {
+	source := seeded(t)
+	dest := filepath.Join(t.TempDir(), "backup")
+	mustRun(t, "backup", "-data", source, "-to", dest)
+
+	// The source drops its history and the bodies only the old versions
+	// referenced; the backup keeps them.
+	mustRun(t, "purge", "-data", source, "-grace", "0", "-confirm", "default", "-no-backup-check")
+
+	out := mustRun(t, "backup", "-data", source, "-to", dest)
+	if countBodies(t, dest) <= countBodies(t, source) {
+		t.Fatalf("the backup does not hold more bodies than the purged source, so this proves nothing:\n%s", out)
+	}
+	if strings.Contains(out, "(-") {
+		t.Fatalf("backup printed a negative body count:\n%s", out)
+	}
+	if !strings.Contains(out, "history it kept") {
+		t.Fatalf("backup does not say why it holds more bodies than the source:\n%s", out)
+	}
+	if strings.Contains(out, "were not copied") {
+		t.Fatalf("backup says bodies were not copied when it holds more than the source:\n%s", out)
+	}
+}
