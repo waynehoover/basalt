@@ -50,7 +50,7 @@ VOLUME /data
 #
 # A named volume inherits /data's ownership from the image above, so it works
 # with nothing else done. A bind mount does not: the host directory's ownership
-# wins, and it has to be chowned to 65532 first. docs/running.md says so.
+# wins, and it has to be chowned to 65532 first. docs/server.md says so.
 USER 65532:65532
 
 EXPOSE 3003

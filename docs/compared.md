@@ -1,10 +1,11 @@
-# Compared, and where it came from
+# Compared, and measured
 
-[Docs index](index.md)
+[Back to the README](../README.md)
 
-Basalt was built against three other projects: Obsidian Sync, whose behaviour was
-read out of the shipped app, and two self-hosted plugins whose source is public.
-This is what differs, what was learned from each, and where theirs is better.
+Basalt was built against three other projects: Obsidian Sync, read out of the
+shipped app, and two self-hosted plugins with public source. This is what
+differs, what was learned from each, where theirs is better, and the numbers
+behind the claims.
 
 ## Against Obsidian Sync
 
@@ -14,49 +15,38 @@ This is what differs, what was learned from each, and where theirs is better.
 | Cost | subscription | electricity |
 | Setup | sign in | run a binary, paste one string |
 | Editing one line of a 2 MiB note | 2 MiB | 21.7 KiB |
-| Encryption | optional | always, with no way to turn it off |
-| A server forging a version | not tested here | refused: every entry is authenticated by the device that wrote it |
-| Merge conflicts | merged silently, failures dropped | merged when provably safe, both kept otherwise |
-| Plugins, themes, config | syncs them | does not, and that one is still open |
-| Deleting an empty folder | stays deleted, verified | stays deleted, since 0.2.2 |
+| Encryption | optional | always |
+| A server forging a version | not tested here | refused; every entry is authenticated by its writer |
+| Merge conflicts | merged silently, failed hunks dropped | merged when provably safe, both kept otherwise |
+| Plugins, themes, config | synced | not synced, and that one is still open |
 | Mobile | iOS and Android | Android in daily use, iOS untested |
 | Version history | in the app | in the app, and restoring never overwrites |
 | Maturity | years in production | early |
 
-**Transfer is the real difference.** Theirs keeps one hash per file and pushes
-the whole body when it changes; the 2 MB websocket pieces are framing, not
-identity, so nothing can be skipped. Basalt chunks on a rolling hash and sends
-only what the server lacks. One line inserted:
+**Transfer is the real difference.** Theirs keeps one hash per file and sends
+the whole body when it changes. Basalt chunks on a rolling hash and sends only
+what the server lacks. One line inserted, from `cd client && bun run bench`:
 
-| Note | Theirs | Basalt | of that, the entry | |
+| Note | Whole file | Basalt | of that, the entry | |
 |---|---|---|---|---|
 | 4 KiB | 4.4 KiB | 1.9 KiB | 624 B | 2x |
+| 32 KiB | 32.4 KiB | 4.9 KiB | 1.3 KiB | 7x |
 | 128 KiB | 128.4 KiB | 5.8 KiB | 2.7 KiB | 22x |
+| 512 KiB | 512.4 KiB | 9.6 KiB | 4.8 KiB | 54x |
 | 2 MiB | 2.0 MiB | 21.7 KiB | 9.0 KiB | 94x |
 
-Both columns include the entry, because both protocols send one: theirs names
-one hash for the whole file, ours names every chunk of the new version. That
-entry is most of what Basalt sends on a large note, and it is what bounds the
-gap. `cd client && bun run bench` prints this table.
+Both columns include the entry, because both protocols send one. Ours names
+every chunk of the new version, which is most of what a large note costs and
+bounds the gap. That is why chunk size is chosen by `sqrt(NAME_BYTES * size)`
+rather than by what one edit costs alone.
 
-> This table used to read 494 B and 4245x, from a benchmark that counted chunk
-> bodies and not the entry naming them, taken when a 2 MiB note was 5638 chunks
-> rather than 133. Those smaller chunks did send a smaller body, and paid 5638
-> names for it in every version. 94x is what it was always worth.
+**Deletions lose to edits.** Deleted here and changed there, theirs propagates
+the delete. Basalt restores the file.
 
-The gap grows with the file, which is the point: a vault accumulates long notes.
-Basalt also deflates each chunk before sealing it, taking a full upload of a
-vault's text from 108% of plaintext to 67%.
-
-**Deletions lose to edits, in both directions.** Deleted here and changed there,
-theirs propagates the delete; Basalt restores the file.
-
-**Where theirs is better**, and it is not close in places: nothing to run, iOS,
-and years of production finding edge cases that were found here by reading code.
-Whole-file upload also has fewer moving parts than chunking plus deterministic
-sealing plus compression, and larger machinery has more ways to be wrong. iOS
-stays conceded because Basalt has not been run there, which is a different
-statement from saying it does not work.
+**Where theirs is better**, and it is not close in places: nothing to run,
+iOS, and years of production finding edge cases that were found here by reading
+code. Whole-file upload also has fewer moving parts than chunking plus
+deterministic sealing plus compression.
 
 ## Against Sync Engine and Fast Note Sync
 
@@ -65,79 +55,158 @@ statement from saying it does not work.
 good, both are further along, and reading them found real defects here.
 
 **Chunks against streaming encryption.** Sync Engine encrypts as a stream with a
-per-file salt: conventional, never holds a whole file, and cannot deduplicate.
-Basalt seals deterministically, so an edit to a 2 MiB note costs one chunk, at
-the cost of holding a file plus one chunk in memory and of the server learning
-that two chunks are identical. This used to also claim that the same content in
-two files is stored once. It is true and it is worth 0.11%: ten thousand
-distinct notes collided twenty-four times. What the determinism actually buys is
-that today's version of a note shares chunks with yesterday's, which saves 73%
-to 90% of the storage a version history would otherwise cost and is what makes
-an edit cost one chunk on the wire.
+per-file salt: conventional, never holds a whole file, cannot deduplicate.
+Basalt seals deterministically, so an edit to a large note costs one chunk and
+a version history costs 73% to 90% less storage. The cost is that the server
+learns when two chunks are identical.
 
 **Refusing a merge against merging better.** Theirs is a real diff3 that splits
-a document into regions first. Basalt applies diff-match-patch patches and adds
-four checks the library does not: do the changed regions overlap, does merging
-both ways round agree, did every hunk apply, did every insertion survive. Ours
-is character-granular, which merges two devices editing different arguments of
-`compute(1, 2)`. It also merges a re-indented Python block with a line appended
-to it into code that no longer runs, which their region splitter would not.
+a document into regions first. Basalt applies diff-match-patch and adds four
+checks: do the changed regions overlap, do both merge orders agree, did every
+hunk apply, did every insertion survive. Ours is character-granular, so it
+merges two devices editing different arguments of one function call. It also
+merges a re-indented code block with a line appended to it into code that no
+longer runs, which their region splitter would not.
 
-**Where theirs is ahead:** they have 351 and 2890 stars against a plugin nobody
-has installed yet, they work with storage you already pay for, and they are
-installable from Obsidian's community list. Phones used to be on this list and
-are not any more: Android is in daily use here, and iOS is untested on all
-three.
+**Where theirs is ahead:** hundreds and thousands of stars against a plugin
+nobody has installed yet, storage you already pay for, and a listing in
+Obsidian's community directory.
+
+### Beside Sync Engine's published numbers, carefully
+
+| 2000 files, 400 ms round trip | up | down |
+|---|---|---|
+| Sync Engine, their machine, Nextcloud over WebDAV | 9.43 min | 5.87 min |
+| Basalt, Apple M4 Pro, Go server behind a latency proxy | 2.79 min | 1.06 min |
+
+26 round trips each way. 2000 arrived, 0 wrong. Not a race: their backend is
+Nextcloud over WebDAV, their CPU is far slower, the latency here is injected on
+loopback with no jitter, and their vault size is not published. What survives
+all four is 26 round trips to move 2000 files, and an edit to a large note that
+costs one chunk here and the whole file on any backend that stores files.
+
+## Measured
+
+```bash
+cd client
+bun run bench:sync      # a whole vault over four wires, timed and checked
+bun run bench           # chunking, sealing, bytes on the wire
+bun run scale           # 1,000 and 10,000 notes
+bun run dedup           # what deduplication saves
+```
+
+Correctness is reported beside the timings, which is Sync Engine's idea, and it
+has caught two real defects here. The vault shape is theirs: many small notes,
+some medium, a few large, half the large ones incompressible, and prose that
+does not repeat. Latency is injected by a proxy; 400 ms at 2.6 MiB/s is Sync
+Engine's published environment.
+
+**A whole vault.** 200 files, 17.8 MiB, Apple M4 Pro. 200 arrived, 0 wrong, on
+every row.
+
+| Round trip | Up, macOS | Up, Linux | Down | 20 notes up | 20 notes down |
+|---|---|---|---|---|---|
+| loopback | 12.2 s | 2.8 s | 0.60 s | 0.25 s | 0.11 s |
+| 100 ms | 12.2 s | 2.8 s | 0.81 s | 0.46 s | 0.23 s |
+| 400 ms, 2.6 MiB/s | 15.0 s | 7.4 s | 5.60 s | 1.09 s | 0.63 s |
+
+17.8 MiB crosses as 10.7 MiB from compression alone; dedup contributes nothing
+because the notes are distinct. Four round trips each way at every latency. The
+rest is `fsync`, and macOS pays four to six times more of it because Go issues
+`F_FULLFSYNC` there. On Linux the 400 ms upload is close to link-bound, so there
+is no large win left in the server for a vault of notes.
+
+**Scale.** Ten thousand notes of distinct prose, 21.1 MiB.
+
+| | 1,000 notes | 10,000 notes |
+|---|---|---|
+| Chunks, of which distinct | 2,198 / 2,198 | 21,641 / 21,617 |
+| Sealed bodies | 0.8 MiB | 8.1 MiB |
+| Local index | 0.6 MiB | 5.6 MiB |
+| A pass over an unchanged vault | 7 ms | 41 ms |
+| Twenty notes edited | 20 chunks, 8.0 KiB | 20 chunks, 8.0 KiB |
+
+Everything is linear in the note count, and editing twenty notes costs the same
+at any vault size. Deduplication across files is worth 0.11%. Across versions
+it is worth 73% to 90%: a note edited twenty times stores 26 chunks for 95
+references when short and 41 for 410 when long. The machinery pays by noticing
+that today's note is mostly yesterday's, which is also what makes an edit cost
+one chunk on the wire.
+
+**A large attachment**, whole sync, headless client, which streams:
+
+| file | peak memory | time |
+|---|---|---|
+| 16 MiB | 144 MB | 0.4 s |
+| 64 MiB | 220 MB | 1.6 s |
+| 256 MiB | 291 MB | 6.5 s |
+
+The plugin streams on desktop through the resource URL the webview already uses
+for images. Mobile uses a different URL scheme that is untested and falls back
+to reading the file whole, at roughly 210 MB plus 2.7 MB per MiB. That curve
+sets the default 64 MiB file limit.
+
+**The entry authenticator** costs 2.2 microseconds per entry and 149 bytes on
+the wire, about 2.7% of a first sync. A globally chained variant that would also
+detect a withholding server was 12.7 microseconds and was rejected for what it
+does to concurrent writers, not for its arithmetic.
+
+### Measured and deliberately not done
+
+- **A whole-file fast path for small notes.** Considered because most vaults
+  are thousands of notes under 64 KB. Chunk size already scales with the file
+  as `sqrt(64 * size)`, clamped to a 1 KiB average and a 512 byte floor, so a
+  4 KiB note is about four chunks and an edit to it costs 1.9 KiB against
+  4.4 KiB for the whole file. One chunk per small note would send more on
+  every edit and store about a third more history, and a body inlined in the
+  `put` would save one round trip that batching already amortises, at the
+  price of a second code path through the most durability-critical part of the
+  client. Kept as is, and the sizing constants are pinned by a test so the
+  decision cannot drift into a re-chunk of every vault.
+- **A global hash chain**, which would catch withholding. Serialises writers.
+- **One transaction per batch.** 10x on the SQL, worth 0.7% of an upload, in
+  exchange for making "an ack means durable" a per-batch argument.
+- **A different deflate level or chunk-size targets.** Both are baked into the
+  chunk name. Changing either re-chunks every vault in existence.
+- **Larger chunks** to cut fsyncs. Trades back a size chosen by measurement.
+- **Solid compression on a first sync.** 57% against 60% of plaintext, for a
+  second code path through the most durability-critical part of the client.
+- **node-diff3** for the merge. It conflicted on five of eight cases that merge
+  cleanly here, including two devices appending to a daily note.
 
 ## What was borrowed
 
-None of their code is copied. What was taken is ideas, parameters and bug
-reports, each credited where it is used.
+None of their code. Ideas, parameters and bug reports, each credited where used.
 
 **[Self-hosted LiveSync](https://github.com/vrtmrz/obsidian-livesync)** (MIT) is
-the largest debt. Content-defined chunking comes from `splitPiecesRabinKarp`,
-including its 48-byte window, along with splitting chunk sizes by text or binary,
-a regression test for U+FEFF on a boundary, and the conclusion that text merging
-is solved and should not be reinvented. Three things are deliberately not taken,
-all consequences of CouchDB rather than mistakes: base64 for binary chunks,
-reading whole files into memory, and a one-way HMAC for paths, which cannot work
-here because a device restoring a vault has to recover the real filename.
+the largest debt: content-defined chunking from `splitPiecesRabinKarp` with its
+48-byte window, chunk sizes split by text or binary, a regression test for
+U+FEFF on a boundary, and the conclusion that text merging is solved. Not taken:
+base64 for binary chunks, whole files in memory, and one-way HMAC for paths, all
+consequences of CouchDB, and the last impossible here because a device restoring
+a vault has to recover the real filename.
 
-**Obsidian Sync** contributed `synchash`: one field per file remembering the
-content as of the last sync turns a three-way merge into something needing no
-version history. The merge construction is kept too, both cleanup passes
-included, minus the step that discards which hunks applied.
+**Obsidian Sync** contributed `synchash`, one field per file remembering the
+content as of the last sync, which turns a three-way merge into something
+needing no version history. The merge construction is kept too, minus the step
+that discards which hunks applied.
 
-**Sync Engine** contributed reporting correctness beside speed, which their
-harness does and which caught a competitor losing 98 files. Also the benchmark
-vault shape and their published 400 ms environment. Their issue 232, `rm` where
-the platform should trash, was a live defect here too.
+**Sync Engine** contributed reporting correctness beside speed, the benchmark
+vault shape, and the 400 ms environment. Their issue 232, `rm` where the
+platform should trash, was a live defect here too.
 
-**Fast Note Sync** contributed issue 257: a path that is a file on one side and a
-folder on the other, which Basalt retried forever one way and ignored the other.
+**Fast Note Sync** contributed issue 257: a path that is a file on one side and
+a folder on the other, which Basalt retried forever one way and ignored the
+other.
 
-**obionesync**, the predecessor, is where every verified Obsidian Sync protocol
-fact came from first. Every bug found in it was a silent one, which is why unit
-tests are necessary here and never sufficient.
-
-## Evaluated, not used
-
-**node-diff3.** Maintained and pure JavaScript, with the conflicting-region
-notion diff-match-patch lacks. It conflicted on five of eight cases that merge
-cleanly here, including two devices appending to a daily note, and caught nothing
-the existing checks miss. It is line-wise, and a Markdown paragraph is one line.
-
-**Solid compression on a first sync.** Per-chunk deflate sends 60% of the
-plaintext and one solid stream sends 57%. Five per cent, against a second code
-path through the most durability-critical part of the client.
-
-Basalt itself is MIT, like LiveSync and like Obsidian's own plugin API
-declarations.
+**obionesync**, the predecessor, is where every verified fact about Obsidian
+Sync's protocol came from. Every bug found in it was silent, which is why unit
+tests here are necessary and never sufficient.
 
 ## Libraries
 
-**diff-match-patch**, the merge, unmaintained since 2020 and a known risk,
-pinned to an exact version with its hash in a committed lockfile rather than
-left on a caret.
-**fflate** for deflate. **modernc.org/sqlite**, so the server is one static
-binary. **github.com/coder/websocket**.
+**diff-match-patch** for the merge, unmaintained since 2020 and pinned to an
+exact version. **fflate** for deflate. **modernc.org/sqlite**, so the server is
+one static binary. **github.com/coder/websocket**.
+
+Basalt is MIT, like LiveSync and like Obsidian's own plugin API declarations.

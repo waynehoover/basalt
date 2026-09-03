@@ -12,13 +12,13 @@ Self-hosted sync for Obsidian. One binary, one pairing string.
   `client/src/plugin` is the Obsidian plugin.
 - Two binaries, two names, because a homelab runs both.
 
-Read `docs/philosophy.md` before adding anything. It is short and it is the
+Read `docs/design.md` before adding anything. It is short and it is the
 point of the project.
 
 ## The first rule
 
 **Do not lose a note.** When simplicity and correctness conflict, correctness
-wins and the feature gets cut instead. `docs/philosophy.md` lists ten durability
+wins and the feature gets cut instead. `docs/design.md` lists ten durability
 rules, each with the incident that produced it; they are not aspirational.
 
 ## Scope, and what is refused

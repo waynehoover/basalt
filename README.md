@@ -4,79 +4,114 @@
 
 # Basalt Sync
 
-> Fast, zero-dependency, self-hosted Obsidian sync
+> Self-hosted Obsidian sync. One binary, one pairing string.
 
 [![CI](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/waynehoover/basalt-sync/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Go](https://img.shields.io/badge/go-1.27-00ADD8?logo=go&logoColor=white)](server/go.mod)
 [![npm](https://img.shields.io/npm/v/basalt-sync?logo=npm&label=basalt-sync)](https://www.npmjs.com/package/basalt-sync)
-[![Client](https://img.shields.io/badge/client-TypeScript-3178C6?logo=typescript&logoColor=white)](client/)
 
 </div>
 
-Sync an Obsidian vault between your own devices, through a server you run. Built
-for vaults rather than files: the chunking, the merge and the protocol are all
-designed around Markdown notes, which is where the speed comes from.
+Basalt syncs an Obsidian vault between your own devices through a server you
+run. Notes and filenames are encrypted before they leave a device. The server
+stores ciphertext, keeps every version, and never holds a key.
 
-## Features
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/panel-dark.png">
+  <img src="docs/assets/screenshots/panel.png" alt="The Basalt panel in Obsidian: up to date, sync now, add another device, recover a deleted note, unlink." width="800">
+</picture>
 
-- **End-to-end encrypted.** Notes and filenames both, and the server cannot
-  forge a version either: every one is authenticated by the device that wrote it.
-  The server holds no key and is never sent one.
-- **Sends only what changed.** One line edited in a 2 MiB note costs 22 KB, not 2 MB.
-- **Fast.** A note reaches another device in about a tenth of a second.
-- **Never mangles a note.** If a merge is not provably safe, both versions are kept.
-- **Full history.** Every version and every deletion, restorable from the plugin.
-- **One static binary.** No database, no broker, no accounts, no settings screen.
-- **Zero dependencies.** The plugin is one 96 KB file that needs nothing installed;
-  the CLI is 91 KB and pulls in no packages at all.
-- **Works headless.** Same engine, no GUI, for a server or a NAS.
+## Why Basalt
+
+- **End-to-end encrypted.** Content and filenames. Every version is also
+  signed by the device that wrote it, so the server cannot forge or alter one.
+- **Sends only what changed.** Notes are cut into content-defined chunks.
+  Editing one line of a 2 MiB note sends about 22 KB, not 2 MB.
+- **Fast.** An edit reaches another device in about a tenth of a second.
+- **Never mangles a note.** Concurrent edits merge only when that is provably
+  safe. Otherwise both versions are kept, and the file you have open stays put.
+- **Full history.** Every version and every deletion, browsable and restorable
+  from inside Obsidian.
+- **Nothing to configure.** No settings screen. The first device gets a
+  recovery key to write down. Every other device joins with a single-use invite.
+- **One static binary.** Pure Go with embedded SQLite, 12 MB, runs from an empty
+  container. No database, no broker, no accounts.
+- **Works headless.** The same engine as a command-line client, for a NAS or a
+  server that has no Obsidian.
 
 Desktop and Android are in daily use. iOS is untested.
 
-## Install
+## Quick start
 
-**1. Run the server.**
+**1. Run the server** on a machine that stays on.
 
 ```bash
 docker run -d --name basalt -p 127.0.0.1:3003:3003 \
   -v basalt-data:/data ghcr.io/waynehoover/basalt-sync:latest
-docker logs basalt        # prints the string for your first device
+docker logs basalt
 ```
 
-**2. Add the plugin.** Put `main.js`, `manifest.json` and `styles.css` from the
-[latest release](https://github.com/waynehoover/basalt-sync/releases/latest) into
-`<vault>/.obsidian/plugins/basalt-sync/`. In Obsidian: **Community plugins**, turn off
-Restricted mode, enable **Basalt Sync**, paste the string.
+The log prints one line for your first device, `host:3003#TOKEN`. The server
+speaks plain HTTP, so put TLS in front before another device reaches it.
+`tailscale serve --bg 3003` is one line. [docs/server.md](docs/server.md) has
+that, Compose, systemd, and every flag.
 
-Done. Other devices paste the string from **Add another device**.
+**2. Install the plugin.** Put `main.js`, `manifest.json` and `styles.css` from
+the [latest release](https://github.com/waynehoover/basalt-sync/releases/latest)
+into `<vault>/.obsidian/plugins/basalt-sync/`. In Obsidian, turn off Restricted
+mode under Community plugins and enable Basalt Sync.
 
-Put TLS in front before anything else reaches it: `tailscale serve` is one line,
-and [`docs/running.md`](docs/running.md) covers that, Compose, systemd and every
-flag. Trying it on one machine? `basaltd serve -localhost` prints a string that
-needs no TLS.
+**3. Pair.** Click the Basalt icon in the ribbon. On your first device, paste
+the line from the server log under **Start a new vault**. It shows the vault's
+recovery key once: write it down and keep it offline. It is the only way back
+into the vault if every device is lost, and anyone who has it has the vault.
 
-### Headless client
+**4. Add your other devices.** On a device that has the vault, press **Add
+another device** and paste the invite it shows into Basalt on the new one. An
+invite works once and expires in ten minutes.
 
-No Obsidian on the machine, for a server or a NAS:
+That is the whole setup. [docs/plugin.md](docs/plugin.md) covers the rest.
+
+### Without Obsidian
 
 ```bash
 npm install -g basalt-sync
-basalt pair basalt2_...
+basalt init 'homelab:3003#K7M2...'   # the first device, from the server log; prints the recovery key once
+basalt invite                        # on a device that has the vault: a single-use invite
+basalt pair basalt3i_...             # on the new device
 basalt sync --watch
 ```
 
-[Every command it takes](client/README.md#the-headless-client), including
-history and recovery.
+[client/README.md](client/README.md) has every command.
+
+## History and recovery
+
+Right-click a note for its version history, with a diff against what is on
+disk. Restoring never overwrites: if the path is taken, the restored copy lands
+beside it.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/changes-dark.png">
+  <img src="docs/assets/screenshots/changes.png" alt="Version history for a note, showing the changes between two versions." width="800">
+</picture>
+
+Deleted notes have their own list. The server keeps them until you purge.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/recover-dark.png">
+  <img src="docs/assets/screenshots/recover.png" alt="The deleted notes list, with a Restore button." width="800">
+</picture>
 
 ## Docs
 
-[Read the docs](docs/index.md).
+| | |
+|---|---|
+| [Server](docs/server.md) | Install, TLS, backup, purge, upgrading, every command and flag |
+| [Plugin](docs/plugin.md) | Pairing, status, history, conflicts, what is not synced, phones |
+| [Headless client](client/README.md) | The `basalt` command, and how the client is built and tested |
+| [Compared](docs/compared.md) | Against Obsidian Sync, Sync Engine and Fast Note Sync, with the measurements |
+| [Design](docs/design.md) | The durability rules, what is refused, and what the server can and cannot do |
+| [Protocol](docs/protocol.md) | The wire protocol |
 
-**[How it compares](docs/compared.md)** is the one to read first if you are
-deciding. It sets Basalt against Obsidian Sync, Sync Engine and Fast Note Sync,
-and it is honest in both directions: an edit to a 2 MiB note costs 22 KB here
-against 2 MiB there, encryption is always on rather than optional, and a
-merge that cannot be made safely keeps both versions instead of dropping one.
-It also says plainly where the others are better, which is the part worth
-trusting a comparison for.
+MIT licensed.
