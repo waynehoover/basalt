@@ -85,8 +85,9 @@ so a poisoned entry is heard about rather than replayed forever.
 
 `basalt rotate` gives the vault a new root secret and prints the new recovery
 key; every other device is disconnected and is added again with `basalt
-invite`. On a vault claimed under protocol 2 it says so and does nothing, since
-for such a vault rotation is a new vault (see `docs/server.md`).
+invite`. It always keeps the history, because the content is sealed under a
+data key that the root only wraps, so a new root re-wraps the same key and
+nothing on the server is re-encrypted.
 
 `basalt rebase` is for a server restored from an older backup, which refuses
 this device with `cursor`. It prints both cursors and refuses without

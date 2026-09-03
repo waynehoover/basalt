@@ -77,13 +77,14 @@ Obsidian's community directory.
 | 2000 files, 400 ms round trip | up | down |
 |---|---|---|
 | Sync Engine, their machine, Nextcloud over WebDAV | 9.43 min | 5.87 min |
-| Basalt, Apple M4 Pro, Go server behind a latency proxy | 2.79 min | 1.06 min |
+| Basalt, Apple M4 Pro, Go server behind a latency proxy | 3.00 min | 1.89 min |
 
-26 round trips each way. 2000 arrived, 0 wrong. Not a race: their backend is
-Nextcloud over WebDAV, their CPU is far slower, the latency here is injected on
-loopback with no jitter, and their vault size is not published. What survives
-all four is 26 round trips to move 2000 files, and an edit to a large note that
-costs one chunk here and the whole file on any backend that stores files.
+18 round trips up and 27 down, for 2000 files. 2000 arrived, 0 wrong. Not a
+race: their backend is Nextcloud over WebDAV, their CPU is far slower, the
+latency here is injected on loopback with no jitter, and their vault size is not
+published. What survives all four is that moving 2000 files takes tens of round
+trips rather than thousands, and that an edit to a large note costs one chunk
+here and the whole file on any backend that stores files.
 
 ## Measured
 
@@ -101,20 +102,33 @@ some medium, a few large, half the large ones incompressible, and prose that
 does not repeat. Latency is injected by a proxy; 400 ms at 2.6 MiB/s is Sync
 Engine's published environment.
 
-**A whole vault.** 200 files, 17.8 MiB, Apple M4 Pro. 200 arrived, 0 wrong, on
-every row.
+**A whole vault.** 200 files, 17.8 MiB, Apple M4 Pro, under protocol 3. 200
+arrived, 0 wrong, on every row.
 
-| Round trip | Up, macOS | Up, Linux | Down | 20 notes up | 20 notes down |
+| Round trip | Up | Down | 20 notes up | 20 notes down | Nothing changed |
 |---|---|---|---|---|---|
-| loopback | 12.2 s | 2.8 s | 0.60 s | 0.25 s | 0.11 s |
-| 100 ms | 12.2 s | 2.8 s | 0.81 s | 0.46 s | 0.23 s |
-| 400 ms, 2.6 MiB/s | 15.0 s | 7.4 s | 5.60 s | 1.09 s | 0.63 s |
+| loopback | 11.9 s | 0.62 s | 0.24 s | 0.11 s | 0.00 s |
+| 20 ms | 12.7 s | 0.85 s | 0.29 s | 0.13 s | 0.00 s |
+| 100 ms | 12.6 s | 1.90 s | 0.44 s | 0.23 s | 0.00 s |
+| 400 ms, 2.6 MiB/s | 15.8 s | 10.1 s | 1.07 s | 0.63 s | 0.01 s |
 
-17.8 MiB crosses as 10.7 MiB from compression alone; dedup contributes nothing
-because the notes are distinct. Four round trips each way at every latency. The
-rest is `fsync`, and macOS pays four to six times more of it because Go issues
-`F_FULLFSYNC` there. On Linux the 400 ms upload is close to link-bound, so there
-is no large win left in the server for a vault of notes.
+17.8 MiB crosses as 10.8 MiB from compression alone; dedup contributes nothing
+because the notes are distinct. Four round trips each way at every latency, and
+a pass over a settled vault is unmeasurable.
+
+The download column is slower than this document used to claim, and the reason
+is the harness rather than the client. The proxy now applies real back-pressure
+in both directions, which it did not before, so a rate of 2.6 MiB/s is now
+actually enforced on the way down: 10.8 MiB cannot arrive in less than about
+four seconds, and it takes ten. The older figure was measured against a link
+that was not really throttling, and it should not be compared with this one.
+
+The upload cost is `fsync`, and macOS pays four to six times more of it than
+Linux because Go issues `F_FULLFSYNC` there. Measured under an earlier protocol,
+the same 200 files uploaded in 2.8 s on Linux against 12.2 s here, and the
+400 ms upload was close to link-bound, so there is no large win left in the
+server for a vault of notes. That comparison has not been repeated under
+protocol 3 and is quoted as the earlier measurement it is.
 
 **Scale.** Ten thousand notes of distinct prose, 21.1 MiB.
 
@@ -145,6 +159,16 @@ The plugin streams on desktop through the resource URL the webview already uses
 for images. Mobile uses a different URL scheme that is untested and falls back
 to reading the file whole, at roughly 210 MB plus 2.7 MB per MiB. That curve
 sets the default 64 MiB file limit.
+
+**A real vault.** The numbers above are a generated corpus. Run against a copy
+of a real one, 3,751 files and 91 MB of notes and attachments, on loopback: the
+first device uploaded it in 54 seconds as 11,307 chunks and 62.7 MiB on the
+wire, which is 69% of the plaintext, and a second device joining by invite
+downloaded the whole vault in 22 seconds. Every file arrived byte-identical,
+and the server's own `verify -deep` checked 11,762 chunk references with 0
+faults. An edit, a rename, a merge, a two-device conflict and a deletion all
+behaved as documented, and the vault's dot-prefixed folders stayed where they
+were.
 
 **The entry authenticator** costs 2.2 microseconds per entry and 149 bytes on
 the wire, about 2.7% of a first sync. A globally chained variant that would also
