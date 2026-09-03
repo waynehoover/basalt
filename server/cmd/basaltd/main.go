@@ -28,6 +28,7 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/dirlock"
 	"github.com/waynehoover/basalt-sync/server/internal/server"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
 // version is stamped at build time with -X main.version=...
@@ -198,6 +199,29 @@ func locked(err error, dataDir, action, hint string) error {
 
 const stopFirst = "Stop the running basalt process and try again."
 
+// requireVault refuses a vault name the store does not hold, before any
+// destructive command mutates on the strength of it (S13).
+//
+// It lists the names that are there, because the reason someone reaches this is
+// a typo and the useful next thing is the spelling they meant. An empty store
+// says so plainly rather than offering an empty list.
+func requireVault(st *store.Store, vault string) error {
+	vaults, err := st.Vaults()
+	if err != nil {
+		return err
+	}
+	for _, v := range vaults {
+		if v == vault {
+			return nil
+		}
+	}
+	if len(vaults) == 0 {
+		return fmt.Errorf("there is no vault %q here, and in fact no vaults at all", vault)
+	}
+	return fmt.Errorf("there is no vault %q here; this server holds: %s",
+		vault, strings.Join(vaults, ", "))
+}
+
 /* ---------------------------------------------------------------- *
  * serve
  * ---------------------------------------------------------------- */
@@ -216,7 +240,11 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		"additional browser origin allowed to connect, repeatable (see the log line a refused client produces)")
 	vault := fs.String("vault", "default", "the one vault this server serves")
 	maxFile := fs.Int64("max-file", store.DefaultPerFileMax,
-		"largest file to accept, in bytes; the cost is the sending device's memory, roughly seven times the file")
+		"largest file to accept, in bytes, up to 256 MiB; the cost is the plugin's memory, about 210 MB plus 2.7 MB per MiB of file")
+	maxBatch := fs.Int64("max-batch-bytes", wire.MaxBatchBytes,
+		"most bytes one putmany may carry, frame and summed budget, in bytes; can be lowered, not raised")
+	maxFetch := fs.Int64("max-fetch-bytes", wire.MaxFetchBytes,
+		"most body bytes one fetch may ask for, in bytes, up to the 256 MiB file ceiling")
 	local := fs.Bool("localhost", false,
 		"bind to 127.0.0.1 and print a ws:// pairing string, for trying this out on one machine")
 	verbose := fs.Bool("v", false, "verbose logging")
@@ -284,10 +312,23 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 	srv := server.New(st, server.DerivedAuth(st, *vault, token, func() int64 {
 		return time.Now().UnixMilli()
 	}), log)
+	srv.SetVersion(resolveVersion(version, moduleVersion()))
 	srv.SetPerFileMax(*maxFile)
 	if srv.PerFileMax() != *maxFile {
 		log.Warn("the file limit was clamped to what the store can hold",
 			"asked", *maxFile, "using", srv.PerFileMax())
+	}
+	// The two caps get the same treatment: advertised is enforced, and a value
+	// outside what the read limit or the store can carry is clamped and said.
+	srv.SetMaxBatchBytes(*maxBatch)
+	if srv.MaxBatchBytes() != *maxBatch {
+		log.Warn("the batch cap was clamped to between one chunk and half the read limit",
+			"asked", *maxBatch, "using", srv.MaxBatchBytes())
+	}
+	srv.SetMaxFetchBytes(*maxFetch)
+	if srv.MaxFetchBytes() != *maxFetch {
+		log.Warn("the fetch cap was clamped to between one chunk and the file ceiling",
+			"asked", *maxFetch, "using", srv.MaxFetchBytes())
 	}
 
 	hs := &http.Server{
@@ -309,6 +350,9 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		log.Warn("could not tell whether the vault is claimed", "err", hashErr)
 	}
 	printSetup(out, *addr, *vault, token, fresh, *local, hash == "" || hashErr != nil)
+	if err := logStartup(log, st, *vault, srv.Version()); err != nil {
+		log.Warn("could not summarise the store at startup", "err", err)
+	}
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -327,13 +371,110 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		return err
 	case <-ctx.Done():
 		log.Info("shutting down")
-		// Give in-flight writes a moment to finish. A put that has stored its
-		// bodies but not yet committed its entry has not been acked, so the
-		// client retries; nothing is lost either way.
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return hs.Shutdown(shutCtx)
+		// Two steps, because http.Server.Shutdown only does the first. It
+		// closes the listener and waits for ordinary requests, but a hijacked
+		// WebSocket is not its connection any more, so it returned while every
+		// session was still open and the store was then closed under them
+		// (S16). srv.Shutdown owns the sessions: it stops admitting, closes
+		// idle peers with a reason, lets a request already in flight finish so
+		// a put that stored its bodies gets its commit and its ack, and kills
+		// whatever is still running at the deadline. A put cut off there has
+		// not been acked, so the client retries; nothing is lost either way.
+		// The store is closed by the defer above, after this returns.
+		listenerErr, sessionsErr := gracefulStop(hs.Shutdown, srv.Shutdown, shutdownTimeout)
+		if listenerErr != nil {
+			log.Warn("closing the listener", "err", listenerErr)
+		}
+		if sessionsErr != nil {
+			// Loud, not fatal: the clients that were cut off retry, and a
+			// non-zero exit here would only make systemd mark a clean stop as
+			// a failure.
+			log.Warn("not every session finished before the deadline", "err", sessionsErr)
+		}
+		return nil
 	}
+}
+
+// shutdownTimeout is how long each half of a stop may take: the listener and
+// its ordinary requests, then the sessions. The systemd unit allows 30 s, so
+// two of these fit inside it with room for the store to close.
+const shutdownTimeout = 5 * time.Second
+
+// gracefulStop stops the listener and then the sessions, each with its own
+// fresh deadline (S28).
+//
+// They used to share one context. A listener whose ordinary requests took the
+// whole budget handed the sessions a context that had already expired, so
+// every session was cut off at once, mid-request, with nothing acknowledged
+// and nothing said, when each had been promised time to finish. Two deadlines
+// cost a few seconds more at the worst and mean what the comment on
+// Server.Shutdown says.
+func gracefulStop(stopListener, stopSessions func(context.Context) error, timeout time.Duration) (listenerErr, sessionsErr error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	listenerErr = stopListener(ctx)
+	cancel()
+	ctx, cancel = context.WithTimeout(context.Background(), timeout)
+	sessionsErr = stopSessions(ctx)
+	cancel()
+	return listenerErr, sessionsErr
+}
+
+// vaultSummary is what the startup line says about one vault: the latest uid,
+// which is the cursor every device compares itself against, and whether it has
+// been claimed. Neither is a secret and both are the first thing to look at
+// when a device says it is behind and nothing arrives (I11).
+type vaultSummary struct {
+	Name    string
+	Latest  int64
+	Claimed bool
+}
+
+func vaultSummaries(st *store.Store) ([]vaultSummary, error) {
+	names, err := st.Vaults()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]vaultSummary, 0, len(names))
+	for _, name := range names {
+		latest, err := st.LatestUID(name)
+		if err != nil {
+			return nil, err
+		}
+		hash, err := st.AuthHash(name)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, vaultSummary{Name: name, Latest: latest, Claimed: hash != ""})
+	}
+	return out, nil
+}
+
+// logStartup writes the one line an operator greps for after a restart: the
+// version, and for the served vault its latest uid and whether it is claimed.
+// A vault in the store that this server is not serving gets its own line, so
+// a -vault typo is visible in the journal rather than only as refused hellos.
+func logStartup(log *slog.Logger, st *store.Store, served, version string) error {
+	vaults, err := vaultSummaries(st)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, v := range vaults {
+		if v.Name == served {
+			found = true
+			log.Info("starting", "version", version, "vault", v.Name, "latest", v.Latest, "claimed", v.Claimed)
+		}
+	}
+	if !found {
+		log.Info("starting", "version", version, "vault", served, "latest", 0, "claimed", false)
+	}
+	for _, v := range vaults {
+		if v.Name != served {
+			log.Warn("vault present but not served", "vault", v.Name, "latest", v.Latest, "claimed", v.Claimed,
+				"hint", "start with -vault "+v.Name+" if this is the one your devices use")
+		}
+	}
+	return nil
 }
 
 // pairingHosts turns a listen address into addresses a device could dial.
@@ -401,7 +542,10 @@ func printSetup(out io.Writer, addr, vault, token string, fresh, local, unclaime
 	}
 
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "No device has claimed this vault yet. Give one of these to the first:")
+	fmt.Fprintln(out, "No device has claimed this vault yet. Paste one of these lines into")
+	fmt.Fprintln(out, "Basalt on your first device, under \"Start a new vault\", or run")
+	fmt.Fprintln(out, "`basalt init <line>` there:")
+	fmt.Fprintln(out)
 	for _, host := range pairingHosts(addr) {
 		// The scheme only where it is not the usual one. A pairing string with
 		// no scheme becomes wss://, which is right behind a tunnel and wrong for
@@ -412,9 +556,15 @@ func printSetup(out io.Writer, addr, vault, token string, fresh, local, unclaime
 		fmt.Fprintf(out, "  %s#%s\n", host, token)
 	}
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "That token authenticates a device. It is not the encryption key:")
-	fmt.Fprintln(out, "the vault passphrase is generated on your first device and this")
-	fmt.Fprintln(out, "server never sees it, so it cannot read anything it stores.")
+	if !local {
+		// The addresses above are this machine's interfaces, and the device
+		// reaches whatever terminates TLS, which is usually somewhere else.
+		fmt.Fprintf(out, "If TLS is in front, use that hostname instead: wss://your-host#%s\n", token)
+		fmt.Fprintln(out)
+	}
+	fmt.Fprintln(out, "The part after the # is a one-time token. It is not the encryption key:")
+	fmt.Fprintln(out, "the vault secret is generated on your first device and this server")
+	fmt.Fprintln(out, "never sees it, so it cannot read anything it stores.")
 }
 
 // loadOrCreateToken reads the auth token, creating one on first run.
@@ -423,6 +573,11 @@ func printSetup(out io.Writer, addr, vault, token string, fresh, local, unclaime
 // back to a fresh token on an unreadable file would silently lock out every
 // device that already has the old one, which is rule 2: absent and unreadable
 // are different states.
+//
+// An existing token is also checked for its mode and tightened to 0600 (S20).
+// writeTokenFile has always written it private, but a file copied in by hand,
+// or left by an older build, kept whatever mode it had and nothing ever looked
+// again. A credential that cannot be made private is a reason not to start.
 func loadOrCreateToken(path string) (string, bool, error) {
 	b, err := os.ReadFile(path)
 	switch {
@@ -430,6 +585,9 @@ func loadOrCreateToken(path string) (string, bool, error) {
 		token := strings.TrimSpace(string(b))
 		if token == "" {
 			return "", false, fmt.Errorf("%s is empty; delete it to generate a new token", path)
+		}
+		if err := ensurePrivate(path); err != nil {
+			return "", false, err
 		}
 		return token, false, nil
 	case errors.Is(err, os.ErrNotExist):
@@ -442,22 +600,113 @@ func loadOrCreateToken(path string) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := writeTokenFile(path, token+"\n"); err != nil {
 		return "", false, err
-	}
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		return "", false, err
-	}
-	// Read it back. Writing a credential and assuming it landed is how a
-	// restart discovers the token it printed was never stored.
-	back, err := os.ReadFile(path)
-	if err != nil {
-		return "", false, fmt.Errorf("verifying %s: %w", path, err)
-	}
-	if strings.TrimSpace(string(back)) != token {
-		return "", false, fmt.Errorf("%s does not contain the token just written", path)
 	}
 	return token, true, nil
+}
+
+// ensurePrivate makes an existing file 0600 if it is not, and proves it.
+func ensurePrivate(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm() == 0o600 {
+		return nil
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("%s has mode %o and could not be made private: %w", path, info.Mode().Perm(), err)
+	}
+	info, err = os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		return fmt.Errorf("%s has mode %o after chmod, want 600", path, perm)
+	}
+	return nil
+}
+
+// writeTokenFile writes a token file atomically and durably, then proves it
+// (S11). A token is a credential: a restart that finds it truncated or absent
+// locks out every paired device, and the failure looks like a typed pairing
+// string, so this is worth more than an os.WriteFile.
+//
+//   - A temp file in the same directory, fsynced, then renamed over the target,
+//     so a crash mid-write leaves either the old token or the new one, never
+//     half of one. os.WriteFile truncates in place, and a crash there is the
+//     truncation this exists to avoid.
+//   - The directory is fsynced after the rename, or the name can be lost while
+//     the bytes are durable.
+//   - The mode is set explicitly to 0600 and re-applied, because os.WriteFile
+//     leaves an existing file's mode alone: a copy made 0644 by an older build,
+//     or by a careless cp, would keep it.
+//   - It is read back and checked, content and mode both. Rule 4: verify the
+//     outcome, not the exit code.
+func writeTokenFile(path, content string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".auth-token.*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	// Removed if anything below fails; a no-op once the rename has consumed it.
+	defer os.Remove(tmpName)
+
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	if err := syncDir(dir); err != nil {
+		return err
+	}
+
+	// Prove it: the bytes, and the mode, are what was intended.
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("verifying %s: %w", path, err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		return fmt.Errorf("%s has mode %o after writing, want 600", path, perm)
+	}
+	back, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("verifying %s: %w", path, err)
+	}
+	if string(back) != content {
+		return fmt.Errorf("%s does not contain what was just written", path)
+	}
+	return nil
+}
+
+// syncDir flushes a directory entry so a rename into it is durable. The chunks
+// and store packages each have their own; this binary needs one that is not in
+// either of their public surfaces.
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // newToken is 160 bits in Crockford-ish base32: no padding, and the alphabet
@@ -525,6 +774,13 @@ func cmdPurge(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("purge", flag.ContinueOnError)
 	dataDir := dataFlags(fs)
 	vault := fs.String("vault", "default", "vault to purge")
+	// Friction proportional to what is lost (I18). Purge is the one command
+	// that destroys something no device holds, so it wants the vault's name
+	// typed a second time, and proof of a backup newer than the newest entry,
+	// or the words that say there is none.
+	confirm := fs.String("confirm", "", "the vault's name again, exactly; purge refuses without it")
+	backup := fs.String("backup", "", "a backup directory that must already hold everything this vault does")
+	noBackupCheck := fs.Bool("no-backup-check", false, "purge without checking a backup; typed in full, because it is the whole safety net")
 	// The grace window spares bodies uploaded so recently that the entry
 	// referencing them may not have been committed yet. Purge holds the data
 	// directory exclusively, so no server can be running while it works and
@@ -542,6 +798,18 @@ func cmdPurge(args []string, out io.Writer) error {
 	}
 	if *grace < 0 {
 		return fmt.Errorf("-grace cannot be negative, and %s is", *grace)
+	}
+	if *confirm == "" {
+		return fmt.Errorf("purge needs -confirm %s: the vault's name typed again, because this deletes history no device holds", *vault)
+	}
+	if *confirm != *vault {
+		return fmt.Errorf("-confirm %q does not match -vault %q; nothing was purged", *confirm, *vault)
+	}
+	if *backup == "" && !*noBackupCheck {
+		return errors.New("purge needs -backup DIR, a backup taken since the last change, or -no-backup-check typed in full; nothing was purged")
+	}
+	if *backup != "" && *noBackupCheck {
+		return errors.New("-backup and -no-backup-check contradict each other; nothing was purged")
 	}
 
 	// Exclusive: purge is the only thing that deletes chunk bodies, and the
@@ -564,14 +832,44 @@ func cmdPurge(args []string, out io.Writer) error {
 	}
 	defer st.Close()
 
-	rep, err := st.Purge(*vault, *grace)
-	if err != nil {
+	// Confirm the vault exists before anything is deleted (S13). A typo used to
+	// purge a vault that was not there, which deletes nothing and then verifies
+	// the *other* vaults and reports success, so a mistyped destructive command
+	// looked completed. The refusal lists what is actually there, because the
+	// next thing anyone does is check which name they meant.
+	if err := requireVault(st, *vault); err != nil {
 		return err
 	}
+
+	// The backup has to cover everything this vault holds. It is compared by
+	// the newest uid, which is what a device compares itself against too: a
+	// backup at a lower uid is missing versions this purge is about to drop
+	// for good. The check reads the backup's own database rather than its
+	// timestamp, because a backup that ran and failed leaves the old file
+	// with a new date.
+	var covered int64
+	if !*noBackupCheck {
+		if covered, err = backupCovers(*backup, *vault, st); err != nil {
+			return err
+		}
+	}
+
+	rep, err := st.Purge(*vault, *grace)
+	// Print the report before returning any error. The versions were deleted
+	// before the sweep ran, so a sweep that fails still leaves work done, and
+	// swallowing the numbers would hide both what went and what a quarantined
+	// body cost. rule 8: trust the numbers.
 	fmt.Fprintf(out, "versions %d -> %d (removed %d)\n",
 		rep.VersionsBefore, rep.VersionsAfter, rep.VersionsRemoved)
 	fmt.Fprintf(out, "chunks %d live, %d deleted, %d spared as too recent to collect\n",
 		rep.ChunksLive, rep.ChunksDeleted, rep.ChunksSpared)
+	if rep.ChunksQuarantined > 0 {
+		fmt.Fprintf(out, "%d quarantined bodies left in place, waiting for a device to resend them\n",
+			rep.ChunksQuarantined)
+	}
+	if err != nil {
+		return err
+	}
 
 	// Purging is the one operation that deletes data, so it verifies what it
 	// left behind rather than reporting success on the strength of no error.
@@ -586,14 +884,54 @@ func cmdPurge(args []string, out io.Writer) error {
 		return fmt.Errorf("purge left %d unserveable entries out of %d references", len(faults), checked)
 	}
 	fmt.Fprintf(out, "verified %d chunk references, all present\n", checked)
-	if rep.VersionsRemoved > 0 {
-		// Purge is the one command that destroys something no device holds a
-		// copy of: old versions, and the deletion records that make a deleted
-		// note recoverable. Saying so after the fact is the least it can do.
-		fmt.Fprintf(out, "\n%d versions are gone for good. Only a backup taken before now has them.\n",
-			rep.VersionsRemoved)
+	// Purge is the one command that destroys something no device holds a copy
+	// of: old versions, and the deletion records that make a deleted note
+	// recoverable. The last line says so, and says where the only copy is, or
+	// that nobody checked (I18).
+	switch {
+	case rep.VersionsRemoved > 0 && *noBackupCheck:
+		fmt.Fprintf(out, "\n%d versions are gone for good. No backup was checked (-no-backup-check), "+
+			"so only a backup taken before now has them.\n", rep.VersionsRemoved)
+	case rep.VersionsRemoved > 0:
+		fmt.Fprintf(out, "\n%d versions are gone for good. The backup at %s holds them, up to uid %d.\n",
+			rep.VersionsRemoved, *backup, covered)
+	case *noBackupCheck:
+		fmt.Fprintln(out, "nothing was removed, and no backup was checked (-no-backup-check)")
+	default:
+		fmt.Fprintf(out, "nothing was removed; the backup at %s holds %q up to uid %d\n", *backup, *vault, covered)
 	}
 	return nil
+}
+
+// backupCovers opens the backup at dir and checks that its copy of the vault is
+// at least as new as the source's, returning the backup's latest uid.
+func backupCovers(dir, vault string, source *store.Store) (int64, error) {
+	if _, err := os.Stat(filepath.Join(dir, "basalt.db")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, fmt.Errorf("there is no backup at %s: no basalt.db in it; nothing was purged", dir)
+		}
+		return 0, err
+	}
+	sourceLatest, err := source.LatestUID(vault)
+	if err != nil {
+		return 0, err
+	}
+	bk, err := openStore(dir)
+	if err != nil {
+		return 0, fmt.Errorf("opening the backup at %s: %w", dir, err)
+	}
+	defer bk.Close()
+	backupLatest, err := bk.LatestUID(vault)
+	if err != nil {
+		return 0, fmt.Errorf("reading the backup at %s: %w", dir, err)
+	}
+	if backupLatest < sourceLatest {
+		return 0, fmt.Errorf(
+			"the backup at %s holds %q up to uid %d and this store is at uid %d, so it is missing "+
+				"versions this purge would drop for good; nothing was purged.\n"+
+				"Take a fresh one first: basaltd backup -to %s", dir, vault, backupLatest, sourceLatest, dir)
+	}
+	return backupLatest, nil
 }
 
 /* ---------------------------------------------------------------- *
@@ -661,6 +999,13 @@ func cmdBackup(args []string, out io.Writer) error {
 		fmt.Fprintf(out, "  (%d source bodies are referenced by no entry and were not copied)\n",
 			rep.SourceBodies-rep.DestBodies)
 	}
+	if rep.Retained > 0 {
+		// The backup holds history the newest snapshot no longer references,
+		// because the source purged it. This is a backup doing its job, not a
+		// discrepancy, so it is named rather than left to look like one.
+		fmt.Fprintf(out, "  (%d bodies are retained history the source has since purged)\n",
+			rep.Retained)
+	}
 
 	if tokenCopied {
 		fmt.Fprintln(out, "  the device auth token is in the backup, so a restore needs no re-pairing")
@@ -693,15 +1038,12 @@ func copyToken(dataDir, destDir string) (bool, error) {
 		return false, err
 	}
 	dst := filepath.Join(destDir, tokenFileName)
-	if err := os.WriteFile(dst, want, 0o600); err != nil {
+	// Through the same atomic, durable, mode-enforcing path as the original.
+	// A backup token overwritten in place by os.WriteFile kept whatever mode
+	// an earlier copy had, and a crash mid-write left the backup's credential
+	// truncated (S11).
+	if err := writeTokenFile(dst, string(want)); err != nil {
 		return false, err
-	}
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		return false, err
-	}
-	if string(got) != string(want) {
-		return false, fmt.Errorf("%s does not match the token it was copied from", dst)
 	}
 	return true, nil
 }

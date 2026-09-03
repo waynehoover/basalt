@@ -1290,3 +1290,32 @@ func TestVerifyIsQuietOnAHealthyVault(t *testing.T) {
 		t.Fatal("verify checked nothing and called it clean")
 	}
 }
+
+// A purge must complete on a vault that holds a quarantined body.
+//
+// Quarantine renames a corrupt body aside and leaves it. Before the sweep
+// recognised that file, Purge deleted history and then aborted on it, so the
+// vault lost old versions and reclaimed nothing, and every later purge failed
+// the same way. Now the purge finishes and reports the quarantined body.
+func TestPurgeCompletesWithAQuarantinedBody(t *testing.T) {
+	h := newTestStore(t)
+	h.file(t, "note.md", "head", "old tail")
+	newest := h.file(t, "note.md", "head", "new tail")
+
+	// Set aside the newest version's own chunk, as a failed fetch would.
+	if err := h.Chunks().Quarantine("v1", newest.Chunks[1]); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+
+	rep, err := h.Purge("v1", 0)
+	if err != nil {
+		t.Fatalf("purge aborted on a quarantined body: %v", err)
+	}
+	if rep.ChunksQuarantined != 1 {
+		t.Fatalf("ChunksQuarantined = %d, want 1", rep.ChunksQuarantined)
+	}
+	// The purge still did its job: the old version is gone and the newest stays.
+	if rep.VersionsAfter != 1 {
+		t.Fatalf("VersionsAfter = %d, want 1", rep.VersionsAfter)
+	}
+}

@@ -21,10 +21,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/waynehoover/basalt-sync/server/internal/dirlock"
 
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
+	"github.com/waynehoover/basalt-sync/server/internal/server"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
 // A mac of the right shape, standing in for a real writer's. The server holds no
@@ -276,7 +280,7 @@ func TestABackupTakenBeforeAPurgeStillHasTheHistory(t *testing.T) {
 	mustRun(t, "backup", "-data", source, "-to", dest)
 
 	beforeVersions := len(readEverything(t, dest))
-	mustRun(t, "purge", "-data", source)
+	mustRun(t, "purge", "-data", source, "-confirm", "default", "-no-backup-check")
 	afterVersions := len(readEverything(t, source))
 
 	if afterVersions >= beforeVersions {
@@ -377,7 +381,7 @@ func TestPurgeKeepsTheNewestOfEachPathAndNothingElse(t *testing.T) {
 		t.Fatal("nothing to purge")
 	}
 
-	out := mustRun(t, "purge", "-data", dir)
+	out := mustRun(t, "purge", "-data", dir, "-confirm", "default", "-no-backup-check")
 	if !strings.Contains(out, "versions") || !strings.Contains(out, "removed") {
 		t.Fatalf("purge did not print its arithmetic:\n%s", out)
 	}
@@ -401,7 +405,7 @@ func TestPurgeKeepsTheNewestOfEachPathAndNothingElse(t *testing.T) {
 // implausible figure is visible rather than inferred from a success message.
 func TestPurgeArithmeticAddsUp(t *testing.T) {
 	dir := seeded(t)
-	out := mustRun(t, "purge", "-data", dir)
+	out := mustRun(t, "purge", "-data", dir, "-confirm", "default", "-no-backup-check")
 
 	var before, after, removed int
 	if _, err := fmt.Sscanf(out, "versions %d -> %d (removed %d)", &before, &after, &removed); err != nil {
@@ -418,8 +422,8 @@ func TestPurgeArithmeticAddsUp(t *testing.T) {
 // Twice in a row is a no-op, which is what "keeps only the newest" means.
 func TestPurgingTwiceRemovesNothingTheSecondTime(t *testing.T) {
 	dir := seeded(t)
-	mustRun(t, "purge", "-data", dir)
-	out := mustRun(t, "purge", "-data", dir)
+	mustRun(t, "purge", "-data", dir, "-confirm", "default", "-no-backup-check")
+	out := mustRun(t, "purge", "-data", dir, "-confirm", "default", "-no-backup-check")
 	if !strings.Contains(out, "(removed 0)") {
 		t.Fatalf("a second purge removed something:\n%s", out)
 	}
@@ -432,7 +436,7 @@ func TestPurgeCollectsBodiesNothingReferences(t *testing.T) {
 	// Grace spares anything recent, and everything here was just written, so a
 	// purge with the default window collects nothing. That is correct, and it
 	// is also why this passes zero.
-	out := mustRun(t, "purge", "-data", dir, "-grace", "0")
+	out := mustRun(t, "purge", "-data", dir, "-grace", "0", "-confirm", "default", "-no-backup-check")
 	after := countBodies(t, dir)
 	if after >= before {
 		t.Fatalf("purge collected nothing: %d bodies before, %d after\n%s", before, after, out)
@@ -448,7 +452,7 @@ func TestPurgeCollectsBodiesNothingReferences(t *testing.T) {
 func TestPurgeSparesBodiesTooRecentToCollect(t *testing.T) {
 	dir := seeded(t)
 	before := countBodies(t, dir)
-	out := mustRun(t, "purge", "-data", dir)
+	out := mustRun(t, "purge", "-data", dir, "-confirm", "default", "-no-backup-check")
 	if countBodies(t, dir) != before {
 		t.Fatalf("purge collected a body written moments ago:\n%s", out)
 	}
@@ -487,7 +491,7 @@ func TestPurgeRefusesWhileAServerIsRunning(t *testing.T) {
 	stop := serveInBackground(t, dir)
 	defer stop()
 
-	out, err := basalt(t, "purge", "-data", dir)
+	out, err := basalt(t, "purge", "-data", dir, "-confirm", "default", "-no-backup-check")
 	if err == nil {
 		t.Fatalf("purge ran against a live server:\n%s", out)
 	}
@@ -518,6 +522,25 @@ func TestVerifyRunsWhileAServerIsRunning(t *testing.T) {
 	defer stop()
 	if out := mustRun(t, "verify", "-data", dir); !strings.Contains(out, "0 faults") {
 		t.Fatalf("verify said:\n%s", out)
+	}
+}
+
+// Stats only reads, but a purge is deleting the bodies it counts. It takes the
+// shared lock like verify and backup, and used to take none.
+func TestStatsRefusesWhileAPurgeHoldsTheDirectory(t *testing.T) {
+	dir := seeded(t)
+	lock, err := dirlock.Exclusive(dir, dirlock.Data, "purge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Release()
+
+	out, err := basalt(t, "stats", "-data", dir)
+	if err == nil {
+		t.Fatalf("stats ran while a purge held the data directory:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "purge") {
+		t.Fatalf("the refusal does not say a purge is the reason: %v", err)
 	}
 }
 
@@ -681,7 +704,7 @@ func TestCommandsRefuseADataDirectoryThatIsNotThere(t *testing.T) {
 		{"backup", "-data", missing, "-to", filepath.Join(t.TempDir(), "backup")},
 		{"verify", "-data", missing},
 		{"verify", "-data", missing, "-deep"},
-		{"purge", "-data", missing},
+		{"purge", "-data", missing, "-confirm", "default", "-no-backup-check"},
 	} {
 		out, err := basalt(t, args...)
 		if err == nil {
@@ -791,6 +814,27 @@ func TestProtectHomeIsOnlySetWhenItWouldNotBreakTheService(t *testing.T) {
 	}
 }
 
+// The prefixes are a guess. The run-as user's real home is the answer, and a
+// home somewhere unusual used to get ProtectHome=true and a unit that could
+// not read its own data directory.
+func TestProtectHomeKnowsWhereTheUsersHomeActuallyIs(t *testing.T) {
+	if !underHome("/srv/people/wayne/.basalt", "/srv/people/wayne") {
+		t.Fatal("a data directory inside an unusual home was not recognised as such")
+	}
+	if !underHome("/srv/people/wayne", "/srv/people/wayne/") {
+		t.Fatal("the home directory itself, with a trailing slash on the home, was not recognised")
+	}
+	if underHome("/srv/people/wayne-data", "/srv/people/wayne") {
+		t.Fatal("a sibling that merely shares a prefix was taken for the home")
+	}
+	if !underHome("/home/somebody/.basalt", "") {
+		t.Fatal("the well-known prefixes stopped working when the home is unknown")
+	}
+	if underHome("/var/lib/basalt", "/") {
+		t.Fatal("a home of / would mark every path as inside it")
+	}
+}
+
 // Restarting must not be something a person has to notice. A sync server that
 // stays down after one bad night is one you find out about from a device that
 // has been quietly not syncing.
@@ -846,7 +890,7 @@ func TestStatsSaysWhatIsThereAndWhatAPurgeWouldDrop(t *testing.T) {
 	}
 
 	// After a purge there is no history left, and it stops saying there is.
-	mustRun(t, "purge", "-data", dir)
+	mustRun(t, "purge", "-data", dir, "-confirm", "default", "-no-backup-check")
 	after := mustRun(t, "stats", "-data", dir)
 	if strings.Contains(after, "would drop") {
 		t.Fatalf("stats still offers a purge with nothing left to drop:\n%s", after)
@@ -1075,5 +1119,60 @@ func TestLocalhostPrintsAStringThatCanBePastedAsIs(t *testing.T) {
 	printSetup(&out, "127.0.0.1:3003", "default", "TOKEN", false, true, true)
 	if !strings.Contains(out.String(), "ws://127.0.0.1:3003#TOKEN") {
 		t.Errorf("-localhost printed a string that needs editing before use:\n%s", out.String())
+	}
+}
+
+/* ---------------------------------------------------------------- *
+ * I25: the caps are flags, and what the flag says is what ready says
+ * ---------------------------------------------------------------- */
+
+// -max-batch-bytes and -max-fetch-bytes reach ready, so a client test can lower
+// the caps against the real binary. Out-of-range values are clamped and the
+// clamped value is what is advertised, because advertised must equal enforced.
+func TestI25TheCapFlagsReachReady(t *testing.T) {
+	readyWith := func(t *testing.T, flags ...string) map[string]any {
+		t.Helper()
+		dir := t.TempDir()
+		port := freeTestPort(t)
+		addr := fmt.Sprintf("127.0.0.1:%d", port)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		out := &safeBuffer{}
+		go func() { _ = run(ctx, append([]string{"serve", "-data", dir, "-addr", addr}, flags...), out) }()
+		waitForServer(t, addr, out)
+
+		wsCtx, wsCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer wsCancel()
+		conn, _, err := websocket.Dial(wsCtx, "ws://"+addr, nil)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer conn.CloseNow()
+		cl := &wsClient{t: t, conn: conn, ctx: wsCtx}
+		cl.write(wire.In{Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
+			Token: bootstrapToken(t, out.String()), Claim: strings.Repeat("k", 43), Device: "probe"})
+		ready := cl.readJSON()
+		if ready["res"] != "ready" {
+			t.Fatalf("wanted ready, got %v", ready)
+		}
+		return ready
+	}
+
+	lowered := readyWith(t, "-max-batch-bytes", "2097152", "-max-fetch-bytes", "3145728")
+	if lowered["maxBatchBytes"] != float64(2<<20) || lowered["maxFetchBytes"] != float64(3<<20) {
+		t.Fatalf("lowered caps did not reach ready: batch %v fetch %v", lowered["maxBatchBytes"], lowered["maxFetchBytes"])
+	}
+
+	// Out of range both ways: clamped, and the clamp is what is advertised.
+	clamped := readyWith(t, "-max-batch-bytes", "1", "-max-fetch-bytes", "999999999999")
+	if clamped["maxBatchBytes"] != float64(store.ChunkMax) {
+		t.Fatalf("a batch cap below one chunk was advertised as %v", clamped["maxBatchBytes"])
+	}
+	if clamped["maxFetchBytes"] != float64(store.PerFileMax) {
+		t.Fatalf("a fetch cap above the file ceiling was advertised as %v", clamped["maxFetchBytes"])
+	}
+	raised := readyWith(t, "-max-batch-bytes", fmt.Sprint(server.ReadLimit))
+	if raised["maxBatchBytes"] != float64(server.ReadLimit/2) {
+		t.Fatalf("a batch cap at the read limit was advertised as %v, want half the read limit", raised["maxBatchBytes"])
 	}
 }

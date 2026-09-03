@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"github.com/coder/websocket"
@@ -70,8 +71,11 @@ func TestHandshakeRefusals(t *testing.T) {
 		{"unsupported proto", wire.In{
 			Op: "hello", Proto: wire.Proto + 1, Crypto: wire.Crypto,
 			Vault: testVault, Token: testToken}, wire.CodeProto},
+		{"proto older than the server still speaks", wire.In{
+			Op: "hello", Proto: wire.MinProto - 1, Crypto: wire.Crypto,
+			Vault: testVault, Token: testToken}, wire.CodeProto},
 		{"unsupported crypto", wire.In{
-			Op: "hello", Proto: wire.Proto, Crypto: "rot13/1",
+			Op: "hello", Crypto: "rot13/1",
 			Vault: testVault, Token: testToken}, wire.CodeProto},
 		{"wrong token", helloMsg(testVault, "guess", "a", 0), wire.CodeAuth},
 		{"unknown vault", helloMsg("someone-elses", testToken, "a", 0), wire.CodeAuth},
@@ -600,8 +604,7 @@ func TestGetThenFetchReturnsOnlyTheBodiesAsked(t *testing.T) {
 	}
 
 	// A device that already holds the head and tail fetches only the middle.
-	cl.sendJSON(wire.In{Op: "fetch", Chunks: []string{got.Chunks[1]}})
-	body := cl.recvBinary()
+	body := cl.fetch(got.Chunks[1])[0]
 	if string(body) != "middle" {
 		t.Fatalf("fetched %q, want %q", body, "middle")
 	}
@@ -617,12 +620,11 @@ func TestFetchStreamsBodiesInTheOrderRequested(t *testing.T) {
 	cl := r.dial("a")
 	cl.hello(0)
 	order := []string{e.Chunks[2], e.Chunks[0], e.Chunks[1]}
-	cl.sendJSON(wire.In{Op: "fetch", Chunks: order})
+	bodies := cl.fetch(order...)
 
 	for i, want := range []string{"three", "one", "two"} {
-		got := cl.recvBinary()
-		if string(got) != want {
-			t.Fatalf("body %d is %q, want %q", i, got, want)
+		if string(bodies[i]) != want {
+			t.Fatalf("body %d is %q, want %q", i, bodies[i], want)
 		}
 	}
 }
@@ -1008,7 +1010,6 @@ func TestAnUnboundedDeviceNameIsRefused(t *testing.T) {
 	cl := r.dial("a")
 	cl.sendJSON(wire.In{
 		Op:     "hello",
-		Proto:  wire.Proto,
 		Vault:  testVault,
 		Token:  testToken,
 		Crypto: wire.Crypto,
@@ -1148,4 +1149,61 @@ func TestAStalledPeerCannotQueueTheWholeVault(t *testing.T) {
 	if peak == 0 {
 		t.Fatal("nothing was ever queued, so this proved nothing")
 	}
+}
+
+// A client that is reading a large fetch slowly is alive, and the keepalive
+// must not say otherwise.
+//
+// coder/websocket only notices a pong inside a Read call, and the session
+// goroutine is the only reader. During a fetch it is not reading: it is inside
+// send, waiting on the byte budget for the client to drain what it has been
+// sent. A ping sent then is answered by the client and never seen by the server,
+// and after PongWait the session was closed for not answering. With the real
+// numbers, any fetch whose send phase straddled a ping tick by fifteen seconds
+// was killed, and the retry of the same fetch hit the same wall.
+func TestAClientReadingAFetchSlowlyIsNotReaped(t *testing.T) {
+	r := newRig(t)
+	// Ping often, so several ticks fall inside one fetch, and give the pong a
+	// window comfortably wider than one full queue drains in, so the only thing
+	// that can kill this connection is a ping the client never got to answer.
+	r.srv.pingEvery = 50 * time.Millisecond
+	r.srv.pongWait = 500 * time.Millisecond
+
+	// Several times the send budget, so the session goroutine spends the fetch
+	// blocked in send while the client drains, which is when it is not reading
+	// and cannot process a pong.
+	const bodies = 32
+	names := make([]string, bodies)
+	for i := range names {
+		b := bytes.Repeat([]byte{byte(i + 1)}, 1<<20)
+		names[i] = chunks.Name(b)
+		if err := r.st.Chunks().Put(testVault, names[i], b); err != nil {
+			t.Fatalf("seed body: %v", err)
+		}
+	}
+
+	cl := r.dial("slow-but-alive")
+	cl.hello(0)
+	cl.sendJSON(wire.In{Op: "fetch", Chunks: names})
+	cl.expectBodies(len(names))
+	for i, want := range names {
+		typ, data, err := cl.read()
+		if err != nil {
+			t.Fatalf("cut off after %d of %d bodies: %v", i, bodies, err)
+		}
+		if typ != websocket.MessageBinary {
+			t.Fatalf("body %d: got a text frame instead: %s", i, data)
+		}
+		if got := chunks.Name(data); got != want {
+			t.Fatalf("body %d is %s, want %s", i, got, want)
+		}
+		// A slow link. The client is reading, and answering pings as it
+		// reads, just not quickly.
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	// Still there afterwards, which is the other half: the keepalive skipped
+	// while the fetch ran and it must be back once the session is reading.
+	cl.sendJSON(wire.In{Op: "ping"})
+	cl.recvInto("pong", &wire.Pong{})
 }

@@ -14,13 +14,29 @@ package wire
 
 import "github.com/waynehoover/basalt-sync/server/internal/store"
 
-// Proto is the protocol version this server implements. A mismatch is refused,
-// not negotiated: interoperating with a version we have not seen is how a
-// silent incompatibility gets shipped.
+// Proto is the newest protocol version this server implements, and MinProto the
+// oldest it still answers. A version outside that range is refused, not
+// negotiated: interoperating with a version we have not seen is how a silent
+// incompatibility gets shipped.
+//
 // Protocol 2 added the per-entry authenticator. A client older than that sends
 // entries nothing can verify, and one newer refuses them, which is a refusal
 // rather than a negotiation for the usual reason.
-const Proto = 2
+//
+// Protocol 3 added request ids, the `bodies` header on a fetch, `retryable` on
+// every error, the batch and fetch caps in `ready`, and the wrapped data key
+// with `rotate`. The server answers a session in the version the client asked
+// for, so a protocol 2 device keeps working for one release while the others
+// are upgraded. docs/protocol.md, "Protocol 2 sessions".
+const (
+	Proto    = 3
+	MinProto = 2
+)
+
+// MaxRequestID bounds a client-chosen request id: an integer from 1 to 2^32-1.
+// Zero is "no id", which is what a protocol 2 request carries, so the two are
+// never confused.
+const MaxRequestID = 1<<32 - 1
 
 // Crypto names the client-side scheme. It is a string rather than an integer
 // because an integer shared with other implementations means two projects
@@ -31,9 +47,9 @@ const Crypto = "basalt/hkdf-aes-gcm/1"
 // read; docs/protocol.md requires both, because an error a device cannot act on
 // and a person cannot read is how a silent failure starts.
 //
-// The doc lists five of these. The rest were needed to name outcomes that would
-// otherwise have had to share a code with something a client must handle
-// differently, and are recorded in the doc alongside them.
+// Every code here has a row in the doc's error table, which also says whether
+// the session continues after it. The two lists are kept in step by hand, so a
+// new code goes in both.
 const (
 	CodeProto = "proto" // unsupported proto or crypto; the session closes
 	CodeAuth  = "auth"  // bad token or vault; the session closes
@@ -67,7 +83,9 @@ const (
 	CodeProtoState = "protostate"
 	// CodeInternal is a server-side fault. The put is not committed.
 	CodeInternal = "internal"
-	// CodeBusy is the vault's device limit. Honest refusal beats degrading.
+	// CodeBusy is the vault's device limit, or a server that is shutting down.
+	// Honest refusal beats degrading. It is the one refusal a client should
+	// simply wait out, which is what `retryable` and `retryAfterMs` say.
 	CodeBusy = "busy"
 	// CodeCursor is a client whose cursor is ahead of the server's.
 	//
@@ -92,6 +110,12 @@ const (
 type In struct {
 	Op string `json:"op"`
 
+	// ID is the client's request id, echoed on the reply and on any error
+	// refusing it. Zero on a protocol 2 request, which carries none. Before
+	// ids, a reply was matched to the one request in flight by position, and
+	// three separate client defects came from that; see docs/protocol.md.
+	ID int64 `json:"id,omitempty"`
+
 	// hello
 	Proto  int    `json:"proto"`
 	Vault  string `json:"vault"`
@@ -104,6 +128,22 @@ type In struct {
 	// vault has been claimed, so a device sending it every time costs nothing
 	// and a device that never sends it can still be the first.
 	Claim string `json:"claim,omitempty"`
+	// Wrapped is the vault's data key, wrapped under a key derived from the
+	// root secret, sent beside Claim by a protocol 3 device and stored with the
+	// auth hash. Opaque here: the server holds neither key. On a rotate it is
+	// the same data key wrapped under the new root.
+	Wrapped string `json:"wrapped,omitempty"`
+
+	// rotate: the new auth key, whose hash replaces the stored one.
+	Auth string `json:"auth,omitempty"`
+
+	// invite: Invite is the random identifier and Sealed the root secret sealed
+	// under the invite key, which never reaches the server. TTLMs is how long
+	// the invite lives; zero is the default. At hello, Invite in place of a
+	// token redeems one.
+	Invite string `json:"invite,omitempty"`
+	Sealed string `json:"sealed,omitempty"`
+	TTLMs  int64  `json:"ttlMs,omitempty"`
 
 	// put
 	Path   string   `json:"path"`
@@ -168,6 +208,33 @@ func (p PutEntry) Entry(device string) store.Entry {
 // enough that a batch is never a reason to run out of anything.
 const MaxBatchEntries = 256
 
+// MaxBatchBytes bounds one batched put two ways: the encoded `putmany` frame
+// may not exceed it, and neither may the summed ciphertext budget of the
+// entries in it (S18). Both are advertised in `ready` so a client can split a
+// batch before sending rather than discover the bound by being refused.
+//
+// The frame bound is what makes "every legal message is receivable" true: the
+// read limit is set above it (server.ReadLimit), so a frame over this cap is
+// read in full and refused with `toolarge`, never dropped with a bare
+// disconnect that the client answers by retrying the identical batch for ever
+// (S22). The budget bound is what stops one authenticated batch streaming
+// gigabytes of bodies: 256 entries at the 64 MiB file limit was 16 GiB of
+// allowed upload in one exchange. A file whose budget alone exceeds this goes
+// through a single `put`, which is bounded by perFileMax instead.
+//
+// 16 MiB is thousands of notes at the sizes people write them and small enough
+// that a batch is never why a server ran out of memory holding it.
+const MaxBatchBytes = 16 << 20
+
+// MaxFetchBytes bounds the summed stored size of the bodies one `fetch` may ask
+// for (S21). The server knows every size from the same stat that answers
+// presence; a client bounds itself with CiphertextBudget over the files it is
+// fetching, which is never smaller. Over it is `toolarge` with no bodies.
+//
+// 64 MiB matches the default file limit, so one fetch can always carry one
+// file, and a first download of a text vault is still a handful of round trips.
+const MaxFetchBytes = 64 << 20
+
 // PutMeta is the metadata of one version. It is nested rather than flat so that
 // the fields a client assembles from the filesystem travel together and are
 // obviously the same set in both directions.
@@ -213,13 +280,27 @@ func (in In) Entry() store.Entry {
 // is that no persisted boolean decides whether a vault uploads: the client
 // announces what it has, the server answers with what it has, and neither
 // remembers a verdict from last time.
+//
+// Proto is the version this session speaks, which is the one the client asked
+// for. MinProto and ServerVersion are there so a refused or puzzled client can
+// name both ends in its error. The two caps and Wrapped are new in protocol 3;
+// a protocol 2 client ignores the caps and is never sent Wrapped.
 type Ready struct {
-	Res        string `json:"res"` // "ready"
-	Proto      int    `json:"proto"`
-	Cursor     int64  `json:"cursor"`
-	PerFileMax int64  `json:"perFileMax"`
-	ChunkMax   int64  `json:"chunkMax"`
-	MaxChunks  int    `json:"maxChunks"`
+	Res           string `json:"res"` // "ready"
+	ID            int64  `json:"id,omitempty"`
+	Proto         int    `json:"proto"`
+	MinProto      int    `json:"minProto"`
+	ServerVersion string `json:"serverVersion"`
+	Cursor        int64  `json:"cursor"`
+	PerFileMax    int64  `json:"perFileMax"`
+	ChunkMax      int64  `json:"chunkMax"`
+	MaxChunks     int    `json:"maxChunks"`
+	MaxBatchBytes int64  `json:"maxBatchBytes"`
+	MaxFetchBytes int64  `json:"maxFetchBytes"`
+	// Wrapped is the vault's wrapped data key when it has one. Absent for a
+	// vault claimed under protocol 2, which is how a client learns which key
+	// schedule applies; docs/protocol.md, "The data key".
+	Wrapped string `json:"wrapped,omitempty"`
 }
 
 // Batch delivers entries, and is the only message that ever does.
@@ -258,6 +339,7 @@ type CaughtUp struct {
 // never longer than the put's own chunk list and never contains a repeat.
 type Want struct {
 	Res    string   `json:"res"` // "want"
+	ID     int64    `json:"id,omitempty"`
 	Chunks []string `json:"chunks"`
 }
 
@@ -265,6 +347,7 @@ type Want struct {
 // entry is committed. It carries the uid for the same reason Ack does.
 type Have struct {
 	Res string `json:"res"` // "have"
+	ID  int64  `json:"id,omitempty"`
 	UID int64  `json:"uid"`
 }
 
@@ -278,6 +361,7 @@ type Have struct {
 // any content.
 type Ack struct {
 	Res string `json:"res"` // "ack"
+	ID  int64  `json:"id,omitempty"`
 	UID int64  `json:"uid"`
 }
 
@@ -285,9 +369,49 @@ type Ack struct {
 // only the chunks it does not already hold from some other version of the file.
 type Chunks struct {
 	Res    string   `json:"res"` // "chunks"
+	ID     int64    `json:"id,omitempty"`
 	UID    int64    `json:"uid"`
 	Size   int64    `json:"size"`
 	Chunks []string `json:"chunks"`
+}
+
+// Bodies answers a protocol 3 fetch and says exactly how many binary frames
+// follow, in the order asked. A fetch is answered by this or by an Err, never
+// by bodies and then an error: a client that received three frames and then a
+// refusal could not tell which three, and stale bodies from a refused fetch
+// used to be consumed as the answer to the next one. A protocol 2 session
+// gets the bodies with no header, as it always did.
+type Bodies struct {
+	Res   string `json:"res"` // "bodies"
+	ID    int64  `json:"id,omitempty"`
+	Count int    `json:"count"`
+}
+
+// Invited answers an invite with the moment it stops working, in milliseconds
+// of the server's clock, which is the only thing the server knows about it
+// that the issuing device did not already.
+type Invited struct {
+	Res       string `json:"res"` // "invited"
+	ID        int64  `json:"id,omitempty"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+
+// Redeemed answers a hello that carried an invite: the sealed root secret the
+// issuing device stored, and the vault's wrapped data key when it has one, so
+// the new device can derive everything and connect again as a device. The
+// session closes after this; the invite was marked used before it was sent.
+type Redeemed struct {
+	Res     string `json:"res"` // "redeemed"
+	ID      int64  `json:"id,omitempty"`
+	Sealed  string `json:"sealed"`
+	Wrapped string `json:"wrapped,omitempty"`
+}
+
+// Rotated answers a rotate: the vault's auth hash and wrapped data key were
+// replaced together, and every other session on the vault has been closed.
+type Rotated struct {
+	Res string `json:"res"` // "rotated"
+	ID  int64  `json:"id,omitempty"`
 }
 
 // History answers a history request with every version of one path, newest
@@ -304,6 +428,7 @@ type Chunks struct {
 // answers it is meant to handle, which is the same reasoning as Batch.
 type History struct {
 	Res string `json:"res"` // "history"
+	ID  int64  `json:"id,omitempty"`
 	// Path echoes the request, so a client with several in flight can tell
 	// which answer it is holding. Still sealed; the server has never seen the
 	// plaintext and cannot start now.
@@ -320,6 +445,7 @@ type History struct {
 // that is mostly noise is one nobody reads.
 type Deleted struct {
 	Res string `json:"res"` // "deleted"
+	ID  int64  `json:"id,omitempty"`
 	// Each entry carries `restorable`: the uid of the newest version with
 	// content in it, or zero. Purge keeps only the newest version per path, and
 	// for a deleted note that is the deletion record, so a note can be listed
@@ -348,6 +474,7 @@ type Pong struct {
 // why.
 type Acks struct {
 	Res     string      `json:"res"` // "acks"
+	ID      int64       `json:"id,omitempty"`
 	Results []AckResult `json:"results"`
 }
 
@@ -359,10 +486,55 @@ type AckResult struct {
 }
 
 // Err is every rejection.
+//
+// ID is present when the error answers a request, and absent on the one
+// unsolicited error the server sends, the shutdown or rotation notice, which a
+// client reads as the reason the connection is about to close.
+//
+// Retryable is a pointer so that a protocol 2 session, which never had the
+// field, is sent exactly the shape it always was. In a protocol 3 session it
+// is always set, from the table in Retryable below, so a client has nothing to
+// interpret: back off and reconnect on true, stop on false. RetryAfterMs is a
+// hint that travels with `busy`.
 type Err struct {
-	Res  string `json:"res"` // "err"
-	Code string `json:"code"`
-	Msg  string `json:"msg"`
+	Res          string `json:"res"` // "err"
+	ID           int64  `json:"id,omitempty"`
+	Code         string `json:"code"`
+	Msg          string `json:"msg"`
+	Retryable    *bool  `json:"retryable,omitempty"`
+	RetryAfterMs int64  `json:"retryAfterMs,omitempty"`
 }
 
+// Error is a protocol 2 shaped rejection: code and message and nothing else.
 func Error(code, msg string) Err { return Err{Res: "err", Code: code, Msg: msg} }
+
+// ForProto3 fills in what a protocol 3 client expects: the id of the request
+// being refused, or zero for an unsolicited error, and the retryable verdict
+// for the code. retryAfterMs is sent only when positive.
+func (e Err) ForProto3(id, retryAfterMs int64) Err {
+	r := Retryable(e.Code)
+	e.ID = id
+	e.Retryable = &r
+	if retryAfterMs > 0 {
+		e.RetryAfterMs = retryAfterMs
+	}
+	return e
+}
+
+// Retryable says whether reconnecting later can succeed where retrying the same
+// request cannot. It is the "retryable" column of the error table in
+// docs/protocol.md, and the two are kept in step by hand.
+//
+// Only three codes are transient. `busy` is a device limit or a shutdown, both
+// of which pass. `nospace` is a full disk, which an operator clears. `internal`
+// is a server fault the put did not survive, and the server is the thing that
+// can be fixed. Everything else names a fact about the request or the
+// credentials that a retry does not change, and a watching client that
+// reconnected on it would loop for ever.
+func Retryable(code string) bool {
+	switch code {
+	case CodeBusy, CodeNoSpace, CodeInternal:
+		return true
+	}
+	return false
+}

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,24 +30,71 @@ type Session struct {
 	// order without a mutex and stops a stalled peer from blocking whoever is
 	// broadcasting to it.
 	out chan outFrame
-	// queued is the bytes sitting in out, and drained wakes a waiter when the
-	// writer has taken some away. Bytes as well as frames, because a frame can
-	// be a whole chunk body.
+	// queued is the bytes and inflight the frames that have been enqueued and
+	// not yet written, counted on every path into out (S8: trySend used to skip
+	// the count, so the writer's decrements drove it negative and the byte bound
+	// switched itself off). Both are reserved before the frame goes on the
+	// channel and released after the write returns, so a zero means every frame
+	// has reached the socket. drained wakes a waiter when the writer has taken
+	// some away.
 	queued    atomic.Int64
+	inflight  atomic.Int64
 	drained   chan struct{}
 	dead      chan struct{}
 	closeOnce sync.Once
+
+	// reading is true only while the session goroutine is parked in conn.Read.
+	// coder/websocket processes an incoming pong only inside a Reader call, and
+	// this goroutine is the only reader, so a ping sent while it is busy sending
+	// a fetch would go unanswered however alive the client is. keepalive uses it
+	// twice: it pings only when this is set, and it treats a ping that went
+	// unanswered while this was clear as no verdict. See keepalive.
+	reading atomic.Bool
 
 	vaultID string
 	device  string
 	remote  string
 	joined  bool
 
+	// proto is the protocol version this session speaks, which is the one the
+	// client asked for at hello, and zero until then. Every reply is shaped by
+	// it: a protocol 2 client gets the frames it always did, a protocol 3 client
+	// gets ids, `retryable` and the `bodies` header. Atomic because shutdown
+	// builds its notice on another goroutine.
+	proto atomic.Int32
+
+	// reqID is the id of the request being served, echoed on its reply and on
+	// any error refusing it, and zero between requests so that an error sent
+	// then, the shutdown notice, is recognisably unsolicited. Only the session
+	// goroutine touches it.
+	reqID int64
+
+	// bootstrap is true when this session authenticated with the server's
+	// first-run token rather than a derived key. Such a session may not rotate
+	// the vault; see Grant.
+	bootstrap bool
+
+	// counted is true while this session is in the server's pre-auth count,
+	// guarded by Server.sessMu (S19).
+	counted bool
+
 	// Guards the catch-up handover. Live changes buffer in pending until the
 	// backlog is on the wire; see handleHello for why the order matters.
-	mu          sync.Mutex
-	catchupDone bool
-	pending     []pendingChange
+	// pendingBytes is their marshalled size, because 4096 entries naming 65536
+	// chunks each is a quarter of a gigabyte, not a buffer.
+	mu           sync.Mutex
+	catchupDone  bool
+	pending      []pendingChange
+	pendingBytes int64
+
+	// Shutdown state, guarded by stateMu. busy is set while the session is
+	// inside a request, which is when a shutdown must wait for it: the store
+	// may be about to commit and the client is owed the ack. closing is set by
+	// Server.Shutdown and read by run between requests, so a session that was
+	// busy ends itself, with a reason, as soon as its request completes.
+	stateMu sync.Mutex
+	busy    bool
+	closing bool
 }
 
 type outFrame struct {
@@ -53,18 +102,20 @@ type outFrame struct {
 	data []byte
 }
 
+// pendingChange is a live batch held back during catch-up, already marshalled.
+// Marshalling at delivery rather than at flush is what lets the buffer be
+// bounded by the bytes it actually holds.
 type pendingChange struct {
-	entry store.Entry
-	// elide is set when this session is the one that pushed the entry: it gets
-	// the range so its cursor advances, without the payload it would otherwise
-	// have to recognise as its own.
-	elide bool
+	uid   int64
+	frame []byte
 }
 
 // Handle runs one connection to completion. The caller has already accepted the
 // WebSocket.
 func (s *Server) Handle(ctx context.Context, conn *websocket.Conn, remote string) {
-	conn.SetReadLimit(ReadLimit)
+	// Small until hello has been accepted, then raised to what an authenticated
+	// peer may send; see ReadLimit.
+	conn.SetReadLimit(HelloReadLimit)
 	sess := &Session{
 		srv: s, conn: conn, ctx: ctx, remote: remote,
 		out:     make(chan outFrame, SendQueueDepth),
@@ -72,6 +123,22 @@ func (s *Server) Handle(ctx context.Context, conn *websocket.Conn, remote string
 		dead:    make(chan struct{}),
 	}
 	go sess.writeLoop()
+
+	// Admission is the first thing a shutdown stops, and the pre-auth cap is
+	// applied here too. A connection accepted between the listener closing and
+	// the sessions being told, or one arriving while too many others have not
+	// yet said hello, is refused with a reason rather than admitted. The
+	// refusal is in the protocol 2 shape, because nothing has said which
+	// protocol it speaks yet; a client reads an error before `ready` as the
+	// reason the connection is closing, and `busy` is the code.
+	if err := s.admit(sess); err != nil {
+		s.log.Info("session refused", "remote", remote, "why", err)
+		_ = sess.fatalWith(wire.CodeBusy, err, ShutdownRetryAfter)
+		sess.drain(2 * time.Second)
+		sess.kill(nil)
+		return
+	}
+	defer s.forget(sess)
 	go sess.keepalive()
 
 	err := sess.run()
@@ -94,10 +161,14 @@ func (s *Session) writeLoop() {
 		case <-s.dead:
 			return
 		case f := <-s.out:
-			ctx, cancel := context.WithTimeout(s.ctx, WriteWait)
+			ctx, cancel := context.WithTimeout(s.ctx, s.srv.writeWait)
 			err := s.conn.Write(ctx, f.typ, f.data)
 			cancel()
+			// Released only now, after the write returned, so a zero on either
+			// counter means the frame has reached the socket rather than merely
+			// left the channel. drain relies on that (S10).
 			s.queued.Add(-int64(len(f.data)))
+			s.inflight.Add(-1)
 			// Non-blocking, and one pending wake is enough: a waiter rechecks
 			// the counter rather than trusting the signal.
 			select {
@@ -124,22 +195,53 @@ func (s *Session) kill(cause error) {
 	})
 }
 
-// drain waits, bounded, for queued frames to reach the wire, so a final error
-// message is not lost to an immediate close.
+// drain waits, bounded, for every queued frame to finish being written, so a
+// final error message is not lost to an immediate close.
+//
+// It waits on inflight, not on the channel being empty. The writer takes a
+// frame off the channel and then spends up to WriteWait writing it, and a drain
+// that returned once the channel was empty let Handle close the socket in the
+// middle of the very frame it was trying to preserve (S10).
 func (s *Session) drain(timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if len(s.out) == 0 {
-			// One more tick: the writer may still be mid-write on the last
-			// frame it took off the channel.
-			time.Sleep(20 * time.Millisecond)
-			return
-		}
+	deadline := time.After(timeout)
+	for s.inflight.Load() > 0 {
 		select {
+		case <-s.drained:
 		case <-s.dead:
 			return
-		case <-time.After(20 * time.Millisecond):
+		case <-deadline:
+			return
 		}
+	}
+}
+
+// enqueue puts a frame on the queue if there is room for it, and says whether
+// it did. It never blocks and never closes anything; the caller decides what
+// "no room" means, which is different for a catch-up, a fan-out and a flush.
+//
+// Room is bytes as well as frames. handleFetch reads a body and sends it, over
+// and over, as fast as the queue accepts them, and bounded only by frame count
+// that let one peer hold a quarter of a gigabyte of chunk bodies in memory. A
+// frame bigger than the whole budget is still accepted when nothing is queued
+// ahead of it, or a single large chunk would wait for room that can never
+// appear.
+//
+// The bytes are reserved before the frame is offered and given back if it is
+// refused, so the counter is never below what the writer will subtract.
+func (s *Session) enqueue(typ websocket.MessageType, data []byte) bool {
+	n := int64(len(data))
+	if after := s.queued.Add(n); after > SendQueueBytes && after != n {
+		s.queued.Add(-n)
+		return false
+	}
+	s.inflight.Add(1)
+	select {
+	case s.out <- outFrame{typ, data}:
+		return true
+	default:
+		s.queued.Add(-n)
+		s.inflight.Add(-1)
+		return false
 	}
 }
 
@@ -148,18 +250,10 @@ func (s *Session) drain(timeout time.Duration) {
 // Only ever called from the session's own goroutine, where blocking is correct
 // backpressure: a catch-up can be far larger than the queue, and dropping
 // frames there would leave the client with gaps it has been told to expect.
+// Waiting here is safe because the peer that is not reading is the one that
+// waits.
 func (s *Session) send(typ websocket.MessageType, data []byte) error {
-	// Waits on bytes as well as on frames.
-	//
-	// handleFetch reads a body and sends it, over and over, as fast as the
-	// queue accepts them. Bounded only by frame count that let one peer hold a
-	// quarter of a gigabyte of chunk bodies in memory. Waiting here is safe and
-	// is what already happens when the queue fills: send runs on the session's
-	// own goroutine, so the peer that is not reading is the one that waits.
-	//
-	// A frame bigger than the whole budget still goes, or a single large chunk
-	// would wait for room that can never appear.
-	for s.queued.Load() > 0 && s.queued.Load()+int64(len(data)) > SendQueueBytes {
+	for !s.enqueue(typ, data) {
 		select {
 		case <-s.drained:
 		case <-s.dead:
@@ -168,18 +262,7 @@ func (s *Session) send(typ websocket.MessageType, data []byte) error {
 			return s.ctx.Err()
 		}
 	}
-
-	s.queued.Add(int64(len(data)))
-	select {
-	case s.out <- outFrame{typ, data}:
-		return nil
-	case <-s.dead:
-		s.queued.Add(-int64(len(data)))
-		return errors.New("session closed")
-	case <-s.ctx.Done():
-		s.queued.Add(-int64(len(data)))
-		return s.ctx.Err()
-	}
+	return nil
 }
 
 // trySend never blocks. Used for fan-out from *other* sessions' goroutines,
@@ -191,14 +274,15 @@ func (s *Session) send(typ websocket.MessageType, data []byte) error {
 // the frame instead would leave a live peer permanently short one file.
 func (s *Session) trySend(typ websocket.MessageType, data []byte) bool {
 	select {
-	case s.out <- outFrame{typ, data}:
-		return true
 	case <-s.dead:
 		return false
 	default:
+	}
+	if !s.enqueue(typ, data) {
 		s.kill(errors.New("send queue overflow, peer too slow"))
 		return false
 	}
+	return true
 }
 
 func (s *Session) writeJSON(v any) error {
@@ -213,25 +297,67 @@ func (s *Session) writeBinary(b []byte) error {
 	return s.send(websocket.MessageBinary, b)
 }
 
+// errFrame shapes an error for this session's protocol. A protocol 3 client
+// gets the id of the request being refused, or none for an unsolicited error,
+// and the retryable verdict; a protocol 2 client gets code and message only,
+// which is exactly what it always got. retryAfter is sent only when positive,
+// which in practice means `busy`.
+func (s *Session) errFrame(id int64, code, msg string, retryAfter time.Duration) wire.Err {
+	e := wire.Error(code, msg)
+	if s.proto.Load() >= 3 {
+		return e.ForProto3(id, retryAfter.Milliseconds())
+	}
+	return e
+}
+
 // reject reports a refusal the session survives. docs/protocol.md: a rejected
 // put returns an error and the session continues, because a protocol with no
 // clean way to refuse a push has to close the connection to say no, and then
 // every bad file costs a reconnect.
 func (s *Session) reject(code string, cause error) error {
 	s.srv.log.Warn("rejected", "vault", s.vaultID, "code", code, "err", cause)
-	return s.writeJSON(wire.Error(code, cause.Error()))
+	return s.writeJSON(s.errFrame(s.reqID, code, cause.Error(), 0))
 }
 
-// refuse writes an error frame the caller already built. The session continues,
-// exactly as it does after reject.
+// refuse writes an error frame the caller already built, shaped for the
+// session. The session continues, exactly as it does after reject.
 func (s *Session) refuse(e *wire.Err) error {
-	return s.writeJSON(*e)
+	return s.writeJSON(s.errFrame(s.reqID, e.Code, e.Msg, 0))
 }
 
-// fatal reports a refusal that ends the session, writing the reason first.
+// fatal reports a refusal that ends the session, writing the reason first. The
+// id is the request's when one is being served, so a protocol 3 client can
+// tell "your put was refused and the connection is closing" from "the
+// connection is closing".
 func (s *Session) fatal(code string, cause error) error {
-	_ = s.writeJSON(wire.Error(code, cause.Error()))
+	return s.fatalWith(code, cause, 0)
+}
+
+// fatalWith is fatal with a retryAfter hint, for the two `busy` refusals.
+func (s *Session) fatalWith(code string, cause error, retryAfter time.Duration) error {
+	_ = s.writeJSON(s.errFrame(s.reqID, code, cause.Error(), retryAfter))
 	return cause
+}
+
+// takeID records the request id a protocol 3 message carries, or refuses one
+// that has none or one out of range. A protocol 2 message has no id and the
+// field stays zero. Pings carry none in either version, because they are
+// answered by position and nothing else ever is.
+//
+// A missing id ends the session rather than refusing the one request: the
+// client could not match the refusal to anything, and would read an error with
+// no id as the connection closing anyway.
+func (s *Session) takeID(m wire.In) error {
+	s.reqID = 0
+	if s.proto.Load() < 3 || m.Op == "ping" {
+		return nil
+	}
+	if m.ID < 1 || m.ID > wire.MaxRequestID {
+		return s.fatal(wire.CodeProtoState, fmt.Errorf(
+			"%s request carries id %d; protocol 3 requests carry an id from 1 to %d", m.Op, m.ID, wire.MaxRequestID))
+	}
+	s.reqID = m.ID
+	return nil
 }
 
 // readMsg waits for the next frame, for as long as the connection lives.
@@ -245,6 +371,12 @@ func (s *Session) fatal(code string, cause error) error {
 // is a slow-loris in a system built for one person's own devices behind a
 // tunnel, and MaxPeers already bounds how many of them there can be.
 func (s *Session) readMsg() (websocket.MessageType, []byte, error) {
+	// A pong is processed only inside this Read, so keepalive may ping only
+	// while it is running. The flag is cleared on the way out because the
+	// goroutine's next move may be a long send, during which a ping would never
+	// be seen.
+	s.reading.Store(true)
+	defer s.reading.Store(false)
 	return s.conn.Read(s.ctx)
 }
 
@@ -264,20 +396,113 @@ func (s *Session) keepalive() {
 		case <-s.dead:
 			return
 		case <-ticker.C:
+			// Only when the session is parked in a read with nothing queued
+			// behind it (S1). A ping sent while the session is mid-send would be
+			// answered by the client and never processed here, because only a
+			// Read processes a pong. A ping sent with frames still queued goes
+			// out behind them and reaches the client only once it has read
+			// everything ahead of it, which on a slow link is longer than
+			// PongWait however alive the client is. In both cases a peer that
+			// has really gone is caught by the write timing out instead, so
+			// skipping the tick costs nothing.
+			if !s.reading.Load() || s.inflight.Load() > 0 {
+				continue
+			}
+			if s.srv.beforePing != nil {
+				s.srv.beforePing()
+			}
 			ctx, cancel := context.WithTimeout(s.ctx, s.srv.pongWait)
 			err := s.conn.Ping(ctx)
 			cancel()
-			if err != nil {
-				// Closing the connection ends the read this session is parked
-				// on, which ends the session. Logged at debug: a device going
-				// away is ordinary.
-				s.srv.log.Debug("connection stopped answering",
-					"remote", s.remote, "vault", s.vaultID, "err", err)
-				s.kill(nil)
-				return
+			if err == nil {
+				continue
 			}
+			if !s.reading.Load() {
+				// The session left its read while the ping was in flight: a
+				// request arrived just behind the ping and is being served,
+				// and the pong is sitting unprocessed behind it. That is not a
+				// verdict on the connection. The next tick asks again once the
+				// session is back in a read.
+				continue
+			}
+			// Closing the connection ends the read this session is parked on,
+			// which ends the session. Logged at debug: a device going away is
+			// ordinary.
+			s.srv.log.Debug("connection stopped answering",
+				"remote", s.remote, "vault", s.vaultID, "err", err)
+			s.kill(nil)
+			return
 		}
 	}
+}
+
+/* ---------------------------------------------------------------- *
+ * Shutdown
+ * ---------------------------------------------------------------- */
+
+// enter marks the session busy with a request, or reports that the server is
+// shutting down and the request must not start. Called between reading a
+// message and acting on it, so a shutdown that arrives while a request is in
+// flight waits for it, and one that arrives before it starts refuses it.
+func (s *Session) enter() bool {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.busy = true
+	return true
+}
+
+// leave marks the request finished and reports whether a shutdown is waiting.
+func (s *Session) leave() (closing bool) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.busy = false
+	return s.closing
+}
+
+// shutdown tells the session the server is stopping.
+//
+// An idle session is told why and closed here. A busy one is left to finish
+// the request it is in: the store may be mid-commit and the client is owed an
+// ack that means what it says, so the session ends itself, with the same
+// reason, once run sees the flag. Server.Shutdown bounds how long that may
+// take and kills whatever is left at the deadline.
+//
+// The read cannot simply be cancelled to interrupt an idle session: cancelling
+// the context of a coder/websocket Read closes the connection, which is the
+// bare disconnect a reason frame exists to avoid.
+func (s *Session) shutdown() {
+	s.stateMu.Lock()
+	s.closing = true
+	idle := !s.busy
+	s.stateMu.Unlock()
+	if !idle {
+		return
+	}
+	// A refusal frame from a goroutine other than the session's, with no id
+	// because no request asked for it. trySend rather than send, because this
+	// must not wait on a peer that has stopped reading, and a peer whose queue
+	// is full at shutdown is dropped as one.
+	if b, err := json.Marshal(s.errFrame(0, wire.CodeBusy, errShuttingDown.Error(), ShutdownRetryAfter)); err == nil {
+		s.trySend(websocket.MessageText, b)
+	}
+	s.drain(time.Second)
+	s.kill(nil)
+}
+
+// evict closes this session from another goroutine because the vault's secret
+// was rotated on a different one. The notice is unsolicited `auth`: the
+// credential this session connected with no longer opens the vault, and the
+// device pairs again with the new string.
+func (s *Session) evict() {
+	if b, err := json.Marshal(s.errFrame(0, wire.CodeAuth,
+		"the vault's secret was rotated by another device; pair again with the new string", 0)); err == nil {
+		s.trySend(websocket.MessageText, b)
+	}
+	s.drain(time.Second)
+	s.kill(errors.New("vault secret rotated"))
 }
 
 /* ---------------------------------------------------------------- *
@@ -285,7 +510,21 @@ func (s *Session) keepalive() {
  * ---------------------------------------------------------------- */
 
 func (s *Session) run() error {
+	// A connection has HelloTimeout to say hello (S19). The timer, not a read
+	// deadline: cancelling a coder/websocket Read closes the connection with
+	// nothing said, and a reason frame is the difference between a client
+	// that can be fixed and one that cannot. Stopped as soon as a frame has
+	// arrived, so a slow authentication is never mistaken for a silent peer.
+	deadline := time.AfterFunc(s.srv.helloTimeout, func() {
+		if b, err := json.Marshal(s.errFrame(0, wire.CodeProtoState,
+			fmt.Sprintf("no hello within %s of connecting", s.srv.helloTimeout), 0)); err == nil {
+			s.trySend(websocket.MessageText, b)
+		}
+		s.drain(time.Second)
+		s.kill(errors.New("no hello before the deadline"))
+	})
 	typ, data, err := s.readMsg()
+	deadline.Stop()
 	if err != nil {
 		return err
 	}
@@ -300,7 +539,15 @@ func (s *Session) run() error {
 	if m.Op != "hello" {
 		return s.fatal(wire.CodeProtoState, fmt.Errorf("first op must be hello, got %q", m.Op))
 	}
-	if err := s.handleHello(m); err != nil {
+	if !s.enter() {
+		return s.fatalWith(wire.CodeBusy, errShuttingDown, ShutdownRetryAfter)
+	}
+	err = s.handleHello(m)
+	s.reqID = 0
+	if closing := s.leave(); err == nil && closing {
+		err = s.fatalWith(wire.CodeBusy, errShuttingDown, ShutdownRetryAfter)
+	}
+	if err != nil {
 		return err
 	}
 
@@ -321,20 +568,39 @@ func (s *Session) run() error {
 		if err := json.Unmarshal(data, &m); err != nil {
 			return s.fatal(wire.CodeProtoState, fmt.Errorf("parse: %w", err))
 		}
-		if err := s.dispatch(m); err != nil {
+		if err := s.takeID(m); err != nil {
+			return err
+		}
+		// The shutdown check sits around the request, not around the read.
+		// A request already in flight is finished, so a put that has stored
+		// its bodies gets its commit and its ack; one that arrives after the
+		// shutdown began is refused before it starts anything (S16).
+		if !s.enter() {
+			return s.fatalWith(wire.CodeBusy, errShuttingDown, ShutdownRetryAfter)
+		}
+		err = s.dispatch(m, len(data))
+		// Cleared before the shutdown notice below, so that notice carries no
+		// id: it answers no request.
+		s.reqID = 0
+		if closing := s.leave(); err == nil && closing {
+			err = s.fatalWith(wire.CodeBusy, errShuttingDown, ShutdownRetryAfter)
+		}
+		if err != nil {
 			return err
 		}
 	}
 }
 
-func (s *Session) dispatch(m wire.In) error {
+// dispatch routes one request. frameLen is the encoded size of the frame it
+// arrived in, which is what maxBatchBytes bounds.
+func (s *Session) dispatch(m wire.In, frameLen int) error {
 	switch m.Op {
 	case "ping":
 		return s.writeJSON(wire.Pong{Res: "pong"})
 	case "put":
 		return s.handlePut(m)
 	case "putmany":
-		return s.handlePutMany(m)
+		return s.handlePutMany(m, frameLen)
 	case "get":
 		return s.handleGet(m)
 	case "fetch":
@@ -343,45 +609,99 @@ func (s *Session) dispatch(m wire.In) error {
 		return s.handleHistory(m)
 	case "deleted":
 		return s.handleDeleted(m)
+	case "rotate", "invite":
+		if s.proto.Load() < 3 {
+			// A protocol 2 session has neither. They are unknown ops to it,
+			// and answered as such, so the session continues.
+			break
+		}
+		if m.Op == "invite" {
+			return s.handleInvite(m)
+		}
+		return s.handleRotate(m)
 	case "hello":
 		return s.fatal(wire.CodeProtoState, errors.New("hello sent twice"))
-	default:
-		// Named, not ignored. A client blocked waiting on a reply it will never
-		// get looks exactly like a hung server.
-		return s.reject(wire.CodeProtoState, fmt.Errorf("unknown op %q", m.Op))
 	}
+	// Named, not ignored. A client blocked waiting on a reply it will never
+	// get looks exactly like a hung server.
+	return s.reject(wire.CodeProtoState, fmt.Errorf("unknown op %q", m.Op))
 }
 
 func (s *Session) handleHello(m wire.In) error {
 	// Version before credentials: refusing on proto is not a security answer
-	// and a client on the wrong version deserves to be told so plainly.
-	if m.Proto != wire.Proto {
-		return s.fatal(wire.CodeProto,
-			fmt.Errorf("protocol %d not supported, this server speaks %d", m.Proto, wire.Proto))
+	// and a client on the wrong version deserves to be told so plainly. The
+	// refusal is shaped for the version asked for where that is known: a
+	// client newer than this server understands ids, one older does not.
+	if m.Proto >= 3 {
+		s.proto.Store(3)
+	}
+	if m.Proto < wire.MinProto || m.Proto > wire.Proto {
+		return s.fatal(wire.CodeProto, fmt.Errorf(
+			"protocol %d not supported, this server (version %s) speaks %d to %d",
+			m.Proto, s.srv.version, wire.MinProto, wire.Proto))
+	}
+	s.proto.Store(int32(m.Proto))
+	if err := s.takeID(m); err != nil {
+		return err
 	}
 	if m.Crypto != wire.Crypto {
 		return s.fatal(wire.CodeProto,
-			fmt.Errorf("crypto %q not supported, this server speaks %q", m.Crypto, wire.Crypto))
+			fmt.Errorf("crypto %q not supported, this server (version %s) speaks %q",
+				m.Crypto, s.srv.version, wire.Crypto))
 	}
 	if m.Vault == "" {
 		return s.fatal(wire.CodeAuth, errors.New("missing vault"))
 	}
+	// Both names are bounded and checked for control characters before either
+	// is logged or handed to the authenticator (S24, I6). They land in log
+	// lines and, for the device, on every entry it writes, and a newline in a
+	// log line is a forged log line.
+	if err := checkName("vault", m.Vault, store.MaxVaultLen); err != nil {
+		return s.fatal(wire.CodeBadName, err)
+	}
+	if err := checkName("device", m.Device, store.MaxDeviceLen); err != nil {
+		return s.fatal(wire.CodeBadName, err)
+	}
 	if m.Cursor < 0 {
 		return s.fatal(wire.CodeProtoState, fmt.Errorf("negative cursor %d", m.Cursor))
 	}
-	if len(m.Device) > store.MaxDeviceLen {
-		return s.fatal(wire.CodeBadName,
-			fmt.Errorf("device name is %d bytes, limit is %d", len(m.Device), store.MaxDeviceLen))
+	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped}
+	if m.Proto >= 3 && m.Token == "" {
+		// An invite stands in for the token, and only in protocol 3: a
+		// protocol 2 hello has no such field, so one that carries it is
+		// authenticated on its empty token and refused like any other.
+		creds.Invite = m.Invite
 	}
-	if err := s.srv.auth(Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim}); err != nil {
+	grant, err := s.srv.auth(creds)
+	if err != nil {
 		// Logged in full, reported as one word. Telling a caller whether the
 		// vault or the token was wrong tells them which half to keep guessing.
 		s.srv.log.Warn("auth failed", "remote", s.remote, "vault", m.Vault, "err", err)
 		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
 	}
+	if grant.Redeemed {
+		// The invite is already marked used. Hand over the sealed secret and
+		// the wrapped key, then close: this connection proved nothing about
+		// holding the root and is not a device yet. It connects again with
+		// the derived key like any other.
+		wrapped, err := s.srv.st.Wrapped(m.Vault)
+		if err != nil {
+			return s.fatal(wire.CodeInternal, err)
+		}
+		s.srv.log.Info("invite redeemed", "remote", s.remote, "vault", m.Vault, "device", m.Device)
+		if err := s.writeJSON(wire.Redeemed{Res: "redeemed", ID: s.reqID, Sealed: grant.Sealed, Wrapped: wrapped}); err != nil {
+			return err
+		}
+		return errRedeemed
+	}
+	s.bootstrap = grant.Bootstrap
 
 	s.vaultID = m.Vault
 	s.device = m.Device
+	// Authenticated: out of the pre-auth count, and allowed the full read
+	// limit from here on.
+	s.srv.authenticated(s)
+	s.conn.SetReadLimit(ReadLimit)
 
 	if err := s.srv.st.EnsureVault(m.Vault, s.srv.now().UnixMilli()); err != nil {
 		return s.fatal(wire.CodeInternal, err)
@@ -389,6 +709,21 @@ func (s *Session) handleHello(m wire.In) error {
 	latest, err := s.srv.st.LatestUID(m.Vault)
 	if err != nil {
 		return s.fatal(wire.CodeInternal, err)
+	}
+	wrapped, err := s.srv.st.Wrapped(m.Vault)
+	if err != nil {
+		return s.fatal(wire.CodeInternal, err)
+	}
+	// A vault with a data key is a protocol 3 vault. A protocol 2 client on it
+	// would seal every path and chunk under keys derived from the root, and
+	// nothing else on the vault could read what it wrote or be read by it:
+	// nothing lost, everything unreadable. Refused as `proto`, after auth so
+	// that an attacker learns nothing about the vault from it, and before
+	// ready so the client never starts.
+	if m.Proto < 3 && wrapped != "" {
+		return s.fatal(wire.CodeProto, fmt.Errorf(
+			"this vault was claimed under protocol 3 and needs a protocol 3 client; "+
+				"protocol %d cannot read or write it (server version %s)", m.Proto, s.srv.version))
 	}
 
 	// A client ahead of the server is refused, loudly.
@@ -414,14 +749,14 @@ func (s *Session) handleHello(m wire.In) error {
 	// open and which loses exactly one file when it is hit.
 	peers, admitted := s.srv.hub.joinIfRoom(m.Vault, s, s.srv.maxPeers)
 	if !admitted {
-		return s.fatal(wire.CodeBusy, fmt.Errorf(
-			"vault has %d devices connected, limit is %d", peers, s.srv.maxPeers))
+		return s.fatalWith(wire.CodeBusy, fmt.Errorf(
+			"vault has %d devices connected, limit is %d", peers, s.srv.maxPeers), DeviceLimitRetryAfter)
 	}
 	s.joined = true
 
 	// Limits first, so a client knows every ceiling before its first put rather
 	// than discovering one by being rejected.
-	if err := s.writeJSON(s.srv.ready(latest)); err != nil {
+	if err := s.writeJSON(s.srv.ready(m.Proto, s.reqID, latest, wrapped)); err != nil {
 		return err
 	}
 	s.srv.log.Info("session ready", "remote", s.remote, "vault", m.Vault,
@@ -435,13 +770,37 @@ func (s *Session) handleHello(m wire.In) error {
 		s.srv.afterReplay()
 	}
 	// Release anything committed while the replay was running, in uid order and
-	// skipping what the replay already covered.
+	// skipping what the replay already covered. flushPending also queues the
+	// caught-up frame, under the same lock, so a broadcast cannot slip in ahead
+	// of it; see flushPending.
 	cursor = s.flushPending(cursor)
 
 	if sent > 0 {
 		s.srv.log.Info("catch-up sent", "vault", m.Vault, "entries", sent, "cursor", cursor)
 	}
-	return s.writeJSON(wire.CaughtUp{Op: "caught-up", Cursor: cursor})
+	return nil
+}
+
+// errRedeemed ends a session that connected only to redeem an invite. It is not
+// a fault, so no error frame follows the reply; Handle drains and closes.
+var errRedeemed = errors.New("invite redeemed, closing")
+
+// checkName bounds a vault or device name and refuses control characters in it.
+//
+// The empty device name is allowed, because it always was and a device that
+// gives none is only harder to tell apart in a history listing. An empty vault
+// is refused before this is reached, as an auth failure, so that an attacker
+// probing the server learns nothing from the difference.
+func checkName(what, name string, max int) error {
+	if len(name) > max {
+		return fmt.Errorf("%s name is %d bytes, limit is %d", what, len(name), max)
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c < 0x20 || c == 0x7f {
+			return fmt.Errorf("%s name contains a control character (byte %d at position %d)", what, c, i)
+		}
+	}
+	return nil
 }
 
 // replay sends the backlog as batches and returns the cursor it reached.
@@ -490,23 +849,28 @@ func (s *Session) replay(vaultID string, cursor int64) (int64, int, error) {
 // older catch-up frame in the same queue, and a client that advances its cursor
 // to a batch's To would then step past files it has not received.
 func (s *Session) deliver(e store.Entry, elide bool) {
+	b, err := json.Marshal(liveBatch(e, elide))
+	if err != nil {
+		return
+	}
+
 	s.mu.Lock()
 	if !s.catchupDone {
-		if len(s.pending) >= CatchupBufferMax {
+		// Bounded in bytes as well as entries (S8). The entry bound alone let
+		// a peer hold 4096 marshalled batches of any size, and a batch naming
+		// tens of thousands of chunks is megabytes.
+		if len(s.pending) >= CatchupBufferMax || s.pendingBytes+int64(len(b)) > CatchupBufferBytes {
 			s.mu.Unlock()
 			s.kill(errors.New("catch-up buffer overflow, peer too slow"))
 			return
 		}
-		s.pending = append(s.pending, pendingChange{entry: e, elide: elide})
+		s.pending = append(s.pending, pendingChange{uid: e.UID, frame: b})
+		s.pendingBytes += int64(len(b))
 		s.mu.Unlock()
 		return
 	}
 	s.mu.Unlock()
 
-	b, err := json.Marshal(liveBatch(e, elide))
-	if err != nil {
-		return
-	}
 	s.trySend(websocket.MessageText, b)
 }
 
@@ -523,36 +887,87 @@ func liveBatch(e store.Entry, elide bool) wire.Batch {
 	return b
 }
 
-// flushPending releases buffered live changes and switches to direct delivery.
+// flushPending releases buffered live changes, queues caught-up, and switches
+// to direct delivery. Returns the highest uid written.
 //
 // The sort matters. Two entries can commit in uid order and reach the hub in
 // the opposite order, because AppendEntry releases the store's write lock
-// before the broadcast runs. The flush and the flag flip happen under one lock
-// so a change arriving mid-flush cannot slip in ahead of the frames being
-// released. Returns the highest uid written.
+// before the broadcast runs. The flush, the caught-up frame, and the flag flip
+// all happen under one lock so a change arriving mid-flush cannot slip in ahead
+// of any of them.
+//
+// caught-up is queued here, before catchupDone is set, rather than by the
+// caller afterwards (S2). Set the flag first and a broadcast from another
+// session reaches s.out through deliver before caught-up does, carrying a uid
+// above the cursor caught-up will announce. The real client
+// (client/src/core/transport.ts) treats a batch after caught-up whose range is
+// below caught-up's cursor as fatal protostate, so that reordering drops a
+// healthy device.
+//
+// When the queue has no room, the lock is released and the session waits for
+// the writer, then tries again. The queue is often nearly full here, because
+// the replay that just finished fills it as fast as the client drains it, and
+// the alternative of dropping the peer for that would turn every catch-up over
+// a slow link into a reconnect loop. Waiting *inside* the lock is not an
+// option either: deliver takes it, so one slow peer would stall every other
+// session's fan-out. Changes that land while the lock is released go into
+// pending and are picked up on the next pass, still in uid order.
 func (s *Session) flushPending(cursor int64) int64 {
+	for {
+		done, next := s.flushPendingOnce(cursor)
+		cursor = next
+		if done {
+			break
+		}
+		select {
+		case <-s.drained:
+		case <-s.dead:
+			return cursor
+		case <-s.ctx.Done():
+			return cursor
+		}
+	}
+	if s.srv != nil && s.srv.afterFlush != nil {
+		s.srv.afterFlush()
+	}
+	return cursor
+}
+
+// flushPendingOnce queues as much of pending as the queue has room for, then
+// caught-up. It reports done once caught-up is queued and the handover is
+// complete; otherwise what did not fit stays in pending for the next pass.
+func (s *Session) flushPendingOnce(cursor int64) (bool, int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	sort.Slice(s.pending, func(i, j int) bool {
-		return s.pending[i].entry.UID < s.pending[j].entry.UID
+		return s.pending[i].uid < s.pending[j].uid
 	})
-	for _, p := range s.pending {
-		if p.entry.UID <= cursor {
-			continue // the replay already covered it
-		}
-		b, err := json.Marshal(liveBatch(p.entry, p.elide))
-		if err != nil {
+	for len(s.pending) > 0 {
+		p := s.pending[0]
+		if p.uid <= cursor {
+			// The replay already covered it.
+			s.pending = s.pending[1:]
+			s.pendingBytes -= int64(len(p.frame))
 			continue
 		}
-		if !s.trySend(websocket.MessageText, b) {
-			break
+		if !s.enqueue(websocket.MessageText, p.frame) {
+			return false, cursor
 		}
-		cursor = p.entry.UID
+		s.pending = s.pending[1:]
+		s.pendingBytes -= int64(len(p.frame))
+		cursor = p.uid
+	}
+	// Same queue, same lock, so nothing can be enqueued between the last
+	// buffered change and caught-up.
+	b, err := json.Marshal(wire.CaughtUp{Op: "caught-up", Cursor: cursor})
+	if err != nil || !s.enqueue(websocket.MessageText, b) {
+		return false, cursor
 	}
 	s.pending = nil
+	s.pendingBytes = 0
 	s.catchupDone = true
-	return cursor
+	return true, cursor
 }
 
 /* ---------------------------------------------------------------- *
@@ -598,13 +1013,34 @@ func (s *Session) checkEntry(e store.Entry) *wire.Err {
 // Nothing is committed until every body has arrived, and each entry is then
 // committed on its own, so an ack still means what it has always meant: this
 // entry and its bodies are durable.
-func (s *Session) handlePutMany(m wire.In) error {
+func (s *Session) handlePutMany(m wire.In, frameLen int) error {
 	if len(m.Entries) == 0 {
 		return s.reject(wire.CodeBadEntry, errors.New("a batched put with no entries in it"))
 	}
 	if len(m.Entries) > wire.MaxBatchEntries {
 		return s.reject(wire.CodeToolarge,
 			fmt.Errorf("%d entries in one put, limit is %d", len(m.Entries), wire.MaxBatchEntries))
+	}
+	// The two bounds maxBatchBytes names (S18). The frame, so that a batch
+	// naming enough chunks to matter is refused with a code rather than dying
+	// at the read limit; and the summed budget over every entry, so that one
+	// exchange can never be allowed to upload more than the cap however many
+	// files it carries. The budget is summed over every entry rather than
+	// over what the server lacks, because that is the figure a client can
+	// compute for itself before sending.
+	if int64(frameLen) > s.srv.maxBatchBytes {
+		return s.reject(wire.CodeToolarge, fmt.Errorf(
+			"the putmany frame is %d bytes, limit is %d; split the batch", frameLen, s.srv.maxBatchBytes))
+	}
+	var budgets int64
+	for _, in := range m.Entries {
+		budgets += store.CiphertextBudget(in.Meta.Size, len(in.Chunks))
+	}
+	if budgets > s.srv.maxBatchBytes {
+		return s.reject(wire.CodeToolarge, fmt.Errorf(
+			"the entries in this batch could upload %d bytes between them, limit is %d; "+
+				"split the batch, and send a file over the limit on its own with put",
+			budgets, s.srv.maxBatchBytes))
 	}
 
 	type prepared struct {
@@ -635,10 +1071,7 @@ func (s *Session) handlePutMany(m wire.In) error {
 			continue
 		}
 		budget := store.CiphertextBudget(e.Size, len(e.Chunks))
-		held, err := s.heldBytes(e.Chunks, missing, sizes)
-		if err != nil {
-			return s.reject(wire.CodeInternal, err)
-		}
+		held := heldBytes(e.Chunks, missing, sizes)
 		if held > budget {
 			refusal := wire.Error(wire.CodeToolarge, fmt.Sprintf(
 				"the chunks named already hold %d bytes for a declared size of %d, budget %d",
@@ -659,7 +1092,7 @@ func (s *Session) handlePutMany(m wire.In) error {
 	}
 
 	if len(want) > 0 {
-		if err := s.writeJSON(wire.Want{Res: "want", Chunks: want}); err != nil {
+		if err := s.writeJSON(wire.Want{Res: "want", ID: s.reqID, Chunks: want}); err != nil {
 			return err
 		}
 		if err := s.readBodies(want, allowance); err != nil {
@@ -683,7 +1116,7 @@ func (s *Session) handlePutMany(m wire.In) error {
 		}
 		results[i] = wire.AckResult{UID: uid}
 	}
-	return s.writeJSON(wire.Acks{Res: "acks", Results: results})
+	return s.writeJSON(wire.Acks{Res: "acks", ID: s.reqID, Results: results})
 }
 
 func (s *Session) handlePut(m wire.In) error {
@@ -695,25 +1128,10 @@ func (s *Session) handlePut(m wire.In) error {
 	// the client and only corrected an empty answer.
 	e.Device = s.device
 
-	// Two checks ahead of Validate, only to name the outcome: docs/protocol.md
-	// gives badname and toolarge their own codes because a client acts on them
-	// differently from a generic structural fault. Validate is still the
-	// enforcer and runs immediately after; if the two ever disagree, Validate
-	// wins and the client gets badentry.
-	if e.Path == "" || len(e.Path) > store.MaxPathLen {
-		return s.reject(wire.CodeBadName,
-			fmt.Errorf("path is %d bytes, must be 1 to %d", len(e.Path), store.MaxPathLen))
-	}
-	if e.Size > s.srv.perFileMax {
-		return s.reject(wire.CodeToolarge,
-			fmt.Errorf("file is %d bytes, limit is %d", e.Size, s.srv.perFileMax))
-	}
-	if len(e.Chunks) > store.MaxChunksPerEntry {
-		return s.reject(wire.CodeToolarge,
-			fmt.Errorf("%d chunks, limit is %d", len(e.Chunks), store.MaxChunksPerEntry))
-	}
-	if err := e.Validate(); err != nil {
-		return s.reject(wire.CodeBadEntry, err)
+	// The same refusals, in the same order, as one entry of a batch. One list,
+	// so the two puts cannot drift apart on what they refuse (S6).
+	if refusal := s.checkEntry(e); refusal != nil {
+		return s.reject(refusal.Code, errors.New(refusal.Msg))
 	}
 
 	missing, sizes, err := s.srv.st.Chunks().Missing(s.vaultID, e.Chunks)
@@ -730,10 +1148,7 @@ func (s *Session) handlePut(m wire.In) error {
 	// relying on it alone would let a client write the disk full and only then
 	// be told no. Refusing before the want list goes out costs nothing.
 	budget := store.CiphertextBudget(e.Size, len(e.Chunks))
-	held, err := s.heldBytes(e.Chunks, missing, sizes)
-	if err != nil {
-		return s.reject(wire.CodeInternal, err)
-	}
+	held := heldBytes(e.Chunks, missing, sizes)
 	if held > budget {
 		return s.reject(wire.CodeToolarge, fmt.Errorf(
 			"the chunks named already hold %d bytes for a declared size of %d, budget %d",
@@ -748,10 +1163,10 @@ func (s *Session) handlePut(m wire.In) error {
 		if refusal != nil {
 			return s.refuse(refusal)
 		}
-		return s.writeJSON(wire.Have{Res: "have", UID: uid})
+		return s.writeJSON(wire.Have{Res: "have", ID: s.reqID, UID: uid})
 	}
 
-	if err := s.writeJSON(wire.Want{Res: "want", Chunks: missing}); err != nil {
+	if err := s.writeJSON(wire.Want{Res: "want", ID: s.reqID, Chunks: missing}); err != nil {
 		return err
 	}
 	if err := s.readBodies(missing, budget-held); err != nil {
@@ -766,19 +1181,20 @@ func (s *Session) handlePut(m wire.In) error {
 		return s.refuse(refusal)
 	}
 	// Only now is the ack truthful: every body is durable and so is the entry.
-	return s.writeJSON(wire.Ack{Res: "ack", UID: uid})
+	return s.writeJSON(wire.Ack{Res: "ack", ID: s.reqID, UID: uid})
 }
 
-// heldBytes totals what this entry's already-present chunks occupy, counting a
-// repeated chunk once per reference because the declared size counts its
-// plaintext once per reference too.
 // heldBytes totals what the named chunks already occupy, from the sizes Missing
 // gathered rather than by stat'ing them again.
 //
 // Once per reference, not once per distinct chunk: an entry naming the same
 // chunk twice is charged for it twice, which is what the budget means and what
 // TestTheBudgetCountsRepeatedChunksOncePerReference is about.
-func (s *Session) heldBytes(all, missing []string, sizes map[string]int64) (int64, error) {
+//
+// A name that is neither missing nor sized was present when Missing looked and
+// is not now. The sweep can do that; the commit will refuse and the client
+// retries, so it is counted as nothing here rather than treated as a fault.
+func heldBytes(all, missing []string, sizes map[string]int64) int64 {
 	absent := make(map[string]struct{}, len(missing))
 	for _, n := range missing {
 		absent[n] = struct{}{}
@@ -788,15 +1204,9 @@ func (s *Session) heldBytes(all, missing []string, sizes map[string]int64) (int6
 		if _, gone := absent[n]; gone {
 			continue
 		}
-		size, ok := sizes[n]
-		if !ok {
-			// Present a moment ago, when Missing looked. The sweep can do this;
-			// the commit will refuse and the client retries.
-			continue
-		}
-		held += size
+		held += sizes[n]
 	}
-	return held, nil
+	return held
 }
 
 // readBodies reads one binary frame per wanted chunk and stores each, refusing
@@ -920,12 +1330,25 @@ func putErrorCode(err error) string {
 // instead would leave a batch half committed and every entry in it unacked,
 // which is the failure batching exists to avoid.
 //
-// Anything else has already ended the session.
+// A fault that is the server's rather than the entry's, the database refusing
+// the commit, comes back as an `internal` refusal and the session continues
+// (S27). Nothing was committed, the bodies on disk are harmless, and the client
+// retries the put; the error table says `internal` ends a session only during
+// the handshake and catch-up, where there is nothing to continue with. Ending
+// it here used to cost a reconnect and a replayed handshake for a fault the
+// next put might not even see.
 func (s *Session) commit(e store.Entry) (int64, *wire.Err, error) {
 	s.srv.commitMu.Lock()
 	defer s.srv.commitMu.Unlock()
 
-	uid, err := s.srv.st.AppendEntry(s.vaultID, e)
+	var uid int64
+	var err error
+	if s.srv.beforeAppend != nil {
+		err = s.srv.beforeAppend(e)
+	}
+	if err == nil {
+		uid, err = s.srv.st.AppendEntry(s.vaultID, e)
+	}
 	if err != nil {
 		if code := commitCode(err); code != "" {
 			s.srv.log.Warn("refused at commit",
@@ -933,7 +1356,9 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err, error) {
 			refusal := wire.Error(code, err.Error())
 			return 0, &refusal, nil
 		}
-		return 0, nil, s.fatal(wire.CodeInternal, err)
+		s.srv.log.Error("commit failed", "vault", s.vaultID, "err", err)
+		refusal := wire.Error(wire.CodeInternal, "the entry could not be committed: "+err.Error())
+		return 0, &refusal, nil
 	}
 	e.UID = uid
 	if s.srv.afterAppend != nil {
@@ -973,7 +1398,7 @@ func (s *Session) handleHistory(m wire.In) error {
 		s.srv.log.Error("history", "vault", s.vaultID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("could not read history"))
 	}
-	return s.writeJSON(wire.History{Res: "history", Path: m.Path, Entries: nonNil(entries)})
+	return s.writeJSON(wire.History{Res: "history", ID: s.reqID, Path: m.Path, Entries: nonNil(entries)})
 }
 
 // handleDeleted answers with every path whose newest version is a deletion.
@@ -987,7 +1412,7 @@ func (s *Session) handleDeleted(m wire.In) error {
 		s.srv.log.Error("deleted", "vault", s.vaultID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("could not list deletions"))
 	}
-	return s.writeJSON(wire.Deleted{Res: "deleted", Entries: nonNilDeletions(entries), More: more})
+	return s.writeJSON(wire.Deleted{Res: "deleted", ID: s.reqID, Entries: nonNilDeletions(entries), More: more})
 }
 
 // nonNil keeps an empty result an empty array rather than JSON null.
@@ -1028,7 +1453,7 @@ func (s *Session) handleGet(m wire.In) error {
 			fmt.Errorf("entry %d is a %s", m.UID, kindOf(e)))
 	}
 	return s.writeJSON(wire.Chunks{
-		Res: "chunks", UID: e.UID, Size: e.Size, Chunks: e.Chunks,
+		Res: "chunks", ID: s.reqID, UID: e.UID, Size: e.Size, Chunks: e.Chunks,
 	})
 }
 
@@ -1054,12 +1479,35 @@ func (s *Session) handleFetch(m wire.In) error {
 		return s.reject(wire.CodeToolarge,
 			fmt.Errorf("%d chunks, limit is %d", len(m.Chunks), store.MaxChunksPerEntry))
 	}
+	// Presence and size from one stat per chunk. The sum is bounded by
+	// maxFetchBytes (S21): a fetch naming every chunk of a large vault would
+	// otherwise be one request that the server answers for as long as the
+	// client cares to read, and the client was told the cap at hello.
+	var total int64
 	for _, n := range m.Chunks {
 		if !chunks.ValidName(n) {
 			return s.reject(wire.CodeBadChunk, fmt.Errorf("%q is not a chunk name", n))
 		}
-		if !s.srv.st.Chunks().Has(s.vaultID, n) {
+		size, ok := s.srv.st.Chunks().Size(s.vaultID, n)
+		if !ok {
 			return s.reject(wire.CodeNoChunk, fmt.Errorf("this vault does not hold %s", n))
+		}
+		total += size
+	}
+	if total > s.srv.maxFetchBytes {
+		return s.reject(wire.CodeToolarge, fmt.Errorf(
+			"the %d chunks asked for hold %d bytes, limit for one fetch is %d; ask in smaller sets",
+			len(m.Chunks), total, s.srv.maxFetchBytes))
+	}
+
+	// A protocol 3 client is told how many frames follow before the first one,
+	// so the answer to a fetch is either this header and exactly that many
+	// bodies or an error, never bodies and then an error. A body found
+	// unreadable below still ends the session, which is the one way a count
+	// once promised may fall short, and the close is what tells the client.
+	if s.proto.Load() >= 3 {
+		if err := s.writeJSON(wire.Bodies{Res: "bodies", ID: s.reqID, Count: len(m.Chunks)}); err != nil {
+			return err
 		}
 	}
 
@@ -1092,4 +1540,102 @@ func (s *Session) handleFetch(m wire.In) error {
 		}
 	}
 	return nil
+}
+
+/* ---------------------------------------------------------------- *
+ * rotate
+ * ---------------------------------------------------------------- */
+
+// handleRotate replaces the vault's auth hash and wrapped data key together and
+// closes every other session on the vault, so a leaked pairing string is retired
+// without the server's history going with it. docs/protocol.md, "The data key,
+// and rotating a leaked secret".
+//
+// Refused with `auth` on a session that authenticated with the bootstrap token,
+// which proved nothing about holding the old root; with `badentry` on a vault
+// that has no data key, whose content keys derive from the root directly and
+// could not be re-wrapped; and with `badentry` on a malformed request. Each
+// refusal leaves the session usable, because none of them changed anything.
+func (s *Session) handleRotate(m wire.In) error {
+	if s.bootstrap {
+		return s.reject(wire.CodeAuth, errors.New(
+			"this session authenticated with the bootstrap token, and only a device holding the vault's secret may rotate it"))
+	}
+	if len(m.Auth) < MinClaimLength {
+		return s.reject(wire.CodeBadEntry, fmt.Errorf(
+			"the new auth key is %d characters, which is too few", len(m.Auth)))
+	}
+	if !store.ValidWrapped(m.Wrapped) {
+		return s.reject(wire.CodeBadEntry, fmt.Errorf(
+			"the wrapped data key is %d bytes and must be base64url of at most %d", len(m.Wrapped), store.MaxWrappedLen))
+	}
+	hash := sha256.Sum256([]byte(m.Auth))
+	if err := s.srv.st.Rotate(s.vaultID, hex.EncodeToString(hash[:]), m.Wrapped); err != nil {
+		if errors.Is(err, store.ErrNoDataKey) || errors.Is(err, store.ErrBadEntry) {
+			return s.reject(wire.CodeBadEntry, err)
+		}
+		s.srv.log.Error("rotate failed", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the vault's secret could not be replaced: "+err.Error()))
+	}
+	// Committed. Every other device on the vault is holding a credential that
+	// no longer opens it; told so and closed, from this goroutine, before this
+	// device is told it succeeded, so "rotated" also means "and nobody else is
+	// still writing under the old string".
+	others := s.srv.hub.others(s.vaultID, s)
+	for _, peer := range others {
+		peer.evict()
+	}
+	s.srv.log.Info("vault secret rotated", "vault", s.vaultID, "device", s.device, "evicted", len(others))
+	return s.writeJSON(wire.Rotated{Res: "rotated", ID: s.reqID})
+}
+
+/* ---------------------------------------------------------------- *
+ * invite
+ * ---------------------------------------------------------------- */
+
+// handleInvite stores a single-use invite: an unguessable identifier and the
+// root secret sealed under a key the server never sees, with an expiry. The
+// server learns nothing it could use; it holds a blob it cannot open under a
+// name it cannot guess, for a few minutes. docs/protocol.md, "Adding a device
+// with a single-use invite".
+//
+// Refused with `auth` on a bootstrap session, which never proved it held the
+// root it would be sealing, and with `badentry` on a malformed request. The ttl
+// defaults to DefaultInviteTTL and is capped at MaxInviteTTL rather than
+// refused above it, because the reply says when the invite actually expires
+// and a client asking for longer has nothing to do differently.
+func (s *Session) handleInvite(m wire.In) error {
+	if s.bootstrap {
+		return s.reject(wire.CodeAuth, errors.New(
+			"this session authenticated with the bootstrap token, and only a device holding the vault's secret may issue invites"))
+	}
+	if !store.ValidInvite(m.Invite) {
+		return s.reject(wire.CodeBadEntry, fmt.Errorf(
+			"the invite identifier is %d bytes and must be base64url of at most %d", len(m.Invite), store.MaxInviteLen))
+	}
+	if !store.ValidSealed(m.Sealed) {
+		return s.reject(wire.CodeBadEntry, fmt.Errorf(
+			"the sealed secret is %d bytes and must be base64url of at most %d", len(m.Sealed), store.MaxSealedLen))
+	}
+	if m.TTLMs < 0 {
+		return s.reject(wire.CodeBadEntry, fmt.Errorf("ttlMs is %d, and an invite cannot expire before it is issued", m.TTLMs))
+	}
+	ttl := time.Duration(m.TTLMs) * time.Millisecond
+	if ttl == 0 {
+		ttl = DefaultInviteTTL
+	}
+	if ttl > MaxInviteTTL {
+		ttl = MaxInviteTTL
+	}
+	now := s.srv.now()
+	expiresAt := now.Add(ttl).UnixMilli()
+	if err := s.srv.st.AddInvite(s.vaultID, m.Invite, m.Sealed, expiresAt, now.UnixMilli()); err != nil {
+		if errors.Is(err, store.ErrBadEntry) || errors.Is(err, store.ErrUnknownVault) {
+			return s.reject(wire.CodeBadEntry, err)
+		}
+		s.srv.log.Error("invite failed", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the invite could not be stored: "+err.Error()))
+	}
+	s.srv.log.Info("invite issued", "vault", s.vaultID, "device", s.device, "expiresAt", expiresAt)
+	return s.writeJSON(wire.Invited{Res: "invited", ID: s.reqID, ExpiresAt: expiresAt})
 }

@@ -7,6 +7,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -28,13 +29,60 @@ const (
 	// buffer. Refusing past the limit is honest; degrading quietly is not.
 	DefaultMaxPeers = 8
 
-	// ReadLimit bounds one incoming frame.
+	// ReadLimit bounds one incoming frame once a session has authenticated, and
+	// HelloReadLimit bounds the first frame, which has to be a hello.
 	//
-	// The binding case is not a chunk body, which is capped at store.ChunkMax.
-	// It is the JSON of a put: store.MaxChunksPerEntry names at 67 bytes each is
-	// about 4.4 MB for the largest legal file. Eight is comfortably above that
-	// and still bounds a hostile peer at maxPeers * 8 MB.
-	ReadLimit = 8 << 20
+	// The rule is that every legal message is receivable (S22): a frame the
+	// protocol allows must never die at the read limit, because a client whose
+	// batch is dropped with no code retries the identical batch for ever. The
+	// arithmetic, with every constant it depends on named:
+	//
+	//   - the largest legal text frame is a putmany at wire.MaxBatchBytes,
+	//     16 MiB, enforced on the encoded frame after it is read (S18). A batch
+	//     of 256 entries naming 65536 chunks each would be about 1.1 GB and is
+	//     not legal, because it is over that cap; the client splits it;
+	//   - a single put is one path of store.MaxPathLen plus
+	//     store.MaxChunksPerEntry names at 67 bytes each, about 4.4 MB;
+	//   - a fetch is at most store.MaxChunksPerEntry names, the same 4.4 MB;
+	//   - a chunk body is at most store.ChunkMax, 1 MiB.
+	//
+	// 32 MiB is twice the largest of those, so a frame between the advertised
+	// cap and the read limit is read in full and refused with `toolarge`, and
+	// only a frame at twice the cap, which no client that read `ready` sends,
+	// meets the bare disconnect. The cost is bounded at maxPeers * 32 MiB.
+	//
+	// Before hello nothing has been authenticated, so the limit is 64 KiB: a
+	// hello is a vault and device of 64 bytes each, a token, a claim of 43 and
+	// a wrapped key of at most 256, a few hundred bytes in all. An unauthenticated
+	// connection therefore cannot make the server allocate more than that, and
+	// MaxPreAuth bounds how many of them there can be (S19).
+	ReadLimit      = 32 << 20
+	HelloReadLimit = 64 << 10
+
+	// MaxPreAuth caps connections that have not completed hello, across every
+	// vault, and HelloTimeout is how long one may take to send it (S19). The
+	// device limit bounds joined sessions per vault, but a connection that never
+	// says hello joined nothing, so nothing bounded it: a port scanner opening
+	// sockets held a goroutine and a buffer each for ever. Past the cap a new
+	// connection is refused with `busy`; past the deadline a silent one is told
+	// `protostate` and closed. Both are generous for anything that is a device.
+	MaxPreAuth   = 32
+	HelloTimeout = 10 * time.Second
+
+	// DeviceLimitRetryAfter and ShutdownRetryAfter are the `retryAfterMs` hints
+	// sent with `busy`. A device refused for the limit needs another device to
+	// go away, which takes a while; one refused for a shutdown needs the
+	// process to come back, which a restart does in seconds.
+	DeviceLimitRetryAfter = 30 * time.Second
+	ShutdownRetryAfter    = 5 * time.Second
+
+	// DefaultInviteTTL is how long an invite lives when the issuing device does
+	// not say, and MaxInviteTTL the most it may ask for. Ten minutes is long
+	// enough to walk to the other device and short enough that an invite left
+	// in a chat is dead before anyone reads it; an hour is the ceiling for the
+	// same reason the client is not allowed to choose a day.
+	DefaultInviteTTL = 10 * time.Minute
+	MaxInviteTTL     = time.Hour
 
 	// WriteWait bounds one frame write, so a peer that stops reading is
 	// detected rather than pinning a goroutine forever.
@@ -84,11 +132,51 @@ const (
 	// entries table plus the uid cursor is the durable queue.
 	CatchupBufferMax = 4096
 
+	// CatchupBufferBytes bounds the same buffer by size. The entry count alone
+	// let a peer hold 4096 marshalled batches of any size, and a batch naming
+	// tens of thousands of chunks is megabytes: the same hole SendQueueBytes
+	// closes for the send queue, so it gets the same figure.
+	CatchupBufferBytes = SendQueueBytes
+
 	// BatchSize is entries per catch-up batch. Small enough that a client sees
 	// progress and can assert continuity often, large enough that a big vault
 	// is not thousands of frames.
 	BatchSize = 200
 )
+
+// Credentials are what a device offers at hello.
+//
+// Token is what it is authenticating with. Claim is the auth key it wants the
+// vault to be bound to from now on, sent only while pairing the first device,
+// and ignored once a vault has been claimed. Wrapped travels with Claim: the
+// vault's data key, wrapped under the root secret, stored beside the hash.
+//
+// Invite, in place of Token, redeems a single-use invite on a claimed vault;
+// the grant then carries the sealed secret and the session ends after handing
+// it over.
+type Credentials struct {
+	VaultID string
+	Token   string
+	Claim   string
+	Wrapped string
+	Invite  string
+}
+
+// Grant is what a successful authentication says about how it succeeded.
+//
+// Bootstrap is true when the token was the server's first-run token, which is
+// the one credential that is not derived from the root secret. A session that
+// authenticated that way may not rotate the vault: rotation retires the old
+// root, and a caller that never proved it held the old one has no business
+// choosing the new.
+//
+// Redeemed is true when the hello carried an invite that was just marked used;
+// Sealed is then the root secret the issuing device sealed for the new one.
+type Grant struct {
+	Bootstrap bool
+	Redeemed  bool
+	Sealed    string
+}
 
 // Authenticator decides whether a token may use a vault.
 //
@@ -96,46 +184,7 @@ const (
 // the wire: every failure is reported to the client as CodeAuth, because
 // distinguishing "no such vault" from "wrong token" tells an attacker which
 // half to keep guessing.
-// Credentials are what a device offers at hello.
-//
-// Token is what it is authenticating with. Claim is the auth key it wants the
-// vault to be bound to from now on, sent only while pairing the first device,
-// and ignored once a vault has been claimed.
-type Credentials struct {
-	VaultID string
-	Token   string
-	Claim   string
-}
-
-type Authenticator func(c Credentials) error
-
-// StaticTokens authenticates against a fixed vault-to-token map.
-//
-// This is the whole of authentication until pairing exists. The comparison is
-// constant time: a token check that returns early on the first wrong byte leaks
-// the token one byte at a time to anyone who can measure it.
-func StaticTokens(tokens map[string]string) Authenticator {
-	// Copy, so a later mutation of the caller's map cannot change who has
-	// access without anything in the log saying so.
-	byVault := make(map[string]string, len(tokens))
-	for v, t := range tokens {
-		byVault[v] = t
-	}
-	return func(c Credentials) error {
-		vaultID, token := c.VaultID, c.Token
-		want, ok := byVault[vaultID]
-		if !ok {
-			// Still do a comparison, against a value that cannot match, so an
-			// unknown vault and a wrong token take the same time.
-			subtle.ConstantTimeCompare([]byte(token), []byte(token))
-			return fmt.Errorf("no such vault %q", vaultID)
-		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(want)) != 1 {
-			return errors.New("token mismatch")
-		}
-		return nil
-	}
-}
+type Authenticator func(c Credentials) (Grant, error)
 
 // Server is the protocol handler. One per process; sessions are per connection.
 type Server struct {
@@ -145,6 +194,24 @@ type Server struct {
 	log  *slog.Logger
 
 	maxPeers int
+
+	// version is what `ready.serverVersion` says and what the startup line
+	// logs: the stamped release, or "dev". A client refused on `proto` names it
+	// so the operator knows which end to upgrade.
+	version string
+
+	// maxPreAuth and helloTimeout are MaxPreAuth and HelloTimeout unless a test
+	// lowers them. preAuth counts connections between accept and a completed
+	// hello, guarded by sessMu.
+	maxPreAuth   int
+	helloTimeout time.Duration
+	preAuth      int
+
+	// maxBatchBytes and maxFetchBytes are the wire constants unless a test
+	// lowers them. One field each for advertising and enforcing, for the same
+	// reason as perFileMax.
+	maxBatchBytes int64
+	maxFetchBytes int64
 
 	// perFileMax is advertised in `ready` and enforced on every put. One field
 	// for both, because advertising a limit that is not enforced, or enforcing
@@ -160,6 +227,11 @@ type Server struct {
 	// minutes.
 	pingEvery time.Duration
 	pongWait  time.Duration
+
+	// writeWait is WriteWait unless a test lowers it. It is what bounds the
+	// detection of a peer that has gone while the server is sending to it,
+	// which is a case the keepalive deliberately leaves alone (S1).
+	writeWait time.Duration
 
 	// batchSize is BatchSize unless a test lowers it. Lowering it is how the
 	// catch-up path can be made to span many frames without seeding a vault
@@ -182,6 +254,24 @@ type Server struct {
 	// fan-out first.
 	afterReplayBatch func(n int)
 	afterReplay      func()
+
+	// afterFlush runs once flushPending has released its lock, and is nil in
+	// every non-test build. By then caught-up is already queued, so a broadcast
+	// triggered here must land after it; a test uses that to prove caught-up is
+	// enqueued under the lock rather than written afterwards.
+	afterFlush func()
+
+	// beforePing runs just before keepalive sends a ping, and is nil in every
+	// non-test build. A test uses it to check what the queue held at that
+	// moment, because the symptom of pinging behind queued data depends on how
+	// much the kernel buffers, which differs by platform.
+	beforePing func()
+
+	// beforeAppend runs just before an entry is committed, and is nil in every
+	// non-test build. An error from it stands in for the database failing the
+	// commit, which no test can arrange honestly on a working disk, so that the
+	// session's answer to that fault can be pinned (S27).
+	beforeAppend func(e store.Entry) error
 
 	// afterAppend runs between assigning a uid and announcing it, and is nil in
 	// every non-test build.
@@ -209,6 +299,150 @@ type Server struct {
 	// ordering reason, so this adds a fan-out of a few non-blocking channel
 	// sends to a section that was serial anyway.
 	commitMu sync.Mutex
+
+	// sessions is every connection Handle is running, joined to a vault or not,
+	// and closing is set once Shutdown has begun. http.Server.Shutdown stops
+	// the listener and waits for ordinary requests, but a hijacked WebSocket is
+	// not its connection any more, so without this list a shutdown returned
+	// while every session was still open and the store was closed under them.
+	sessMu   sync.Mutex
+	sessions map[*Session]struct{}
+	closing  bool
+}
+
+// errShuttingDown is the reason a peer is given when the server is stopping.
+// Reported as busy, which the client already treats as "not now, reconnect",
+// because that is exactly what it means.
+var errShuttingDown = errors.New("this server is shutting down, reconnect in a moment")
+
+// errTooManyPreAuth is the reason a connection is refused when too many others
+// have connected and not yet said hello (S19).
+var errTooManyPreAuth = errors.New("too many connections are waiting to authenticate, try again in a moment")
+
+// admit registers a session, unless the server is shutting down or too many
+// sessions are still waiting to say hello. The reason is returned so the
+// refusal can say which.
+func (s *Server) admit(sess *Session) error {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	if s.closing {
+		return errShuttingDown
+	}
+	if s.preAuth >= s.maxPreAuth {
+		return errTooManyPreAuth
+	}
+	if s.sessions == nil {
+		s.sessions = make(map[*Session]struct{})
+	}
+	s.sessions[sess] = struct{}{}
+	sess.counted = true
+	s.preAuth++
+	return nil
+}
+
+// authenticated moves a session out of the pre-auth count. Called once, when
+// its hello has been accepted; a session that never gets there is released by
+// forget.
+func (s *Server) authenticated(sess *Session) {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	if !sess.counted {
+		return
+	}
+	sess.counted = false
+	s.preAuth--
+}
+
+func (s *Server) forget(sess *Session) {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	if _, ok := s.sessions[sess]; !ok {
+		return
+	}
+	delete(s.sessions, sess)
+	if sess.counted {
+		sess.counted = false
+		s.preAuth--
+	}
+}
+
+// PreAuth is how many connections are waiting to say hello, for tests and for
+// the operator's own curiosity.
+func (s *Server) PreAuth() int {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	return s.preAuth
+}
+
+// Sessions is how many connections are being handled, joined or not.
+func (s *Server) Sessions() int {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	return len(s.sessions)
+}
+
+// Shutdown stops admitting connections, tells every session to finish, and
+// waits for them to go, bounded by ctx (S16).
+//
+// A session between requests is closed with a reason at once. One inside a
+// request is left to finish it: a put that has stored its bodies gets its
+// commit and its ack, because an ack means stored and a shutdown must not
+// turn one into a lie in either direction. Whatever is still running when ctx
+// expires is killed, which a client experiences as a dropped connection with
+// nothing acknowledged, and retries. Call this before closing the store; a
+// session that outlives the store would fail its commit and could not say why.
+func (s *Server) Shutdown(ctx context.Context) error {
+	s.sessMu.Lock()
+	s.closing = true
+	peers := make([]*Session, 0, len(s.sessions))
+	for sess := range s.sessions {
+		peers = append(peers, sess)
+	}
+	s.sessMu.Unlock()
+
+	// In parallel, because each idle peer is given a moment to read its reason
+	// and eight of them in series would spend the whole budget on the first.
+	var wg sync.WaitGroup
+	for _, sess := range peers {
+		wg.Add(1)
+		go func(sess *Session) {
+			defer wg.Done()
+			sess.shutdown()
+		}(sess)
+	}
+	wg.Wait()
+
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for s.Sessions() > 0 {
+		select {
+		case <-tick.C:
+			continue
+		case <-ctx.Done():
+		}
+		// Out of time. What is left is mid-request; it is cut off, unacked, and
+		// the client retries. Then a short wait for Handle to unwind, so the
+		// store is not closed under a session that is still using it.
+		s.sessMu.Lock()
+		left := make([]*Session, 0, len(s.sessions))
+		for sess := range s.sessions {
+			left = append(left, sess)
+		}
+		s.sessMu.Unlock()
+		for _, sess := range left {
+			sess.kill(errors.New("shutdown deadline reached with a request in flight"))
+		}
+		grace := time.After(time.Second)
+		for s.Sessions() > 0 {
+			select {
+			case <-tick.C:
+			case <-grace:
+				return fmt.Errorf("shutdown: %d sessions cut off mid-request", len(left))
+			}
+		}
+		return fmt.Errorf("shutdown: %d sessions cut off mid-request", len(left))
+	}
+	return nil
 }
 
 func New(st *store.Store, auth Authenticator, log *slog.Logger) *Server {
@@ -225,10 +459,24 @@ func NewWithLimit(st *store.Store, auth Authenticator, log *slog.Logger, maxPeer
 	return &Server{
 		st: st, hub: NewHub(), auth: auth, log: log,
 		maxPeers: maxPeers, perFileMax: store.DefaultPerFileMax,
-		pingEvery: PingInterval, pongWait: PongWait,
+		version:   "dev",
+		pingEvery: PingInterval, pongWait: PongWait, writeWait: WriteWait,
+		maxPreAuth: MaxPreAuth, helloTimeout: HelloTimeout,
+		maxBatchBytes: wire.MaxBatchBytes, maxFetchBytes: wire.MaxFetchBytes,
 		now: time.Now, batchSize: BatchSize,
 	}
 }
+
+// SetVersion names the release this server is, for `ready` and the log. Empty
+// is left as "dev" rather than advertised as nothing.
+func (s *Server) SetVersion(v string) {
+	if v != "" {
+		s.version = v
+	}
+}
+
+// Version is what this server calls itself.
+func (s *Server) Version() string { return s.version }
 
 // SetPerFileMax changes the largest file this server accepts and advertises.
 //
@@ -248,6 +496,48 @@ func (s *Server) SetPerFileMax(max int64) {
 // PerFileMax is what this server advertises and enforces.
 func (s *Server) PerFileMax() int64 { return s.perFileMax }
 
+// SetMaxBatchBytes changes the batch cap this server advertises and enforces
+// (I25). Clamped to what makes sense: no lower than one chunk, or no batch
+// could carry a body, and no higher than half the read limit, which is the
+// default, so that a frame over the cap is still read in full and refused with
+// a code rather than dying at the socket (S22). The flag exists to lower the
+// cap, for a client test against the real binary; it cannot raise it.
+func (s *Server) SetMaxBatchBytes(n int64) {
+	if n <= 0 {
+		n = wire.MaxBatchBytes
+	}
+	if n < store.ChunkMax {
+		n = store.ChunkMax
+	}
+	if n > ReadLimit/2 {
+		n = ReadLimit / 2
+	}
+	s.maxBatchBytes = n
+}
+
+// MaxBatchBytes is what this server advertises and enforces.
+func (s *Server) MaxBatchBytes() int64 { return s.maxBatchBytes }
+
+// SetMaxFetchBytes changes the fetch cap this server advertises and enforces
+// (I25). Bodies go out, not in, so the read limit does not bound them; the
+// clamp is one chunk at the bottom and the largest file the store can hold at
+// the top, so one fetch can always carry one file and never has to.
+func (s *Server) SetMaxFetchBytes(n int64) {
+	if n <= 0 {
+		n = wire.MaxFetchBytes
+	}
+	if n < store.ChunkMax {
+		n = store.ChunkMax
+	}
+	if n > store.PerFileMax {
+		n = store.PerFileMax
+	}
+	s.maxFetchBytes = n
+}
+
+// MaxFetchBytes is what this server advertises and enforces.
+func (s *Server) MaxFetchBytes() int64 { return s.maxFetchBytes }
+
 // Store is the persistence this server is serving. Exposed for the command line
 // tools that verify and purge, which must go through the same code the sessions
 // do rather than opening the database a second time.
@@ -256,19 +546,32 @@ func (s *Server) Store() *store.Store { return s.st }
 // Peers is the number of devices currently connected to a vault.
 func (s *Server) Peers(vaultID string) int { return s.hub.peerCount(vaultID) }
 
-// ready is the handshake reply, built from the same constants the store
-// enforces. Advertising a limit the store does not enforce, or enforcing one it
-// does not advertise, is how a client ends up retrying a put that can never
-// succeed.
-func (s *Server) ready(cursor int64) wire.Ready {
-	return wire.Ready{
-		Res:        "ready",
-		Proto:      wire.Proto,
-		Cursor:     cursor,
-		PerFileMax: s.perFileMax,
-		ChunkMax:   s.st.Chunks().Max(),
-		MaxChunks:  store.MaxChunksPerEntry,
+// ready is the handshake reply, built from the same constants the store and
+// the session enforce. Advertising a limit that is not enforced, or enforcing
+// one that is not advertised, is how a client ends up retrying a put that can
+// never succeed.
+//
+// proto is the client's, echoed, and wrapped is sent only to a protocol 3
+// client: a protocol 2 session is answered exactly as protocol 2 was, and
+// carries the new caps because a client that ignores a field costs nothing.
+func (s *Server) ready(proto int, id, cursor int64, wrapped string) wire.Ready {
+	r := wire.Ready{
+		Res:           "ready",
+		Proto:         proto,
+		MinProto:      wire.MinProto,
+		ServerVersion: s.version,
+		Cursor:        cursor,
+		PerFileMax:    s.perFileMax,
+		ChunkMax:      s.st.Chunks().Max(),
+		MaxChunks:     store.MaxChunksPerEntry,
+		MaxBatchBytes: s.maxBatchBytes,
+		MaxFetchBytes: s.maxFetchBytes,
 	}
+	if proto >= 3 {
+		r.ID = id
+		r.Wrapped = wrapped
+	}
+	return r
 }
 
 /* ---------------------------------------------------------------- *
@@ -302,24 +605,52 @@ func (s *Server) ready(cursor int64) wire.Ready {
 // and the weak key is not.
 const MinClaimLength = 32
 
+// # Why the hash is a bare, unsalted SHA-256, and must stay one
+//
+// The auth key is 256 random bits derived by HKDF from a random root. There is
+// nothing to guess, so there is nothing for a salt to defeat and nothing for a
+// slow hash to slow down: bcrypt or argon2 here would burn a core on every
+// hello for no security and block the accept loop while doing it. That
+// reasoning holds only because the input is random and long. It must never be
+// reused for anything a person chose, where a fast unsalted hash is exactly
+// the wrong tool (I12).
 func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int64) Authenticator {
-	return func(c Credentials) error {
+	return func(c Credentials) (Grant, error) {
 		// Exactly one vault is authorised. A typo in the vault name fails here
 		// instead of quietly creating a second, empty vault that reports itself
 		// as fully synced, which is what claiming does if it is allowed to
 		// invent the vault it claims.
 		if c.VaultID != allowedVault {
-			return fmt.Errorf("this server serves %q, not %q", allowedVault, c.VaultID)
+			return Grant{}, fmt.Errorf("this server serves %q, not %q", allowedVault, c.VaultID)
 		}
 		if bootstrap == "" {
 			// Otherwise an empty token would match an empty bootstrap and the
 			// first caller would claim the vault with nothing at all.
-			return errors.New("this server has no bootstrap token, so no vault can be claimed")
+			return Grant{}, errors.New("this server has no bootstrap token, so no vault can be claimed")
 		}
 
 		hash, err := st.AuthHash(c.VaultID)
 		if err != nil {
-			return fmt.Errorf("reading the vault's auth hash: %w", err)
+			return Grant{}, fmt.Errorf("reading the vault's auth hash: %w", err)
+		}
+
+		if c.Invite != "" {
+			// An invite is redeemed only on a claimed vault, because an
+			// unclaimed one has no root to have sealed. Unknown, expired and
+			// used are one answer: saying which would tell a guesser it had
+			// found a real identifier. The mark-used is the same statement as
+			// the read, so the invite is burned before anything is replied.
+			if hash == "" {
+				return Grant{}, errors.New("an unclaimed vault has no invites to redeem")
+			}
+			sealed, ok, err := st.RedeemInvite(c.VaultID, c.Invite, now())
+			if err != nil {
+				return Grant{}, fmt.Errorf("redeeming an invite: %w", err)
+			}
+			if !ok {
+				return Grant{}, errors.New("invite is unknown, expired or already used")
+			}
+			return Grant{Redeemed: true, Sealed: sealed}, nil
 		}
 
 		if hash != "" {
@@ -328,34 +659,38 @@ func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int
 			offered := sha256.Sum256([]byte(c.Token))
 			want, decodeErr := hex.DecodeString(hash)
 			if decodeErr != nil {
-				return fmt.Errorf("vault %q has an unreadable auth hash", c.VaultID)
+				return Grant{}, fmt.Errorf("vault %q has an unreadable auth hash", c.VaultID)
 			}
 			if subtle.ConstantTimeCompare(offered[:], want) != 1 {
-				return errors.New("auth key mismatch")
+				return Grant{}, errors.New("auth key mismatch")
 			}
-			return nil
+			return Grant{}, nil
 		}
 
 		// Unclaimed. The bootstrap token is the only thing that opens it, and
 		// only in exchange for the key that replaces it.
 		if subtle.ConstantTimeCompare([]byte(c.Token), []byte(bootstrap)) != 1 {
-			return errors.New("bootstrap token mismatch")
+			return Grant{}, errors.New("bootstrap token mismatch")
 		}
 		if len(c.Claim) < MinClaimLength {
-			return fmt.Errorf(
+			return Grant{}, fmt.Errorf(
 				"this vault has not been claimed, and the key offered to claim it with is %d characters, which is too few",
 				len(c.Claim))
 		}
+		if c.Wrapped != "" && !store.ValidWrapped(c.Wrapped) {
+			return Grant{}, fmt.Errorf(
+				"the wrapped data key offered with the claim is %d bytes and not base64url", len(c.Wrapped))
+		}
 		claimed := sha256.Sum256([]byte(c.Claim))
-		ok, err := st.ClaimVault(c.VaultID, hex.EncodeToString(claimed[:]), now())
+		ok, err := st.ClaimVault(c.VaultID, hex.EncodeToString(claimed[:]), c.Wrapped, now())
 		if err != nil {
-			return fmt.Errorf("claiming vault %q: %w", c.VaultID, err)
+			return Grant{}, fmt.Errorf("claiming vault %q: %w", c.VaultID, err)
 		}
 		if !ok {
 			// Another device claimed it between the read and the write. Its key
 			// is the vault's key now, and this one is not it.
-			return errors.New("the vault was claimed by another device a moment ago")
+			return Grant{}, errors.New("the vault was claimed by another device a moment ago")
 		}
-		return nil
+		return Grant{Bootstrap: true}, nil
 	}
 }

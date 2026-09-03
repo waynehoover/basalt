@@ -42,6 +42,24 @@ type rig struct {
 func newRig(t *testing.T) *rig { return newRigWithPeers(t, DefaultMaxPeers) }
 
 func newRigWithPeers(t *testing.T, maxPeers int) *rig {
+	return newRigWith(t, maxPeers, nil)
+}
+
+// newRigDerived is a rig whose authenticator is the real one: a bootstrap token
+// claims the vault, and only the claimed key opens it afterwards. testToken is
+// the bootstrap.
+//
+// Its clock is the rig's, so a test that moves r.srv.now moves invite expiry
+// with it.
+func newRigDerived(t *testing.T) *rig {
+	var r *rig
+	r = newRigWith(t, DefaultMaxPeers, func(st *store.Store) Authenticator {
+		return DerivedAuth(st, testVault, testToken, func() int64 { return r.srv.now().UnixMilli() })
+	})
+	return r
+}
+
+func newRigWith(t *testing.T, maxPeers int, auth func(*store.Store) Authenticator) *rig {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "basalt.db"), filepath.Join(dir, "chunks"))
@@ -57,7 +75,11 @@ func newRigWithPeers(t *testing.T, maxPeers int) *rig {
 		out = os.Stderr
 	}
 	log := slog.New(slog.NewTextHandler(out, nil))
-	srv := NewWithLimit(st, StaticTokens(map[string]string{testVault: testToken}), log, maxPeers)
+	a := StaticTokens(map[string]string{testVault: testToken})
+	if auth != nil {
+		a = auth(st)
+	}
+	srv := NewWithLimit(st, a, log, maxPeers)
 
 	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
@@ -111,6 +133,14 @@ func (r *rig) seed(path string, bodies ...string) store.Entry {
 // batches, and everything else is the answer to the request in flight. A test
 // client that assumed the next frame was its reply would be testing a client
 // nobody can write.
+//
+// It speaks protocol 3 unless a test lowers proto to 2. In protocol 3 every
+// request it sends gets a fresh id, the ids of requests still awaiting their
+// final reply are kept in order in pending, and every reply is checked against
+// the oldest: a reply carrying an id the client did not issue, or none where
+// one is owed, is a protocol violation and fails the test. In protocol 2 the
+// checks invert, and any id or `retryable` in a reply fails the test, because a
+// protocol 2 session must be answered exactly as protocol 2 was.
 type client struct {
 	t       *testing.T
 	conn    *websocket.Conn
@@ -118,23 +148,63 @@ type client struct {
 	cancel  context.CancelFunc
 	name    string
 	batches []wire.Batch
+	proto   int
+	nextID  int64
+	pending []int64
+	// ready is set once the handshake reply has arrived. Before it the server
+	// may not know which protocol this client speaks, so an error refusing the
+	// connection outright is allowed to be plain; after it, never.
+	ready bool
 }
 
-func (r *rig) dial(name string) *client {
+func (r *rig) dial(name string) *client { return r.dialWith(name, nil) }
+
+// dialProto is dial for a client speaking an older protocol.
+func (r *rig) dialProto(name string, proto int) *client {
+	c := r.dialWith(name, nil)
+	c.proto = proto
+	return c
+}
+
+// dialWith is dial with the library's options exposed, for the tests that need
+// to see a ping arrive or to act before the pong goes back.
+func (r *rig) dialWith(name string, opts *websocket.DialOptions) *client {
 	r.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	conn, _, err := websocket.Dial(ctx, r.url, nil)
+	conn, _, err := websocket.Dial(ctx, r.url, opts)
 	if err != nil {
 		cancel()
 		r.t.Fatalf("dial: %v", err)
 	}
 	conn.SetReadLimit(ReadLimit)
-	c := &client{t: r.t, conn: conn, ctx: ctx, cancel: cancel, name: name}
+	c := &client{t: r.t, conn: conn, ctx: ctx, cancel: cancel, name: name, proto: wire.Proto}
 	r.t.Cleanup(func() { conn.CloseNow(); cancel() })
 	return c
 }
 
+// sendJSON writes one frame. A wire.In with no id gets the next one when the
+// client speaks protocol 3 and the op expects a reply; a test that wants to
+// send a particular id, or none, sets ID itself and uses sendRaw.
 func (c *client) sendJSON(v any) {
+	c.t.Helper()
+	if in, ok := v.(wire.In); ok {
+		if c.proto >= 3 && in.Op != "ping" && in.ID == 0 {
+			c.nextID++
+			in.ID = c.nextID
+		}
+		if in.Proto == 0 && in.Op == "hello" {
+			in.Proto = c.proto
+		}
+		if in.ID != 0 {
+			c.pending = append(c.pending, in.ID)
+		}
+		v = in
+	}
+	c.sendRaw(v)
+}
+
+// sendRaw writes a frame exactly as given, tracking nothing.
+func (c *client) sendRaw(v any) {
 	c.t.Helper()
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -142,6 +212,65 @@ func (c *client) sendJSON(v any) {
 	}
 	if err := c.conn.Write(c.ctx, websocket.MessageText, b); err != nil {
 		c.t.Fatalf("%s: write: %v", c.name, err)
+	}
+}
+
+// check is the client-side half of request ids, run on every reply. It is the
+// rule docs/protocol.md gives a client: a reply whose id it does not recognise
+// ends the session, an error with no id is the reason the connection is about
+// to close. Here both fail the test instead.
+func (c *client) check(data []byte) {
+	c.t.Helper()
+	var probe struct {
+		Res       string `json:"res"`
+		ID        *int64 `json:"id"`
+		Retryable *bool  `json:"retryable"`
+	}
+	if err := json.Unmarshal(data, &probe); err != nil || probe.Res == "" {
+		return
+	}
+	if c.proto < 3 {
+		if probe.ID != nil {
+			c.t.Fatalf("%s: a protocol %d session was sent an id: %s", c.name, c.proto, data)
+		}
+		if probe.Retryable != nil {
+			c.t.Fatalf("%s: a protocol %d session was sent retryable: %s", c.name, c.proto, data)
+		}
+		return
+	}
+	switch probe.Res {
+	case "pong":
+		if probe.ID != nil {
+			c.t.Fatalf("%s: a pong carried an id: %s", c.name, data)
+		}
+		return
+	case "err":
+		if probe.Retryable == nil && (c.ready || probe.ID != nil) {
+			c.t.Fatalf("%s: a protocol 3 error carries no retryable: %s", c.name, data)
+		}
+		if probe.ID == nil {
+			return // unsolicited: the reason the connection is closing
+		}
+	case "ready":
+		c.ready = true
+		if probe.ID == nil {
+			c.t.Fatalf("%s: ready carries no id: %s", c.name, data)
+		}
+	default:
+		if probe.ID == nil {
+			c.t.Fatalf("%s: reply %q carries no id: %s", c.name, probe.Res, data)
+		}
+	}
+	if len(c.pending) == 0 {
+		c.t.Fatalf("%s: reply carries id %d with no request outstanding: %s", c.name, *probe.ID, data)
+	}
+	if *probe.ID != c.pending[0] {
+		c.t.Fatalf("%s: reply carries id %d, the oldest request in flight is %d: %s",
+			c.name, *probe.ID, c.pending[0], data)
+	}
+	// `want` is answered again by the ack, so its request stays in flight.
+	if probe.Res != "want" {
+		c.pending = c.pending[1:]
 	}
 }
 
@@ -178,6 +307,7 @@ func (c *client) pump() []byte {
 	}
 	_ = json.Unmarshal(data, &probe)
 	if probe.Op != "batch" {
+		c.check(data)
 		return data
 	}
 	var b wire.Batch
@@ -200,6 +330,7 @@ func (c *client) recvRaw() string {
 	if typ != websocket.MessageText {
 		c.t.Fatalf("%s: expected a text frame, got binary (%d bytes)", c.name, len(data))
 	}
+	c.check(data)
 	return string(data)
 }
 
@@ -235,6 +366,34 @@ func (c *client) recvBinary() []byte {
 		c.t.Fatalf("%s: expected a body, got text %q", c.name, data)
 	}
 	return data
+}
+
+// fetch asks for the named chunks and returns their bodies in the order asked,
+// consuming the `bodies` header a protocol 3 session is sent first and checking
+// it promises exactly as many frames as were asked for.
+func (c *client) fetch(names ...string) [][]byte {
+	c.t.Helper()
+	c.sendJSON(wire.In{Op: "fetch", Chunks: names})
+	c.expectBodies(len(names))
+	out := make([][]byte, 0, len(names))
+	for range names {
+		out = append(out, c.recvBinary())
+	}
+	return out
+}
+
+// expectBodies reads the `bodies` header a protocol 3 fetch is answered with,
+// and reads nothing in protocol 2, where there is none.
+func (c *client) expectBodies(n int) {
+	c.t.Helper()
+	if c.proto < 3 {
+		return
+	}
+	var b wire.Bodies
+	c.recvInto("bodies", &b)
+	if b.Count != n {
+		c.t.Fatalf("%s: bodies header promises %d frames, %d were asked for", c.name, b.Count, n)
+	}
 }
 
 // recvInto reads a text frame and decodes it into v, after checking that its
@@ -283,9 +442,11 @@ func (c *client) expectErr(code string) string {
 	return msg
 }
 
+// helloMsg builds a hello. Proto is left zero so that sendJSON fills in the
+// client's own, and the id likewise.
 func helloMsg(vault, token, device string, cursor int64) wire.In {
 	return wire.In{
-		Op: "hello", Proto: wire.Proto, Crypto: wire.Crypto,
+		Op: "hello", Crypto: wire.Crypto,
 		Vault: vault, Token: token, Device: device, Cursor: cursor,
 	}
 }
@@ -450,6 +611,27 @@ func (c *client) closed() bool {
 		// stayed open and idle.
 		return ctx.Err() == nil
 	}
+}
+
+// onlyPeer is the one session joined to the test vault, for tests that drive
+// the queue from the server side. It waits, because a client's hello has
+// returned before the server has necessarily finished joining it.
+func (r *rig) onlyPeer() *Session {
+	r.t.Helper()
+	var peer *Session
+	waitFor(r.t, "the session to join", func() bool {
+		r.srv.hub.mu.RLock()
+		defer r.srv.hub.mu.RUnlock()
+		m := r.srv.hub.byVault[testVault]
+		if len(m) != 1 {
+			return false
+		}
+		for s := range m {
+			peer = s
+		}
+		return true
+	})
+	return peer
 }
 
 func (r *rig) mustStats() store.Stats {

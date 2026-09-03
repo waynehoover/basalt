@@ -74,6 +74,21 @@ func (h *Hub) broadcast(vaultID string, e store.Entry, origin *Session) {
 	}
 }
 
+// others returns every session on the vault except origin, for a rotation to
+// close: their credential was just retired, and a device left connected under
+// it would go on writing until it happened to reconnect and be refused.
+func (h *Hub) others(vaultID string, origin *Session) []*Session {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]*Session, 0, len(h.byVault[vaultID]))
+	for s := range h.byVault[vaultID] {
+		if s != origin {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (h *Hub) peerCount(vaultID string) int {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

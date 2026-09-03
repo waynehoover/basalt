@@ -36,10 +36,10 @@ func authRig(t *testing.T) (*store.Store, Authenticator) {
 func TestAnUnclaimedVaultIsOpenedOnlyByTheBootstrapToken(t *testing.T) {
 	_, auth := authRig(t)
 
-	if err := auth(Credentials{VaultID: "v", Token: "not-the-bootstrap", Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: "not-the-bootstrap", Claim: longKey}); err == nil {
 		t.Fatal("an unclaimed vault accepted a token that was not the bootstrap")
 	}
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
 		t.Fatalf("the bootstrap token did not open an unclaimed vault: %v", err)
 	}
 }
@@ -49,17 +49,17 @@ func TestAnUnclaimedVaultIsOpenedOnlyByTheBootstrapToken(t *testing.T) {
 // this exists to remove.
 func TestTheBootstrapStopsWorkingOnceTheVaultIsClaimed(t *testing.T) {
 	_, auth := authRig(t)
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err == nil {
 		t.Fatal("the bootstrap token still opens the vault after it was claimed")
 	}
-	if err := auth(Credentials{VaultID: "v", Token: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: longKey}); err != nil {
 		t.Fatalf("the claimed key does not open the vault: %v", err)
 	}
-	if err := auth(Credentials{VaultID: "v", Token: longKey + "-other"}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: longKey + "-other"}); err == nil {
 		t.Fatal("a key that never claimed anything opened the vault")
 	}
 }
@@ -68,16 +68,16 @@ func TestTheBootstrapStopsWorkingOnceTheVaultIsClaimed(t *testing.T) {
 // offers, or the first device would be locked out of its own notes.
 func TestAClaimedVaultCannotBeReclaimed(t *testing.T) {
 	_, auth := authRig(t)
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey + "-two"}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey + "-two"}); err == nil {
 		t.Fatal("a second device re-claimed the vault with the bootstrap")
 	}
-	if err := auth(Credentials{VaultID: "v", Token: longKey + "-two", Claim: longKey + "-two"}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: longKey + "-two", Claim: longKey + "-two"}); err == nil {
 		t.Fatal("a second device claimed the vault by offering its own key as both")
 	}
-	if err := auth(Credentials{VaultID: "v", Token: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: longKey}); err != nil {
 		t.Fatalf("the original device was locked out: %v", err)
 	}
 }
@@ -86,7 +86,7 @@ func TestAClaimedVaultCannotBeReclaimed(t *testing.T) {
 // the vault open to the bootstrap for ever, which is the state being left.
 func TestClaimingNeedsAKey(t *testing.T) {
 	_, auth := authRig(t)
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap}); err == nil {
 		t.Fatal("the bootstrap opened an unclaimed vault with nothing to bind it to")
 	}
 }
@@ -98,7 +98,7 @@ func TestClaimingNeedsAKey(t *testing.T) {
 func TestTheServerStoresAHashAndNotTheKey(t *testing.T) {
 	st, auth := authRig(t)
 	const key = longKey
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: key}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: key}); err != nil {
 		t.Fatalf("claim: %v", err)
 	}
 
@@ -121,7 +121,7 @@ func TestTheServerStoresAHashAndNotTheKey(t *testing.T) {
 // which is what claiming does if it is allowed to invent what it claims.
 func TestOnlyTheServedVaultCanBeClaimed(t *testing.T) {
 	st, auth := authRig(t)
-	if err := auth(Credentials{VaultID: "typo", Token: bootstrap, Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "typo", Token: bootstrap, Claim: longKey}); err == nil {
 		t.Fatal("a vault this server does not serve was claimed")
 	}
 	vaults, err := st.Vaults()
@@ -140,11 +140,11 @@ func TestOnlyTheServedVaultCanBeClaimed(t *testing.T) {
 func TestAVaultWillNotBeBoundToAGuessableKey(t *testing.T) {
 	_, auth := authRig(t)
 	for _, claim := range []string{"", "x", "short", strings.Repeat("a", MinClaimLength-1)} {
-		if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: claim}); err == nil {
+		if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: claim}); err == nil {
 			t.Fatalf("the vault was bound to a %d character key", len(claim))
 		}
 	}
-	if err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: bootstrap, Claim: longKey}); err != nil {
 		t.Fatalf("a proper key was refused: %v", err)
 	}
 }
@@ -160,7 +160,7 @@ func TestAServerWithNoBootstrapClaimsNothing(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	auth := DerivedAuth(st, "v", "", func() int64 { return 1 })
 
-	if err := auth(Credentials{VaultID: "v", Token: "", Claim: longKey}); err == nil {
+	if _, err := auth(Credentials{VaultID: "v", Token: "", Claim: longKey}); err == nil {
 		t.Fatal("an empty token claimed a vault from a server with no bootstrap")
 	}
 }

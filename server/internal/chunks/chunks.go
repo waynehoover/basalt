@@ -84,6 +84,16 @@ func ValidName(s string) bool {
 type Store struct {
 	dir string
 	max int64
+
+	// sync flushes one directory and is syncDir in every non-test build. A
+	// test replaces it to see which directories were flushed, because the one
+	// fault this package guards against, a name that is not durable, leaves
+	// no trace on a disk that did not lose power.
+	sync func(dir string) error
+	// write puts a body into its temp file and is the plain write in every
+	// non-test build. A test replaces it with one that stops short, to prove
+	// the size check after it refuses the body (S25).
+	write func(f *os.File, body []byte) error
 }
 
 // New opens (and creates) a chunk store rooted at dir.
@@ -98,7 +108,25 @@ func New(dir string, max int64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir, max: max}, nil
+	return &Store{dir: dir, max: max, sync: syncDir, write: writeAll}, nil
+}
+
+// writeAll writes the whole body or reports why it could not.
+//
+// os.File.Write already loops to the full length and reports a short write as
+// an error, so this is the plain call. What it exists for is the check in
+// place after it, which asks the file how long it is rather than trusting the
+// count: a body renamed into place at the wrong length would satisfy Has for
+// ever, and the client, told the chunk was held, would never send it again.
+func writeAll(f *os.File, body []byte) error {
+	n, err := f.Write(body)
+	if err != nil {
+		return err
+	}
+	if n != len(body) {
+		return fmt.Errorf("short write: %d of %d bytes", n, len(body))
+	}
+	return nil
 }
 
 // Max is the largest body this store accepts, for the handshake to advertise.
@@ -238,23 +266,36 @@ func (s *Store) Put(vaultID, name string, body []byte) error {
 	// goroutine is about to do the write. Storing a body under a claimed name
 	// would corrupt the vault invisibly, and storing it under the computed name
 	// would leave the entry pointing at a chunk that does not exist.
-	dir, err := s.place(vaultID, name, body)
-	if err != nil || dir == "" {
+	dirs, err := s.place(vaultID, name, body)
+	if err != nil {
 		return err
 	}
-	return syncDir(dir)
+	for _, dir := range dirs {
+		if err := s.sync(dir); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// place does everything Put does except the directory fsync, and returns the
-// directory that still needs one. An empty directory means the chunk was
-// already there and nothing was written.
+// place does everything Put does except the directory fsyncs, and returns the
+// directories that still need one: the one the body landed in, and every
+// directory whose entry was created on the way to it. Nothing means the chunk
+// was already there and nothing was written.
 //
 // Split out because a batch of chunks landing in the same directory needs that
 // fsync once rather than once each, and because the file fsyncs in a batch can
 // then run at the same time. Neither changes what has to be true before an ack:
 // every body durable, every name durable. It changes only how many times the
 // same directory is flushed to make that so.
-func (s *Store) place(vaultID, name string, body []byte) (string, error) {
+//
+// The ancestors are in the list because of S17. The first chunk of a vault
+// creates <root>/<vault>/<ab>/, and flushing <ab>/ makes the body's name
+// durable inside a directory whose own name was not: a crash could lose the
+// <ab> entry from <vault>/, or <vault>/ from the root, and take the flushed
+// body with it. A directory entry is durable when its parent is flushed, the
+// same rule the body follows, so every newly created level is flushed too.
+func (s *Store) place(vaultID, name string, body []byte) ([]string, error) {
 	// Re-hashed here rather than trusted from the caller, because in a batch the
 	// caller and the writer are different goroutines: whoever handed this over
 	// has moved on, and if the bytes ever came from a buffer that gets reused,
@@ -265,7 +306,7 @@ func (s *Store) place(vaultID, name string, body []byte) (string, error) {
 	// this is closing the class rather than a live fault. One SHA-256 over data
 	// already in hand, on a server that has the cores.
 	if got := Name(body); got != name {
-		return "", fmt.Errorf("%w: claimed %s, computed %s", ErrCorrupt, name, got)
+		return nil, fmt.Errorf("%w: claimed %s, computed %s", ErrCorrupt, name, got)
 	}
 
 	p := s.path(vaultID, name)
@@ -273,32 +314,82 @@ func (s *Store) place(vaultID, name string, body []byte) (string, error) {
 	// body and the body was verified on the way in. Re-writing it would be a
 	// window in which the chunk is a temp file rather than itself.
 	if s.Has(vaultID, name) {
-		return "", nil
+		return nil, nil
 	}
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+	created, err := s.mkdirAll(dir)
+	if err != nil {
+		return nil, err
 	}
 	tmp, err := os.CreateTemp(dir, tmpPrefix+"*")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer os.Remove(tmp.Name()) // no-op once the rename has succeeded
-	if _, err := tmp.Write(body); err != nil {
+	if err := s.write(tmp, body); err != nil {
 		tmp.Close()
-		return "", err
+		return nil, err
+	}
+	// Ask the file, not the writer (S25). Rule 4: verify the outcome, not the
+	// exit code. A body renamed into place at the wrong length would count as
+	// held for ever and never be asked for again.
+	info, err := tmp.Stat()
+	if err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	if info.Size() != int64(len(body)) {
+		tmp.Close()
+		return nil, fmt.Errorf("wrote %d bytes of %d for %s; the body is not stored", info.Size(), len(body), name)
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return "", err
+		return nil, err
 	}
 	if err := tmp.Close(); err != nil {
-		return "", err
+		return nil, err
 	}
 	if err := os.Rename(tmp.Name(), p); err != nil {
-		return "", err
+		return nil, err
 	}
-	return dir, nil
+	// The leaf last: a caller flushing in order flushes the parents whose
+	// entries were just created before the directory the body's name is in,
+	// though for durability before an ack the order does not matter, only
+	// that every one of them is flushed.
+	return append(created, dir), nil
+}
+
+// mkdirAll creates dir and any missing ancestors under the store root, and
+// returns the directories that gained a new entry and so need flushing: for
+// each level created, its parent. Nothing is returned for a path that already
+// existed, which is every chunk after the first in its fan-out directory.
+func (s *Store) mkdirAll(dir string) ([]string, error) {
+	rel, err := filepath.Rel(s.dir, dir)
+	if err != nil {
+		return nil, err
+	}
+	var toSync []string
+	cur := s.dir
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "" || part == "." {
+			continue
+		}
+		next := filepath.Join(cur, part)
+		err := os.Mkdir(next, 0o700)
+		switch {
+		case err == nil:
+			// A new entry in cur, which is durable only once cur is flushed.
+			toSync = append(toSync, cur)
+		case errors.Is(err, os.ErrExist):
+			// Already there, whether from an earlier chunk or a moment ago
+			// from another writer in the same batch. Either way its parent
+			// was, or is being, flushed by whoever created it.
+		default:
+			return nil, err
+		}
+		cur = next
+	}
+	return toSync, nil
 }
 
 // Writers is how many chunks a batch fsyncs at once.
@@ -366,12 +457,12 @@ func (w *Writer) run() {
 			// this channel and would block on a closed pool for ever.
 			continue
 		}
-		dir, err := w.store.place(w.vaultID, job.name, job.body)
+		dirs, err := w.store.place(w.vaultID, job.name, job.body)
 		w.mu.Lock()
 		if err != nil && w.err == nil {
 			w.err = err
 		}
-		if dir != "" {
+		for _, dir := range dirs {
 			w.dirs[dir] = struct{}{}
 		}
 		w.mu.Unlock()
@@ -423,7 +514,7 @@ func (w *Writer) Close() error {
 		return w.err
 	}
 	for dir := range w.dirs {
-		if err := syncDir(dir); err != nil {
+		if err := w.store.sync(dir); err != nil {
 			return err
 		}
 	}
@@ -441,7 +532,7 @@ func (w *Writer) Close() error {
 // So the body is renamed rather than deleted. Renamed, it stops satisfying Has,
 // the next put asks for it, and a client that still holds the note sends it
 // back. Deleted, the evidence of what went wrong would be gone too, and
-// docs/philosophy.md rule 3 is that nothing is destroyed until a verified copy
+// docs/design.md rule 3 is that nothing is destroyed until a verified copy
 // exists elsewhere: for a body that fails its own hash there is no copy, only a
 // name that no longer means anything.
 func (s *Store) Quarantine(vaultID, name string) error {
@@ -456,7 +547,7 @@ func (s *Store) Quarantine(vaultID, name string) error {
 		}
 		return err
 	}
-	return syncDir(filepath.Dir(p))
+	return s.sync(filepath.Dir(p))
 }
 
 // corruptSuffix marks a body that did not match its own name. It is outside the
@@ -530,10 +621,15 @@ const DefaultGrace = time.Hour
 //
 // Sweep never reports success it has not verified: a body it fails to remove is
 // an error, not a silent omission from the count.
-func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time) (deleted, spared int, err error) {
+//
+// quarantined counts bodies Quarantine set aside because they failed their own
+// hash. They are left in place on purpose, so the sweep reports them rather than
+// aborting on them: aborting is how one quarantined body turned every later
+// purge into a failure that deleted history and reclaimed nothing.
+func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time) (deleted, spared, quarantined int, err error) {
 	root := s.VaultDir(vaultID)
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -552,9 +648,18 @@ func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time
 			// a live upload.
 			return nil
 		}
+		if strings.HasSuffix(name, corruptSuffix) {
+			// A body Quarantine renamed aside because it did not match its name.
+			// It is meant to stay until a client resends the real chunk, so it
+			// is counted and skipped, not deleted and not treated as an
+			// unexpected file. See Quarantine.
+			quarantined++
+			return nil
+		}
 		if !ValidName(name) {
-			// Not something this package wrote. Report it rather than deleting
-			// it: an unexplained file in the blob tree is evidence.
+			// Not a chunk, not a quarantined body, not an in-progress write:
+			// nothing this package puts here. Report it rather than deleting it,
+			// because an unexplained file in the blob tree is evidence.
 			return fmt.Errorf("unexpected file in chunk store: %s", p)
 		}
 		if _, keep := live[name]; keep {
@@ -576,7 +681,7 @@ func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time
 		deleted++
 		return nil
 	})
-	return deleted, spared, err
+	return deleted, spared, quarantined, err
 }
 
 // CountBodies counts the chunk files this store holds, across every vault.
@@ -592,7 +697,10 @@ func (s *Store) CountBodies() (int, error) {
 		if err != nil {
 			return err
 		}
-		if d.IsDir() || strings.HasPrefix(d.Name(), tmpPrefix) {
+		if d.IsDir() || strings.HasPrefix(d.Name(), tmpPrefix) || strings.HasSuffix(d.Name(), corruptSuffix) {
+			// A quarantined body is not a body: it is a chunk the store no
+			// longer serves, kept only as evidence until the real one returns.
+			// Counting it would overstate what the store holds.
 			return nil
 		}
 		n++

@@ -39,6 +39,12 @@ func drainBatchFrames(t *testing.T, s *Session) []wire.Batch {
 			if err := json.Unmarshal(f.data, &b); err != nil {
 				t.Fatalf("decode %q: %v", f.data, err)
 			}
+			// flushPending queues caught-up on the same channel now. These
+			// tests are about the batches around it, not caught-up itself,
+			// which its own test covers.
+			if b.Op == "caught-up" {
+				continue
+			}
 			out = append(out, b)
 		default:
 			return out
@@ -379,5 +385,76 @@ func TestCommitAndAnnounceCannotBeInterleaved(t *testing.T) {
 				b.From, b.To, cursor)
 		}
 		cursor = b.To
+	}
+}
+
+// caught-up must reach the wire before any live change that lands after the
+// handover, or the client sees a batch whose range is below caught-up's cursor
+// and treats it as fatal protostate (client/src/core/transport.ts).
+//
+// The window is between flushPending flipping catchupDone and caught-up being
+// queued. flushPending now queues caught-up under the same lock, so this closes
+// it. Forced with the afterFlush hook: it fires once flushPending has released
+// its lock, by which point caught-up is already queued, and broadcasts a late
+// entry. Before the fix caught-up was written by the caller after flushPending
+// returned, so the broadcast slipped in ahead of it.
+func TestCaughtUpIsQueuedBeforeAChangeThatLandsInTheHandoverWindow(t *testing.T) {
+	r := newRig(t)
+	r.seed("seed.md", "backlog")
+
+	var once sync.Once
+	var late store.Entry
+	r.srv.afterFlush = func() {
+		once.Do(func() {
+			// Committed and announced the way a concurrent push would be, so the
+			// only route to the client is the fan-out.
+			late = r.seed("late.md", "landed in the handover window")
+			r.srv.hub.broadcast(testVault, late, nil)
+		})
+	}
+
+	cl := r.dial("a")
+	cl.sendJSON(helloMsg(testVault, testToken, "a", 0))
+
+	var ready wire.Ready
+	cl.recvInto("ready", &ready)
+
+	var cursor int64
+	sawCaughtUp := false
+	sawLate := false
+	for !sawLate {
+		data := cl.recvRaw()
+		var probe struct {
+			Op     string `json:"op"`
+			From   int64  `json:"from"`
+			To     int64  `json:"to"`
+			Cursor int64  `json:"cursor"`
+		}
+		if err := json.Unmarshal([]byte(data), &probe); err != nil {
+			t.Fatalf("decode %q: %v", data, err)
+		}
+		switch probe.Op {
+		case "batch":
+			if probe.From != cursor+1 {
+				t.Fatalf("gap: batch [%d,%d] after cursor %d", probe.From, probe.To, cursor)
+			}
+			cursor = probe.To
+			if sawCaughtUp {
+				// The late change, correctly after caught-up.
+				if probe.To != late.UID {
+					t.Fatalf("post-caught-up batch is [%d,%d], want the late one at %d",
+						probe.From, probe.To, late.UID)
+				}
+				sawLate = true
+			}
+		case "caught-up":
+			if probe.Cursor != cursor {
+				t.Fatalf("caught-up says cursor %d but batches reached %d: a live change overtook it",
+					probe.Cursor, cursor)
+			}
+			sawCaughtUp = true
+		default:
+			t.Fatalf("unexpected frame: %s", data)
+		}
 	}
 }

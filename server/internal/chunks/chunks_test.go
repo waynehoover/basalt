@@ -272,7 +272,7 @@ func TestSweepDeletesUnreferencedAndKeepsLive(t *testing.T) {
 		}
 	}
 
-	deleted, spared, err := s.Sweep("v1", map[string]struct{}{nk: {}}, time.Now())
+	deleted, spared, _, err := s.Sweep("v1", map[string]struct{}{nk: {}}, time.Now())
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestSweepLeavesInProgressWritesAlone(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if _, _, err := s.Sweep("v1", nil, time.Now()); err != nil {
+	if _, _, _, err := s.Sweep("v1", nil, time.Now()); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 	if _, err := os.Stat(tmp); err != nil {
@@ -322,7 +322,7 @@ func TestSweepRefusesToDeleteAFileItDidNotWrite(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if _, _, err := s.Sweep("v1", nil, time.Now()); err == nil {
+	if _, _, _, err := s.Sweep("v1", nil, time.Now()); err == nil {
 		t.Fatal("sweep reported success over a file it did not recognise")
 	}
 	if _, err := os.Stat(stray); err != nil {
@@ -332,7 +332,7 @@ func TestSweepRefusesToDeleteAFileItDidNotWrite(t *testing.T) {
 
 func TestSweepOfAnUntouchedVaultIsNotAnError(t *testing.T) {
 	s := newTestStore(t)
-	deleted, _, err := s.Sweep("never-used", map[string]struct{}{}, time.Now())
+	deleted, _, _, err := s.Sweep("never-used", map[string]struct{}{}, time.Now())
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestSweepSparesRecentlyWrittenChunks(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	deleted, spared, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
+	deleted, spared, _, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestSweepCollectsChunksOlderThanTheGraceWindow(t *testing.T) {
 		t.Fatalf("backdate: %v", err)
 	}
 
-	deleted, spared, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
+	deleted, spared, _, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -434,7 +434,7 @@ func TestSweepKeepsAnOldChunkThatIsStillReferenced(t *testing.T) {
 		t.Fatalf("backdate: %v", err)
 	}
 
-	deleted, spared, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now())
+	deleted, spared, _, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now())
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -459,7 +459,7 @@ func TestSweepCountsALiveRecentChunkAsLiveNotSpared(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	deleted, spared, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now().Add(-DefaultGrace))
+	deleted, spared, _, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now().Add(-DefaultGrace))
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
@@ -504,5 +504,51 @@ func TestSizeAndHasAgree(t *testing.T) {
 	}
 	if s.Has("v1", other) {
 		t.Fatal("Has accepted a directory")
+	}
+}
+
+// A quarantined body must not turn every later sweep into a failure.
+//
+// Quarantine renames a corrupt body to <name>.corrupt and leaves it, so a device
+// that still holds the note can resend the real chunk. Before this was handled,
+// Sweep saw a non-hex filename and aborted with "unexpected file", which made
+// store.Purge fail after it had already deleted history: one bad body poisoned
+// every purge. Now the sweep counts it and carries on.
+func TestSweepReportsQuarantinedBodiesInsteadOfAborting(t *testing.T) {
+	s := newTestStore(t)
+	good := []byte("a healthy body")
+	name := Name(good)
+	if err := s.Put("v1", name, good); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := s.Quarantine("v1", name); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+
+	// Nothing live, no grace: a sweep that should simply tidy up and report.
+	deleted, spared, quarantined, err := s.Sweep("v1", map[string]struct{}{}, time.Now())
+	if err != nil {
+		t.Fatalf("sweep aborted on a quarantined body: %v", err)
+	}
+	if quarantined != 1 {
+		t.Fatalf("quarantined = %d, want 1", quarantined)
+	}
+	if deleted != 0 || spared != 0 {
+		t.Fatalf("deleted %d, spared %d; a quarantined body is neither", deleted, spared)
+	}
+
+	// It is kept, not collected: the evidence and the chance to heal both need
+	// it to stay on disk.
+	if _, err := os.Stat(s.path("v1", name) + corruptSuffix); err != nil {
+		t.Fatalf("the quarantined body was removed: %v", err)
+	}
+
+	// And it is not counted as a body the store holds, because it is not one.
+	n, err := s.CountBodies()
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("CountBodies = %d, want 0: a quarantined body is not a body", n)
 	}
 }

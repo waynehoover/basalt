@@ -84,6 +84,27 @@ const (
 	// anybody would type.
 	MaxDeviceLen = 64
 
+	// MaxVaultLen bounds a vault id, for the same reason as MaxDeviceLen and
+	// one more: it lands in log lines on every refusal, and it was unbounded
+	// (S24). It is hashed before it touches the filesystem, so the bound is
+	// about logs and memory rather than paths. 64 is the device bound, and a
+	// vault name is the same kind of thing.
+	MaxVaultLen = 64
+
+	// MaxWrappedLen bounds the wrapped data key a protocol 3 device stores at
+	// claim. The real thing is 60 bytes of nonce and AES-GCM output, 80
+	// characters in base64url; 256 leaves room for a scheme that pads without
+	// letting an authenticated client park kilobytes in a row the server hands
+	// to every device at hello.
+	MaxWrappedLen = 256
+
+	// MaxSealedLen bounds the sealed root secret an invite carries, and
+	// MaxInviteLen the invite identifier. A sealed 32-byte secret is 60 bytes,
+	// 80 in base64url; a 128-bit identifier is 22. The bounds are generous for
+	// the same reason MaxWrappedLen is and for the same cost.
+	MaxSealedLen = 256
+	MaxInviteLen = 64
+
 	// ChunkOverheadMax bounds what encryption adds to one chunk: a nonce, an
 	// authentication tag, and any framing. AES-GCM-SIV needs 12 plus 16, so
 	// this is an order of magnitude of headroom, which is deliberate: it is the
@@ -205,7 +226,28 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- the vault. The key itself is never stored: a server holding one could
   -- write to the vault it is meant only to keep, and a stolen disk already
   -- yields every byte of ciphertext without also handing over the credential.
-  auth_hash  TEXT    NOT NULL DEFAULT ''
+  auth_hash  TEXT    NOT NULL DEFAULT '',
+  -- The vault's data key, wrapped by the first device under a key derived
+  -- from the root secret, or empty for a vault claimed under protocol 2. The
+  -- server cannot open it and never needs to; it stores it so every device
+  -- holding the root secret can, and so a rotate can swap hash and blob in
+  -- one statement without any device losing the history sealed under it.
+  wrapped    TEXT    NOT NULL DEFAULT ''
+);
+
+-- Single-use invites for adding a device without showing the root secret
+-- again. sealed is the root sealed under an invite key the server never sees;
+-- used is flipped in the same statement that reads the row, so a reply lost
+-- on the wire still burns the invite. Expired rows are swept lazily whenever
+-- an invite is added to the vault, and every row goes when the vault's secret
+-- is rotated, because they seal the root that was just retired.
+CREATE TABLE IF NOT EXISTS invites (
+  vault_id   TEXT    NOT NULL,
+  invite     TEXT    NOT NULL,
+  sealed     TEXT    NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (vault_id, invite)
 );
 
 CREATE TABLE IF NOT EXISTS entries (
@@ -239,7 +281,8 @@ CREATE TABLE IF NOT EXISTS entry_chunks (
   FOREIGN KEY (vault_id, uid) REFERENCES entries(vault_id, uid) ON DELETE CASCADE
 );
 
--- Serves both "everything newer than my cursor" and "latest version of path".
+-- Serves "latest version of path" and the per-path grouping behind Deleted,
+-- Stats and Purge. "Everything newer than my cursor" is the primary key.
 CREATE INDEX IF NOT EXISTS entries_by_path ON entries(vault_id, path, uid DESC);
 
 -- Makes the live-set query for the chunk sweep an index scan rather than a
@@ -280,6 +323,12 @@ type Store struct {
 	// that tried to commit inside it by timing would be a test that passes when
 	// the machine is busy.
 	duringBackup func()
+
+	// afterPurgeDelete runs inside Purge's transaction, after the DELETE and
+	// before the checks, and is nil in every non-test build. Returning an error
+	// from it stands in for any post-delete query failing, so a test can prove
+	// the delete rolls back rather than standing with the history already gone.
+	afterPurgeDelete func() error
 }
 
 // Open uses SyncFull. Use OpenWithSync only to trade durability for speed in a
@@ -594,14 +643,6 @@ func (s *Store) EntryByUID(vaultID string, uid int64) (Entry, bool, error) {
 	return s.oneEntry(vaultID,
 		`SELECT `+entryCols+` FROM entries WHERE vault_id = ? AND uid = ?`,
 		vaultID, uid)
-}
-
-// LatestForPath returns the newest version of one encrypted path, if any.
-func (s *Store) LatestForPath(vaultID, path string) (Entry, bool, error) {
-	return s.oneEntry(vaultID,
-		`SELECT `+entryCols+` FROM entries WHERE vault_id = ? AND path = ?
-		  ORDER BY uid DESC LIMIT 1`,
-		vaultID, path)
 }
 
 func (s *Store) oneEntry(vaultID, query string, args ...any) (Entry, bool, error) {
@@ -1006,6 +1047,11 @@ type PurgeReport struct {
 	// rather than folded into the deleted count so the numbers add up and a
 	// grace window that is doing nothing is visible.
 	ChunksSpared int
+	// ChunksQuarantined were set aside because they failed their own hash. They
+	// are kept until a client resends the real chunk, so a purge counts them
+	// rather than collecting them, and reports the count so a body that has gone
+	// bad is visible rather than silently sitting in the tree.
+	ChunksQuarantined int
 }
 
 // Purge drops version history, keeping only the newest entry per path, then
@@ -1022,63 +1068,104 @@ type PurgeReport struct {
 // just-committed entry references. Purge is a rare manual operation, so blocking
 // writes for its duration is the right trade.
 //
-// Chunk links go with their entries by ON DELETE CASCADE, so the live set is
-// read after the delete and is exactly what survived.
+// The delete, every invariant that proves it right, and the live set the sweep
+// uses are all one transaction (S9). The delete is irreversible history loss,
+// so it must not be left standing when a check that would have caught a mistake
+// cannot even run. Before this, the DELETE ran in autocommit and a later query
+// failing returned an error with the history already gone. Now a failure in any
+// of those steps rolls the whole thing back, so the versions are still there to
+// try again. The transaction commits before the filesystem sweep, because the
+// sweep is not reversible SQL and a body it removes is unreferenced by the
+// committed result; a chunk link goes with its entry by ON DELETE CASCADE, so
+// the live set read inside the transaction is exactly what survives.
 func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	var rep PurgeReport
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM entries WHERE vault_id = ?`, vaultID).Scan(&rep.VersionsBefore); err != nil {
-		return rep, err
-	}
+	var live map[string]struct{}
 
-	res, err := s.db.Exec(
-		`DELETE FROM entries
-		  WHERE vault_id = ?
-		    AND uid NOT IN (SELECT MAX(uid) FROM entries WHERE vault_id = ? GROUP BY path)`,
-		vaultID, vaultID)
+	// Everything that reads or writes the entries, in one transaction, so the
+	// history is only gone once the proof that the purge was right has passed.
+	err := s.inTx(func(tx *sql.Tx) error {
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM entries WHERE vault_id = ?`, vaultID).Scan(&rep.VersionsBefore); err != nil {
+			return err
+		}
+
+		res, err := tx.Exec(
+			`DELETE FROM entries
+			  WHERE vault_id = ?
+			    AND uid NOT IN (SELECT MAX(uid) FROM entries WHERE vault_id = ? GROUP BY path)`,
+			vaultID, vaultID)
+		if err != nil {
+			return err
+		}
+		rep.VersionsRemoved, _ = res.RowsAffected()
+
+		if s.afterPurgeDelete != nil {
+			if err := s.afterPurgeDelete(); err != nil {
+				return err
+			}
+		}
+
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM entries WHERE vault_id = ?`, vaultID).Scan(&rep.VersionsAfter); err != nil {
+			return err
+		}
+		// The purge keeps one version per path, so what remains must equal the
+		// number of distinct paths. Checking it inside the transaction means a
+		// future change to the delete predicate that removes a live entry rolls
+		// back here instead of being discovered as a missing note.
+		var paths int64
+		if err := tx.QueryRow(
+			`SELECT COUNT(DISTINCT path) FROM entries WHERE vault_id = ?`, vaultID).Scan(&paths); err != nil {
+			return err
+		}
+		if rep.VersionsAfter != paths {
+			return fmt.Errorf("purge left %d versions for %d paths in vault %q",
+				rep.VersionsAfter, paths, vaultID)
+		}
+		if rep.VersionsBefore-rep.VersionsRemoved != rep.VersionsAfter {
+			return fmt.Errorf("purge arithmetic: %d - %d != %d",
+				rep.VersionsBefore, rep.VersionsRemoved, rep.VersionsAfter)
+		}
+
+		// The live set is read here, after the delete and inside the same
+		// transaction, so it is exactly what the committed result references.
+		live, err = liveChunks(tx, vaultID)
+		return err
+	})
 	if err != nil {
 		return rep, err
 	}
-	rep.VersionsRemoved, _ = res.RowsAffected()
 
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM entries WHERE vault_id = ?`, vaultID).Scan(&rep.VersionsAfter); err != nil {
-		return rep, err
-	}
-	// The purge keeps one version per path, so what remains must equal the
-	// number of distinct paths. Checking it here means a future change to the
-	// delete predicate that removes a live entry fails immediately instead of
-	// being discovered as a missing note.
-	var paths int64
-	if err := s.db.QueryRow(
-		`SELECT COUNT(DISTINCT path) FROM entries WHERE vault_id = ?`, vaultID).Scan(&paths); err != nil {
-		return rep, err
-	}
-	if rep.VersionsAfter != paths {
-		return rep, fmt.Errorf("purge left %d versions for %d paths in vault %q",
-			rep.VersionsAfter, paths, vaultID)
-	}
-	if rep.VersionsBefore-rep.VersionsRemoved != rep.VersionsAfter {
-		return rep, fmt.Errorf("purge arithmetic: %d - %d != %d",
-			rep.VersionsBefore, rep.VersionsRemoved, rep.VersionsAfter)
-	}
-
-	live, err := s.liveChunks(vaultID)
-	if err != nil {
-		return rep, err
-	}
 	rep.ChunksLive = len(live)
-	rep.ChunksDeleted, rep.ChunksSpared, err = s.chunks.Sweep(vaultID, live, time.Now().Add(-grace))
+	rep.ChunksDeleted, rep.ChunksSpared, rep.ChunksQuarantined, err = s.chunks.Sweep(vaultID, live, time.Now().Add(-grace))
 	return rep, err
 }
 
-// liveChunks is every chunk name referenced by a committed entry of this vault.
-// Caller must hold writeMu.
-func (s *Store) liveChunks(vaultID string) (map[string]struct{}, error) {
-	rows, err := s.db.Query(
+// inTx runs fn in a transaction, committing if it returns nil and rolling back
+// otherwise. It is the shape a purge needs: an irreversible delete and the
+// checks that prove it right have to stand or fall together.
+func (s *Store) inTx(fn func(*sql.Tx) error) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	if err := fn(tx); err != nil {
+		// Rollback's own error is not worth returning over fn's: fn's is why
+		// the purge is being abandoned, and it is the one a caller can act on.
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// liveChunks is every chunk name referenced by a committed entry of this vault,
+// read within the caller's transaction so it matches the rest of that snapshot.
+func liveChunks(tx *sql.Tx, vaultID string) (map[string]struct{}, error) {
+	rows, err := tx.Query(
 		`SELECT DISTINCT name FROM entry_chunks WHERE vault_id = ?`, vaultID)
 	if err != nil {
 		return nil, err
@@ -1215,79 +1302,6 @@ func (s *Store) verifyEntries() ([]Fault, error) {
 	return faults, rows.Err()
 }
 
-// PrunedVault names a vault removed by PruneEmptyVaults.
-type PrunedVault struct {
-	VaultID   string
-	CreatedAt int64
-}
-
-// PruneEmptyVaults removes vaults that hold no entries at all.
-//
-// These accumulate from typos in a vault id, from probing and from tests: a
-// connect is enough to create the row, because EnsureVault runs before anything
-// is pushed. They cost almost nothing, but they make the vault list untrustworthy
-// as a picture of what is stored.
-//
-// minAgeMillis exists because "no entries" is also what a brand-new device looks
-// like during its first connect, before its initial upload lands. Deleting the
-// row underneath it would make the next AppendEntry fail with unknown vault.
-//
-// Only genuinely empty vaults qualify. A vault whose files were all deleted
-// still has rows, because deletions are entries, so it is not empty and is not
-// touched. That is rule 6, and it is the reason this is safe to run unattended.
-func (s *Store) PruneEmptyVaults(now, minAgeMillis int64) ([]PrunedVault, error) {
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	rows, err := s.db.Query(
-		`SELECT v.vault_id, v.created_at FROM vaults v
-		  WHERE v.created_at <= ?
-		    AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.vault_id = v.vault_id)`,
-		now-minAgeMillis)
-	if err != nil {
-		return nil, err
-	}
-	var doomed []PrunedVault
-	for rows.Next() {
-		var pv PrunedVault
-		if err := rows.Scan(&pv.VaultID, &pv.CreatedAt); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		doomed = append(doomed, pv)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	var pruned []PrunedVault
-	for _, pv := range doomed {
-		// The delete re-checks emptiness rather than trusting the list above.
-		// Both run under one lock today; making the delete itself conditional
-		// means a future caller that forgets the lock still cannot remove a
-		// vault that has gained entries.
-		res, err := s.db.Exec(
-			`DELETE FROM vaults WHERE vault_id = ?
-			   AND NOT EXISTS (SELECT 1 FROM entries e WHERE e.vault_id = vaults.vault_id)`,
-			pv.VaultID)
-		if err != nil {
-			return pruned, err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			continue
-		}
-		pruned = append(pruned, pv)
-		// The chunk directory should be absent or empty. Remove it only if
-		// empty, so a surprise here leaves evidence instead of deleting data.
-		dir := s.chunks.VaultDir(pv.VaultID)
-		if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
-			_ = os.Remove(dir)
-		}
-	}
-	return pruned, nil
-}
-
 /* ---------------------------------------------------------------- */
 
 type scannable interface {
@@ -1340,13 +1354,18 @@ func migrate(db *sql.DB) error {
 		return nil
 	}
 
-	has, err := hasColumn(db, "vaults", "auth_hash")
-	if err != nil {
-		return err
-	}
-	if !has {
-		if _, err := db.Exec(`ALTER TABLE vaults ADD COLUMN auth_hash TEXT NOT NULL DEFAULT ''`); err != nil {
+	// auth_hash arrived with the one-secret model, wrapped with protocol 3. A
+	// vault claimed before either keeps the empty string: it is unclaimed, or
+	// it has no data key, and both are states the code above understands.
+	for _, col := range []string{"auth_hash", "wrapped"} {
+		has, err := hasColumn(db, "vaults", col)
+		if err != nil {
 			return err
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE vaults ADD COLUMN ` + col + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -1408,16 +1427,146 @@ func (s *Store) AuthHash(vaultID string) (string, error) {
 	return hash, err
 }
 
-// ClaimVault records the auth key hash for a vault that has none, and reports
-// whether this call is the one that did it.
+// ValidWrapped reports whether a wrapped data key is one the server will store:
+// non-empty, within MaxWrappedLen, and base64url with optional padding. The
+// server cannot check what it means; it can refuse a shape nothing could have
+// produced, so a client bug lands on the writer at claim rather than on every
+// other device at hello.
+func ValidWrapped(w string) bool { return validBase64URL(w, MaxWrappedLen) }
+
+// ValidSealed is ValidWrapped for the sealed root secret an invite carries.
+func ValidSealed(s string) bool { return validBase64URL(s, MaxSealedLen) }
+
+// ValidInvite is the same check for an invite identifier.
+func ValidInvite(s string) bool { return validBase64URL(s, MaxInviteLen) }
+
+func validBase64URL(s string, max int) bool {
+	if s == "" || len(s) > max {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
+		case c == '=' && i >= len(s)-2:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// AddInvite stores a single-use invite for a claimed vault, expiring at
+// expiresAt (milliseconds), and sweeps that vault's expired invites while it is
+// there. Sweeping at insert rather than on a timer keeps the table bounded by
+// what was issued since the last issue, with no goroutine to forget to start;
+// a vault that never issues another invite keeps a handful of dead rows, which
+// redeem refuses anyway.
+func (s *Store) AddInvite(vaultID, invite, sealed string, expiresAt, now int64) error {
+	if !ValidInvite(invite) {
+		return fmt.Errorf("%w: invite identifier is %d bytes and must be base64url of at most %d",
+			ErrBadEntry, len(invite), MaxInviteLen)
+	}
+	if !ValidSealed(sealed) {
+		return fmt.Errorf("%w: sealed secret is %d bytes and must be base64url of at most %d",
+			ErrBadEntry, len(sealed), MaxSealedLen)
+	}
+	if expiresAt <= now {
+		return fmt.Errorf("%w: invite would expire before it was issued", ErrBadEntry)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.inTx(func(tx *sql.Tx) error {
+		var hash string
+		err := tx.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && hash == "") {
+			// An unclaimed vault has no root to seal, so nothing to invite to.
+			return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM invites WHERE vault_id = ? AND expires_at < ?`, vaultID, now); err != nil {
+			return err
+		}
+		_, err = tx.Exec(
+			`INSERT INTO invites (vault_id, invite, sealed, expires_at, used) VALUES (?, ?, ?, ?, 0)`,
+			vaultID, invite, sealed, expiresAt)
+		return err
+	})
+}
+
+// RedeemInvite marks an invite used and returns its sealed secret, or reports
+// ok false for one that is unknown, expired or already used, without saying
+// which. The read and the mark are one statement, so two devices redeeming at
+// once cannot both succeed, and a reply lost after this returns has still
+// burned the invite: one use means one, not one delivered.
+func (s *Store) RedeemInvite(vaultID, invite string, now int64) (sealed string, ok bool, err error) {
+	if !ValidInvite(invite) {
+		return "", false, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	err = s.db.QueryRow(
+		`UPDATE invites SET used = 1
+		  WHERE vault_id = ? AND invite = ? AND used = 0 AND expires_at >= ?
+		  RETURNING sealed`, vaultID, invite, now).Scan(&sealed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return sealed, true, nil
+}
+
+// OutstandingInvites counts invites that could still be redeemed: unused and
+// not yet expired at now.
+func (s *Store) OutstandingInvites(vaultID string, now int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM invites WHERE vault_id = ? AND used = 0 AND expires_at >= ?`,
+		vaultID, now).Scan(&n)
+	return n, err
+}
+
+// InviteRows counts every invite row for a vault, expired and used included,
+// so a test can see the sweep.
+func (s *Store) InviteRows(vaultID string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM invites WHERE vault_id = ?`, vaultID).Scan(&n)
+	return n, err
+}
+
+// Wrapped returns the vault's wrapped data key, or empty for an unclaimed vault
+// and for one claimed under protocol 2, which has none.
+func (s *Store) Wrapped(vaultID string) (string, error) {
+	var w string
+	err := s.db.QueryRow(`SELECT wrapped FROM vaults WHERE vault_id = ?`, vaultID).Scan(&w)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return w, err
+}
+
+// ClaimVault records the auth key hash, and the wrapped data key when the
+// device offered one, for a vault that has no hash yet, and reports whether
+// this call is the one that did it.
 //
 // The write is conditional in SQL rather than checked and then written, so two
 // devices arriving at once cannot both believe they claimed it. The loser is
 // told no and can decide what that means; silently accepting the second would
-// hand the vault to whichever connection happened to finish last.
-func (s *Store) ClaimVault(vaultID, hash string, now int64) (bool, error) {
+// hand the vault to whichever connection happened to finish last. Hash and
+// blob go in one statement, because a vault with a hash and no blob would
+// read to every protocol 3 device as one claimed under protocol 2, and they
+// would seal under the wrong key schedule for ever.
+func (s *Store) ClaimVault(vaultID, hash, wrapped string, now int64) (bool, error) {
 	if hash == "" {
 		return false, errors.New("refusing to claim a vault with an empty auth hash")
+	}
+	if wrapped != "" && !ValidWrapped(wrapped) {
+		return false, fmt.Errorf("%w: wrapped data key is %d bytes and must be base64url of at most %d",
+			ErrBadEntry, len(wrapped), MaxWrappedLen)
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -1426,10 +1575,68 @@ func (s *Store) ClaimVault(vaultID, hash string, now int64) (bool, error) {
 		return false, err
 	}
 	res, err := s.db.Exec(
-		`UPDATE vaults SET auth_hash = ? WHERE vault_id = ? AND auth_hash = ''`, hash, vaultID)
+		`UPDATE vaults SET auth_hash = ?, wrapped = ? WHERE vault_id = ? AND auth_hash = ''`,
+		hash, wrapped, vaultID)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
 	return n == 1, err
+}
+
+// ErrNoDataKey is a rotate against a vault that has no wrapped data key: one
+// claimed under protocol 2, whose content keys derive from the root directly.
+// Swapping its auth hash would lock every device out of history nothing can
+// re-seal, so the only rotation such a vault has is a new vault.
+var ErrNoDataKey = errors.New("this vault has no data key, so its secret cannot be rotated in place")
+
+// Rotate replaces a claimed vault's auth hash and wrapped data key, and
+// deletes every invite on the vault, in one transaction, so there is no moment
+// at which the new credential opens a vault whose blob the new root cannot
+// unwrap, or the other way round, and no invite survives that would hand out
+// the root just retired.
+//
+// It refuses a vault with no blob (ErrNoDataKey) and an unclaimed one
+// (ErrUnknownVault), because both are states in which "rotate" does not mean
+// anything: the first has nothing to re-wrap and the second nothing to
+// replace.
+func (s *Store) Rotate(vaultID, hash, wrapped string) error {
+	if hash == "" {
+		return errors.New("refusing to rotate to an empty auth hash")
+	}
+	if !ValidWrapped(wrapped) {
+		return fmt.Errorf("%w: wrapped data key is %d bytes and must be base64url of at most %d",
+			ErrBadEntry, len(wrapped), MaxWrappedLen)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	return s.inTx(func(tx *sql.Tx) error {
+		var current string
+		err := tx.QueryRow(`SELECT wrapped FROM vaults WHERE vault_id = ?`, vaultID).Scan(&current)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %q", ErrUnknownVault, vaultID)
+		}
+		if err != nil {
+			return err
+		}
+		if current == "" {
+			return ErrNoDataKey
+		}
+		res, err := tx.Exec(
+			`UPDATE vaults SET auth_hash = ?, wrapped = ? WHERE vault_id = ? AND auth_hash != '' AND wrapped != ''`,
+			hash, wrapped, vaultID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("%w: %q", ErrUnknownVault, vaultID)
+		}
+		_, err = tx.Exec(`DELETE FROM invites WHERE vault_id = ?`, vaultID)
+		return err
+	})
 }
