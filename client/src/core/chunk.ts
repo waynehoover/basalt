@@ -348,18 +348,6 @@ export function* chunkBytes(
 }
 
 /**
- * Splits a stream into content-defined chunks, holding at most one chunk plus a
- * window in memory.
- *
- * This is the departure from LiveSync that matters most. The boundary decision
- * needs 48 bytes of history and nothing else, so there is no reason to hold a
- * 700 MB attachment in memory to chunk it, and on a phone there is every reason
- * not to.
- *
- * The chunk being accumulated is bounded by `sizes.max`, so peak memory is that
- * plus one incoming block, whatever the file size.
- */
-/**
  * The rolling hash over a stream, as a class so its loop is a method.
  *
  * The only reason this is not a closure inside `chunkStream` is that the loop
@@ -414,6 +402,18 @@ class Roller {
   }
 }
 
+/**
+ * Splits a stream into content-defined chunks, holding at most one chunk plus a
+ * window in memory.
+ *
+ * This is the departure from LiveSync that matters most. The boundary decision
+ * needs 48 bytes of history and nothing else, so there is no reason to hold a
+ * 700 MB attachment in memory to chunk it, and on a phone there is every reason
+ * not to.
+ *
+ * The chunk being accumulated is bounded by `sizes.max`, so peak memory is that
+ * plus one incoming block, whatever the file size.
+ */
 export async function* chunkStream(
   blocks: AsyncIterable<Uint8Array>,
   sizes: ChunkSizes,

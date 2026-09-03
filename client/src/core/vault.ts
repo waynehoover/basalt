@@ -185,8 +185,6 @@ export class MemoryVault implements Vault {
   private readonly folders = new Set<string>();
 
   private listeners: ((path: string) => void)[] = [];
-  /** Every write this vault has seen, for tests that care about how it got here. */
-  readonly writeLog: string[] = [];
   /**
    * How many times a file has been read.
    *
@@ -221,7 +219,6 @@ export class MemoryVault implements Vault {
   ): Promise<void> {
     this.files.set(path, { bytes: bytes.slice(), mtime: times.mtime, ctime: times.ctime });
     for (const parent of parents(path)) this.folders.add(parent);
-    this.writeLog.push(path);
     this.notify(path);
   }
 

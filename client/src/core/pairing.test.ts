@@ -1,15 +1,8 @@
 import { describe, expect, it } from "vitest";
 
-import {
-  LEGACY_SECRET_LENGTH,
-  SECRET_LENGTH,
-  base64urlDecode,
-  base64urlEncode,
-  generateSecret,
-} from "./crypto.ts";
+import { SECRET_LENGTH, base64urlDecode, base64urlEncode, generateSecret } from "./crypto.ts";
 import {
   INVITE_PREFIX,
-  LEGACY_PAIRING_PREFIX,
   PAIRING_PREFIX,
   formatInvite,
   formatPairing,
@@ -64,25 +57,21 @@ describe("round tripping", () => {
   });
 
   /**
-   * I4 in TODO.md. A secret made now is 32 bytes and travels as `basalt3_`;
-   * a 20-byte one from a vault paired before that travels as `basalt2_`, and
-   * both are read back exactly. A device holding a 20-byte root prints a
-   * version 2 string, so what it prints is what it holds.
+   * review finding I4, now with one length rather than two. Every root is 32
+   * bytes and every string is `basalt3_`; a root of any other length is a
+   * bug upstream and is refused here rather than encoded into a string that
+   * would then be read back as something else.
    */
-  it("carries a 32-byte root as version 3 and a 20-byte root as version 2, and reads both", () => {
+  it("carries a 32-byte root, and refuses any other length", () => {
     const fresh = sample({ secret: generateSecret() });
     expect(fresh.secret.length).toBe(32);
     const three = formatPairing(fresh);
     expect(three.startsWith(PAIRING_PREFIX)).toBe(true);
     expect([...parsePairing(three).secret]).toEqual([...fresh.secret]);
 
-    const old = sample({ secret: new Uint8Array(LEGACY_SECRET_LENGTH).map((_, i) => i * 7) });
-    const two = formatPairing(old);
-    expect(two.startsWith(LEGACY_PAIRING_PREFIX)).toBe(true);
-    const back = parsePairing(two);
-    expect(back.secret.length).toBe(20);
-    expect([...back.secret]).toEqual([...old.secret]);
-    expect(back.url).toBe(old.url);
+    expect(() => formatPairing(sample({ secret: new Uint8Array(20).fill(7) }))).toThrow(
+      /a root secret is 32 bytes, not 20/,
+    );
   });
 });
 
@@ -95,12 +84,24 @@ describe("round tripping", () => {
  */
 describe("refusing a string it cannot read completely", () => {
   /**
-   * Version 1 carried a server token alongside the root secret. Somebody will
-   * have one written down, so it is named rather than lumped in with rubbish.
+   * Versions 1 and 2 went with the protocols that made them, and neither can
+   * be read into a vault this client can talk to. Somebody may still have one
+   * written down from testing, so each is named and told what to do instead
+   * rather than lumped in with rubbish.
    */
-  it("says what to do about a version 1 string", () => {
-    expect(() => parsePairing("basalt1_AAAAAAAA")).toThrow(/version 1 pairing string/);
-    expect(() => parsePairing("basalt1_AAAAAAAA")).toThrow(/basalt invite/);
+  it("names a string from before protocol 3 and says to start a fresh vault", () => {
+    for (const [prefix, version] of [
+      ["basalt1_", 1],
+      ["basalt2_", 2],
+    ] as const) {
+      expect(() => parsePairing(`${prefix}AAAAAAAA`)).toThrow(
+        new RegExp(`version ${version} pairing string, from before protocol 3`),
+      );
+      expect(() => parsePairing(`${prefix}AAAAAAAA`)).toThrow(/start a fresh vault/);
+      // And the same string offered as a setup line, which is the other
+      // place somebody pastes one.
+      expect(() => parseSetup(`${prefix}AAAAAAAA`)).toThrow(/from before protocol 3/);
+    }
   });
 
   it("refuses something that is not a pairing string at all", () => {
@@ -114,6 +115,50 @@ describe("refusing a string it cannot read completely", () => {
     expect(() => parseInvite(formatPairing(sample()))).toThrow(/a recovery key, not an invite/);
     expect(isInvite(inv)).toBe(true);
     expect(isInvite(formatPairing(sample()))).toBe(false);
+  });
+
+  /**
+   * The decoder used to accept a trailing character that produced no byte, and
+   * unused low bits that were flipped. Both leave the decoded body, and so the
+   * CRC, exactly as they were, so a damaged credential read as the real one:
+   * total failure was the contract and this was the hole in it.
+   */
+  it("refuses a credential with one character appended", () => {
+    for (const [what, base] of [
+      ["recovery key", pairingWholeBytes()],
+      ["invite", inviteWholeBytes()],
+    ] as const) {
+      // A body that is a whole number of triples encodes to a length divisible
+      // by four, which is where a spare character adds no byte at all.
+      expect(base.slice(base.indexOf("_") + 1).length % 4, `${what} setup`).toBe(0);
+      for (const extra of ["A", "Q", "-"]) {
+        const damaged = base + extra;
+        expect(
+          () => (what === "invite" ? parseInvite(damaged) : parsePairing(damaged)),
+          `${what} + ${extra}`,
+        ).toThrow(/one more than a whole number/);
+      }
+    }
+  });
+
+  it("refuses a credential whose unused final bits were flipped", () => {
+    for (const [what, base] of [
+      ["recovery key", pairingPartialBytes()],
+      ["invite", invitePartialBytes()],
+    ] as const) {
+      const body = base.slice(base.indexOf("_") + 1);
+      expect(body.length % 4, `${what} setup`).not.toBe(0);
+      const unused = body.length % 4 === 2 ? 4 : 2;
+      const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+      const last = alphabet.indexOf(body[body.length - 1]!);
+      for (let flip = 1; flip < 1 << unused; flip++) {
+        const damaged = base.slice(0, base.length - 1) + alphabet[last ^ flip]!;
+        expect(
+          () => (what === "invite" ? parseInvite(damaged) : parsePairing(damaged)),
+          damaged,
+        ).toThrow(/bits that no byte uses/);
+      }
+    }
   });
 
   it("refuses one that lost its end", () => {
@@ -184,8 +229,8 @@ describe("refusing a string it cannot read completely", () => {
 
 describe("refusing to make a string it could not read back", () => {
   it("refuses a secret of the wrong length", () => {
-    expect(() => formatPairing(sample({ secret: new Uint8Array(8) }))).toThrow(/32 bytes, or 20/);
-    expect(() => formatPairing(sample({ secret: new Uint8Array(64) }))).toThrow(/32 bytes, or 20/);
+    expect(() => formatPairing(sample({ secret: new Uint8Array(8) }))).toThrow(/is 32 bytes/);
+    expect(() => formatPairing(sample({ secret: new Uint8Array(64) }))).toThrow(/is 32 bytes/);
   });
 
   it("refuses a field too long for its length byte", () => {
@@ -194,7 +239,7 @@ describe("refusing to make a string it could not read back", () => {
 });
 
 /**
- * I6 in TODO.md. A hostname is bounded by the length byte and has to be ASCII
+ * review finding I6. A hostname is bounded by the length byte and has to be ASCII
  * on the wire. An internationalised one is converted the way every socket
  * would convert it before connecting, so the stored address and the connected
  * address are one string on every device; a host that cannot be converted is
@@ -232,7 +277,7 @@ const sampleInvite = (over: Partial<Invite> = {}): Invite => ({
 });
 
 /**
- * I21 in TODO.md. The invite string carries what a new device needs to fetch
+ * review finding I21. The invite string carries what a new device needs to fetch
  * the root once: where to ask, which vault, the identifier the sealed root is
  * stored under and the key that opens it. None of it is the root, and the key
  * never reaches the server.
@@ -330,3 +375,36 @@ describe("the line the server prints for the first device", () => {
     expect(() => parseSetup(formatInvite(sampleInvite()))).toThrow(/an invite from another device/);
   });
 });
+
+/**
+ * A recovery key and an invite whose bodies are a whole number of three-byte
+ * groups, so their base64url is divisible by four and a spare character adds
+ * no byte. The vault name is grown until the arithmetic lands there, because
+ * which length does it depends on the address, and a test that hard-coded one
+ * would silently stop testing the case.
+ */
+function pairingWholeBytes(): string {
+  return untilLength((v) => formatPairing(sample({ vaultId: v })), 0);
+}
+
+function inviteWholeBytes(): string {
+  return untilLength((v) => formatInvite(sampleInvite({ vaultId: v })), 0);
+}
+
+/** The same two, sized so the last character carries bits nothing reads. */
+function pairingPartialBytes(): string {
+  return untilLength((v) => formatPairing(sample({ vaultId: v })), 2);
+}
+
+function invitePartialBytes(): string {
+  return untilLength((v) => formatInvite(sampleInvite({ vaultId: v })), 2);
+}
+
+function untilLength(make: (vaultId: string) => string, want: number): string {
+  for (let n = 1; n <= 4; n++) {
+    const s = make("v".repeat(n));
+    const body = s.slice(s.indexOf("_") + 1);
+    if (body.length % 4 === want) return s;
+  }
+  throw new Error(`no vault name of one to four characters gives a body of length %4 == ${want}`);
+}

@@ -16,6 +16,7 @@
  * both still exist.
  */
 
+import { isChunkName } from "./crypto.ts";
 import type { StoredState } from "./vault.ts";
 
 /** How to get out of a refused index. Always the same, so said once. */
@@ -28,10 +29,10 @@ const RECOVERY =
  * `undefined` passes through: a device that has never synced has no index and
  * that is a valid state, not a broken one.
  */
-export function validateStoredState(raw: unknown, where = "the index"): StoredState | undefined {
+export function validateStoredState(raw: unknown): StoredState | undefined {
   if (raw === undefined) return undefined;
   const refuse = (what: string): Error =>
-    new Error(`${where} cannot be trusted: ${what}. ${RECOVERY}`);
+    new Error(`the index cannot be trusted: ${what}. ${RECOVERY}`);
   if (!isObject(raw)) throw refuse("it is not an object");
 
   const cursor = raw["cursor"];
@@ -142,11 +143,6 @@ function isCount(v: unknown): v is number {
 
 function isPath(v: unknown): v is string {
   return typeof v === "string" && v !== "" && !v.includes("\0");
-}
-
-/** A chunk name is the hex of a 32-byte digest, and nothing else ever is. */
-function isChunkName(v: unknown): boolean {
-  return typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
 }
 
 function describe(v: unknown): string {

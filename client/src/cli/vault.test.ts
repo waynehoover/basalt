@@ -243,7 +243,7 @@ describe("paths from elsewhere", () => {
 });
 
 /**
- * C17 in TODO.md: a create that is exclusive, so the gap between choosing a
+ * review finding C17: a create that is exclusive, so the gap between choosing a
  * free name and writing to it cannot swallow a file that appeared in it.
  */
 describe("creating a file only if nothing is there", () => {
@@ -277,7 +277,7 @@ describe("creating a file only if nothing is there", () => {
 });
 
 /**
- * C16 in TODO.md: the identity the disk gives a name, asked of the disk.
+ * review finding C16: the identity the disk gives a name, asked of the disk.
  */
 describe("what this disk files a name under", () => {
   it("folds Unicode normalisation always, and case as the disk does", async () => {

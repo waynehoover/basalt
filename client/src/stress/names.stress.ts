@@ -13,14 +13,11 @@ import { dirname, join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import type { Client } from "../core/client.ts";
-import type { VaultKeys } from "../core/crypto.ts";
 import { cleanupBinary, serverBinary, TestServer } from "../core/test-server.ts";
-import { device, differences, fingerprint, settle, suiteKeys, tidy } from "./harness.ts";
+import { device, differences, fingerprint, settle, tidy } from "./harness.ts";
 
-let keys: VaultKeys;
 beforeAll(async () => {
   await serverBinary();
-  keys = await suiteKeys();
 }, 300_000);
 afterAll(async () => await cleanupBinary());
 
@@ -55,7 +52,7 @@ describe("a vault full of awkward names", () => {
   it("round-trips every one to another device", async () => {
     server = new TestServer();
     await server.start();
-    const a = await device(server, keys, "a", dirs, open);
+    const a = await device(server, "a", dirs, open);
 
     for (const [path, body] of AWKWARD) {
       const full = join(a.dir, path);
@@ -66,7 +63,7 @@ describe("a vault full of awkward names", () => {
     expect(before.size).toBe(AWKWARD.length);
 
     await settle([a]);
-    const b = await device(server, keys, "b", dirs, open);
+    const b = await device(server, "b", dirs, open);
     await settle([b]);
 
     const gaps = differences(before, await fingerprint(b.dir));

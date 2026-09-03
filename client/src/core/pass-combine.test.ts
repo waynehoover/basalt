@@ -1,5 +1,5 @@
 /**
- * C35 in TODO.md. A sync asked for while a pass was running runs again when it
+ * review finding C35. A sync asked for while a pass was running runs again when it
  * finishes, and the two reports were added field by field. The work counters
  * add; the state counters do not: one file held back by the write debounce in
  * both passes was reported as two waiting, and a settled vault passed over

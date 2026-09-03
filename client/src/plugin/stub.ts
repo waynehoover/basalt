@@ -218,52 +218,6 @@ export class App {
   readonly workspace = new FakeWorkspace();
 }
 
-/**
- * The context menu Obsidian hands to a `file-menu` handler.
- *
- * Records what a plugin adds, and lets a test click it, which is the only way
- * to find out whether the entry does what its title says.
- */
-export class MenuItem {
-  title = "";
-  icon = "";
-  private handler: (() => void) | undefined;
-
-  setTitle(title: string): this {
-    this.title = title;
-    return this;
-  }
-
-  setIcon(icon: string): this {
-    this.icon = icon;
-    return this;
-  }
-
-  onClick(handler: () => void): this {
-    this.handler = handler;
-    return this;
-  }
-
-  click(): void {
-    this.handler?.();
-  }
-}
-
-export class Menu {
-  readonly items: MenuItem[] = [];
-
-  addItem(cb: (item: MenuItem) => unknown): this {
-    const item = new MenuItem();
-    cb(item);
-    this.items.push(item);
-    return this;
-  }
-
-  addSeparator(): this {
-    return this;
-  }
-}
-
 /* ---------------------------------------------------------------- *
  * Notices
  * ---------------------------------------------------------------- */

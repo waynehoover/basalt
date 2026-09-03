@@ -64,7 +64,13 @@ import {
   type Vault as ObsidianVaultApi,
 } from "obsidian";
 
-import { configFolderName, isNeverSynced } from "../core/paths.ts";
+import {
+  configFolderName,
+  foldPath,
+  foldsTogether,
+  isNeverSynced,
+  neverSync,
+} from "../core/paths.ts";
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
 
 /**
@@ -738,8 +744,8 @@ export class ObsidianVault implements Vault {
     }
     if (listed.files.includes(normalized)) return; // Already spelled this way.
 
-    const folded = normalized.normalize("NFC").toLowerCase();
-    const actual = listed.files.find((f) => f.normalize("NFC").toLowerCase() === folded);
+    const folded = foldPath(normalized);
+    const actual = listed.files.find((f) => foldPath(f) === folded);
     if (actual === undefined || actual === normalized) return;
     await this.adapter.rename(actual, normalized);
     this.actualName.delete(actual);
@@ -757,7 +763,7 @@ export class ObsidianVault implements Vault {
     const left = this.resolve(a);
     const right = this.resolve(b);
     if (left === right) return true;
-    if (left.normalize("NFC").toLowerCase() !== right.normalize("NFC").toLowerCase()) return false;
+    if (!foldsTogether(left, right)) return false;
 
     const cut = left.lastIndexOf("/");
     const dir = cut === -1 ? "/" : left.slice(0, cut);
@@ -998,19 +1004,4 @@ export class ObsidianIndexStore implements IndexStore {
 
 function trimLeadingSlash(path: string): string {
   return path.startsWith("/") ? path.slice(1) : path;
-}
-
-/**
- * A refusal to write under a name this shell never syncs, with the code the
- * engine reads it by.
- *
- * The engine classifies a failure by its code and had none for this one, so
- * an inbound path under a folder this device ignores was filed for retry and
- * retried on every pass for ever, each time exiting 1 (C29). The code says
- * it is a fact about the path.
- */
-function neverSync(message: string): Error {
-  const err = new Error(message) as Error & { code: string };
-  err.code = "neversync";
-  return err;
 }

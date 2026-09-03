@@ -12,16 +12,15 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { Client } from "../core/client.ts";
-import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
+import { authToken, deriveRootKeys } from "../core/crypto.ts";
+import { testWrapped } from "../core/test-keys.ts";
 import { removeTree, TestServer } from "../core/test-server.ts";
 import { JsonIndexStore, NodeVault } from "../cli/vault.ts";
 
 export const enc = new TextEncoder();
 
-/** One key for the whole suite: these tests are not about key derivation. */
-export async function suiteKeys(): Promise<VaultKeys> {
-  return deriveKeys(new Uint8Array(20).fill(23));
-}
+/** One root for the whole suite: these tests are not about key derivation. */
+export const SUITE_SECRET = new Uint8Array(32).fill(23);
 
 export interface Device {
   readonly c: Client;
@@ -31,14 +30,13 @@ export interface Device {
 /** A device on its own directory, connected. */
 export async function device(
   server: TestServer,
-  keys: VaultKeys,
   name: string,
   dirs: string[],
   open: Client[],
 ): Promise<Device> {
   const dir = await mkdtemp(join(tmpdir(), `basalt-stress-${name}-`));
   dirs.push(dir);
-  return reopen(server, keys, name, dir, open);
+  return reopen(server, name, dir, open);
 }
 
 /**
@@ -50,7 +48,6 @@ export async function device(
  */
 export async function reopen(
   server: TestServer,
-  keys: VaultKeys,
   name: string,
   dir: string,
   open: Client[],
@@ -58,9 +55,12 @@ export async function reopen(
   const c = new Client({
     vault: new NodeVault(dir),
     store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-    keys,
+    secret: SUITE_SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys)),
+    ...server.credentials(
+      authToken(await deriveRootKeys(SUITE_SECRET)),
+      await testWrapped(SUITE_SECRET),
+    ),
     vaultId: "default",
     device: name,
     timeoutMs: 120_000,

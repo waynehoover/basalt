@@ -24,9 +24,10 @@
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 
-import { authToken, deriveKeys, generateSecret, randomBytes } from "../core/crypto.ts";
+import { deriveRootKeys, generateSecret, randomBytes } from "../core/crypto.ts";
 import {
   Client,
+  credentialsFor,
   redeemInvite,
   runForever,
   wrappedForClaim,
@@ -34,6 +35,7 @@ import {
 } from "../core/client.ts";
 import type { SyncReport } from "../core/engine.ts";
 import {
+  encodeConfig,
   formatPairing,
   isInvite,
   normaliseUrl,
@@ -208,15 +210,21 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
     );
   await refuseIfPaired(args.dir);
 
+  const secret = generateSecret();
   const config: Config = {
     url: normaliseUrl(server),
     vaultId: args.vaultId,
     device: deviceNameFor(args),
-    secret: generateSecret(),
+    secret,
     // The server's first-run token, kept only until this device has claimed
     // the vault with it. What authenticates afterwards is derived from the
     // secret above, so there is nothing else to hold on to.
     bootstrap: token,
+    // The vault's data key, made here and once. It is written down before the
+    // claim goes out for the same reason the root is: a claim that commits
+    // with its reply lost must be retried with the key it already offered,
+    // not with a second candidate.
+    claimWrapped: await wrappedForClaim(await deriveRootKeys(secret)),
   };
   await saveConfig(args.dir, config);
   // Read back before the claim. The claim binds the server to the key this
@@ -354,6 +362,15 @@ async function mustReadBack(dir: string, config: Config): Promise<void> {
   if (!back || Buffer.compare(back.secret, config.secret) !== 0 || back.url !== config.url) {
     throw new Error(`${configPath(dir)} did not read back as what was just written`);
   }
+  // A rotation stages its new secret here and then sends the request. If this
+  // is not on disk, nothing is: the whole point of writing first is that the
+  // secret exists somewhere other than in this process before the server could
+  // possibly have committed it.
+  if (config.pending) {
+    if (!back.pending || Buffer.compare(back.pending.secret, config.pending.secret) !== 0) {
+      throw new Error(`${configPath(dir)} did not read back with the rotation's new secret`);
+    }
+  }
 }
 
 /**
@@ -394,8 +411,22 @@ async function cmdInvite(args: Args, io: Console): Promise<number> {
 async function cmdRecoveryKey(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
   const recoveryKey = formatPairing(config);
+  // A rotation that was sent and never answered leaves two keys that could be
+  // the vault's, and this command cannot tell which without connecting. Both
+  // are printed rather than one guessed at: printing only the old one, when the
+  // rotation did commit, is a recovery key that opens nothing, written down by
+  // somebody who now believes they have one.
+  const pendingKey = config.pending
+    ? formatPairing({ ...config, secret: config.pending.secret })
+    : undefined;
   if (args.json) {
-    io.out(JSON.stringify({ ok: true, recoveryKey }));
+    io.out(
+      JSON.stringify({
+        ok: true,
+        recoveryKey,
+        ...(pendingKey !== undefined ? { pendingRecoveryKey: pendingKey } : {}),
+      }),
+    );
     return 0;
   }
   io.err(
@@ -403,28 +434,77 @@ async function cmdRecoveryKey(args: Args, io: Console): Promise<number> {
       "To add a device, use basalt invite instead.",
   );
   io.out(recoveryKey);
+  if (pendingKey !== undefined) {
+    io.err(
+      "A rotation from this device was never answered, so the vault may already have a new " +
+        "secret. Keep both keys until basalt sync here has settled which it is.",
+    );
+    io.out(pendingKey);
+  }
   return 0;
 }
 
 /**
  * Gives the vault a new root secret and keeps its history.
  *
- * Only a vault with a data key can do this, and the client says so before
- * doing anything for one that cannot. The new secret is saved before the new
+ * Every vault can do this, because every vault's content is sealed under a
+ * data key that the root only wraps. The new secret is saved before the new
  * recovery key is printed, and printed regardless if the save fails, because
  * at that point it is the only thing that opens the vault.
  */
 async function cmdRotate(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
   const client = await open(config, args, io);
-  const next: Config = { ...config, secret: generateSecret() };
-  delete (next as { bootstrap?: string }).bootstrap;
+  const secret = generateSecret();
+  const recoveryKey = formatPairing({ ...config, secret });
+  // The data key re-wrapped under the new root, which is what the server will
+  // hold and therefore what this device must pin from now on. Captured on the
+  // way past, because the same value has to reach the staged config and the
+  // promoted one.
+  let rewrapped: string | undefined;
   try {
-    await client.rotate(next.secret);
+    // Written down before it is sent, and both secrets are in the file while
+    // the request is in flight. The server commits, closes every other
+    // session, and only then answers, so a connection that drops in between
+    // leaves a vault whose new root this process is the only holder of. With
+    // the pending secret on disk the next run tries it first and falls back to
+    // the old one, and either way the vault opens.
+    await client.rotate(secret, async (wrapped) => {
+      rewrapped = wrapped;
+      const staged: Config = { ...config, pending: { secret, wrapped } };
+      await saveConfig(args.dir, staged);
+      await mustReadBack(args.dir, staged);
+    });
+  } catch (err) {
+    if (err instanceof ProtocolError && err.code === "rotated") {
+      // Answered, and refused: another device rotated first, so nothing here
+      // committed and the staged secret is not the vault's. This device's own
+      // secret went with the same rotation, so there is nothing to retry until
+      // it has the new string.
+      await saveConfig(args.dir, config).catch(() => undefined);
+      await client.close();
+      io.err(
+        "basalt: the vault was rotated by another device, so this rotation was refused. " +
+          "Reconnect and try again: this device's secret was retired by that rotation too, " +
+          "so pair it again with the new recovery key or an invite from the device that rotated.",
+      );
+      return 1;
+    }
+    // The reply never came, and there is no way from here to tell a rotation
+    // that committed from one that did not. Both are survivable and neither is
+    // survivable quietly: this key is the vault if it committed.
+    io.err(`basalt: the rotation was not answered: ${(err as Error).message}`);
+    io.err("It may have committed. Write this recovery key down now, in place of the old one:");
+    io.err(`  ${recoveryKey}`);
+    io.err("Then run basalt sync here, which tries the new secret first and settles which it is.");
+    return 1;
   } finally {
     await client.close();
   }
-  const recoveryKey = formatPairing(next);
+  const next: Config = { ...config, secret, ...(rewrapped ? { wrapped: rewrapped } : {}) };
+  delete (next as { bootstrap?: string }).bootstrap;
+  delete (next as { claimWrapped?: string }).claimWrapped;
+  delete (next as { pending?: unknown }).pending;
   try {
     await saveConfig(args.dir, next);
     await mustReadBack(args.dir, next);
@@ -848,26 +928,57 @@ async function cmdUnlink(args: Args, io: Console): Promise<number> {
  */
 async function open(config: Config, args: Args, io?: Console, forget = true): Promise<Client> {
   const connected = await connectWith(config, args, io);
-  if (connected.spent === undefined) return connected.client;
+  const settled = settle(config, connected.config, connected.client);
+  if (settled === undefined) return connected.client;
 
-  // A bootstrap was used, or found to be already spent, so the vault is
-  // claimed and the token opens nothing any more. Kept any longer it is a
-  // second secret sitting in a file for no reason, and one the next run
-  // would try first and be refused with.
+  // Something the connection proved that the file does not say yet: a
+  // bootstrap that is spent, a rotation that is resolved, or the vault's
+  // wrapped data key seen for the first time. Kept out of step, the bootstrap
+  // is a second secret in a file for no reason and one the next run would
+  // offer first, and the unpinned blob is a wrapping this device would go on
+  // believing whatever the server said.
   if (!forget) return connected.client;
   try {
-    await saveConfig(args.dir, connected.spent);
+    await saveConfig(args.dir, settled);
   } catch (err) {
-    // The vault is claimed and this device holds the key, so nothing is
-    // lost: the next run finds the bootstrap refused and recovers below.
-    // What must not happen is leaving a connection running behind an
-    // error, or reporting success while the file still says otherwise.
+    // Nothing is lost by this: every one of those facts is re-derivable on the
+    // next connection, and the recovery in `candidates` is what does it. What
+    // must not happen is leaving a connection running behind an error, or
+    // reporting success while the file still says otherwise.
     await connected.client.close();
     throw new Error(
-      `the vault is claimed but the spent bootstrap could not be removed from the config: ${(err as Error).message}`,
+      `the vault is claimed but ${configPath(args.dir)} could not be brought up to date: ${(err as Error).message}`,
     );
   }
   return connected.client;
+}
+
+/**
+ * What the config should say now that a connection has succeeded, or undefined
+ * when the file already says it.
+ *
+ * `used` is the credential that actually authenticated, which is `stored` for
+ * an ordinary device and one of the fallbacks in `candidates` otherwise. The
+ * one thing neither of them knows is the vault's wrapped data key, because that
+ * arrives in `ready`.
+ *
+ * Compared against what is on disk rather than against `used`, because the
+ * whole reason a fallback was needed is that the two disagree.
+ */
+function settle(stored: Config, used: Config, client: Client): Config | undefined {
+  const wrapped = client.wrapped;
+  const next: Config = { ...used, ...(wrapped !== undefined ? { wrapped } : {}) };
+  delete (next as { bootstrap?: string }).bootstrap;
+  // The claim candidate goes with the bootstrap: nothing sends a claim once
+  // the vault is known to be claimed, so keeping it is keeping a wrapping of
+  // a data key the vault never adopted.
+  delete (next as { claimWrapped?: string }).claimWrapped;
+  delete (next as { pending?: unknown }).pending;
+  return sameConfig(next, stored) ? undefined : next;
+}
+
+function sameConfig(a: Config, b: Config): boolean {
+  return JSON.stringify(encodeConfig(a)) === JSON.stringify(encodeConfig(b));
 }
 
 /**
@@ -890,50 +1001,75 @@ async function connectWith(
   config: Config,
   args: Args,
   io?: Console,
-): Promise<{ client: Client; spent: Config | undefined }> {
-  const { bootstrap, ...withoutBootstrap } = config;
-  const client = new Client(await clientOptions(config, args, io));
-  try {
-    await client.connect();
-  } catch (err) {
-    await client.close();
-    if (bootstrap === undefined || !(err instanceof ProtocolError) || err.code !== "auth")
-      throw err;
-    const derived = new Client(await clientOptions(withoutBootstrap, args, io));
+): Promise<{ client: Client; config: Config }> {
+  let first: Error | undefined;
+  for (const candidate of candidates(config)) {
+    const client = new Client(await clientOptions(candidate, args, io));
     try {
-      await derived.connect();
-    } catch {
-      await derived.close();
-      // The derived key does not open it either, so nothing is proven
-      // and the original refusal stands.
-      throw err;
+      await client.connect();
+      return { client, config: candidate };
+    } catch (err) {
+      await client.close();
+      first ??= err as Error;
+      // Only an `auth` refusal says "this credential is not the vault's", and
+      // only that is worth trying another one against. Anything else is the
+      // server, the network or this vault's own state, and every candidate
+      // would meet it identically.
+      if (!(err instanceof ProtocolError) || err.code !== "auth") throw err;
     }
-    return { client: derived, spent: withoutBootstrap };
   }
-  return { client, spent: bootstrap === undefined ? undefined : withoutBootstrap };
+  // Nothing opened it, so nothing is proven and the first refusal stands: it is
+  // the one that describes the credential this device believes in.
+  throw first ?? new Error("this vault has no credential to connect with");
+}
+
+/**
+ * The credentials to try, best first.
+ *
+ * An outstanding rotation goes first, because if it committed then it is the
+ * only thing that opens the vault, and it carries the wrapping the server holds
+ * so the pin does not refuse the very connection that resolves it. Then the
+ * config as it stands. Then, for the first device only, the config without its
+ * bootstrap.
+ *
+ * That last one is the narrow case in which a bootstrap can be proven spent.
+ * `init` writes the config with the bootstrap, claims the vault, and writes it
+ * again without. If the second write fails, or the claim commits and its reply
+ * is lost, the next run offers the bootstrap first and is refused, for ever.
+ * The refusal is `auth`, which is also what a wrong token and another device's
+ * vault produce, so it does not on its own say what happened. What does say is
+ * the key derived from this config's root secret: the server compares it
+ * against the hash it bound the vault to, so that key being accepted proves the
+ * vault was claimed with this secret.
+ */
+function candidates(config: Config): Config[] {
+  const out: Config[] = [];
+  if (config.pending) {
+    const promoted: Config = {
+      ...config,
+      secret: config.pending.secret,
+      wrapped: config.pending.wrapped,
+    };
+    delete (promoted as { bootstrap?: string }).bootstrap;
+    delete (promoted as { pending?: unknown }).pending;
+    out.push(promoted);
+  }
+  out.push(config);
+  if (config.bootstrap !== undefined) {
+    const spent: Config = { ...config };
+    delete (spent as { bootstrap?: string }).bootstrap;
+    out.push(spent);
+  }
+  return out;
 }
 
 async function clientOptions(config: Config, args: Args, io?: Console): Promise<ClientOptions> {
-  const keys = await deriveKeys(config.secret);
-  const derived = authToken(keys);
   return {
     vault: new NodeVault(args.dir, { configDir: args.configDir, alsoIgnore: args.ignore }),
     store: new JsonIndexStore(indexPath(args.dir)),
-    keys,
-    secret: config.secret,
-    url: config.url,
-    // The bootstrap while there is one, and what the root secret derives
-    // once the vault has been claimed. `claim` goes every time and is
-    // ignored by a server that already knows its answer, so a device never
-    // has to work out whether it is the first.
-    token: config.bootstrap ?? derived,
-    claim: derived,
-    // A data key to claim the vault with, while this device still holds the
-    // bootstrap and so may be the one that claims it. The key the vault
-    // ends up with comes back in `ready`, never from here.
-    ...(config.bootstrap !== undefined ? { wrapped: await wrappedForClaim(keys) } : {}),
-    vaultId: config.vaultId,
-    device: config.device,
+    // Which key authenticates and what the vault is bound to, worked out in
+    // core so that both shells cannot answer it differently.
+    ...(await credentialsFor(config)),
     timeoutMs: args.timeout,
     // A one-shot sync does not defer a file to a next pass it will never
     // run. A watching one does, because there is one.

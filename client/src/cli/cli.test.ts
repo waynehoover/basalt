@@ -524,7 +524,7 @@ describe("saying no clearly", () => {
     );
     const r = await cli("status", "--dir", dir);
     expect(r.code).toBe(1);
-    expect(r.all).toMatch(/root secret is 32 bytes, or 20/);
+    expect(r.all).toMatch(/root secret is 32 bytes/);
   });
 
   it("refuses init without somewhere to init against", async () => {
@@ -613,7 +613,9 @@ describe("one secret", () => {
     // Keeping it is keeping a second secret that opens nothing.
     const after = JSON.parse(await read(a, ".basalt/config.json")) as Record<string, string>;
     expect(after["bootstrap"]).toBeUndefined();
-    expect(Object.keys(after).sort()).toEqual(["device", "secret", "url", "vaultId"]);
+    // `wrapped` arrives with it: the vault's data key as the server holds it,
+    // pinned so a server cannot hand this device a different schedule later.
+    expect(Object.keys(after).sort()).toEqual(["device", "secret", "url", "vaultId", "wrapped"]);
 
     // And the vault still syncs, on a credential derived from the secret.
     await write(a, "again.md", "still working\n");
@@ -833,7 +835,7 @@ describe("a vault is claimed when init says it is", () => {
 });
 
 /**
- * I21 and I13 in TODO.md. Adding a device is an invite; the recovery key is
+ * I21 and review finding I13. Adding a device is an invite; the recovery key is
  * shown once by init, named for what it is, and reprinted only on request.
  */
 describe("invites (I21)", () => {
@@ -1002,7 +1004,7 @@ describe("invites (I21)", () => {
 });
 
 /**
- * I5 in TODO.md. A vault claimed under protocol 3 has a data key the root
+ * review finding I5. A vault claimed under protocol 3 has a data key the root
  * only wraps, so the root can be replaced without the history going with it.
  */
 describe("rotating the secret (I5)", () => {
@@ -1046,41 +1048,58 @@ describe("rotating the secret (I5)", () => {
     expect(await read(c, "after.md")).toBe("after\n");
   }, 60_000);
 
-  it("says a protocol 2 vault cannot be rotated, before doing anything", async () => {
+  /**
+   * Every claim carries a data key, so there is no such thing as a vault that
+   * cannot be rotated, and no connection the server has to refuse.
+   *
+   * It used to be conditional on this device still holding the bootstrap
+   * token: the first device offered a data key and every device after it
+   * offered a claim with none. That left a vault that could be bound without
+   * one, whose content was then sealed under the root itself: unrotatable,
+   * and readable only by a device that guessed the same schedule (C40). The
+   * server now refuses a claim with no data key, so the condition is not an
+   * optimisation, it is a device that cannot connect.
+   */
+  it("offers a data key with every claim, from the first device and the second", async () => {
     await fresh();
-    // A vault claimed with no data key, as every protocol 2 device claimed.
+    const a = await vaultDir("a");
+    const init = await cli("init", server.setup, "--dir", a, "--device", "a", "--json");
+    expect(init.code, init.all).toBe(0);
+    await write(a, "note.md", "one\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    // The second device has no bootstrap token and still sends a claim, which
+    // the server ignores and would refuse if it carried no data key.
+    const b = await vaultDir("b");
+    const key = init.json()["recoveryKey"] as string;
+    expect((await cli("pair", key, "--dir", b, "--device", "b")).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+    expect(await read(b, "note.md")).toBe("one\n");
+
+    // And what the server stored for the claim, read back from a bare
+    // handshake: the vault has a data key, so it can be rotated.
     const { Transport } = await import("../core/transport.ts");
-    const { authToken, deriveKeys, generateSecret } = await import("../core/crypto.ts");
-    const { formatPairing } = await import("../core/pairing.ts");
-    const secret = generateSecret();
-    const keys = await deriveKeys(secret);
+    const { authToken, deriveRootKeys } = await import("../core/crypto.ts");
+    const { loadConfig } = await import("./config.ts");
+    const config = (await loadConfig(a))!;
     const t = new Transport(server.wsUrl, { onBatch: () => {}, timeoutMs: 10_000 });
     await t.connect();
     const ready = await t.hello({
       vault: "default",
-      token: server.token,
-      claim: authToken(keys),
-      device: "old",
+      token: authToken(await deriveRootKeys(config.secret)),
+      device: "reader",
       cursor: 0,
     });
     t.close();
-    expect(ready.wrapped).toBeUndefined();
+    expect(ready.wrapped).toMatch(/^[A-Za-z0-9_-]+$/);
 
-    const a = await vaultDir("a");
-    const key = formatPairing({ url: server.wsUrl, vaultId: "default", secret });
-    expect((await cli("pair", key, "--dir", a, "--device", "a")).code).toBe(0);
     const rotated = await cli("rotate", "--dir", a);
-    expect(rotated.code).toBe(1);
-    expect(rotated.all).toMatch(
-      /this vault was claimed under protocol 2, rotation is a new vault, see docs\/server\.md/,
-    );
-    // Nothing changed: the same key still opens it.
-    expect((await cli("sync", "--dir", a)).code).toBe(0);
-  });
+    expect(rotated.code, rotated.all).toBe(0);
+  }, 60_000);
 });
 
 /**
- * I11, I14, I15, I24 and C33 in TODO.md: the smaller CLI contracts.
+ * I11, I14, I15, I24 and review finding C33: the smaller CLI contracts.
  */
 describe("what the CLI says about itself and the vault", () => {
   it("prints both cursors on their own lines, and the ignore list (I11, I14)", async () => {
@@ -1194,7 +1213,7 @@ describe("what the CLI says about itself and the vault", () => {
 });
 
 /**
- * I10 in TODO.md. A server restored from an older backup is behind a device
+ * review finding I10. A server restored from an older backup is behind a device
  * that applied what it lost. The refusal is right, and this is the one safe
  * way past it: forget what this device believed was synced and rejoin from
  * the server's cursor, sending what only this device holds as new versions.

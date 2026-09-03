@@ -11,7 +11,8 @@
  * shipped bundle.
  */
 
-import { deriveKeys, type VaultKeys } from "./crypto.ts";
+import { type VaultKeys } from "./crypto.ts";
+import { testKeys, testWrapped } from "./test-keys.ts";
 import { Engine } from "./engine.ts";
 import { Transport, type SocketLike } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
@@ -93,12 +94,12 @@ export class FakeSocket implements SocketLike {
   }
 }
 
-/** A well-formed protocol 3 ready, with whatever the case wants changed. */
+/** A well-formed ready, with whatever the case wants changed. */
 export function ready(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     res: "ready",
     proto: 3,
-    minProto: 2,
+    minProto: 3,
     serverVersion: "test",
     cursor: 10,
     perFileMax: 1,
@@ -106,6 +107,9 @@ export function ready(over: Record<string, unknown> = {}): Record<string, unknow
     maxChunks: 1,
     maxBatchBytes: 16 << 20,
     maxFetchBytes: 64 << 20,
+    // Every vault has one, so the well-formed frame carries one. A case that
+    // wants a server without it passes `wrapped: undefined`.
+    wrapped: RIG_WRAPPED,
     ...over,
   };
 }
@@ -114,7 +118,10 @@ export function ready(over: Record<string, unknown> = {}): Record<string, unknow
 export const settle = (): Promise<unknown> => new Promise((r) => setTimeout(r, 0));
 
 /** The fixed root every fake-socket rig derives its keys from. */
-export const RIG_SECRET = new Uint8Array(20).fill(1);
+export const RIG_SECRET = new Uint8Array(32).fill(1);
+
+/** The vault's data key as the rig's server holds it, wrapped under RIG_SECRET. */
+const RIG_WRAPPED = await testWrapped(RIG_SECRET);
 
 /** An engine wired to a fake socket, connected, with limits of the test's choosing. */
 export async function engineOnFakeSocket(
@@ -149,11 +156,11 @@ export async function engineOnFakeSocket(
   await connecting;
 
   const vault = opts.vault ?? new MemoryVault();
-  const keys = await deriveKeys(RIG_SECRET);
+  const keys = await testKeys(RIG_SECRET);
   engine = new Engine({
     vault,
     store: new MemoryIndexStore(),
-    keys,
+    secret: RIG_SECRET,
     transport: t,
     device: "d",
     vaultId: "v",

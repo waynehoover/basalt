@@ -100,7 +100,7 @@ describe("the headless bundle", () => {
   });
 
   /**
-   * I24 in TODO.md. The version is written in at build time from package.json,
+   * review finding I24. The version is written in at build time from package.json,
    * so the one file somebody installs says which release it is and the
    * version matrix in docs/server.md has a number to name.
    */

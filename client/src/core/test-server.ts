@@ -209,14 +209,23 @@ export class TestServer {
    *
    * The first device to connect uses the token the server printed on its
    * first run, and offers the auth key the vault should belong to from then
-   * on. Every device after that uses the key. This mirrors what the shells
-   * do, and a harness that handed out the bootstrap for ever would be testing
-   * a server that does not exist.
+   * on, with a data key for the server to store. Every device after that uses
+   * the key and offers the same pair, which the server ignores. This mirrors
+   * what the shells do, and a harness that handed out the bootstrap for ever,
+   * or that claimed without a data key, would be testing a server that does
+   * not exist.
+   *
+   * The wrapped data key comes from the caller rather than from here, because
+   * a test derives it from the same fixed key it derives its own keys from;
+   * see test-keys.ts.
    */
-  credentials(derivedAuthKey: string): { token: string; claim: string } {
+  credentials(
+    derivedAuthKey: string,
+    wrapped: string,
+  ): { token: string; claim: { auth: string; wrapped: string } } {
     const token = this.claimed ? derivedAuthKey : this.token;
     this.claimed = true;
-    return { token, claim: derivedAuthKey };
+    return { token, claim: { auth: derivedAuthKey, wrapped } };
   }
 
   private claimed = false;

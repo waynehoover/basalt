@@ -25,7 +25,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
-import { configFolderName, isNeverSynced } from "../core/paths.ts";
+import { configFolderName, foldPath, isNeverSynced, neverSync, splitName } from "../core/paths.ts";
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
 
 /**
@@ -83,15 +83,6 @@ export class NodeVault implements Vault {
     this.ignore = new Set([...NEVER_SYNC, configDir, ...(opts.alsoIgnore ?? [])]);
   }
 
-  /**
-   * Turns a vault-relative path into an absolute one, refusing to escape.
-   *
-   * Paths arrive from the server, sealed by another device, and a client that
-   * joined `../../.ssh/authorized_keys` onto the vault root without looking
-   * would write outside it. The seal proves the path came from someone holding
-   * the vault key; it does not prove they meant this device well, and a bug on
-   * another device is enough.
-   */
   /** The vault root with its links resolved, worked out once. */
   private realRootOnce: Promise<string> | undefined;
 
@@ -137,7 +128,7 @@ export class NodeVault implements Vault {
    * made for a note, a case rename, a move into the trash and the copy across
    * a mount all changed names on disk that nothing then synced.
    */
-  private async dirty(full: string, deepestExisting: string): Promise<void> {
+  private dirty(full: string, deepestExisting: string): void {
     let at = dirname(full);
     this.unflushed.add(at);
     while (at !== deepestExisting && at.startsWith(this.root) && at !== this.root) {
@@ -198,6 +189,15 @@ export class NodeVault implements Vault {
     }
   }
 
+  /**
+   * Turns a vault-relative path into an absolute one, refusing to escape.
+   *
+   * Paths arrive from the server, sealed by another device, and a client that
+   * joined `../../.ssh/authorized_keys` onto the vault root without looking
+   * would write outside it. The seal proves the path came from someone holding
+   * the vault key; it does not prove they meant this device well, and a bug on
+   * another device is enough.
+   */
   private absolute(path: string): string {
     const full = resolve(this.root, path);
     const outside = relative(this.root, full);
@@ -228,27 +228,6 @@ export class NodeVault implements Vault {
     return isNeverSynced(rel, this.ignore);
   }
 
-  /**
-   * Every file and folder in the vault, with the stats the engine decides on.
-   *
-   * The stats go together rather than one after another. Serially this was
-   * 14 us a file and 138 ms over ten thousand of them, of which 112 ms was
-   * nothing but waiting: `readdir` over the same tree is 25 ms. It runs on
-   * every pass, so a settled vault paid it on every watch tick and every
-   * keepalive, for ever. Together it is 27 ms.
-   *
-   * The engine's own comment, that an unchanged file costs one stat and so a
-   * full pass is affordable, was right about the number of syscalls and wrong
-   * about the wall clock, purely because they were issued one at a time.
-   *
-   * Order is unchanged and deliberately so: a folder is listed before
-   * anything inside it, because that is the order folders have to be created
-   * in. Each directory returns its own list and they are assembled in the
-   * order they were read, so concurrency cannot reshuffle them.
-   *
-   * Do not raise UV_THREADPOOL_SIZE to go further. Measured at 16 it made this
-   * 2.6x worse than the default 4.
-   */
   /** Temporary files of a crashed earlier run that `list` has removed. */
   reaped = 0;
 
@@ -284,6 +263,27 @@ export class NodeVault implements Vault {
     }
   }
 
+  /**
+   * Every file and folder in the vault, with the stats the engine decides on.
+   *
+   * The stats go together rather than one after another. Serially this was
+   * 14 us a file and 138 ms over ten thousand of them, of which 112 ms was
+   * nothing but waiting: `readdir` over the same tree is 25 ms. It runs on
+   * every pass, so a settled vault paid it on every watch tick and every
+   * keepalive, for ever. Together it is 27 ms.
+   *
+   * The engine's own comment, that an unchanged file costs one stat and so a
+   * full pass is affordable, was right about the number of syscalls and wrong
+   * about the wall clock, purely because they were issued one at a time.
+   *
+   * Order is unchanged and deliberately so: a folder is listed before
+   * anything inside it, because that is the order folders have to be created
+   * in. Each directory returns its own list and they are assembled in the
+   * order they were read, so concurrency cannot reshuffle them.
+   *
+   * Do not raise UV_THREADPOOL_SIZE to go further. Measured at 16 it made this
+   * 2.6x worse than the default 4.
+   */
   async list(): Promise<FileStat[]> {
     await this.reapStaleTemps();
     const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
@@ -426,7 +426,7 @@ export class NodeVault implements Vault {
     await mkdir(dirname(full), { recursive: true });
     await this.matchCase(full);
     await writeDurably(full, bytes, false, { mtime: times.mtime, stageIn: this.staging });
-    await this.dirty(full, had);
+    this.dirty(full, had);
   }
 
   /** Where this vault's temporary files live: under its own state folder, never beside a note. */
@@ -465,8 +465,8 @@ export class NodeVault implements Vault {
     const entries = await readdir(dir);
     if (entries.includes(want)) return; // Spelled the way it is being written.
 
-    const folded = want.normalize("NFC").toLowerCase();
-    const actual = entries.find((e) => e.normalize("NFC").toLowerCase() === folded);
+    const folded = foldPath(want);
+    const actual = entries.find((e) => foldPath(e) === folded);
     if (actual === undefined) return;
     await rename(join(dir, actual), full);
     this.unflushed.add(dir);
@@ -504,7 +504,7 @@ export class NodeVault implements Vault {
     try {
       await rename(full, target);
       this.unflushed.add(dirname(full));
-      await this.dirty(target, had);
+      this.dirty(target, had);
       return;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
@@ -513,7 +513,7 @@ export class NodeVault implements Vault {
     // mounts. Copied, checked byte for byte, and only then removed.
     await copyVerifiedThenRemove(full, target);
     this.unflushed.add(dirname(full));
-    await this.dirty(target, had);
+    this.dirty(target, had);
   }
 
   /**
@@ -525,14 +525,10 @@ export class NodeVault implements Vault {
    */
   private async freeTrashPath(path: string): Promise<string> {
     const base = join(this.root, TRASH_DIR, path);
-    const dot = basename(path).lastIndexOf(".");
-    const [stem, ext] =
-      dot <= 0
-        ? [base, ""]
-        : [
-            base.slice(0, base.length - (basename(path).length - dot)),
-            base.slice(base.length - (basename(path).length - dot)),
-          ];
+    // Split on the vault-relative path, which always uses forward slashes,
+    // and take the extension off the joined absolute one, which may not.
+    const { ext } = splitName(path);
+    const stem = ext === "" ? base : base.slice(0, base.length - ext.length);
     for (let n = 0; n < 1000; n++) {
       const candidate = n === 0 ? base : `${stem} (${n})${ext}`;
       try {
@@ -552,7 +548,7 @@ export class NodeVault implements Vault {
     await this.insideForReal(full);
     const had = await this.deepestExisting(join(full, "x"));
     await mkdir(full, { recursive: true });
-    await this.dirty(join(full, "x"), had);
+    this.dirty(join(full, "x"), had);
   }
 
   async exists(path: string): Promise<boolean> {
@@ -663,7 +659,7 @@ export class NodeVault implements Vault {
           await exclusive.close();
         }
       }
-      await this.dirty(full, had);
+      this.dirty(full, had);
       return true;
     } finally {
       await rm(tmp, { force: true }).catch(() => {});
@@ -1042,14 +1038,11 @@ async function sameTree(source: string, target: string): Promise<void> {
 }
 
 async function digestOf(path: string): Promise<string> {
+  // No close here: createReadStream closes the handle itself.
   const handle = await open(path, "r");
-  try {
-    const hash = createHash("sha256");
-    for await (const chunk of handle.createReadStream()) hash.update(chunk as Buffer);
-    return hash.digest("hex");
-  } finally {
-    // createReadStream closes the handle itself.
-  }
+  const hash = createHash("sha256");
+  for await (const chunk of handle.createReadStream()) hash.update(chunk as Buffer);
+  return hash.digest("hex");
 }
 
 /**
@@ -1086,19 +1079,4 @@ export async function syncDirectory(dir: string): Promise<void> {
   } finally {
     await handle.close();
   }
-}
-
-/**
- * A refusal to write under a name this shell never syncs, with the code the
- * engine reads it by.
- *
- * The engine classifies a failure by its code and had none for this one, so
- * an inbound path under a folder this device ignores was filed for retry and
- * retried on every pass for ever, each time exiting 1 (C29). The code says
- * it is a fact about the path.
- */
-function neverSync(message: string): Error {
-  const err = new Error(message) as Error & { code: string };
-  err.code = "neversync";
-  return err;
 }

@@ -39,12 +39,13 @@ import {
   redeemInvite,
   runForever,
   summarise,
+  credentialsFor,
   wrappedForClaim,
   type ClientOptions,
   type DeletedList,
   type Version,
 } from "../core/client.ts";
-import { authToken, deriveKeys, generateSecret } from "../core/crypto.ts";
+import { deriveRootKeys, generateSecret } from "../core/crypto.ts";
 import type { SyncReport } from "../core/engine.ts";
 import {
   decodeConfig,
@@ -382,10 +383,12 @@ export default class BasaltPlugin extends Plugin {
         this.client = client;
         if (!client) return;
         this.everConnected = true;
-        // A connection means a bootstrap, if there was one, has been
-        // spent. Keeping it is keeping a second secret that no longer
-        // opens anything, and one the next start would offer first.
-        if (this.config?.bootstrap) void this.forgetBootstrap();
+        // A connection means a bootstrap, if there was one, has been spent,
+        // and it means the vault's wrapped data key has been seen. Both are
+        // written back: the token is a second secret that no longer opens
+        // anything, and the blob is the thing every later `ready` is checked
+        // against.
+        void this.settleConfig(client.wrapped);
       },
       onDisconnected: (cause, retryIn) => {
         if (!current()) return;
@@ -461,25 +464,37 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
-   * Drops the spent first-run token from the saved settings.
+   * Writes back what a successful connection settled: the spent first-run
+   * token is gone, along with the data key it was claiming with, and the
+   * vault's wrapped data key is pinned as this device now knows it.
    *
    * Disk first, then memory. The first version did it the other way round
    * and did not wait for the save, so a save that failed left a file that
    * still had the token and a plugin that thought it had gone: after a
    * restart the spent token was offered first and refused, for ever. Now a
-   * failed save leaves both agreeing that the token is still there, says
-   * so, and the next connection tries again.
+   * failed save leaves both agreeing that nothing changed, says so, and the
+   * next connection tries again.
+   *
+   * The pin is what stops a server choosing the key schedule. Until it is
+   * written down, whatever `ready` says is the vault's data key; afterwards a
+   * different blob is refused. The CLI's `settle` is the same step.
    */
-  private async forgetBootstrap(): Promise<void> {
+  private async settleConfig(wrapped: string | undefined): Promise<void> {
     const config = this.config;
-    if (!config?.bootstrap) return;
-    const { bootstrap: _spent, ...rest } = config;
+    if (!config) return;
+    const learned = wrapped !== undefined && config.wrapped === undefined;
+    if (!learned && config.bootstrap === undefined && config.claimWrapped === undefined) return;
+    const {
+      bootstrap: _spent,
+      claimWrapped: _candidate,
+      ...rest
+    } = { ...config, ...(learned ? { wrapped } : {}) };
     try {
       await this.saveData(encodeConfig(rest));
     } catch (err) {
       new Notice(
-        `Basalt: the vault is claimed, but its first-run token could not be removed from ` +
-          `${this.dataPath}: ${(err as Error).message}. It will be tried again on the next connection.`,
+        `Basalt: the vault is claimed, but ${this.dataPath} could not be brought up to date: ` +
+          `${(err as Error).message}. It will be tried again on the next connection.`,
         10_000,
       );
       return;
@@ -491,27 +506,13 @@ export default class BasaltPlugin extends Plugin {
   private async clientOptions(config: DeviceConfig, mine: number): Promise<ClientOptions> {
     const current = () => mine === this.generation;
     const configDir = this.app.vault.configDir;
-    const keys = await deriveKeys(config.secret);
-    const derived = authToken(keys);
     const log = (message: string, ...rest: unknown[]) => console.info("Basalt:", message, ...rest);
     return {
       vault: new ObsidianVault(this.app.vault, configDir, log),
       store: this.indexStore(),
-      keys,
-      secret: config.secret,
-      url: config.url,
-      // The bootstrap while there is one, and what the root secret
-      // derives once the vault has been claimed. `claim` goes every time
-      // and a server that already knows its answer ignores it, so a
-      // device never has to work out whether it is the first.
-      token: config.bootstrap ?? derived,
-      claim: derived,
-      // A data key to claim with, while this device still holds the
-      // bootstrap and so may be the first. The key the vault ends up with
-      // comes back in `ready`; see the CLI's clientOptions for the same.
-      ...(config.bootstrap !== undefined ? { wrapped: await wrappedForClaim(keys) } : {}),
-      vaultId: config.vaultId,
-      device: config.device,
+      // Which key authenticates and what the vault is bound to, worked out in
+      // core so that both shells cannot answer it differently.
+      ...(await credentialsFor(config)),
       onProgress: (path) => {
         if (current()) this.working(path);
       },
@@ -814,12 +815,17 @@ export default class BasaltPlugin extends Plugin {
   async pairFirst(setup: string, device: string): Promise<string> {
     return this.onePairing(async () => {
       const { url, token } = parseSetup(setup);
+      const secret = generateSecret();
       const config: DeviceConfig = {
         url,
         vaultId: "default",
         device: deviceName(device),
-        secret: generateSecret(),
+        secret,
         bootstrap: token,
+        // The vault's data key, made here and once, so a claim retried after a
+        // lost reply offers the key it offered before rather than a second
+        // candidate. See DeviceConfig.
+        claimWrapped: await wrappedForClaim(await deriveRootKeys(secret)),
       };
       await this.saveData(encodeConfig(config));
       this.config = config;

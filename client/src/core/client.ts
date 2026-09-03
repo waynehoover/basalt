@@ -17,8 +17,10 @@
 
 import {
   Engine,
+  combinePasses,
   contentId,
   firstFreeName,
+  mustBeOurs,
   placeBeside,
   type SyncOptions,
   type SyncReport,
@@ -35,9 +37,8 @@ import {
 import type { IndexStore, Vault } from "./vault.ts";
 import {
   authToken,
-  base64urlEncode as encodeBase64url,
-  deriveKeys,
-  entryIsOurs,
+  base64urlEncode,
+  deriveRootKeys,
   generateDataKey,
   openPath,
   randomBytes,
@@ -46,27 +47,35 @@ import {
   unsealSecret,
   unwrapDataKey,
   wrapDataKey,
+  type RootKeys,
   type VaultKeys,
 } from "./crypto.ts";
-import { INVITE_ID_LENGTH, INVITE_KEY_LENGTH, formatInvite, type Invite } from "./pairing.ts";
+import {
+  INVITE_ID_LENGTH,
+  INVITE_KEY_LENGTH,
+  formatInvite,
+  type DeviceConfig,
+  type Invite,
+} from "./pairing.ts";
+import { splitName } from "./paths.ts";
 
 export interface ClientOptions {
   readonly vault: Vault;
   readonly store: IndexStore;
-  /** The keys derived from the root secret alone. See EngineOptions. */
-  readonly keys: VaultKeys;
   /**
-   * The root secret, so the data key `ready` returns can be unwrapped, an
-   * invite can seal it, and a rotation can replace it. A shell always passes
-   * it; only a test that knows its vault has no data key leaves it out.
+   * The root secret: what unwraps the data key `ready` returns, what an
+   * invite seals, and what a rotation replaces. See EngineOptions.
    */
-  readonly secret?: Uint8Array;
+  readonly secret: Uint8Array;
   /** WebSocket URL of the server. */
   readonly url: string;
   readonly token: string;
-  /** The auth key to bind the vault to, if it has not been claimed yet. */
-  readonly claim?: string;
-  /** A fresh wrapped data key to store with the claim. See EngineOptions. */
+  /** What to bind the vault to if it has not been claimed. See EngineOptions. */
+  readonly claim?: { auth: string; wrapped: string };
+  /**
+   * The vault's wrapped data key as this device last saw it. A `ready` with a
+   * different blob is refused. See DeviceConfig.
+   */
   readonly wrapped?: string;
   readonly vaultId: string;
   readonly device: string;
@@ -90,7 +99,6 @@ export interface ClientOptions {
   readonly socketFactory?: (url: string) => SocketLike;
 }
 
-/** One connection, from hello to close. */
 /**
  * How long to wait after a batch arrives before fetching what it named.
  *
@@ -99,6 +107,7 @@ export interface ClientOptions {
  */
 const ARRIVAL_DELAY_MS = 150;
 
+/** One connection, from hello to close. */
 export class Client {
   readonly engine: Engine;
   readonly transport: Transport;
@@ -141,8 +150,7 @@ export class Client {
     engine = new Engine({
       vault: opts.vault,
       store: opts.store,
-      keys: opts.keys,
-      ...(opts.secret !== undefined ? { secret: opts.secret } : {}),
+      secret: opts.secret,
       transport: this.transport,
       device: opts.device,
       vaultId: opts.vaultId,
@@ -190,20 +198,12 @@ export class Client {
     return this.limits?.cursor ?? 0;
   }
 
-  /** Everything the server advertised at hello, or undefined before it. */
-  get serverLimits(): ServerLimits | undefined {
-    return this.limits;
-  }
-
-  /**
-   * The vault's wrapped data key as the server holds it, or undefined for a
-   * vault claimed under protocol 2, which has none.
-   */
+  /** The vault's wrapped data key as the server holds it, once connected. */
   get wrapped(): string | undefined {
     return this.limits?.wrapped;
   }
 
-  /** The keys in use, which after `ready` may be the data key's rather than the root's. */
+  /** The keys in use, which are the data key's and are known from `ready` onwards. */
   get keys(): VaultKeys {
     return this.engine.vaultKeys;
   }
@@ -253,7 +253,7 @@ export class Client {
     for (let i = 0; i < maxPasses && didSomething(pass); i++) {
       await sleep(60);
       pass = await this.pass(opts);
-      total = accumulate(total, pass);
+      total = combinePasses(total, pass);
     }
     return total;
   }
@@ -403,48 +403,20 @@ export class Client {
   async history(path: string, opts: { before?: number; limit?: number } = {}): Promise<Version[]> {
     const sealed = await sealPath(this.keys, path);
     const entries = await this.serial(() => this.transport.history(sealed, opts));
-    await this.mustBeOurs(entries);
+    await this.recoveryIsOurs(entries);
     return entries.map((e) => this.asVersion(e, path));
   }
 
   /**
    * Refuses a recovery list holding an entry this vault's key did not sign.
    *
-   * The ordinary sync path checks every batch entry's authenticator before it
-   * acts on it. Recovery did not (C32): a `history` was shown, a `deleted`
-   * list was offered for restore, and the version chosen was fetched and
-   * written, all on the server's word. The server holds every sealed path
-   * and could name any file; an entry it invented would decrypt, being made
-   * of real chunks, and be written into the vault as a restored note.
+   * The same check the sync path runs on every batch entry, which for a while
+   * recovery did not run at all (C32); `mustBeOurs` in the engine holds the
+   * reason. What is added here is the tail of the sentence: nothing forged is
+   * acted on, and nothing forged is put in front of somebody either.
    */
-  private async mustBeOurs(entries: readonly WireEntry[]): Promise<void> {
-    const keys = this.keys;
-    const ours = await Promise.all(
-      entries.map((e) =>
-        entryIsOurs(
-          keys,
-          {
-            path: e.path,
-            size: e.size,
-            ctime: e.ctime,
-            mtime: e.mtime,
-            folder: e.folder,
-            deleted: e.deleted,
-            prev: e.prev,
-            chunks: e.chunks,
-            parent: e.parent ?? "",
-          },
-          e.mac,
-        ),
-      ),
-    );
-    const forged = ours.indexOf(false);
-    if (forged >= 0) {
-      throw new Error(
-        `version ${entries[forged]!.uid} is not authenticated by this vault's key, ` +
-          `so nothing that holds the key wrote it, and it is not shown`,
-      );
-    }
+  private recoveryIsOurs(entries: readonly WireEntry[]): Promise<void> {
+    return mustBeOurs(this.keys, entries, ", and it is not shown");
   }
 
   /**
@@ -456,7 +428,7 @@ export class Client {
    */
   async deleted(limit?: number): Promise<DeletedList> {
     const answer = await this.serial(() => this.transport.deleted(limit));
-    await this.mustBeOurs(answer.entries);
+    await this.recoveryIsOurs(answer.entries);
     const notes: Deletion[] = [];
     for (const e of answer.entries) {
       notes.push({
@@ -467,6 +439,21 @@ export class Client {
       });
     }
     return { notes, more: answer.more };
+  }
+
+  /**
+   * The bytes of one version, without writing anything.
+   *
+   * What a history view needs and what restore cannot give it: somebody
+   * deciding whether to put a version back has to read it first, and reading
+   * it must not be the act of restoring it.
+   *
+   * Queued for the same reason restore is: reassembling a version is several
+   * requests and a sync starting in the middle of them would collide.
+   */
+  async contentAt(version: Version): Promise<Uint8Array> {
+    if (version.deleted || version.folder) return new Uint8Array(0);
+    return this.serial(() => this.engine.contentOf(version.uid, version.contentId));
   }
 
   /**
@@ -484,21 +471,6 @@ export class Client {
    * because a recovery tool that can destroy the thing you have is worse than
    * no recovery tool.
    */
-  /**
-   * The bytes of one version, without writing anything.
-   *
-   * What a history view needs and what restore cannot give it: somebody
-   * deciding whether to put a version back has to read it first, and reading
-   * it must not be the act of restoring it.
-   *
-   * Queued for the same reason restore is: reassembling a version is several
-   * requests and a sync starting in the middle of them would collide.
-   */
-  async contentAt(version: Version): Promise<Uint8Array> {
-    if (version.deleted || version.folder) return new Uint8Array(0);
-    return this.serial(() => this.engine.contentOf(version.uid, undefined, version.contentId));
-  }
-
   async restore(version: Version, to?: string): Promise<{ path: string; bytes: number }> {
     if (version.deleted) {
       throw new Error(
@@ -515,9 +487,7 @@ export class Client {
     // requests and a sync starting in the middle of them would collide. The
     // chunk list the signed history entry named is what `get` must answer
     // with; anything else is not this version (C32).
-    const content = await this.serial(() =>
-      this.engine.contentOf(version.uid, undefined, version.contentId),
-    );
+    const content = await this.serial(() => this.engine.contentOf(version.uid, version.contentId));
     const wanted = to ?? version.path;
     const vault = this.opts.vault;
     const exists = (p: string) => vault.exists(p);
@@ -588,8 +558,8 @@ export class Client {
       folder: e.folder,
       deleted: e.deleted,
       device: e.device,
-      chunks: e.chunks?.length ?? 0,
-      contentId: contentId(e.chunks ?? []),
+      chunks: e.chunks.length,
+      contentId: contentId(e.chunks),
     };
   }
 
@@ -608,18 +578,14 @@ export class Client {
    * keeps it.
    */
   async invite(ttlMs?: number): Promise<{ invite: string; expiresAt: number }> {
+    this.refuseIfRotated("issue an invite");
     const secret = this.opts.secret;
-    if (secret === undefined) {
-      throw new Error(
-        "this client was given no root secret, so it has nothing to put in an invite",
-      );
-    }
     const id = randomBytes(INVITE_ID_LENGTH);
     const key = randomBytes(INVITE_KEY_LENGTH);
     const sealed = await sealSecret(key, secret);
     const expiresAt = await this.serial(() =>
       this.transport.invite({
-        invite: base64url(id),
+        invite: base64urlEncode(id),
         sealed,
         ...(ttlMs !== undefined ? { ttlMs } : {}),
       }),
@@ -631,30 +597,68 @@ export class Client {
   /**
    * Gives the vault a new root secret, keeping its history.
    *
-   * The data key does not change; it is unwrapped under the old root and
-   * wrapped again under the new one, and the server swaps the auth hash and
-   * the blob together. Only a vault with a data key can do this: one claimed
-   * under protocol 2 seals its content under the root itself, so for it the
-   * only rotation is a new vault, and this says so rather than doing anything.
-   * The caller saves the new secret once this returns; until then nothing has
-   * changed on either end.
+   * Always available, and it always keeps the history: the data key does not
+   * change, it is unwrapped under the old root and wrapped again under the
+   * new one, and the server swaps the auth hash and the blob together.
+   *
+   * `beforeSend` is handed the re-wrapped data key and is awaited before the
+   * request goes out, so a caller can put the new secret somewhere durable
+   * first. It is not optional in spirit: the server commits, evicts every other
+   * session and only then replies, so a socket that drops in between leaves a
+   * vault whose new root exists nowhere but in this process. Whatever this
+   * callback wrote is what the next connection tries.
+   *
+   * After this returns the client is spent, and says so on every later
+   * operation; see `refuseIfRotated`.
    */
-  async rotate(newSecret: Uint8Array): Promise<void> {
-    const secret = this.opts.secret;
-    if (secret === undefined) {
-      throw new Error("this client was given no root secret, so it cannot rotate one");
-    }
+  async rotate(
+    newSecret: Uint8Array,
+    beforeSend?: (rewrapped: string) => Promise<void> | void,
+  ): Promise<void> {
+    this.refuseIfRotated("rotate the vault's secret");
     const wrapped = this.wrapped;
     if (wrapped === undefined) {
-      throw new Error(
-        "this vault was claimed under protocol 2, rotation is a new vault, see docs/server.md",
-      );
+      // Not a vault without a data key, of which there are none: a client
+      // that has not connected, and so has not been told what to re-wrap.
+      throw new Error("this client is not connected, so it cannot rotate the vault's secret");
     }
-    const old = await deriveKeys(secret);
+    const old = await deriveRootKeys(this.opts.secret);
     const dataKey = await unwrapDataKey(old.wrap, wrapped);
-    const fresh = await deriveKeys(newSecret);
+    const fresh = await deriveRootKeys(newSecret);
     const rewrapped = await wrapDataKey(fresh.wrap, dataKey);
+    await beforeSend?.(rewrapped);
     await this.serial(() => this.transport.rotate({ auth: authToken(fresh), wrapped: rewrapped }));
+    this.rotated = true;
+  }
+
+  /**
+   * Whether this client's root secret has been replaced under it.
+   *
+   * A rotation retires the secret this object was built with, and nothing here
+   * adopts the new one: `opts.secret` is what an invite seals and what the next
+   * rotation would unwrap with, and both would be the retired root. Refusing is
+   * the simpler half of the choice. Adopting would mean this object holding two
+   * answers to "what is the vault's secret" for the rest of its life, with
+   * every later operation having to pick the right one, and the shells close
+   * the client immediately after rotating anyway. So the connection stays
+   * usable for nothing: whoever rotated saved the new secret and reconnects
+   * with it.
+   *
+   * What is refused is everything that uses the root: `invite`, which would
+   * seal a secret the server no longer accepts and hand it to somebody as a way
+   * in, and a second `rotate`, which would re-wrap under a key derived from the
+   * retired root. Syncing is not refused, because nothing it touches changed: a
+   * rotation replaces the wrapping of the data key and not the data key, and
+   * this session is the one the server did not evict.
+   */
+  private rotated = false;
+
+  private refuseIfRotated(what: string): void {
+    if (!this.rotated) return;
+    throw new Error(
+      `this client's connection holds the vault's old secret, which was retired by the rotation ` +
+        `it just performed, so it cannot ${what}. Reconnect with the new secret.`,
+    );
   }
 
   /**
@@ -739,13 +743,8 @@ export interface Version {
  * with both.
  */
 export function restoredCopyPath(path: string, version: Version): string {
-  const slash = path.lastIndexOf("/");
-  const dir = slash === -1 ? "" : path.slice(0, slash + 1);
-  const name = slash === -1 ? path : path.slice(slash + 1);
-  const dot = name.lastIndexOf(".");
-  const stem = dot <= 0 ? name : name.slice(0, dot);
-  const ext = dot <= 0 ? "" : name.slice(dot);
-  return `${dir}${stem} (restored ${version.uid})${ext}`;
+  const { stem, ext } = splitName(path);
+  return `${stem} (restored ${version.uid})${ext}`;
 }
 
 /** What a long-running client tells whoever is watching it. */
@@ -919,26 +918,93 @@ export function retryWait(cause: Error, backoffMs: number): number {
 }
 
 /**
- * A fresh data key for a vault this device is about to claim, wrapped under
- * its root so the server can store it.
+ * A fresh data key for a vault about to be claimed, wrapped under its root so
+ * the server can store it.
  *
- * Made once per connection attempt and used only if the claim goes through,
- * because the key a vault actually has comes back in `ready`. A claim that
- * committed while its reply was lost leaves the server holding the key it
- * stored, and the next attempt's fresh one is ignored like the claim it came
- * with.
+ * Made once, when the vault is started, and written into the device config.
+ * It used to be made per connection attempt, on the reasoning that only one
+ * claim can win. What that missed is the retry: a claim whose reply was lost
+ * came back with a different candidate, so the vault could be bound to one key
+ * while the device that bound it went on offering another.
  */
-export async function wrappedForClaim(keys: VaultKeys): Promise<string> {
+export async function wrappedForClaim(keys: RootKeys): Promise<string> {
   return wrapDataKey(keys.wrap, generateDataKey());
+}
+
+/**
+ * The claim to send with a hello, or nothing.
+ *
+ * Nothing, once the vault is known to be claimed, which is when the bootstrap
+ * has been spent. A claim after that is ignored by an honest server and is a
+ * gift to a dishonest one: it is a wrapping of a data key, made by this device
+ * and unwrappable by it, which the server can hand back in `ready` as the
+ * vault's own. The device would install a schedule no other device derives, and
+ * the server would have split the vault in two without learning a key. Not
+ * sending it is what makes that unexpressible; the pinned blob in DeviceConfig
+ * is what covers everything else.
+ *
+ * One function rather than the same condition in both shells, because two
+ * copies of a rule are two rules and only one of them has a test.
+ *
+ * The fallback is for a config written before `claimWrapped` existed, which can
+ * only be one whose init never got its claim committed. It behaves as that
+ * build did rather than refusing to connect at all.
+ */
+export async function claimFor(
+  config: { readonly bootstrap?: string | undefined; readonly claimWrapped?: string | undefined },
+  auth: string,
+  keys: RootKeys,
+): Promise<{ auth: string; wrapped: string } | undefined> {
+  if (config.bootstrap === undefined) return undefined;
+  return { auth, wrapped: config.claimWrapped ?? (await wrappedForClaim(keys)) };
+}
+
+/**
+ * The half of a client's options that says who this device is.
+ *
+ * Which key authenticates, and what the vault gets bound to if it is not
+ * bound yet. Both shells worked this out for themselves, from the same stored
+ * config, in the same four steps, with near-verbatim copies of the comments
+ * below; the two copies were the highest-consequence drift point in the
+ * client, because a shell that got the token-or-bootstrap choice wrong
+ * authenticates as nobody and a shell that got the claim wrong binds the
+ * vault to a data key the rest of the vault cannot derive.
+ *
+ * It takes a whole `DeviceConfig` rather than the fields it reads, because
+ * the set of fields it reads is exactly the thing that keeps changing.
+ */
+export async function credentialsFor(
+  config: DeviceConfig,
+): Promise<
+  Pick<ClientOptions, "secret" | "url" | "token" | "claim" | "wrapped" | "vaultId" | "device">
+> {
+  const keys = await deriveRootKeys(config.secret);
+  const derived = authToken(keys);
+  const claim = await claimFor(config, derived, keys);
+  return {
+    secret: config.secret,
+    url: config.url,
+    // The bootstrap while there is one, and what the root secret derives
+    // once the vault has been claimed.
+    token: config.bootstrap ?? derived,
+    // A claim only while this device is still claiming, and always with the
+    // same data key; see claimFor.
+    ...(claim !== undefined ? { claim } : {}),
+    // And the blob this device has already seen, so a server that returns a
+    // different one is refused rather than believed.
+    ...(config.wrapped !== undefined ? { wrapped: config.wrapped } : {}),
+    vaultId: config.vaultId,
+    device: config.device,
+  };
 }
 
 /**
  * Redeems an invite: one connection that carries the invite in place of a
  * token, takes the sealed root, and closes.
  *
- * Returns the root secret and, for a vault with a data key, the wrapped key
- * the server holds. The caller stores the secret and connects again as a
- * device. Nothing here is a device: the connection proved only that it held
+ * Returns the root secret, which is all a device needs: it connects again as
+ * an ordinary device and takes the vault's data key from that connection's
+ * `ready`. Nothing here is a device: the connection proved only that it held
  * an unused invite, which the server burned before answering, so a reply lost
  * on the way leaves the invite spent and the caller with nothing saved, which
  * is a usable state: the issuing device makes another.
@@ -947,7 +1013,7 @@ export async function redeemInvite(
   invite: Invite,
   device: string,
   opts: { timeoutMs?: number; socketFactory?: (url: string) => SocketLike } = {},
-): Promise<{ secret: Uint8Array; wrapped?: string }> {
+): Promise<{ secret: Uint8Array }> {
   const transport = new Transport(invite.url, {
     onBatch: () => {},
     ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
@@ -958,49 +1024,12 @@ export async function redeemInvite(
     const redeemed = await transport.redeem({
       vault: invite.vaultId,
       device,
-      invite: base64url(invite.id),
+      invite: base64urlEncode(invite.id),
     });
-    const secret = await unsealSecret(invite.key, redeemed.sealed);
-    return { secret, ...(redeemed.wrapped !== undefined ? { wrapped: redeemed.wrapped } : {}) };
+    return { secret: await unsealSecret(invite.key, redeemed.sealed) };
   } finally {
     transport.close();
   }
-}
-
-function base64url(bytes: Uint8Array): string {
-  // The same alphabet crypto.ts uses, imported from there to keep one copy.
-  return encodeBase64url(bytes);
-}
-
-/**
- * Adds a pass onto a running total.
- *
- * The work counters add up, because they count things that happened. The state
- * counters do not: `unchanged`, `waiting`, `retrying` and `skipped` describe how
- * the vault looks at the end of a pass, and summing them would report one
- * unchanged file four times for having been looked at four times.
- */
-export function accumulate(total: SyncReport, pass: SyncReport): SyncReport {
-  return {
-    uploaded: total.uploaded + pass.uploaded,
-    downloaded: total.downloaded + pass.downloaded,
-    merged: total.merged + pass.merged,
-    conflicted: total.conflicted + pass.conflicted,
-    deletedLocally: total.deletedLocally + pass.deletedLocally,
-    deletedRemotely: total.deletedRemotely + pass.deletedRemotely,
-    restored: total.restored + pass.restored,
-    foldersCreated: total.foldersCreated + pass.foldersCreated,
-    chunksSent: total.chunksSent + pass.chunksSent,
-    bytesSent: total.bytesSent + pass.bytesSent,
-    unchanged: pass.unchanged,
-    waiting: pass.waiting,
-    retrying: pass.retrying,
-    skipped: pass.skipped,
-    blocked: pass.blocked,
-    // A state, like the four above it: the newest pass's answer, not every
-    // pass's answers concatenated.
-    inTheWay: pass.inTheWay,
-  };
 }
 
 /** Whether a pass did anything that could produce more work. */

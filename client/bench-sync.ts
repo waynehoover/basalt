@@ -25,7 +25,9 @@ import { join } from "node:path";
 import { cpus, totalmem } from "node:os";
 
 import { Client } from "./src/core/client.ts";
-import { authToken, deriveKeys } from "./src/core/crypto.ts";
+import { authToken, deriveRootKeys } from "./src/core/crypto.ts";
+import { testWrapped } from "./src/core/test-keys.ts";
+
 import { TestServer, serverBinary } from "./src/core/test-server.ts";
 import { LatencyProxy, type Wire } from "./src/core/latency.ts";
 import { JsonIndexStore, NodeVault } from "./src/cli/vault.ts";
@@ -191,7 +193,7 @@ async function run(wire: Wire) {
   await server.start();
   const proxy = new LatencyProxy("127.0.0.1", server.port, wire);
   await proxy.start();
-  const keys = await deriveKeys(new Uint8Array(20).fill(31));
+  const secret = new Uint8Array(32).fill(31);
   const dirs: string[] = [];
   const clients: Client[] = [];
 
@@ -201,9 +203,9 @@ async function run(wire: Wire) {
     const c = new Client({
       vault: new NodeVault(dir),
       store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-      keys,
+      secret,
       url: proxy.url,
-      ...server.credentials(authToken(keys)),
+      ...server.credentials(authToken(await deriveRootKeys(secret)), await testWrapped(secret)),
       vaultId: "default",
       device: name,
       timeoutMs: 120_000,

@@ -10,7 +10,8 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "../core/client.ts";
-import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
+import { authToken, type VaultKeys } from "../core/crypto.ts";
+import { testKeys, testWrapped } from "../core/test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
 import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
@@ -18,14 +19,16 @@ import { App, notices } from "./stub.ts";
 import type { Version } from "../core/client.ts";
 import { HistoryModal, PAGE, diffLines, type HistorySource } from "./history.ts";
 
-const SECRET = new Uint8Array(20).fill(91);
+const SECRET = new Uint8Array(32).fill(91);
 let keys: VaultKeys;
+let wrapped: string;
 let server: TestServer;
 const clients: Client[] = [];
 
 beforeAll(async () => {
   await serverBinary();
-  keys = await deriveKeys(SECRET);
+  keys = await testKeys(SECRET);
+  wrapped = await testWrapped(SECRET);
 }, 180_000);
 
 afterAll(async () => {
@@ -46,9 +49,9 @@ async function device(): Promise<{ adapter: FakeAdapter; client: Client; source:
   const client = new Client({
     vault: new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian"),
     store: new ObsidianIndexStore(adapter, ".obsidian/plugins/basalt/index.json"),
-    keys,
+    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys)),
+    ...server.credentials(authToken(keys), wrapped),
     vaultId: "default",
     device: "laptop",
     timeoutMs: 20_000,
@@ -283,7 +286,7 @@ it("names the note whose history it is showing", async () => {
 });
 
 /**
- * P6 in TODO.md. `diffLines` was a set difference of the two line lists, so
+ * review finding P6. `diffLines` was a set difference of the two line lists, so
  * anything a set cannot see, a duplicate removed or two paragraphs swapped,
  * came out as "No difference", and somebody deciding whether to restore was
  * told two versions were the same when they were not.
@@ -310,7 +313,7 @@ describe("the line diff (P6)", () => {
 });
 
 /**
- * P19 in TODO.md. Reading a version is a round trip and two clicks start two.
+ * review finding P19. Reading a version is a round trip and two clicks start two.
  * The one that finished last used to win the pane, so the list said B, Restore
  * restored B, and the text on screen was A.
  */

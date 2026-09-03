@@ -10,15 +10,19 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client, runForever, type ClientOptions } from "./client.ts";
-import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
+import { authToken, type VaultKeys } from "./crypto.ts";
+import { testKeys, testWrapped } from "./test-keys.ts";
 import type { SyncReport } from "./engine.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
+const SECRET = new Uint8Array(32).fill(21);
 let keys: VaultKeys;
+let wrapped: string;
 beforeAll(async () => {
   await serverBinary();
-  keys = await deriveKeys(new Uint8Array(20).fill(21));
+  keys = await testKeys(SECRET);
+  wrapped = await testWrapped(SECRET);
 }, 180_000);
 afterAll(async () => {
   await cleanupBinary();
@@ -42,9 +46,9 @@ function options(
   return {
     vault,
     store: new MemoryIndexStore(),
-    keys,
+    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys)),
+    ...server.credentials(authToken(keys), wrapped),
     vaultId: "default",
     device: name,
     timeoutMs: 20_000,
@@ -244,7 +248,7 @@ describe("what a shell is handed and when", () => {
 });
 
 /**
- * I2 and C27 in TODO.md. `busy` used to be in the loop's fatal list, so a
+ * I2 and review finding C27. `busy` used to be in the loop's fatal list, so a
  * device refused for the device limit, or told the server was shutting down,
  * stopped for good. The server now says on every error whether reconnecting
  * can help, and the loop has nothing to interpret: retryable goes to backoff,

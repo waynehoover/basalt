@@ -10,14 +10,18 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client, restoredCopyPath } from "./client.ts";
-import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
+import { authToken, type VaultKeys } from "./crypto.ts";
+import { testKeys, testWrapped } from "./test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
+const SECRET = new Uint8Array(32).fill(23);
 let keys: VaultKeys;
+let wrapped: string;
 beforeAll(async () => {
   await serverBinary();
-  keys = await deriveKeys(new Uint8Array(20).fill(23));
+  keys = await testKeys(SECRET);
+  wrapped = await testWrapped(SECRET);
 }, 180_000);
 afterAll(async () => {
   await cleanupBinary();
@@ -39,9 +43,9 @@ async function ready(): Promise<{ client: Client; vault: MemoryVault }> {
   client = new Client({
     vault,
     store: new MemoryIndexStore(),
-    keys,
+    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys)),
+    ...server.credentials(authToken(keys), wrapped),
     vaultId: "default",
     device: "a",
     timeoutMs: 20_000,
@@ -77,7 +81,7 @@ describe("restoring onto an occupied path (C8)", () => {
   }, 120_000);
 
   /**
-   * C17 in TODO.md. The name was checked free and then written to with a
+   * review finding C17. The name was checked free and then written to with a
    * replacing write, so a file appearing in between was replaced by the
    * restore.
    */
@@ -88,9 +92,9 @@ describe("restoring onto an occupied path (C8)", () => {
     client = new Client({
       vault,
       store: new MemoryIndexStore(),
-      keys,
+      secret: SECRET,
       url: server.wsUrl,
-      ...server.credentials(authToken(keys)),
+      ...server.credentials(authToken(keys), wrapped),
       vaultId: "default",
       device: "a",
       timeoutMs: 20_000,

@@ -1,5 +1,5 @@
 /**
- * C28 in TODO.md. A batch the engine cannot apply, an entry that fails its
+ * review finding C28. A batch the engine cannot apply, an entry that fails its
  * authenticator above all, threw out of `acceptBatch`, which ended the
  * session, which the loop read as a dropped connection and retried. The
  * server sent the same batch, the engine threw the same error, and the loop
@@ -10,13 +10,14 @@
 import { describe, expect, it } from "vitest";
 
 import { runForever } from "./client.ts";
-import { deriveKeys, sealPath } from "./crypto.ts";
+import { sealPath } from "./crypto.ts";
+import { testKeys } from "./test-keys.ts";
 import { FakeSocket, RIG_SECRET, ready } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
 describe("a batch no reconnection can get past (C28)", () => {
   it("stops after three identical failures, naming the cursor and the entry", async () => {
-    const keys = await deriveKeys(RIG_SECRET);
+    const keys = await testKeys(RIG_SECRET);
     const forged = {
       uid: 1,
       path: await sealPath(keys, "note.md"),
@@ -38,7 +39,6 @@ describe("a batch no reconnection can get past (C28)", () => {
       {
         vault: new MemoryVault(),
         store: new MemoryIndexStore(),
-        keys,
         secret: RIG_SECRET,
         url: "ws://test",
         token: "t",
@@ -83,14 +83,13 @@ describe("a batch no reconnection can get past (C28)", () => {
     // Only the same failure three times running is a wall. A connection
     // that drops with a different reason each time is a network, and a
     // network is retried for as long as the shell says.
-    const keys = await deriveKeys(RIG_SECRET);
     let attempt = 0;
     let fatal: Error | undefined;
     await runForever(
       {
         vault: new MemoryVault(),
         store: new MemoryIndexStore(),
-        keys,
+        secret: RIG_SECRET,
         url: "ws://test",
         token: "t",
         vaultId: "v",

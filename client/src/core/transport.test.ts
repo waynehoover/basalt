@@ -184,14 +184,15 @@ describe("the handshake", () => {
   });
 
   /**
-   * I9 in TODO.md. A server that speaks only protocol 2 refuses a protocol 3
-   * hello in the protocol 2 shape: no id, no retryable, a message naming its
-   * own range. The client has to turn that into a sentence naming both ends
-   * and the one thing to do about it, because the upgrade order is the
+   * review finding I9. A server that does not speak this client's protocol
+   * refuses the hello before it knows anything about who is asking, so the
+   * refusal carries no id and no `retryable`, only a message naming the
+   * server's own range. The client turns that into a sentence naming both
+   * ends and the one thing to do about it, because the upgrade order is the
    * server first and a person reading "protocol 3 not supported" on their
    * phone has no way to know which end is behind.
    */
-  it("names both versions when an older server refuses, and says which end to upgrade", async () => {
+  it("names both versions when a server refuses the protocol, and says which end to upgrade", async () => {
     const { t, socket } = await connected();
     const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
     socket.raw({
@@ -220,12 +221,12 @@ describe("the handshake", () => {
     expect(socket.sentText[0]!["id"]).toBe(1);
   });
 
-  it("reads every ceiling ready carries, and the wrapped key when there is one", async () => {
+  it("reads every ceiling ready carries, and the wrapped key", async () => {
     const { t, socket } = await connected();
     const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
     socket.reply(
       ready({
-        minProto: 2,
+        minProto: 3,
         serverVersion: "1.2.3",
         maxBatchBytes: 1234,
         maxFetchBytes: 5678,
@@ -234,7 +235,7 @@ describe("the handshake", () => {
     );
     expect(await hello).toMatchObject({
       proto: 3,
-      minProto: 2,
+      minProto: 3,
       serverVersion: "1.2.3",
       maxBatchBytes: 1234,
       maxFetchBytes: 5678,
@@ -243,15 +244,103 @@ describe("the handshake", () => {
     expect(t.serverLimits?.maxBatchBytes).toBe(1234);
   });
 
-  it("leaves wrapped out for a vault that has no data key", async () => {
-    const { t, socket } = await connected();
-    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
-    socket.reply(ready());
-    expect("wrapped" in (await hello)).toBe(false);
+  /**
+   * C40. Every vault has a data key, so a `ready` without one is not a second
+   * kind of vault: it is a server telling this device to derive its content
+   * keys some other way, and the only other way was from the root. A device
+   * that accepted it would seal its notes under keys no other device on the
+   * vault derives, and both ends would report success. Refused here, before
+   * a path is sealed, and the session ends.
+   */
+  it("ends the session on a ready with no wrapped data key", async () => {
+    for (const missing of [{ wrapped: undefined }, { wrapped: "" }]) {
+      const { t, socket } = await connected();
+      const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+      socket.reply(ready(missing));
+      await expect(hello).rejects.toMatchObject({ code: "protostate" });
+      await expect(hello).rejects.toThrow(/no wrapped data key/);
+      expect(t.isClosed, "carried on without the vault's keys").toBe(true);
+    }
   });
 
   /**
-   * I6 in TODO.md. Both names land in the server's log and on every entry
+   * The pin. `ready.wrapped` used to be believed on the grounds that it
+   * unwrapped under this root, and the client handed the server a freshly
+   * wrapped candidate on every hello, claimed vault or not. A hostile server
+   * could echo that candidate back as the vault's own: it unwraps perfectly,
+   * the device installs a schedule no other device on the vault derives, and
+   * the server has split the vault in two without learning a key. Nothing on
+   * the wire tells that from the real blob, so what tells it is having seen the
+   * real blob before.
+   */
+  it("refuses a ready whose wrapped key is not the one this device saw before", async () => {
+    for (const [why, answered] of [
+      ["the wrapping it was just handed with the claim", "ECHOED-CLAIM"],
+      ["some other blob entirely", "SOMETHING-ELSE"],
+    ] as const) {
+      const { t, socket } = await connected();
+      const hello = t.hello({
+        vault: "v",
+        token: "t",
+        device: "d",
+        cursor: 0,
+        claim: { auth: "AUTH", wrapped: "ECHOED-CLAIM" },
+        knownWrapped: "THE-VAULTS-OWN",
+      });
+      socket.reply(ready({ wrapped: answered }));
+      await expect(hello, why).rejects.toMatchObject({ code: "protostate" });
+      await expect(hello, why).rejects.toThrow(/not the one this device saw before/);
+      expect(t.isClosed, why).toBe(true);
+    }
+  });
+
+  it("accepts the ready whose wrapped key is the one it saw before", async () => {
+    const { t, socket } = await connected();
+    const hello = t.hello({
+      vault: "v",
+      token: "t",
+      device: "d",
+      cursor: 0,
+      knownWrapped: "THE-VAULTS-OWN",
+    });
+    socket.reply(ready({ wrapped: "THE-VAULTS-OWN" }));
+    expect((await hello).wrapped).toBe("THE-VAULTS-OWN");
+  });
+
+  it("takes whatever ready says when this device has never seen the vault's key", async () => {
+    // A device on its first connection has no other source, so there is
+    // nothing to check against; what it takes here is what it pins.
+    const { t, socket } = await connected();
+    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    socket.reply(ready({ wrapped: "FIRST-SIGHT" }));
+    expect((await hello).wrapped).toBe("FIRST-SIGHT");
+  });
+
+  it("sends the claim and its wrapped data key together, or neither", async () => {
+    const { t, socket } = await connected();
+    void t
+      .hello({
+        vault: "v",
+        token: "t",
+        device: "d",
+        cursor: 0,
+        claim: { auth: "AUTH", wrapped: "WRAPPED" },
+      })
+      .catch(() => {});
+    await settle();
+    // One argument on the way in, two fields on the wire, and no way to
+    // express a claim that would bind a vault with no data key.
+    expect(socket.sentText[0]).toMatchObject({ claim: "AUTH", wrapped: "WRAPPED" });
+
+    const bare = await connected();
+    void bare.t.hello({ vault: "v", token: "t", device: "d", cursor: 0 }).catch(() => {});
+    await settle();
+    expect("claim" in bare.socket.sentText[0]!).toBe(false);
+    expect("wrapped" in bare.socket.sentText[0]!).toBe(false);
+  });
+
+  /**
+   * review finding I6. Both names land in the server's log and on every entry
    * this device writes; the server refuses over 64 bytes or a control
    * character with `badname` and ends the session. Refused here first, so a
    * bad name is one error at pairing rather than a connection that dies on
@@ -372,7 +461,7 @@ describe("put, against a server that answers oddly", () => {
 });
 
 /**
- * C11 in TODO.md. The ack follows the last body, and a loopback server answers
+ * review finding C11. The ack follows the last body, and a loopback server answers
  * inside the same tick as the send. A waiter installed after the bodies went
  * out found the answer already there, and with no waiter in place a valid
  * acknowledgement read as a reply nobody asked for and closed the connection.
@@ -542,7 +631,16 @@ describe("errors", () => {
   });
 
   it("knows which codes end a session", () => {
-    for (const code of ["proto", "auth", "cursor", "busy", "protostate", "nospace", "internal"]) {
+    for (const code of [
+      "proto",
+      "auth",
+      "cursor",
+      "busy",
+      "protostate",
+      "nospace",
+      "internal",
+      "rotated",
+    ]) {
       expect(new ProtocolError(code, "x").endsSession, code).toBe(true);
     }
     for (const code of ["badentry", "badname", "toolarge", "nouid", "nocontent", "nochunk"]) {
@@ -551,7 +649,7 @@ describe("errors", () => {
   });
 
   /**
-   * I2 in TODO.md. Whether a loop retries is the server's `retryable`, read
+   * review finding I2. Whether a loop retries is the server's `retryable`, read
    * off the frame, and the code table stands in only for an error that
    * arrived before the protocol was settled and so has no field.
    */
@@ -601,7 +699,7 @@ describe("errors", () => {
   });
 
   /**
-   * C26 in TODO.md. On shutdown the server sends every idle session
+   * review finding C26. On shutdown the server sends every idle session
    * `{res:"err", code:"busy"}` and then closes it. Read as a stray reply this
    * was a protocol violation, so every plugin attached to a restarting server
    * went to "stopped" instead of waiting for it to come back.
@@ -685,7 +783,7 @@ describe("errors", () => {
   });
 
   /**
-   * I1 in TODO.md. Two requests in flight used to be refused, because a
+   * review finding I1. Two requests in flight used to be refused, because a
    * reply was matched to the one request in flight by position. Every reply
    * now echoes the id it answers, so the answers can arrive in any order and
    * each caller gets its own.
@@ -772,7 +870,7 @@ describe("errors", () => {
 });
 
 /**
- * C31 in TODO.md. `connect` waited for the socket to open with no deadline, so
+ * review finding C31. `connect` waited for the socket to open with no deadline, so
  * a server that accepted the TCP connection and never completed the handshake,
  * or a firewall that swallowed it, left the client hanging for as long as the
  * platform cared to wait, and the CLI held the vault's lock for the whole of it.
@@ -874,7 +972,7 @@ describe("bodies", () => {
   });
 
   /**
-   * C34 in TODO.md. Under protocol 2 a fetch was answered in bare bodies, so
+   * review finding C34. A fetch was once answered in bare bodies, so
    * a body left over from a refused one was consumed as the answer to the
    * next. The `bodies` header removes the class: a fetch is answered by the
    * header and exactly that many frames, or by an error and none, so there
@@ -922,7 +1020,7 @@ describe("bodies", () => {
 });
 
 /**
- * C24 in TODO.md. Success replies were read leniently: a missing or non-numeric
+ * review finding C24. Success replies were read leniently: a missing or non-numeric
  * uid became zero and was committed to the index as a version, and a `want`
  * with a malformed member dropped it and carried on. Every field a reply is
  * acted on has one shape, and anything else ends the session.
@@ -1433,7 +1531,7 @@ describe("a batch frame that cannot be trusted", () => {
 });
 
 /**
- * I3 in TODO.md. `ready` carries two caps on a batched write, the encoded
+ * review finding I3. `ready` carries two caps on a batched write, the encoded
  * frame and the summed ciphertext budget, and one on a fetch. The engine used
  * a constant of its own, so a server advertising something smaller was ignored
  * and the batch refused with `toolarge`, which the engine reads as permanent

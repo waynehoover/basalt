@@ -1,5 +1,5 @@
 /**
- * C23 in TODO.md. Both index stores handed back any valid JSON, and the engine
+ * review finding C23. Both index stores handed back any valid JSON, and the engine
  * spread it into state through casts. What follows is the corpus of shapes
  * that used to be accepted and are now refused, each with the field named.
  */
@@ -10,7 +10,6 @@ import { Engine } from "./engine.ts";
 import { validateStoredState } from "./stored-state.ts";
 import type { Transport } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault, type StoredState } from "./vault.ts";
-import { deriveKeys } from "./crypto.ts";
 
 const chunk = "ab".repeat(32);
 const remoteA = () => good().remote["a.md"] as Record<string, unknown>;
@@ -129,7 +128,6 @@ describe("what a saved index must look like (C23)", () => {
   it("stops the engine before it changes any state", async () => {
     const store = new MemoryIndexStore();
     await store.save({ ...good(), cursor: -3 } as StoredState);
-    const keys = await deriveKeys(new Uint8Array(20).fill(1));
     let helloed = false;
     const transport = {
       hello: async () => (
@@ -140,7 +138,7 @@ describe("what a saved index must look like (C23)", () => {
     const engine = new Engine({
       vault: new MemoryVault(),
       store,
-      keys,
+      secret: new Uint8Array(32).fill(1),
       transport,
       device: "d",
       vaultId: "v",

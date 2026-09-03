@@ -12,22 +12,11 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import type { Client } from "../core/client.ts";
-import type { VaultKeys } from "../core/crypto.ts";
 import { cleanupBinary, serverBinary, TestServer } from "../core/test-server.ts";
-import {
-  buildVault,
-  device,
-  differences,
-  fingerprint,
-  settle,
-  suiteKeys,
-  tidy,
-} from "./harness.ts";
+import { buildVault, device, differences, fingerprint, settle, tidy } from "./harness.ts";
 
-let keys: VaultKeys;
 beforeAll(async () => {
   await serverBinary();
-  keys = await suiteKeys();
 }, 300_000);
 afterAll(async () => await cleanupBinary());
 
@@ -48,10 +37,10 @@ describe("forty edits made on two devices at once", () => {
   it("keeps every one of them, on both devices", async () => {
     server = new TestServer();
     await server.start();
-    const a = await device(server, keys, "a", dirs, open);
+    const a = await device(server, "a", dirs, open);
     await buildVault(a.dir, 40);
     await settle([a]);
-    const b = await device(server, keys, "b", dirs, open);
+    const b = await device(server, "b", dirs, open);
     await settle([b]);
 
     // Twenty notes, edited on both, neither having seen the other. Half append
@@ -91,12 +80,12 @@ describe("two devices rewriting the same sentence", () => {
   it("keeps both versions rather than picking one", async () => {
     server = new TestServer();
     await server.start();
-    const a = await device(server, keys, "a", dirs, open);
+    const a = await device(server, "a", dirs, open);
     for (let i = 1; i <= 10; i++) {
       await writeFile(join(a.dir, `note-${i}.md`), `The original sentence ${i}.\nA second line.\n`);
     }
     await settle([a]);
-    const b = await device(server, keys, "b", dirs, open);
+    const b = await device(server, "b", dirs, open);
     await settle([b]);
 
     for (let i = 1; i <= 10; i++) {

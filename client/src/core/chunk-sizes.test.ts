@@ -1,5 +1,5 @@
 /**
- * I8 in TODO.md. The small-file question was measured and decided: keep
+ * review finding I8. The small-file question was measured and decided: keep
  * chunking as it is, no whole-file fast path. docs/compared.md, "A whole-file
  * fast path for small notes", records the numbers. This pins the constants
  * that decision rests on, because changing any of them renames every chunk in

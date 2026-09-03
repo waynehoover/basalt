@@ -58,26 +58,16 @@ const TAG_BITS = 128;
 export const SEAL_OVERHEAD = NONCE_LENGTH + TAG_BITS / 8 + 1;
 
 /**
- * Root secret length in bytes, for a secret made now.
+ * Root secret length in bytes. Thirty-two, and only thirty-two.
  *
- * Thirty-two. It was twenty, which is enough through HKDF-SHA256 and unusual
- * enough that everyone reading it asked whether it was a truncation bug, so
- * pairing format 3 carries thirty-two and format 2 strings with their twenty
- * are accepted for as long as the project exists. Both lengths are legal for
- * every key derivation here; which schedule a vault uses is decided by the
- * server's `ready`, never by the length of the secret.
+ * It was twenty before protocol 3, which is enough through HKDF-SHA256 and
+ * unusual enough that everyone reading it asked whether it was a truncation
+ * bug. Nothing produces or accepts one now: a pairing string carries this
+ * length or it is refused.
  */
 export const SECRET_LENGTH = 32;
 
-/** The root secret length a `basalt2_` pairing string carries. Still accepted. */
-export const LEGACY_SECRET_LENGTH = 20;
-
-/** Whether a root secret is one of the two lengths a pairing string can carry. */
-export function isSecretLength(n: number): boolean {
-  return n === SECRET_LENGTH || n === LEGACY_SECRET_LENGTH;
-}
-
-/** The data key length in bytes: what every content key derives from on a protocol 3 vault. */
+/** The data key length in bytes: what every content key derives from. */
 export const DATA_KEY_LENGTH = 32;
 
 import { deflateSync, inflateSync } from "fflate";
@@ -103,27 +93,29 @@ const INFO = {
 } as const;
 
 /**
- * The keys derived from one root secret.
+ * The two keys the root secret produces on its own.
+ *
+ * All a device has before the handshake, and all it needs there: `auth` to
+ * prove it may connect, `wrap` to open the vault's data key when the server
+ * hands it over. Nothing here seals a path or a chunk, which is the point.
+ * Rotation replaces exactly these two.
+ */
+export interface RootKeys {
+  /** Sent to the server, which stores only a hash of it. */
+  readonly auth: Uint8Array;
+  /** Wraps the data key, and unwraps it again on every device holding the root. */
+  readonly wrap: CryptoKey;
+}
+
+/**
+ * Every key a device uses: the root's two, and the four the data key gives.
  *
  * `auth` is raw bytes because it goes on the wire; the others are CryptoKeys
  * because they must not. WebCrypto is asked for non-extractable keys, so the
  * content key cannot be read back out of this object even by our own code,
  * which is one fewer way for it to end up somewhere it should not be.
  */
-export interface VaultKeys {
-  /** Sent to the server, which stores only a hash of it. */
-  readonly auth: Uint8Array;
-  /**
-   * Wraps the data key. Derived from the root secret alone, like `auth`, so
-   * the two are all that changes when the root is rotated.
-   */
-  readonly wrap: CryptoKey;
-  /**
-   * Whether the four content keys below derive from a data key rather than
-   * from the root. A vault claimed under protocol 3 has one; a vault claimed
-   * under protocol 2 does not, and for it rotation is a new vault.
-   */
-  readonly hasDataKey: boolean;
+export interface VaultKeys extends RootKeys {
   /** Seals paths. Deterministic, and reversible: a device must recover the name. */
   readonly path: CryptoKey;
   /** Seals chunk bodies. */
@@ -176,8 +168,8 @@ export function randomBytes(n: number): Uint8Array {
 }
 
 /**
- * Derives every key a device needs from its root secret, and the vault's
- * wrapped data key when it has one.
+ * Derives every key a device needs, from its root secret and the vault's
+ * wrapped data key.
  *
  * The secret is used as HKDF input keying material directly, with no password
  * stretching, because it is random rather than something a human chose. A
@@ -189,25 +181,27 @@ export function randomBytes(n: number): Uint8Array {
  * string is doing the domain separation and a salt would be one more value to
  * transport, store and lose.
  *
- * Two keys always come from the root: `auth`, which the server stores a hash
- * of, and `wrap`. Where the content keys come from depends on `wrapped`. With
- * it, the root unwraps the vault's data key and the four content keys derive
- * from that, which is what lets a leaked root be rotated without the history
- * going with it. Without it the four derive from the root, as every protocol 2
- * vault's do. Which applies is the server's to say, in `ready`, and never the
- * pairing string's.
+ * `auth` and `wrap` come from the root. Everything that touches content comes
+ * from the data key the root unwraps, which is what lets a leaked root be
+ * rotated without the history going with it. `wrapped` is required because
+ * every vault has a data key: when it was optional, a server could put a
+ * device on the root-derived schedule by leaving it out of `ready`, and that
+ * device sealed its notes under keys no other device would ever derive.
  */
-export async function deriveKeys(secret: Uint8Array, wrapped?: string): Promise<VaultKeys> {
-  const root = await deriveRoot(secret);
-  if (wrapped === undefined) {
-    return { ...root, hasDataKey: false, ...(await deriveSchedule(secret)) };
-  }
+export async function deriveKeys(secret: Uint8Array, wrapped: string): Promise<VaultKeys> {
+  const root = await deriveRootKeys(secret);
   const data = await unwrapDataKey(root.wrap, wrapped);
-  return { ...root, hasDataKey: true, ...(await deriveSchedule(data)) };
+  return { ...root, ...(await deriveSchedule(data)) };
 }
 
-/** The two keys that come from the root and nothing else. */
-async function deriveRoot(secret: Uint8Array): Promise<{ auth: Uint8Array; wrap: CryptoKey }> {
+/**
+ * The two keys that come from the root and nothing else.
+ *
+ * What a device can derive before it has spoken to the server: enough to
+ * authenticate and to unwrap what `ready` returns, and not enough to seal
+ * anything. A shell derives these, connects, and gets the rest.
+ */
+export async function deriveRootKeys(secret: Uint8Array): Promise<RootKeys> {
   const { s, ikm, hkdf } = await ikmOf(secret);
   const [auth, wrap] = await Promise.all([
     s.deriveBits(hkdf(INFO.auth), ikm, 256),
@@ -219,19 +213,18 @@ async function deriveRoot(secret: Uint8Array): Promise<{ auth: Uint8Array; wrap:
   return { auth: new Uint8Array(auth), wrap };
 }
 
-/** The four content keys, from whichever root the schedule hangs off. */
-type Schedule = Pick<VaultKeys, "path" | "content" | "nonce" | "meta">;
+/** The four keys that seal a vault's content, all from the data key. */
+export type Schedule = Pick<VaultKeys, "path" | "content" | "nonce" | "meta">;
 
 /**
- * The content key schedule, from one root.
+ * The content key schedule, from the vault's data key.
  *
- * One function for both cases on purpose: a protocol 2 vault hands it the root
- * secret and a protocol 3 vault hands it the data key, and the info strings
- * are the same either way. Two copies of this would be two chances for the
- * two kinds of vault to disagree about how a path is sealed.
+ * Separate from `deriveKeys` because the golden vectors in
+ * compression-golden.ts pin the sealed bytes for a fixed key and need to
+ * derive that schedule without a root secret or a wrapping in front of it.
  */
-export async function deriveSchedule(root: Uint8Array): Promise<Schedule> {
-  const { s, ikm, hkdf } = await ikmOf(root);
+export async function deriveSchedule(dataKey: Uint8Array): Promise<Schedule> {
+  const { s, ikm, hkdf } = await ikmOf(dataKey);
   const [path, content, nonce, meta] = await Promise.all([
     s.deriveKey(hkdf(INFO.path), ikm, { name: "AES-GCM", length: 256 }, false, [
       "encrypt",
@@ -250,9 +243,12 @@ export async function deriveSchedule(root: Uint8Array): Promise<Schedule> {
 /** HKDF input keying material and the parameter builder, for the two derivations above. */
 async function ikmOf(root: Uint8Array) {
   if (root.length < 16) {
-    // A short secret is a bug somewhere upstream, and silently accepting it
-    // would produce a vault that looks encrypted and is not.
-    throw new Error(`root secret is ${root.length} bytes, need at least 16`);
+    // The last guard rather than the first: a pairing string, a stored config
+    // and an unsealed invite each refuse anything but SECRET_LENGTH, and a
+    // data key is checked when it is unwrapped. What is left for this to
+    // catch is keying material truncated in transit between those checks,
+    // which would produce a vault that looks encrypted and is not.
+    throw new Error(`keying material is ${root.length} bytes, need at least 16`);
   }
   const s = subtle();
   const ikm = await s.importKey("raw", toBuffer(root), "HKDF", false, ["deriveKey", "deriveBits"]);
@@ -327,9 +323,9 @@ export async function unsealSecret(inviteKey: Uint8Array, sealed: string): Promi
       cause,
     });
   }
-  if (!isSecretLength(secret.length)) {
+  if (secret.length !== SECRET_LENGTH) {
     throw new Error(
-      `the invite unsealed to a ${secret.length} byte secret, which is not a root secret`,
+      `the invite unsealed to a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH} bytes`,
     );
   }
   return secret;
@@ -343,9 +339,23 @@ async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
   ]);
 }
 
-/** AES-GCM with a random nonce in front, for the two places determinism buys nothing. */
-async function sealRandom(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
-  const nonce = randomBytes(NONCE_LENGTH);
+/**
+ * AES-GCM under a nonce the caller chose, with that nonce in front.
+ *
+ * Output is `nonce(12) || ciphertext || tag(16)`, so the overhead is 28 bytes
+ * flat. The nonce is prepended rather than recomputed on open, because opening
+ * would need the plaintext to recompute it and the plaintext is what it is
+ * trying to produce.
+ *
+ * Choosing the nonce is the only thing the two callers below disagree about,
+ * and it is the whole of the difference between them, so it is the only thing
+ * they are left doing.
+ */
+async function sealUnder(
+  key: CryptoKey,
+  nonce: Uint8Array,
+  plaintext: Uint8Array,
+): Promise<Uint8Array> {
   const sealed = await subtle().encrypt(
     { name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS },
     key,
@@ -357,30 +367,18 @@ async function sealRandom(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8A
   return out;
 }
 
-/**
- * Seals bytes: deterministic, authenticated, reversible.
- *
- * Output is `nonce(12) || ciphertext || tag(16)`, so the overhead is 28 bytes
- * flat. The nonce is prepended rather than recomputed on open, because opening
- * would need the plaintext to recompute it and the plaintext is what it is
- * trying to produce.
- */
+/** A random nonce, for the two places determinism buys nothing. */
+function sealRandom(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+  return sealUnder(key, randomBytes(NONCE_LENGTH), plaintext);
+}
+
+/** Seals bytes: deterministic, authenticated, reversible. */
 export async function seal(
   key: CryptoKey,
   nonceKey: CryptoKey,
   plaintext: Uint8Array,
 ): Promise<Uint8Array> {
-  const s = subtle();
-  const nonce = await syntheticNonce(nonceKey, plaintext);
-  const sealed = await s.encrypt(
-    { name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS },
-    key,
-    toBuffer(plaintext),
-  );
-  const out = new Uint8Array(NONCE_LENGTH + sealed.byteLength);
-  out.set(nonce, 0);
-  out.set(new Uint8Array(sealed), NONCE_LENGTH);
-  return out;
+  return sealUnder(key, await syntheticNonce(nonceKey, plaintext), plaintext);
 }
 
 /**
@@ -482,7 +480,7 @@ const CHUNK_DEFLATE = 1;
  * A chunk that does not shrink is stored raw. The result is never larger than
  * the plaintext plus 29 bytes.
  */
-export async function sealChunk(keys: VaultKeys, chunk: Uint8Array): Promise<Uint8Array> {
+export async function sealChunk(keys: Schedule, chunk: Uint8Array): Promise<Uint8Array> {
   const deflated = worthDeflating(chunk) ? deflateSync(chunk, { level: 6 }) : undefined;
   const useDeflate = deflated !== undefined && deflated.length < chunk.length;
   const payload = useDeflate ? deflated : chunk;
@@ -602,8 +600,20 @@ export async function chunkName(sealedChunk: Uint8Array): Promise<string> {
   return hex(new Uint8Array(digest));
 }
 
-/** The auth token as it goes on the wire. */
-export function authToken(keys: VaultKeys): string {
+/**
+ * Whether a string has the shape `chunkName` produces, and nothing else has.
+ *
+ * Beside the function that makes one, because the shape is that function's
+ * output and nothing else. Three readers check it: a `get`, a recovery list
+ * (C32) and the stored index. Each one is about to fetch by the name or key
+ * something on it, and each had the pattern written out again.
+ */
+export function isChunkName(v: unknown): v is string {
+  return typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
+}
+
+/** The auth token as it goes on the wire. Derived from the root, so a device has it before it connects. */
+export function authToken(keys: RootKeys): string {
   return base64urlEncode(keys.auth);
 }
 
@@ -669,6 +679,21 @@ const B64URL_INDEX = (() => {
   return m;
 })();
 
+/**
+ * Decodes base64url, refusing anything that is not exactly one encoding of the
+ * bytes it produces.
+ *
+ * The two refusals at the end are what make the total-failure contract above
+ * hold, and both were once accepted. A length leaving six unconsumed bits is a
+ * string with one character too many: those six bits produce no output byte, so
+ * a recovery key or an invite with a character appended decoded to the original
+ * bytes and passed its CRC, and a damaged credential was taken for the real
+ * one. Nonzero bits below the last output byte are the same fault in the other
+ * direction: the low bits of a final partial sextet are not read, so they could
+ * be flipped without changing a byte, and the checksum never saw the difference.
+ *
+ * A canonical encoder never produces either, so nothing legitimate is refused.
+ */
 export function base64urlDecode(s: string): Uint8Array {
   const n = s.length;
   const out = new Uint8Array(Math.floor((n * 3) / 4));
@@ -691,6 +716,18 @@ export function base64urlDecode(s: string): Uint8Array {
       bits -= 8;
       out[o++] = (acc >> bits) & 0xff;
     }
+  }
+  if (bits === 6) {
+    throw new Error(
+      `this base64url value is ${n} characters, which is one more than a whole number of bytes: ` +
+        "the last character adds no byte and something has been added to it or lost from it",
+    );
+  }
+  if (bits > 0 && (acc & ((1 << bits) - 1)) !== 0) {
+    throw new Error(
+      `this base64url value ends with ${bits} bits that no byte uses, and they are not zero, ` +
+        "so it is not the encoding of the bytes it decodes to",
+    );
   }
   return out.subarray(0, o);
 }

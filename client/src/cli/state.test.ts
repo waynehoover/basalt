@@ -1,7 +1,7 @@
 /**
  * The vault's state directory under contention and under failure.
  *
- * C12 and C13 in TODO.md. Two processes on one vault each loaded the index,
+ * C12 and review finding C13. Two processes on one vault each loaded the index,
  * decided from it, and wrote notes, config and index over each other from
  * state the other never saw; and an unlink removed the config before the
  * index, so a failure in between left a vault that read as unpaired while an
@@ -269,7 +269,7 @@ describe("unlinking as one transition (C13)", () => {
 });
 
 /**
- * C23 in TODO.md, at the CLI. The index on disk is valid JSON and nothing
+ * review finding C23, at the CLI. The index on disk is valid JSON and nothing
  * else, and both `sync` and `status` used to read numbers out of it.
  */
 describe("an index that is valid JSON and wrong (C23)", () => {
@@ -290,7 +290,7 @@ describe("an index that is valid JSON and wrong (C23)", () => {
 });
 
 /**
- * C15 in TODO.md. The claim and the removal of the spent bootstrap are two
+ * review finding C15. The claim and the removal of the spent bootstrap are two
  * writes, and the second can fail. Left as it was, the next run offered the
  * spent bootstrap first, was refused with `auth`, and gave up: a vault this
  * device had claimed, refusing this device for ever.
@@ -319,7 +319,7 @@ describe("a bootstrap that was spent but not forgotten (C15)", () => {
     failSavesAfter = saves; // the very next save fails
     const attempt = await cli("sync", "--dir", dir);
     expect(attempt.code).toBe(1);
-    expect(attempt.all).toMatch(/claimed but the spent bootstrap could not be removed/);
+    expect(attempt.all).toMatch(/claimed but .* could not be brought up to date/);
     expect((await loadConfig(dir))!.bootstrap).toBe(server!.token);
 
     failSavesAfter = Infinity;
@@ -335,7 +335,7 @@ describe("a bootstrap that was spent but not forgotten (C15)", () => {
     failSavesAfter = 1; // the first save, with the bootstrap, succeeds; the one after the claim fails
     const init = await cli("init", server.setup, "--dir", dir, "--device", "init");
     expect(init.code).toBe(1);
-    expect(init.all).toMatch(/could not be removed/);
+    expect(init.all).toMatch(/could not be brought up to date/);
     expect((await loadConfig(dir))!.bootstrap).toBe(server.token);
 
     failSavesAfter = Infinity;

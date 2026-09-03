@@ -6,11 +6,12 @@
  * with yesterday's? The first is what "dedup" sounds like and the second is
  * what pays for the machinery.
  */
-import { deriveKeys, sealChunks } from "../core/crypto.ts";
+import { sealChunks } from "../core/crypto.ts";
+import { testKeys } from "../core/test-keys.ts";
 import { chunkBytes, sizesFor } from "../core/chunk.ts";
 
 const enc = new TextEncoder();
-const keys = await deriveKeys(new Uint8Array(20).fill(7));
+const keys = await testKeys(new Uint8Array(32).fill(7));
 
 async function namesOf(text: string): Promise<string[]> {
   const bytes = enc.encode(text);

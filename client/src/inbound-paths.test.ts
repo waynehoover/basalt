@@ -80,7 +80,7 @@ describe("the headless client refuses to write where it would never read", () =>
   });
 
   /**
-   * T4 in TODO.md: the contract is that any dot-prefixed segment never syncs,
+   * review finding T4: the contract is that any dot-prefixed segment never syncs,
    * in either direction, in both clients. Obsidian's own index never lists
    * one, so a headless client that accepted `.obsidian-notes/n.md` from a
    * peer would hold a file it could never report, and report it deleted.

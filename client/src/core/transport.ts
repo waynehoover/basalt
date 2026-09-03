@@ -19,15 +19,15 @@
  *     ends desync. Obsidian rejects and disconnects; so does this.
  *
  * The third, one promise slot resolved by the next reply that is not a
- * notification, is what protocol 2 did and what protocol 3 removes. Matching a
- * reply to a request by position produced three separate defects here: an
- * acknowledgement arriving from inside the last `send`, before its waiter was
- * armed, read as a reply nobody asked for (C11); a shutdown notice read as a bad
- * reply (C26); and the bodies of a refused fetch consumed as the answer to the
- * next one (C34). Every request now carries an `id` and every reply echoes it,
- * so a reply is matched to its request by name and a reply with no name is a
- * notification or the reason the connection is closing. docs/protocol.md,
- * "Request ids".
+ * notification, is what this transport used to do and what request ids
+ * removed. Matching a reply to a request by position produced three separate
+ * defects here: an acknowledgement arriving from inside the last `send`,
+ * before its waiter was armed, read as a reply nobody asked for (C11); a
+ * shutdown notice read as a bad reply (C26); and the bodies of a refused fetch
+ * consumed as the answer to the next one (C34). Every request now carries an
+ * `id` and every reply echoes it, so a reply is matched to its request by name
+ * and a reply with no name is a notification or the reason the connection is
+ * closing. docs/protocol.md, "Request ids".
  *
  * And one thing every client of this protocol has to do, which is worth saying
  * plainly because the first two written against it got it wrong: **replies are
@@ -36,19 +36,18 @@
  * next frame is its reply will read a batch as an answer and hang.
  */
 
-import { CRYPTO_SUITE, chunkName } from "./crypto.ts";
+import { CRYPTO_SUITE, chunkName, isChunkName } from "./crypto.ts";
 
 /**
  * The protocol version this client speaks. A mismatch is refused, not negotiated.
  *
- * 2 added the per-entry authenticator. Before it, everything a client acted on
- * except the bytes themselves travelled unsigned, so a server could say anything
- * about any file whose sealed path it held, which is all of them.
+ * Three, and nothing else: request ids, the `bodies` header on a fetch,
+ * `retryable` on every error, the per-entry authenticator, the batch and fetch
+ * caps in `ready`, the wrapped data key, invites and `rotate`. Every earlier
+ * version was withdrawn before anyone was running one.
  *
- * 3 added request ids, the `bodies` header on a fetch, `retryable` on every
- * error, the batch and fetch caps in `ready`, the wrapped data key, invites
- * and `rotate`. This client speaks 3 only; a server that speaks only 2 refuses
- * the hello and the refusal says to upgrade the server first.
+ * The number still travels, and a mismatch still names both ends and the
+ * server's version, because that is how the next upgrade gets diagnosed.
  */
 export const PROTO = 3;
 
@@ -84,17 +83,39 @@ export function entryBudget(size: number, chunkCount: number): number {
 
 /** An entry as it arrives from the server. Paths and chunk names are sealed. */
 export interface WireDeletion extends WireEntry {
-  /** The newest version with content, or 0 when purge has taken them all. */
-  readonly restorable: number;
+  /**
+   * The newest version with content, or 0 when purge has taken them all.
+   *
+   * Optional because nothing validates it, and the reader defaults it to 0.
+   * Declared required, the default read as dead code and the type read as a
+   * promise the parser does not keep.
+   */
+  readonly restorable?: number;
 }
 
+/**
+ * One version as the server hands it over.
+ *
+ * `uid`, `path` and `chunks` are the three the parsers check, because they are
+ * the three a reader cannot do without. The rest carries no check here and
+ * needs none: every field below except `uid`, `mac` and `device` is covered by
+ * the entry's authenticator, so a server that alters one produces an entry no
+ * device will accept. `uid` is the server's to assign, `mac` is what is being
+ * checked, and `device` is a label shown to a person and acted on by nothing.
+ */
 export interface WireEntry {
   readonly uid: number;
   readonly path: string;
-  /** The writer's authenticator over this entry. Empty from a server predating protocol 2. */
+  /** The writer's authenticator over this entry. Anything that does not verify is refused. */
   readonly mac: string;
-  /** The version this entry was written on top of, as `parentOf` names it. */
-  readonly parent: string;
+  /**
+   * The version this entry was written on top of, as `parentOf` names it.
+   *
+   * Optional for the same reason `restorable` is: nothing validates it, and a
+   * missing one is read as "" by everything that uses it, which is what an
+   * entry with no parent carries anyway.
+   */
+  readonly parent?: string;
   readonly size: number;
   readonly ctime: number;
   readonly mtime: number;
@@ -131,11 +152,10 @@ export interface ServerLimits {
   /**
    * The vault's data key, wrapped under a key derived from the root secret.
    *
-   * Present for a vault claimed under protocol 3, absent for one claimed under
-   * protocol 2, and that presence is what decides which key schedule this
-   * device uses; docs/protocol.md, "The data key".
+   * Every vault has one, so this is not optional: see `readReady` for what an
+   * absent one would mean. docs/protocol.md, "The data key".
    */
-  readonly wrapped?: string;
+  readonly wrapped: string;
 }
 
 /** Metadata for a put. Mirrors the protocol's `meta` object exactly. */
@@ -233,16 +253,23 @@ const ENDS_SESSION = new Set([
   "protostate",
   "nospace",
   "internal",
+  // A rotate refused because another device rotated first. The credential this
+  // session is holding is not the vault's any more, so there is nothing else
+  // it could usefully do.
+  "rotated",
 ]);
 
 /**
  * Whether reconnecting later can succeed, by code alone.
  *
- * The "retryable" column of the error table, kept only for an error that
- * arrives before the server knows which protocol the client speaks, which has
- * the protocol 2 shape and no `retryable` field: a refusal at admission
- * during shutdown, at the pre-auth cap, or a `proto` below the minimum.
- * Everything after `ready` carries the field and this is not consulted.
+ * The "retryable" column of the error table, as a default for a frame that
+ * arrives without the field. That is not an older protocol, of which there is
+ * none: it is an error the server sends before it has parsed the hello, when
+ * it knows nothing about who is asking, such as a refusal at admission during
+ * shutdown or at the pre-auth cap. The server sets the field on those too, so
+ * in practice this is never consulted, and it stays because a client that
+ * guessed "retry" at a `proto` mismatch would loop for ever and one that
+ * guessed "stop" at a `busy` would stop on every server restart.
  */
 function retryableByCode(code: string): boolean {
   return code === "busy" || code === "nospace" || code === "internal";
@@ -258,10 +285,10 @@ function retryableByCode(code: string): boolean {
 export class ProtocolError extends Error {
   /**
    * Whether reconnecting later can succeed where retrying the same request
-   * cannot. The server says so on every protocol 3 error, and a watching
-   * client has nothing to interpret: back off and reconnect on true, stop on
-   * false. Read from the frame when it carries the field, and from the code
-   * table only for an error that arrived before the protocol was settled.
+   * cannot. The server says so on every error, and a watching client has
+   * nothing to interpret: back off and reconnect on true, stop on false. Read
+   * from the frame, and from the code table only as a default for a frame
+   * that somehow carries no such field.
    */
   readonly retryable: boolean;
   /** How long the server suggests waiting before reconnecting, when it said. */
@@ -808,18 +835,12 @@ export class Transport {
    * Sending
    * ------------------------------------------------------------ */
 
-  private send(text: string): void {
+  /** A text frame or a body, over a socket that is still there. */
+  private send(data: string | Uint8Array): void {
     if (this.closed || !this.socket) {
       throw this.closeReason ?? new ConnectionError("not connected");
     }
-    this.socket.send(text);
-  }
-
-  private sendBody(bytes: Uint8Array): void {
-    if (this.closed || !this.socket) {
-      throw this.closeReason ?? new ConnectionError("not connected");
-    }
-    this.socket.send(bytes);
+    this.socket.send(data);
   }
 
   /** A fresh request id, never one still in flight. */
@@ -910,20 +931,24 @@ export class Transport {
     device: string;
     cursor: number;
     /**
-     * The auth key this device wants the vault bound to.
+     * What this device offers to bind an unclaimed vault to: the auth key,
+     * and a data key wrapped under this device's root.
+     *
+     * One argument rather than two, so a claim cannot be sent without a data
+     * key. The server refuses that pair anyway, and a vault bound with no
+     * data key is the state protocol 3 exists to remove.
      *
      * Sent every time and meaningful only once: the server ignores it for a
      * vault that has already been claimed. Sending it unconditionally means
-     * a device never has to know whether it is the first one.
+     * a device never has to know whether it is the first one, and which key
+     * the vault actually has comes back in `ready`, never from here.
      */
-    claim?: string;
+    claim?: { auth: string; wrapped: string };
     /**
-     * The vault's data key, wrapped under this device's root, offered with
-     * the claim. Stored by the server if the claim goes through and ignored
-     * otherwise, like the claim itself. Which key the vault actually has
-     * comes back in `ready`, never from here.
+     * The vault's wrapped data key as this device last saw it, when it has
+     * seen it. A `ready` carrying a different one is refused; see readReady.
      */
-    wrapped?: string;
+    knownWrapped?: string;
   }): Promise<ServerLimits> {
     checkName("vault", args.vault);
     checkName("device", args.device);
@@ -939,31 +964,34 @@ export class Transport {
           token: args.token,
           device: args.device,
           cursor: args.cursor,
-          ...(args.claim !== undefined ? { claim: args.claim } : {}),
-          ...(args.wrapped !== undefined ? { wrapped: args.wrapped } : {}),
+          ...(args.claim !== undefined
+            ? { claim: args.claim.auth, wrapped: args.claim.wrapped }
+            : {}),
         },
         "ready",
       );
     } catch (err) {
       throw protoRefusal(err);
     }
-    return this.readReady(reply);
+    return this.readReady(reply, args.knownWrapped);
   }
 
   /**
    * Redeems a single-use invite: a hello with the invite in place of a token.
    *
-   * The server answers with the root secret sealed under the invite key and
-   * the vault's wrapped data key, then closes; this connection is not a device
-   * and never becomes one. The caller unseals, stores, and connects again with
-   * the derived key like any other device. docs/protocol.md, "Adding a device
-   * with a single-use invite".
+   * The server answers with the root secret sealed under the invite key, then
+   * closes; this connection is not a device and never becomes one. The caller
+   * unseals, stores, and connects again with the derived key like any other
+   * device, and takes the vault's data key from that connection's `ready`.
+   * The `redeemed` frame carries the wrapped key too and this ignores it:
+   * one place decides which keys a vault uses, and it is `ready`.
+   * docs/protocol.md, "Adding a device with a single-use invite".
    */
   async redeem(args: {
     vault: string;
     device: string;
     invite: string;
-  }): Promise<{ sealed: string; wrapped?: string }> {
+  }): Promise<{ sealed: string }> {
     checkName("vault", args.vault);
     checkName("device", args.device);
     let reply: Reply;
@@ -990,24 +1018,42 @@ export class Transport {
     if (typeof sealed !== "string" || sealed === "") {
       throw this.malformed("redeemed with no sealed secret");
     }
-    const wrapped = reply["wrapped"];
-    if (wrapped !== undefined && typeof wrapped !== "string") {
-      throw this.malformed("redeemed whose wrapped key is not a string");
-    }
-    return {
-      sealed,
-      ...(typeof wrapped === "string" && wrapped !== "" ? { wrapped } : {}),
-    };
+    return { sealed };
   }
 
-  private readReady(reply: Reply): ServerLimits {
+  private readReady(reply: Reply, knownWrapped?: string): ServerLimits {
     if (reply["res"] !== "ready") {
       throw new ProtocolError("protostate", `expected ready, got ${JSON.stringify(reply)}`);
     }
     const version = reply["serverVersion"];
     const wrapped = reply["wrapped"];
-    if (wrapped !== undefined && typeof wrapped !== "string") {
-      throw this.malformed("ready whose wrapped key is not a string");
+    if (typeof wrapped !== "string" || wrapped === "") {
+      // C40. Every vault has a data key, so an absent one is not a second
+      // kind of vault to accommodate: it is a server saying "derive your
+      // content keys some other way", and the only other way was the
+      // root-derived schedule. A device that took the hint would seal its
+      // notes under keys no other device on the vault derives, and both ends
+      // would report success while the vault quietly split in two. Refused
+      // here, before a single path is sealed, and the session ends.
+      throw this.malformed(
+        "a ready with no wrapped data key, which no vault has; this device will not seal anything under a key the rest of the vault cannot derive",
+      );
+    }
+    if (knownWrapped !== undefined && wrapped !== knownWrapped) {
+      // The vault's data key is one key, chosen once, and this device has
+      // already seen which. A different blob is a server choosing a second
+      // schedule: it can hand back the wrapping it was just given with a claim,
+      // which unwraps perfectly under this root and is a key no other device on
+      // the vault derives. Nothing on the wire distinguishes that from the real
+      // thing, so the only thing that can is remembering the real thing.
+      //
+      // The one legitimate change is a rotation, and neither side of that
+      // reaches here: the device that rotates stores the new blob itself, and
+      // every other device is evicted with `auth` and pairs again.
+      throw this.malformed(
+        "a ready whose wrapped data key is not the one this device saw before; " +
+          "the vault's data key does not change except at a rotation, and a rotation ends this session",
+      );
     }
     const limits: ServerLimits = {
       proto: this.count(reply, "proto", "ready"),
@@ -1019,7 +1065,7 @@ export class Transport {
       maxChunks: this.count(reply, "maxChunks", "ready"),
       maxBatchBytes: this.count(reply, "maxBatchBytes", "ready"),
       maxFetchBytes: this.count(reply, "maxFetchBytes", "ready"),
-      ...(typeof wrapped === "string" && wrapped !== "" ? { wrapped } : {}),
+      wrapped,
     };
     if (limits.proto !== PROTO) {
       // A server answers in the version the client asked for, so a ready in
@@ -1226,7 +1272,7 @@ export class Transport {
         );
       }
       const body = await bodyOf(name);
-      this.sendBody(body);
+      this.send(body);
       bytes += body.length;
       await this.drained(UPLOAD_HIGH_WATER);
     }
@@ -1558,7 +1604,7 @@ export class Transport {
   private chunkNames(v: unknown, of: string): string[] {
     if (!Array.isArray(v)) throw this.malformed(`${of} with no chunks list`);
     for (const name of v) {
-      if (typeof name !== "string" || !/^[0-9a-f]{64}$/.test(name)) {
+      if (!isChunkName(name)) {
         throw this.malformed(`${of} naming ${JSON.stringify(name)}, which is not a chunk name`);
       }
     }
@@ -1659,10 +1705,11 @@ export function checkName(what: "vault" | "device", name: string): void {
  * Names both protocol versions in a `proto` refusal, and says which end to
  * upgrade.
  *
- * A server that speaks only protocol 2 refuses a protocol 3 hello with an
- * error in the protocol 2 shape, no id, which arrives here as the close
- * reason. Its message names the server's range; this adds the client's
- * version and the one instruction that follows from the upgrade order.
+ * A server that does not speak this client's protocol refuses the hello, and
+ * the refusal arrives here as the close reason. Its message names the server's
+ * range and version; this adds the client's version and the one instruction
+ * that follows from the upgrade order, which is the server first. Kept against
+ * the next version, not for any version that exists.
  */
 function protoRefusal(err: unknown): unknown {
   if (err instanceof ProtocolError && err.code === "proto") {
@@ -1726,10 +1773,6 @@ export class Backoff {
     let t = this.base * Math.pow(2, this.count - 1);
     if (this.jitter) t *= 0.5 + 0.5 * this.random();
     return Math.floor(Math.min(this.max, this.min + t));
-  }
-
-  readyAt(): number {
-    return this.nextAt;
   }
 
   isReady(now: number): boolean {
@@ -1830,7 +1873,7 @@ function entriesOf(value: unknown, what: string): WireEntry[] {
     // Every name the shape a chunk name has, before anything is fetched by
     // it (C32). A `get` is held to this already; a recovery list was not.
     for (const name of row.chunks) {
-      if (typeof name !== "string" || !/^[0-9a-f]{64}$/.test(name)) {
+      if (!isChunkName(name)) {
         throw new ProtocolError(
           "protostate",
           `${what}[${i}] names ${JSON.stringify(name)}, which is not a chunk name`,

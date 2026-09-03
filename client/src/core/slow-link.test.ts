@@ -16,15 +16,19 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "./client.ts";
-import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
+import { authToken, type VaultKeys } from "./crypto.ts";
+import { testKeys, testWrapped } from "./test-keys.ts";
 import { LatencyProxy } from "./latency.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
+const SECRET = new Uint8Array(32).fill(36);
 let keys: VaultKeys;
+let wrapped: string;
 beforeAll(async () => {
   await serverBinary();
-  keys = await deriveKeys(new Uint8Array(20).fill(36));
+  keys = await testKeys(SECRET);
+  wrapped = await testWrapped(SECRET);
 }, 180_000);
 afterAll(async () => {
   await cleanupBinary();
@@ -52,9 +56,9 @@ async function client(
   const c = new Client({
     vault,
     store: new MemoryIndexStore(),
-    keys,
+    secret: SECRET,
     url,
-    ...server!.credentials(authToken(keys)),
+    ...server!.credentials(authToken(keys), wrapped),
     vaultId: "default",
     device: name,
     timeoutMs,
@@ -75,9 +79,22 @@ function incompressible(size: number): Uint8Array {
   return out;
 }
 
-/** About four seconds of wire at the rate below, against a two second timeout. */
-const BIG = 2 * 1024 * 1024;
-const RATE = 500_000;
+/**
+ * Six seconds of wire at the rate below, against a two second timeout.
+ *
+ * The rate is set by the largest single body rather than by the total, and
+ * that is the arithmetic this had wrong. A timeout is re-armed per body, so
+ * what must fit inside one is one chunk, and a binary chunk runs to
+ * `BINARY_SIZES.max`, a mebibyte, plus the seal. At 500 KB/s that is 2.1
+ * seconds against a 2 second timeout, so any run whose rolling hash happened
+ * to place a boundary near the maximum failed: measured at roughly one run in
+ * five, on random bytes that make a different cut every time. At the rate
+ * below the largest body a chunker can produce takes half a second, and the
+ * file is made large enough that the whole still spans three timeouts, which
+ * is the property being tested.
+ */
+const BIG = 12 * 1024 * 1024;
+const RATE = 2_000_000;
 const TIMEOUT = 2_000;
 
 /**

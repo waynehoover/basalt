@@ -10,7 +10,10 @@ import { mkdtemp, mkdir, writeFile, stat, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Client } from "../core/client.ts";
-import { authToken, deriveKeys, sealChunks } from "../core/crypto.ts";
+import { authToken, deriveRootKeys } from "../core/crypto.ts";
+import { testWrapped } from "../core/test-keys.ts";
+import { sealChunks } from "../core/crypto.ts";
+import { testKeys } from "../core/test-keys.ts";
 import { chunkBytes, sizesFor } from "../core/chunk.ts";
 import { TestServer } from "../core/test-server.ts";
 import { JsonIndexStore, NodeVault } from "../cli/vault.ts";
@@ -75,7 +78,8 @@ for (let i = 1; i <= COUNT; i++) {
 console.log(`${COUNT} notes, ${(plaintext / 1048576).toFixed(1)} MiB of prose`);
 
 // What chunking produces, before any server is involved.
-const keys = await deriveKeys(new Uint8Array(20).fill(7));
+const SECRET = new Uint8Array(32).fill(7);
+const keys = await testKeys(SECRET);
 let chunks = 0;
 const names = new Set<string>();
 let sealedBytes = 0;
@@ -109,9 +113,9 @@ await server.start();
 const client = new Client({
   vault: new NodeVault(dir),
   store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-  keys,
+  secret: SECRET,
   url: server.wsUrl,
-  ...server.credentials(authToken(keys)),
+  ...server.credentials(authToken(await deriveRootKeys(SECRET)), await testWrapped(SECRET)),
   vaultId: "default",
   device: "scale",
   timeoutMs: 600_000,

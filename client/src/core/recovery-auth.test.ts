@@ -1,5 +1,5 @@
 /**
- * C32 in TODO.md. Recovery read entries the server handed back and acted on
+ * review finding C32. Recovery read entries the server handed back and acted on
  * them: a `history` list was shown, a `deleted` list was offered for restore,
  * and a `get` answered with a chunk list that was assembled and written into
  * the vault. None of it was checked against the vault's key. The ordinary
@@ -10,7 +10,8 @@
 import { describe, expect, it } from "vitest";
 
 import { Client } from "./client.ts";
-import { deriveKeys, macEntry, sealChunks, sealPath, type VaultKeys } from "./crypto.ts";
+import { macEntry, sealChunks, sealPath, type VaultKeys } from "./crypto.ts";
+import { testKeys } from "./test-keys.ts";
 import { FakeSocket, RIG_SECRET, ready, settle } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
@@ -18,12 +19,11 @@ const enc = new TextEncoder();
 
 async function rig() {
   const socket = new FakeSocket();
-  const keys = await deriveKeys(RIG_SECRET);
+  const keys = await testKeys(RIG_SECRET);
   const vault = new MemoryVault();
   const client = new Client({
     vault,
     store: new MemoryIndexStore(),
-    keys,
     secret: RIG_SECRET,
     url: "ws://test",
     token: "t",
@@ -68,13 +68,30 @@ async function version(
   };
 }
 
+/**
+ * Waits until the request is actually on the wire before the fake server
+ * answers it.
+ *
+ * A single `settle` is not enough: sealing the path goes through WebCrypto,
+ * which resolves on its own task, so how many ticks pass between calling
+ * `history` and the frame being sent is not fixed. Answering early filled in
+ * the id of the previous request and the client refused its own reply.
+ */
+async function sent(socket: FakeSocket, op: string): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (socket.sentText.some((m) => m["op"] === op)) return;
+    await settle();
+  }
+  throw new Error(`no ${op} was sent`);
+}
+
 describe("recovery against a server that answers with entries nobody wrote (C32)", () => {
   it("refuses a history list holding a version this vault's key did not sign", async () => {
     const { socket, keys, client } = await rig();
     const good = await version(keys, 3, "note.md", "three");
     const forged = await version(keys, 2, "note.md", "two", { mac: "0".repeat(64) });
     const asking = client.history("note.md");
-    await settle();
+    await sent(socket, "history");
     socket.reply({ res: "history", path: good.entry.path, entries: [good.entry, forged.entry] });
     await expect(asking).rejects.toThrow(/version 2 .*not authenticated/);
   });
@@ -83,7 +100,7 @@ describe("recovery against a server that answers with entries nobody wrote (C32)
     const { socket, keys, client } = await rig();
     const forged = await version(keys, 5, "gone.md", "", { deleted: true, mac: "f".repeat(64) });
     const asking = client.deleted();
-    await settle();
+    await sent(socket, "deleted");
     socket.reply({ res: "deleted", entries: [{ ...forged.entry, restorable: 4 }], more: false });
     await expect(asking).rejects.toThrow(/not authenticated/);
   });
@@ -93,7 +110,7 @@ describe("recovery against a server that answers with entries nobody wrote (C32)
     const real = await version(keys, 7, "note.md", "what was written");
     const other = await version(keys, 8, "other.md", "something else entirely");
     const asking = client.history("note.md");
-    await settle();
+    await sent(socket, "history");
     socket.reply({ res: "history", path: real.entry.path, entries: [real.entry] });
     const [v] = await asking;
 
@@ -101,8 +118,7 @@ describe("recovery against a server that answers with entries nobody wrote (C32)
     // decrypt, being real content under the vault's key, and be written
     // under this note's name.
     const restoring = client.restore(v!);
-    await settle();
-    await settle();
+    await sent(socket, "get");
     socket.reply({
       res: "chunks",
       uid: 7,
@@ -117,7 +133,7 @@ describe("recovery against a server that answers with entries nobody wrote (C32)
     const { socket, keys, client } = await rig();
     const good = await version(keys, 3, "note.md", "three");
     const asking = client.history("note.md");
-    await settle();
+    await sent(socket, "history");
     socket.reply({
       res: "history",
       path: good.entry.path,
@@ -130,7 +146,7 @@ describe("recovery against a server that answers with entries nobody wrote (C32)
     const { socket, keys, client, vault } = await rig();
     const real = await version(keys, 7, "note.md", "what was written");
     const asking = client.history("note.md");
-    await settle();
+    await sent(socket, "history");
     socket.reply({ res: "history", path: real.entry.path, entries: [real.entry] });
     const [v] = await asking;
     socket.autoReply = (frame, s) => {

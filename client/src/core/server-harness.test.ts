@@ -22,7 +22,6 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { chunkBytes, looksLikeText, sizesFor } from "./chunk.ts";
 import {
   authToken,
-  deriveKeys,
   macEntry,
   openChunk,
   openPath,
@@ -31,6 +30,7 @@ import {
   sealPath,
   type VaultKeys,
 } from "./crypto.ts";
+import { testKeys, testWrapped } from "./test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
 import { ProtocolError, Transport, type Batch, type BatchEntry } from "./transport.ts";
 
@@ -47,7 +47,7 @@ const run = promisify(execFile);
  */
 let sharedKeys: VaultKeys | undefined;
 async function vaultKeys(): Promise<VaultKeys> {
-  sharedKeys ??= await deriveKeys(SECRET);
+  sharedKeys ??= await testKeys(SECRET);
   return sharedKeys;
 }
 const enc = new TextEncoder();
@@ -110,7 +110,7 @@ class Client {
       vault: "default",
       device: this.device,
       cursor,
-      ...server.credentials(authToken(this.keys)),
+      ...server.credentials(authToken(this.keys), await testWrapped(SECRET)),
     });
   }
 
@@ -208,12 +208,12 @@ class Client {
   }
 }
 
-const SECRET = new Uint8Array(20).fill(21);
+const SECRET = new Uint8Array(32).fill(21);
 let server: Server;
 const clients: Client[] = [];
 
 async function newClient(device: string, cursor = 0): Promise<Client> {
-  const c = new Client(await deriveKeys(SECRET), device);
+  const c = new Client(await testKeys(SECRET), device);
   clients.push(c);
   await c.connect(server, cursor);
   return c;
@@ -248,13 +248,16 @@ describe("the handshake, against the real server", () => {
   it("agrees on the protocol and the limits", async () => {
     // The values the server enforces, which the client has to know before
     // its first put or it will send something that can never be accepted.
-    const c = new Client(await deriveKeys(SECRET), "a");
+    const c = new Client(await testKeys(SECRET), "a");
     clients.push(c);
     const ready = await c.connect(server);
     expect(ready.proto).toBe(3);
-    expect(ready.minProto).toBe(2);
+    // One protocol, so the range the server speaks is one number wide.
+    expect(ready.minProto).toBe(3);
     expect(ready.serverVersion).not.toBe("");
-    // The two protocol 3 caps, at the server's own constants.
+    // And a data key, which every vault has.
+    expect(ready.wrapped).not.toBe("");
+    // The two caps, at the server's own constants.
     expect(ready.maxBatchBytes).toBe(16 * 1024 * 1024);
     expect(ready.maxFetchBytes).toBe(64 * 1024 * 1024);
     expect(ready.chunkMax).toBe(1024 * 1024);
@@ -296,7 +299,7 @@ describe("the handshake, against the real server", () => {
     await t.connect();
     await expect(
       t.hello({
-        ...server.credentials(authToken(await vaultKeys())),
+        ...server.credentials(authToken(await vaultKeys()), await testWrapped(SECRET)),
         vault: "default",
         device: "a",
         cursor: 999_999,
@@ -311,7 +314,7 @@ describe("a file, all the way there and back", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       const content = "# A real note\n\nWith several lines.\n\nAnd a second paragraph.\n";
@@ -335,7 +338,7 @@ describe("a file, all the way there and back", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       let text = "";
@@ -362,7 +365,7 @@ describe("a file, all the way there and back", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       const bytes = new Uint8Array(600_000);
@@ -380,7 +383,7 @@ describe("a file, all the way there and back", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
       const put = await c.write("notes/empty.md", "");
       expect(put.uploaded).toBe(0);
@@ -395,7 +398,7 @@ describe("a file, all the way there and back", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
       const path = "notes/2026-08-27 meeting: with a colon 🗿.md";
       const put = await c.write(path, "content");
@@ -420,7 +423,7 @@ describe("a batched write, which is one exchange for many notes", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       const files = Array.from({ length: 40 }, (_, i) => ({
@@ -450,7 +453,7 @@ describe("a batched write, which is one exchange for many notes", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
       const same = "# Identical\n\nThe same bytes in two places.\n";
       const { results, uploaded } = await c.writeMany([
@@ -473,7 +476,7 @@ describe("a batched write, which is one exchange for many notes", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       const good = await sealPath(c.keys, "good.md");
@@ -527,7 +530,7 @@ describe("deduplication, which is the point", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       const content = "# Shared\n\nThe very same words.\n";
@@ -549,7 +552,7 @@ describe("deduplication, which is the point", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       let text = "";
@@ -585,8 +588,8 @@ describe("two devices", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const a = new Client(await deriveKeys(SECRET), "a");
-      const b = new Client(await deriveKeys(SECRET), "b");
+      const a = new Client(await testKeys(SECRET), "a");
+      const b = new Client(await testKeys(SECRET), "b");
       await a.connect(fresh);
       await b.connect(fresh);
 
@@ -618,8 +621,8 @@ describe("two devices", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const a = new Client(await deriveKeys(SECRET), "a");
-      const b = new Client(await deriveKeys(SECRET), "b");
+      const a = new Client(await testKeys(SECRET), "a");
+      const b = new Client(await testKeys(SECRET), "b");
       await a.connect(fresh);
       await b.connect(fresh);
 
@@ -649,13 +652,13 @@ describe("two devices", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const a = new Client(await deriveKeys(SECRET), "a");
+      const a = new Client(await testKeys(SECRET), "a");
       await a.connect(fresh);
       for (let i = 0; i < 5; i++) await a.write(`f${i}.md`, `content ${i}`);
       a.close();
 
       // A second device arriving late gets everything, in order.
-      const late = new Client(await deriveKeys(SECRET), "late");
+      const late = new Client(await testKeys(SECRET), "late");
       clients.push(late);
       const ready = await late.connect(fresh, 0);
       expect(ready.cursor).toBe(5);
@@ -663,7 +666,7 @@ describe("two devices", () => {
       expect(late.entries.size).toBe(5);
 
       // And one that already has part of it gets only the rest.
-      const partial = new Client(await deriveKeys(SECRET), "partial");
+      const partial = new Client(await testKeys(SECRET), "partial");
       clients.push(partial);
       await partial.connect(fresh, 3);
       await until("the remainder to arrive", () => partial.caughtUpAt === 5);
@@ -682,7 +685,7 @@ describe("refusals that the session survives", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
 
       // A size with no chunks, which is indistinguishable from an empty
@@ -723,7 +726,16 @@ describe("refusals that the session survives", () => {
     // The transport has to know, because a caller that carried on after a
     // busy would talk to a closed connection and one that tore down over a
     // badname would turn one bad file into a reconnect.
-    for (const code of ["proto", "auth", "cursor", "busy", "protostate", "nospace", "internal"]) {
+    for (const code of [
+      "proto",
+      "auth",
+      "cursor",
+      "busy",
+      "protostate",
+      "nospace",
+      "internal",
+      "rotated",
+    ]) {
       expect(new ProtocolError(code, "x").endsSession, code).toBe(true);
     }
     for (const code of ["badentry", "badname", "toolarge", "nouid", "nocontent", "nochunk"]) {
@@ -732,7 +744,7 @@ describe("refusals that the session survives", () => {
   });
 
   /**
-   * I9 in TODO.md. Every reply from the real server echoes the id of the
+   * review finding I9. Every reply from the real server echoes the id of the
    * request it answers, on the handshake and on both halves of a put.
    */
   it("echoes the request id on ready, want and ack", async () => {
@@ -764,7 +776,7 @@ describe("refusals that the session survives", () => {
         vault: "default",
         device: "ids",
         cursor: 0,
-        ...server.credentials(authToken(keys)),
+        ...server.credentials(authToken(keys), await testWrapped(SECRET)),
       });
       const hello = frames.find((f) => f["op"] === "hello")!;
       const ready = seen.find((f) => f["res"] === "ready")!;
@@ -802,14 +814,15 @@ describe("refusals that the session survives", () => {
   });
 
   /**
-   * The upgrade window, from the server's side: a protocol 2 hello is still
-   * answered on a vault without a data key, in the protocol 2 shape. This is
-   * what lets a phone on the old release keep working for the week between
-   * upgrading the server and upgrading it.
+   * The other side of the version check: this client says `proto: 3`, and a
+   * hello in any other version is refused rather than answered. Protocol 2
+   * was withdrawn with the vaults that had no data key, and a server still
+   * answering it would let a device seal notes under the root-derived
+   * schedule that nothing else on the vault could read.
    */
-  it("still answers a protocol 2 hello, without ids", async () => {
+  it("refuses a hello in any protocol but this one", async () => {
     const keys = await vaultKeys();
-    const creds = server.credentials(authToken(keys));
+    const creds = server.credentials(authToken(keys), await testWrapped(SECRET));
     const ws = new WebSocket(server.wsUrl);
     const answer = new Promise<Record<string, unknown>>((resolve, reject) => {
       ws.addEventListener("message", (ev) => {
@@ -827,15 +840,18 @@ describe("refusals that the session survives", () => {
         vault: "default",
         device: "old-phone",
         cursor: 0,
-        ...creds,
+        token: creds.token,
+        claim: creds.claim.auth,
+        wrapped: creds.claim.wrapped,
       }),
     );
-    const ready = await answer;
+    const refusal = await answer;
     ws.close();
-    expect(ready["res"]).toBe("ready");
-    expect(ready["proto"]).toBe(2);
-    expect("id" in ready).toBe(false);
-    expect(ready["minProto"]).toBe(2);
+    expect(refusal["res"]).toBe("err");
+    expect(refusal["code"]).toBe("proto");
+    // Named, with the server's own version, because that is how somebody
+    // works out which end to upgrade.
+    expect(String(refusal["msg"])).toMatch(/2/);
   });
 });
 
@@ -844,7 +860,7 @@ describe("what the server can and cannot see", () => {
     const fresh = new Server();
     await fresh.start();
     try {
-      const c = new Client(await deriveKeys(SECRET), "a");
+      const c = new Client(await testKeys(SECRET), "a");
       await c.connect(fresh);
       await c.write("Personal/Diary 2026.md", "Today I wrote something private.");
       c.close();

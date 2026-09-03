@@ -1,5 +1,5 @@
 /**
- * I7 in TODO.md: the sealed-chunk format, byte for byte, under Node.
+ * review finding I7: the sealed-chunk format, byte for byte, under Node.
  *
  * The same check runs under Bun in CI through compression-golden.run.ts, and
  * the two together are what say the format is the same on two runtimes. See

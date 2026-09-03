@@ -2,8 +2,9 @@
  * The pairing string.
  *
  * "One binary, one pairing string" is the promise in the README, and this is the
- * string. Everything a second device needs to join a vault is in it: where the
- * server is, the token that server will accept, and the vault's root secret.
+ * string. Everything a device needs to join a vault is in it: where the server
+ * is, which vault, and the vault's root secret, which is also what
+ * authenticates to the server.
  *
  * It lives in `core` rather than beside the CLI because the plugin has to read
  * exactly the same string the headless client writes. Two parsers for one format
@@ -32,13 +33,7 @@
  * stays length-prefixed and versioned because it once carried two.
  */
 
-import {
-  LEGACY_SECRET_LENGTH,
-  SECRET_LENGTH,
-  base64urlDecode,
-  base64urlEncode,
-  isSecretLength,
-} from "./crypto.ts";
+import { SECRET_LENGTH, base64urlDecode, base64urlEncode } from "./crypto.ts";
 
 /**
  * Marks the string as ours, and says which layout follows.
@@ -50,36 +45,19 @@ import {
  */
 export const PAIRING_PREFIX = "basalt3_";
 
-/** The prefix of a version 2 string, which carries a 20-byte root and is still accepted. */
-export const LEGACY_PAIRING_PREFIX = "basalt2_";
-
 /** Marks a single-use invite, which is not a pairing string and does not carry the root. */
 export const INVITE_PREFIX = "basalt3i_";
 
 /**
- * Version 2 dropped the server token; version 3 widened the root to 32 bytes.
+ * The one layout there is: a version byte, a 32-byte root, the address and the
+ * vault, and a checksum.
  *
- * A vault used to have two secrets: a root secret the devices shared, and a
- * server token that had nothing to do with it, and a pairing string had to
- * carry both. The auth key is now another branch of the same HKDF schedule
- * that produces the content and path keys, so the root secret is the whole of
- * it. Version 3 changed only the root's length; a version 2 string still
- * parses and still opens its vault, for as long as the project exists.
- *
- * The prefix carries the version as well as the length byte, so a version 1
- * string pasted into this is refused by the prefix check with something to say
- * rather than by the checksum with nothing.
+ * Versions 1 and 2 are gone with the protocols that made them. The byte and
+ * the versioned prefix stay, so that the next change is refused by name rather
+ * than by the checksum with nothing to say.
  */
 const VERSION = 3;
-const LEGACY_VERSION = 2;
 const CHECKSUM_BYTES = 4;
-
-/** The root length each version carries. */
-function secretLengthFor(version: number): number | undefined {
-  if (version === VERSION) return SECRET_LENGTH;
-  if (version === LEGACY_VERSION) return LEGACY_SECRET_LENGTH;
-  return undefined;
-}
 
 /** Everything a device needs to join a vault. */
 export interface Pairing {
@@ -97,24 +75,13 @@ export interface Pairing {
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-/**
- * Renders a pairing as the string a person copies.
- *
- * The version follows the secret: a 32-byte root is a `basalt3_` string and a
- * 20-byte one, from a vault paired before version 3, is a `basalt2_` string.
- * A device holding a version 2 root prints a version 2 string, so the root it
- * prints is the root it holds and nothing is silently re-encoded.
- */
+/** Renders a pairing as the string a person copies. */
 export function formatPairing(p: Pairing): string {
-  if (!isSecretLength(p.secret.length)) {
-    throw new Error(
-      `a root secret is ${SECRET_LENGTH} bytes, or ${LEGACY_SECRET_LENGTH} from a version 2 pairing, not ${p.secret.length}`,
-    );
+  if (p.secret.length !== SECRET_LENGTH) {
+    throw new Error(`a root secret is ${SECRET_LENGTH} bytes, not ${p.secret.length}`);
   }
-  const version = p.secret.length === SECRET_LENGTH ? VERSION : LEGACY_VERSION;
-  const prefix = version === VERSION ? PAIRING_PREFIX : LEGACY_PAIRING_PREFIX;
-  const body = frame(version, p.secret, [p.url, p.vaultId]);
-  return prefix + base64urlEncode(withChecksum(body));
+  const body = frame(VERSION, p.secret, [p.url, p.vaultId]);
+  return PAIRING_PREFIX + base64urlEncode(withChecksum(body));
 }
 
 /**
@@ -160,8 +127,12 @@ function unframe(text: string, prefix: string, what: string, minimum: number): U
   let raw: Uint8Array;
   try {
     raw = base64urlDecode(text.slice(prefix.length));
-  } catch {
-    throw new Error(`this ${what} is damaged: it is not valid base64url`);
+  } catch (err) {
+    // The decoder's own reason, not a summary of it. It refuses a stray
+    // character, a length that leaves a dangling sextet and unused bits that
+    // are not zero, and those are three different things to have happened to a
+    // string somebody is holding in their hand.
+    throw new Error(`this ${what} is damaged: ${(err as Error).message}`);
   }
   if (raw.length < minimum + CHECKSUM_BYTES) {
     throw new Error(`this ${what} is too short to be complete`);
@@ -204,50 +175,51 @@ function fields(body: Uint8Array, at: number, what: string, names: readonly stri
  */
 export function parsePairing(input: string): Pairing {
   const text = input.trim();
-  if (text.startsWith("basalt1_")) {
-    // Named rather than lumped in with rubbish, because somebody will have
-    // one written down. The vault it belongs to needs re-pairing: the
-    // server no longer takes the token in it, and the root secret in it is
-    // in a layout this cannot read.
-    throw new Error(
-      "this is a version 1 pairing string, from before the server token was folded into the root secret. " +
-        "Run basalt invite on a device that is already paired to get a current one.",
-    );
-  }
+  if (isPreProtocol3(text)) throw preProtocol3Error(text);
   if (text.startsWith(INVITE_PREFIX)) {
     throw new Error(
       "this is an invite, not a recovery key. It adds a device: give it to basalt pair, or to the Basalt panel on the new device.",
     );
   }
-  const prefix = text.startsWith(PAIRING_PREFIX)
-    ? PAIRING_PREFIX
-    : text.startsWith(LEGACY_PAIRING_PREFIX)
-      ? LEGACY_PAIRING_PREFIX
-      : undefined;
-  if (prefix === undefined) {
-    throw new Error(
-      `not a pairing string: it should start with ${PAIRING_PREFIX} (or ${LEGACY_PAIRING_PREFIX} from an older vault)`,
-    );
+  if (!text.startsWith(PAIRING_PREFIX)) {
+    throw new Error(`not a pairing string: it should start with ${PAIRING_PREFIX}`);
   }
 
-  const body = unframe(text, prefix, "pairing string", 1 + LEGACY_SECRET_LENGTH + 2);
-  const secretLength = secretLengthFor(body[0]!);
-  if (secretLength === undefined) {
+  const body = unframe(text, PAIRING_PREFIX, "pairing string", 1 + SECRET_LENGTH + 2);
+  if (body[0] !== VERSION) {
     throw new Error(
-      `this pairing string is version ${body[0]}, and this device understands ${LEGACY_VERSION} and ${VERSION}`,
+      `this pairing string is version ${body[0]}, and this device understands ${VERSION}`,
     );
   }
-  if (body.length < 1 + secretLength + 2) {
-    throw new Error("this pairing string is too short to be complete");
-  }
-  const secret = body.slice(1, 1 + secretLength);
-  const [url, vaultId] = fields(body, 1 + secretLength, "pairing string", [
+  const secret = body.slice(1, 1 + SECRET_LENGTH);
+  const [url, vaultId] = fields(body, 1 + SECRET_LENGTH, "pairing string", [
     "server address",
     "vault name",
   ]) as [string, string];
   if (url === "" || vaultId === "") throw new Error("this pairing string has an empty field");
 
   return { url: normaliseUrl(url), secret, vaultId };
+}
+
+/** Whether this is a string from before protocol 3, which nothing here reads. */
+function isPreProtocol3(text: string): boolean {
+  return text.startsWith("basalt1_") || text.startsWith("basalt2_");
+}
+
+/**
+ * Names an old string rather than lumping it in with rubbish.
+ *
+ * Somebody may still have one written down from testing, and "not a pairing
+ * string" would send them looking for a typo. There is nothing to migrate:
+ * the vault it belongs to was claimed under a protocol this client no longer
+ * speaks and the server no longer serves, so the answer is a new vault.
+ */
+function preProtocol3Error(text: string): Error {
+  const version = text.startsWith("basalt1_") ? 1 : 2;
+  return new Error(
+    `this is a version ${version} pairing string, from before protocol 3. Nothing reads it any more: ` +
+      "start a fresh vault with basalt init, or the Basalt panel, and pair this device to that.",
+  );
 }
 
 /** Whether a string is an invite rather than a recovery key, by its prefix. */
@@ -307,7 +279,7 @@ export function formatInvite(inv: Invite): string {
  */
 export function parseInvite(input: string): Invite {
   const text = input.trim();
-  if (text.startsWith(PAIRING_PREFIX) || text.startsWith(LEGACY_PAIRING_PREFIX)) {
+  if (text.startsWith(PAIRING_PREFIX)) {
     throw new Error("this is a recovery key, not an invite; basalt pair takes either");
   }
   if (!text.startsWith(INVITE_PREFIX)) {
@@ -373,6 +345,50 @@ export interface DeviceConfig extends Pairing {
    * root secret, so there is nothing else to keep.
    */
   readonly bootstrap?: string;
+  /**
+   * The data key this device offers while it is still claiming the vault,
+   * already wrapped under this root.
+   *
+   * Made once, when the vault is started, and sent with every claim until the
+   * bootstrap is spent. It used to be made afresh on every connection, on the
+   * reasoning that only one claim can win so the others cost nothing. They cost
+   * something: a claim whose reply was lost was retried with a different data
+   * key, so the vault could be bound to one candidate while this device went on
+   * offering another. Kept here, a retry offers the same key it offered before.
+   *
+   * Absent once the vault is known to be claimed, which is when the bootstrap
+   * has gone, because a claim is not sent after that.
+   */
+  readonly claimWrapped?: string;
+  /**
+   * The vault's wrapped data key, as this device first saw it in `ready`.
+   *
+   * The pin against a server choosing the key schedule. A hostile server that
+   * was handed a claim could echo that wrapping back as the vault's, and the
+   * device would install a schedule no other device on the vault derives: the
+   * server learns nothing either way and the vault quietly splits in two.
+   * Remembering the blob turns the second `ready` into a check. The one
+   * legitimate change is a rotation, which this device either performs, and
+   * stores the new blob, or is evicted by, and re-pairs.
+   */
+  readonly wrapped?: string;
+  /**
+   * A rotation this device sent and never heard the answer to.
+   *
+   * Written before the request goes out, so the new secret exists somewhere
+   * other than in memory from the moment it could possibly have committed. The
+   * server commits, evicts every other session, and only then replies; a socket
+   * that drops in between used to leave the caller throwing, nothing saved, the
+   * old root no longer authenticating and the only copy of the new one in a
+   * process that is about to exit. That is intact ciphertext nothing can ever
+   * open again.
+   *
+   * The next connection tries this secret first and falls back to the current
+   * one, promoting whichever authenticates. `wrapped` is the blob the server
+   * holds if the rotation did commit, so the pin above accepts it too while
+   * this is outstanding.
+   */
+  readonly pending?: { readonly secret: Uint8Array; readonly wrapped: string };
 }
 
 /** The stored form, which is JSON on both platforms. */
@@ -383,6 +399,14 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
     device: config.device,
     secret: base64urlEncode(config.secret),
     ...(config.bootstrap ? { bootstrap: config.bootstrap } : {}),
+    ...(config.claimWrapped ? { claimWrapped: config.claimWrapped } : {}),
+    ...(config.wrapped ? { wrapped: config.wrapped } : {}),
+    ...(config.pending
+      ? {
+          pendingSecret: base64urlEncode(config.pending.secret),
+          pendingWrapped: config.pending.wrapped,
+        }
+      : {}),
   };
 }
 
@@ -404,9 +428,9 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     return value;
   };
   const secret = base64urlDecode(str("secret"));
-  if (!isSecretLength(secret.length)) {
+  if (secret.length !== SECRET_LENGTH) {
     throw new Error(
-      `${where} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH} bytes, or ${LEGACY_SECRET_LENGTH} from a version 2 pairing`,
+      `${where} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH} bytes`,
     );
   }
   const bootstrap = record["bootstrap"];
@@ -416,7 +440,67 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     device: str("device"),
     secret,
     ...(typeof bootstrap === "string" && bootstrap !== "" ? { bootstrap } : {}),
+    ...opaque(record, "claimWrapped", where),
+    ...opaque(record, "wrapped", where),
+    ...pendingRotation(record, where),
   };
+}
+
+/**
+ * An opaque base64url blob the server stores and this device only ever compares
+ * or repeats: absent, or present and of a shape something could have produced.
+ *
+ * Refused rather than dropped when it is the wrong type. Rule 2: a field that
+ * cannot be read is not a field that is absent, and dropping either of these
+ * silently would turn "refuse a wrapping that changed" back into "accept
+ * whatever the server says", which is the check they exist for.
+ */
+function opaque(
+  record: Record<string, unknown>,
+  key: string,
+  where: string,
+): Record<string, string> {
+  const value = record[key];
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error(`${where} holds a ${key} that is not base64url, so it cannot be trusted`);
+  }
+  return { [key]: value };
+}
+
+/**
+ * The outstanding rotation, if there is one: both halves or neither.
+ *
+ * One half alone is a file that was written in the middle of something, and
+ * guessing which half is missing is guessing which secret opens the vault.
+ */
+function pendingRotation(
+  record: Record<string, unknown>,
+  where: string,
+): { pending?: { secret: Uint8Array; wrapped: string } } {
+  const rawSecret = record["pendingSecret"];
+  const rawWrapped = record["pendingWrapped"];
+  if (
+    (rawSecret === undefined || rawSecret === null) &&
+    (rawWrapped === undefined || rawWrapped === null)
+  ) {
+    return {};
+  }
+  if (typeof rawSecret !== "string" || typeof rawWrapped !== "string") {
+    throw new Error(
+      `${where} holds half of an outstanding rotation, so it cannot be told which secret opens the vault`,
+    );
+  }
+  const secret = base64urlDecode(rawSecret);
+  if (secret.length !== SECRET_LENGTH) {
+    throw new Error(
+      `${where} holds a ${secret.length} byte pending secret, and a root secret is ${SECRET_LENGTH} bytes`,
+    );
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(rawWrapped)) {
+    throw new Error(`${where} holds a pendingWrapped that is not base64url`);
+  }
+  return { pending: { secret, wrapped: rawWrapped } };
 }
 
 /**
@@ -494,11 +578,8 @@ function asciiHost(url: string): string {
  */
 export function parseSetup(input: string): { url: string; token: string } {
   const text = input.trim();
-  if (
-    text.startsWith(PAIRING_PREFIX) ||
-    text.startsWith(LEGACY_PAIRING_PREFIX) ||
-    text.startsWith("basalt1_")
-  ) {
+  if (isPreProtocol3(text)) throw preProtocol3Error(text);
+  if (text.startsWith(PAIRING_PREFIX)) {
     throw new Error(
       "that is a recovery key from another device. It joins an existing vault; " +
         "to start a new one, paste the line the server printed, like host:3003#TOKEN",

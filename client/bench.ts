@@ -35,7 +35,8 @@ import {
   sizesFor,
   type ChunkSizes,
 } from "./src/core/chunk.ts";
-import { chunkName, deriveKeys, sealChunk, sealChunks } from "./src/core/crypto.ts";
+import { chunkName, sealChunk, sealChunks } from "./src/core/crypto.ts";
+import { testKeys } from "./src/core/test-keys.ts";
 
 const enc = new TextEncoder();
 const MIB = 1024 * 1024;
@@ -109,7 +110,7 @@ async function chunking() {
 
 async function sealing() {
   console.log("\nsealing: compress, encrypt, name (three WebCrypto calls a chunk)");
-  const keys = await deriveKeys(new Uint8Array(20).fill(9));
+  const keys = await testKeys(new Uint8Array(32).fill(9));
   const parts = [...chunkBytes(note(512 * 1024), sizesFor(512 * 1024, true), true)].map(
     (c) => c.bytes,
   );
@@ -155,7 +156,7 @@ async function wire(
   edited: Uint8Array,
   sizes: ChunkSizes,
   isText: boolean,
-  keys: Awaited<ReturnType<typeof deriveKeys>>,
+  keys: Awaited<ReturnType<typeof testKeys>>,
 ) {
   const held = new Set(
     [...chunkBytes(original, sizes, isText)].map((c) => Buffer.from(c.bytes).toString("base64")),
@@ -192,7 +193,7 @@ async function bandwidth() {
   console.log("  Both columns carry the entry as well as the bodies, because both");
   console.log("  protocols send one. Theirs is a whole file and one hash.\n");
   console.log("  note size    basalt      of that: entry   whole file    ratio    chunks");
-  const keys = await deriveKeys(new Uint8Array(20).fill(11));
+  const keys = await testKeys(new Uint8Array(32).fill(11));
   for (const size of [4096, 32 * 1024, 128 * 1024, 512 * 1024, 2 * MIB]) {
     const original = note(size);
     const ins = enc.encode("A line added by hand.\n");
@@ -232,7 +233,7 @@ async function realVault(path: string) {
   const plain = files.reduce((n, f) => n + f.data.length, 0);
   console.log(`\nreal vault: ${files.length} files, ${fmt(plain)}`);
 
-  const keys = await deriveKeys(new Uint8Array(20).fill(13));
+  const keys = await testKeys(new Uint8Array(32).fill(13));
   const started = performance.now();
   let chunks = 0;
   let onWire = 0;

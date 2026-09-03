@@ -660,7 +660,7 @@ describe("writing a name that differs only by case", () => {
 });
 
 /**
- * P17 in TODO.md. The adapter's own write truncates the destination and then
+ * review finding P17. The adapter's own write truncates the destination and then
  * fills it, read out of the shipped bundle, so a note used to be able to end up
  * empty with no copy of the old bytes or the new. Every failure below is one a
  * full disk or a killed process produces, and after each the note is either
@@ -759,7 +759,7 @@ describe("landing a note without a moment where it is half written (P17)", () =>
 });
 
 /**
- * C17 in TODO.md, the adapter half. `exists` and then `write` is a gap, and a
+ * review finding C17, the adapter half. `exists` and then `write` is a gap, and a
  * conflict copy or a restore landing in it replaced whatever appeared there.
  * The claim has to be exclusive, and `rename` refusing an occupied destination
  * is what makes it so.
@@ -795,7 +795,7 @@ describe("creating a file only where nothing is (C17)", () => {
 });
 
 /**
- * P20 and C16 in TODO.md. Two raw names in Obsidian's index that normalize to
+ * P20 and review finding C16. Two raw names in Obsidian's index that normalize to
  * one path used to be one entry in the map, the second winning silently.
  */
 describe("two names the plugin cannot hold apart (P20)", () => {
@@ -842,7 +842,7 @@ describe("two names the plugin cannot hold apart (P20)", () => {
 });
 
 /**
- * P21 in TODO.md. `matchCase` used to shrug at a listing that failed and write
+ * review finding P21. `matchCase` used to shrug at a listing that failed and write
  * under a spelling nothing had checked, leaving the old spelling on disk while
  * the engine recorded the new one as synced.
  */
@@ -868,7 +868,7 @@ describe("a spelling check that cannot be made (P21)", () => {
 });
 
 /**
- * P18 in TODO.md. The index is written with the same truncating write as a
+ * review finding P18. The index is written with the same truncating write as a
  * note, and an index cut short is not JSON, and an index that is not JSON stops
  * the plugin on every load. A vault whose notes were all fine sat behind it.
  */
@@ -1021,7 +1021,7 @@ describe("a dotfile of the user's where a staging copy would go (P30)", () => {
 });
 
 /**
- * P25 in TODO.md. The engine saves the index after `flush`, so the index is
+ * review finding P25. The engine saves the index after `flush`, so the index is
  * never durable ahead of the notes it names, and the plugin's vault had no
  * `flush` at all: on desktop the adapter's writes reached the disk when the
  * operating system felt like it, and the index could be durable first. On

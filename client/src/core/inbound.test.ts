@@ -56,7 +56,7 @@ async function accepted(engine: { status(): { pending: number } }, n: number): P
 }
 
 /**
- * C29 in TODO.md. A peer wrote a path under a dot folder, which this device
+ * review finding C29. A peer wrote a path under a dot folder, which this device
  * will never list and so would report deleted the moment it wrote it. The
  * vault refused the write, the engine filed the refusal for retry, and the
  * one-shot sync exited 1 on every run for ever, saying the file would be
@@ -119,7 +119,7 @@ describe("an inbound path that never syncs (C29)", () => {
 });
 
 /**
- * C36 in TODO.md. `a//b`, `a/./b` and `a/b/` are not the paths they look
+ * review finding C36. `a//b`, `a/./b` and `a/b/` are not the paths they look
  * like: a filesystem collapses them onto `a/b`, and the engine keyed its
  * whole idea of a file on the string as it arrived. Two spellings of one file
  * are two entries here and one file there, which is the alias problem with a
@@ -151,7 +151,7 @@ describe("a wire path that is not canonical (C36)", () => {
 });
 
 /**
- * C30 in TODO.md. The alias check ran per fill, against the listing taken at
+ * review finding C30. The alias check ran per fill, against the listing taken at
  * the start of the pass, so two paths one disk files as one that arrived in
  * different fills of one pass both landed: the second over the first, and
  * both recorded as synced.
@@ -183,7 +183,7 @@ describe("two aliases of one file arriving in different fills (C30)", () => {
 });
 
 /**
- * C37 in TODO.md. Every sealed path ever seen was kept in a map for the life
+ * review finding C37. Every sealed path ever seen was kept in a map for the life
  * of the session, so a device that stayed connected through months of
  * renames and deletions held every name it had ever been told, for nothing.
  */

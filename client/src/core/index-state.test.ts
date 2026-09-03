@@ -379,7 +379,7 @@ describe("the write-coalescing debounce", () => {
 });
 
 /**
- * I12 in TODO.md. Timestamps are client-asserted and clocks disagree, so they
+ * review finding I12. Timestamps are client-asserted and clocks disagree, so they
  * are hints and never the authority. The decision table reads `mtime` from
  * neither side: ordering is uid order, agreement is content, and a device with
  * a clock a year off makes exactly the decisions a device with the right time

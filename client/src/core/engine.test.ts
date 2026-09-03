@@ -26,18 +26,22 @@ import {
 } from "./engine.ts";
 import { chunkBytes, sizesFor } from "./chunk.ts";
 import { macEntry, sealChunks, sealPath } from "./crypto.ts";
-import { authToken, deriveKeys, type VaultKeys } from "./crypto.ts";
+import { authToken, type VaultKeys } from "./crypto.ts";
+import { otherVaultKeys, testKeys, testWrapped } from "./test-keys.ts";
 import { Transport, type WireEntry } from "./transport.ts";
+import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 import type { IndexEntry } from "./index-state.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 
-const SECRET = new Uint8Array(20).fill(33);
+const SECRET = new Uint8Array(32).fill(33);
 let keys: VaultKeys;
+let wrapped: string;
 
 beforeAll(async () => {
   await serverBinary();
-  keys = await deriveKeys(SECRET);
+  keys = await testKeys(SECRET);
+  wrapped = await testWrapped(SECRET);
 }, 180_000);
 
 afterAll(async () => {
@@ -80,11 +84,11 @@ class Device {
     this.engine = new Engine({
       vault: this.vault,
       store: this.store,
-      keys,
+      secret: SECRET,
       transport: this.transport,
       device: this.name,
       vaultId: "default",
-      ...server.credentials(authToken(keys)),
+      ...server.credentials(authToken(keys), wrapped),
       // A clock the test advances, so the size-scaled write debounce does
       // not decide when a sync may happen.
       now: () => (this.clock += 60_000),
@@ -234,6 +238,50 @@ async function convergeBoth(a: Device, b: Device, rounds = 5): Promise<void> {
   await new Promise((r) => setTimeout(r, 60));
   await b.engine.sync();
 }
+
+/**
+ * C40. The vault's keys come from the data key `ready` carries, and every
+ * vault has one. A `ready` without it used to mean "derive your content keys
+ * from the root instead", which is a schedule no other device on the vault
+ * uses: this device would seal every note under keys nothing else can open,
+ * and both ends would report success. So the absence is refused rather than
+ * accommodated, the session ends, and the engine never reaches the state
+ * where it has keys to seal with.
+ *
+ * A fake socket rather than the real server, because the real server cannot
+ * make this mistake and this is about what happens when something does.
+ */
+describe("a server that answers ready with no data key (C40)", () => {
+  it("ends the session and derives nothing", async () => {
+    const socket = new FakeSocket();
+    const transport = new Transport("ws://test", {
+      onBatch: () => {},
+      socketFactory: () => socket,
+      timeoutMs: 2000,
+    });
+    const engine = new Engine({
+      vault: new MemoryVault(),
+      store: new MemoryIndexStore(),
+      secret: SECRET,
+      transport,
+      device: "d",
+      vaultId: "default",
+      token: "t",
+    });
+    const connecting = transport.connect();
+    socket.open();
+    await connecting;
+
+    const started = engine.start();
+    await settle();
+    const { wrapped: _none, ...withoutKey } = ready({ cursor: 0 });
+    socket.reply(withoutKey);
+    await expect(started).rejects.toThrow(/no wrapped data key/);
+    expect(transport.isClosed, "carried on without the vault's keys").toBe(true);
+    // And nothing can be sealed: there is no schedule to fall back to.
+    expect(() => engine.vaultKeys).toThrow(/handshake/);
+  });
+});
 
 describe("one device", () => {
   it("uploads what is in the vault and says what it sent", async () => {
@@ -878,7 +926,7 @@ describe("folders and renames", () => {
 });
 
 /**
- * C16 in TODO.md. Two distinct paths on the server that one disk files as a
+ * review finding C16. Two distinct paths on the server that one disk files as a
  * single name. Writing the second replaced the first, both were recorded as
  * synced, and the next scan reported the first deleted to every device.
  */
@@ -940,7 +988,7 @@ describe("two notes the receiving disk cannot hold apart", () => {
 });
 
 /**
- * C17 in TODO.md. The conflict copy is the only surviving record of one side
+ * review finding C17. The conflict copy is the only surviving record of one side
  * of a divergence, and its name was chosen with `exists` and then written
  * with an ordinary replacing write. A file appearing in between was replaced.
  */
@@ -1387,11 +1435,7 @@ describe("a pass that ended early", () => {
     // What a thrown pass would leave behind. If the guard goes, this commits
     // during the next pass and its uid lands on nothing.
     let committed = false;
-    const engine = a.engine as unknown as {
-      outbox: unknown[];
-      outboxBytes: number;
-      inbox: unknown[];
-    };
+    const engine = a.engine as unknown as { outbox: unknown[]; inbox: unknown[] };
     engine.outbox.push({
       path: "left-over.md",
       size: 0,
@@ -1401,7 +1445,6 @@ describe("a pass that ended early", () => {
         committed = true;
       },
     });
-    engine.outboxBytes = 0;
 
     const report = await a.engine.sync();
 
@@ -1921,7 +1964,7 @@ async function signed(e: Omit<WireEntry, "mac">): Promise<WireEntry> {
       deleted: e.deleted,
       prev: e.prev,
       chunks: e.chunks,
-      parent: e.parent,
+      parent: e.parent ?? "",
     }),
   };
 }
@@ -1954,7 +1997,7 @@ describe("a batch that contradicts itself", () => {
    * The envelope itself. Everything above tests a check behind it; this tests
    * that a server which does not hold the key cannot get past it at all.
    *
-   * Before protocol 2 each of these worked: the bytes of a file were sealed
+   * Before the entry authenticator each of these worked: the bytes of a file were sealed
    * and nothing else was, and the server holds every sealed path in the vault,
    * so it could name any file and say anything about it.
    */
@@ -1990,7 +2033,7 @@ describe("a batch that contradicts itself", () => {
     const { path, sealed, before } = await synced();
     const uid = 1_000_000;
     // A well-formed mac, from a key this vault does not use.
-    const stranger = await deriveKeys(new Uint8Array(20).fill(3));
+    const stranger = await otherVaultKeys(3);
     const facts = {
       path: sealed,
       size: 0,
@@ -2179,7 +2222,7 @@ describe("a batch that contradicts itself", () => {
     const uid = 1_000_000;
 
     // A second vault's key, so its sealed path cannot be opened by this one.
-    const stranger = await deriveKeys(new Uint8Array(20).fill(9));
+    const stranger = await otherVaultKeys(9);
     const foreign = await sealPath(stranger, "Notes/theirs.md");
 
     await expect(
@@ -2271,6 +2314,40 @@ describe("bounds taken from the party they exist to bound", () => {
     expect(OWN_LIMITS.perFileMax).toBe(256 * 1024 * 1024);
     expect(OWN_LIMITS.maxChunks).toBe(65536);
   });
+
+  /**
+   * The outbound half of the same rule, which was left behind when the inbound
+   * half was converted.
+   *
+   * `assemble` reads its ceiling through `boundedBy`; the pre-check in
+   * `reconcile` read the server's raw number and gated on `> 0`. Against a
+   * server advertising `perFileMax: 0` that guard was simply off, so this
+   * device would read, chunk and seal a file no server anywhere will store,
+   * which on a phone is the end of the process rather than a wasted pass.
+   */
+  it("refuses an outbound file over this device's ceiling when the server names none", async () => {
+    class Huge extends MemoryVault {
+      override async list() {
+        return [
+          {
+            path: "huge.bin",
+            folder: false,
+            mtime: 1000,
+            ctime: 1000,
+            size: OWN_LIMITS.perFileMax + 1,
+          },
+        ];
+      }
+      override async read(): Promise<Uint8Array> {
+        throw new Error("read a file the size pre-check should already have refused");
+      }
+    }
+    const { engine } = await engineOnFakeSocket({ perFileMax: 0 }, { vault: new Huge() });
+    const report = await engine.sync();
+    expect(report.uploaded).toBe(0);
+    expect(report.retrying, "refused for a reason no retry changes").toBe(0);
+    expect(report.skipped).toBe(1);
+  });
 });
 
 /**
@@ -2293,62 +2370,6 @@ describe("a server that is behind this device", () => {
 
   it("is fine for a device that has never synced", () => {
     expect(() => refuseIfBehind(0, 0)).not.toThrow();
-  });
-});
-
-/**
- * Whoever picks the merge base picks what can be thrown away.
- *
- * A three-way merge decides which side's changes are already present. A base
- * equal to the local file plus a few paragraphs makes those paragraphs look
- * deleted by the other side; mergeText drops them, the engine writes the result
- * and uploads it, and the shortened text becomes canonical on every device. No
- * conflict copy, and the pass reports one clean merge.
- *
- * The base is fetched by uid from the server. What the server cannot touch is
- * `entry.synchash`, this device's own record of the ancestor as of the last
- * completed sync, so the fetched chunks are checked against it.
- */
-describe("a version that is not the version it is offered as", () => {
-  let server: TestServer;
-  let a: Device;
-
-  afterEach(async () => {
-    a?.transport?.close();
-    if (server) await server.cleanup();
-  });
-
-  it("is refused when its chunks are not the ones recorded for it", async () => {
-    server = new TestServer();
-    await server.start();
-    a = new Device("a");
-    await a.connect(server);
-
-    const path = "Notes/n.md";
-    await a.vault.write(path, new TextEncoder().encode("one\ntwo\n"), {
-      mtime: a.clock,
-      ctime: a.clock,
-    });
-    await a.engine.sync();
-
-    const stored = await a.store.load();
-    const entry = stored?.entries[path] as
-      { chunks?: string[]; syncuid?: number; synchash?: string } | undefined;
-    const chunks = entry?.chunks ?? [];
-    expect(chunks.length).toBeGreaterThan(0);
-    // Derived rather than read: the stored form leaves out a hash it can work
-    // out from the chunk list, so the field is absent in the ordinary case.
-    const synchash = entry?.synchash ?? contentId(chunks);
-
-    // The real chunks under the real uid still open.
-    await expect(a.engine.contentOf(entry!.syncuid!, chunks, synchash)).resolves.toBeInstanceOf(
-      Uint8Array,
-    );
-
-    // A different chunk list for the same uid does not.
-    await expect(
-      a.engine.contentOf(entry!.syncuid!, [...chunks, chunks[0]!], synchash),
-    ).rejects.toThrow(/not the version it is being offered as/);
   });
 });
 

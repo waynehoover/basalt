@@ -22,7 +22,8 @@
 
 import { describe, expect, it } from "vitest";
 import { chunkBytes, sizesFor, type ChunkSizes, NAME_BYTES } from "./chunk.ts";
-import { deriveKeys, sealChunks } from "./crypto.ts";
+import { sealChunks } from "./crypto.ts";
+import { testKeys } from "./test-keys.ts";
 
 const enc = new TextEncoder();
 
@@ -34,7 +35,7 @@ const enc = new TextEncoder();
  * hundred milliseconds across this file and it means these numbers are the
  * numbers.
  */
-const KEY = await deriveKeys(new Uint8Array(20).fill(11));
+const KEY = await testKeys(new Uint8Array(32).fill(11));
 
 /** Prose with enough variety to behave like real text. */
 function note(bytes: number, seed = 1): Uint8Array {
@@ -229,7 +230,7 @@ describe("cost per file, in operations", () => {
     // an HMAC for the nonce, the seal, and a SHA-256 for the name. Anything
     // that adds a fourth doubles a large vault's first sync for a third more
     // work, so the count is pinned.
-    const k = await deriveKeys(new Uint8Array(20).fill(3));
+    const k = await testKeys(new Uint8Array(32).fill(3));
     const subtle = globalThis.crypto.subtle;
     const counts: Record<string, number> = {};
     const wrap = <T extends keyof SubtleCrypto>(name: T) => {
@@ -262,7 +263,7 @@ describe("cost per file, in operations", () => {
     // 310,000 PBKDF2 iterations is a visible pause on a phone. Doing it per
     // file would make a first sync unusable, and the only thing stopping
     // that is that the key schedule is separate from sealing.
-    const k = await deriveKeys(new Uint8Array(20).fill(5));
+    const k = await testKeys(new Uint8Array(32).fill(5));
     const subtle = globalThis.crypto.subtle;
     const original = subtle.deriveKey;
     let derived = 0;

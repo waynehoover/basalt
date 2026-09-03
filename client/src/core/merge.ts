@@ -121,6 +121,8 @@
 
 import { diff_match_patch, type Diff } from "diff-match-patch";
 
+import { splitName } from "./paths.ts";
+
 /** diff-match-patch's operation codes, named so the intent is readable. */
 const DELETE = -1;
 const EQUAL = 0;
@@ -353,23 +355,13 @@ export function mergeText(
     };
   }
 
+  // The forward result, which is the local changes applied to the incoming
+  // version. When the two directions agree on the lines and differ only in
+  // their order, one of them has to be picked; arbitrary, and fixed, which is
+  // what matters.
   return { kind: "merged", text: forward.text };
 }
 
-/**
- * Whether two merge results hold the same lines, in any order.
- *
- * Comparing the strings outright is too strict, and the case that shows it is
- * the common one: two devices each appending a line to a daily note. Both orders
- * lose nothing, and only the order differs, so demanding identical strings would
- * produce a conflict copy a day. Comparing line multisets accepts that and still
- * catches a misplaced hunk, because a hunk that lands in the wrong place changes
- * *which* lines exist rather than their order.
- *
- * When the two orders differ, the forward result is the one returned: local
- * changes applied to the incoming version. Arbitrary, and fixed, which is what
- * matters.
- */
 /**
  * Whether two merges produced the same content, allowing for ordering.
  *
@@ -447,11 +439,7 @@ function describe(text: string): string {
  * you are editing.
  */
 export function conflictCopyPath(path: string, device: string, at: Date): string {
-  const dot = path.lastIndexOf(".");
-  const slash = path.lastIndexOf("/");
-  const hasExt = dot > slash;
-  const stem = hasExt ? path.slice(0, dot) : path;
-  const ext = hasExt ? path.slice(dot) : "";
+  const { stem, ext } = splitName(path);
 
   const p = (n: number, width = 2) => String(n).padStart(width, "0");
   const stamp =

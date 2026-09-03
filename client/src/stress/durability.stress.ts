@@ -12,23 +12,11 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import type { Client } from "../core/client.ts";
-import type { VaultKeys } from "../core/crypto.ts";
 import { cleanupBinary, serverBinary, TestServer } from "../core/test-server.ts";
-import {
-  buildVault,
-  device,
-  differences,
-  fingerprint,
-  reopen,
-  settle,
-  suiteKeys,
-  tidy,
-} from "./harness.ts";
+import { buildVault, device, differences, fingerprint, reopen, settle, tidy } from "./harness.ts";
 
-let keys: VaultKeys;
 beforeAll(async () => {
   await serverBinary();
-  keys = await suiteKeys();
 }, 300_000);
 afterAll(async () => await cleanupBinary());
 
@@ -53,7 +41,7 @@ describe("a server killed while it is committing", () => {
   it("loses no note, and a new device still gets every one", async () => {
     server = new TestServer();
     await server.start();
-    const a = await device(server, keys, "a", dirs, open);
+    const a = await device(server, "a", dirs, open);
     await buildVault(a.dir, NOTES);
     const before = await fingerprint(a.dir);
     expect(before.size).toBe(NOTES);
@@ -71,9 +59,9 @@ describe("a server killed while it is committing", () => {
 
     // The device comes back as a new process would: same directory, whatever
     // index survived, a fresh connection.
-    const again = await reopen(server, keys, "a", a.dir, open);
+    const again = await reopen(server, "a", a.dir, open);
     await settle([again], 10);
-    const b = await device(server, keys, "b", dirs, open);
+    const b = await device(server, "b", dirs, open);
     await settle([b], 10);
 
     const after = await fingerprint(b.dir);
@@ -86,7 +74,7 @@ describe("a client killed while it is uploading", () => {
   it("leaves its own vault untouched and finishes on the next run", async () => {
     server = new TestServer();
     await server.start();
-    const a = await device(server, keys, "a", dirs, open);
+    const a = await device(server, "a", dirs, open);
     await buildVault(a.dir, NOTES);
     const before = await fingerprint(a.dir);
 
@@ -101,9 +89,9 @@ describe("a client killed while it is uploading", () => {
     // touched them.
     expect(differences(before, await fingerprint(a.dir))).toEqual([]);
 
-    const again = await reopen(server, keys, "a", a.dir, open);
+    const again = await reopen(server, "a", a.dir, open);
     await settle([again], 10);
-    const b = await device(server, keys, "b", dirs, open);
+    const b = await device(server, "b", dirs, open);
     await settle([b], 10);
     expect(differences(before, await fingerprint(b.dir))).toEqual([]);
     expect(await server.cli("verify", "-deep")).toMatch(/0 faults/);

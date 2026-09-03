@@ -13,7 +13,8 @@ import {
   type Chunk,
   type ChunkSizes,
 } from "./chunk.ts";
-import { SEAL_OVERHEAD, deriveKeys, sealChunks } from "./crypto.ts";
+import { SEAL_OVERHEAD, sealChunks } from "./crypto.ts";
+import { testKeys } from "./test-keys.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -541,7 +542,7 @@ describe("chunks that have to survive being sealed", () => {
 
   it("keeps every sealed chunk of incompressible data under the ceiling", async () => {
     const ceiling = 256 * 1024;
-    const keys = await deriveKeys(new Uint8Array(20).fill(4));
+    const keys = await testKeys(new Uint8Array(32).fill(4));
     const bytes = new Uint8Array(4 * 1024 * 1024);
     for (let at = 0; at < bytes.length; at += 65536) {
       crypto.getRandomValues(bytes.subarray(at, Math.min(at + 65536, bytes.length)));

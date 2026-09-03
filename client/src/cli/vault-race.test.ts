@@ -127,7 +127,7 @@ describe("listing while something else is deleting (C10)", () => {
 });
 
 /**
- * C21 in TODO.md. `FileHandle.write` says how much it wrote and may say less
+ * review finding C21. `FileHandle.write` says how much it wrote and may say less
  * than it was given; the count was ignored, so a short write was fsynced and
  * renamed into place as a complete note, or a complete index.
  */
@@ -159,7 +159,7 @@ describe("a write the filesystem cuts short", () => {
 });
 
 /**
- * C14 in TODO.md. The config is the only copy of the root secret, and the
+ * review finding C14. The config is the only copy of the root secret, and the
  * first device claims the server the moment after writing it. It goes through
  * the same durable path as a note, and a failure at any step leaves either the
  * previous config or none, never a temporary and never a partial file.
@@ -204,7 +204,7 @@ describe("the config on disk", () => {
 });
 
 /**
- * C18 in TODO.md. Several helpers turned every filesystem error into "absent"
+ * review finding C18. Several helpers turned every filesystem error into "absent"
  * or "not the same". A `remove` that could not look at the file reported it
  * gone, a trash name that could not be looked at was taken for free, and a
  * write whose spelling check failed went ahead under an unverified name.
@@ -255,7 +255,7 @@ describe("a filesystem that answers with an error rather than an answer", () => 
 });
 
 /**
- * C19 in TODO.md. The directory syncs that make the index safe to save were
+ * review finding C19. The directory syncs that make the index safe to save were
  * forgotten on failure, and only a plain write registered its directory.
  */
 describe("what a flush remembers", () => {
@@ -310,7 +310,7 @@ describe("what a flush remembers", () => {
 });
 
 /**
- * C20 in TODO.md. The move across filesystems copied and then removed, and
+ * review finding C20. The move across filesystems copied and then removed, and
  * trusted the copy. Rule 3 says copy, compare, then delete.
  */
 describe("moving a note across filesystems", () => {
@@ -358,7 +358,7 @@ describe("moving a note across filesystems", () => {
 });
 
 /**
- * C22 in TODO.md. Any name containing the temp marker vanished from the
+ * review finding C22. Any name containing the temp marker vanished from the
  * listing, while a crash's own temporaries stayed beside notes for ever.
  */
 describe("temporary files, ours and not", () => {

@@ -358,7 +358,7 @@ export function observe(
     return;
   }
 
-  if (needsRehash(entry, mtime, size(obs))) {
+  if (needsRehash(entry, mtime, obs.size)) {
     entry.hash = "";
     entry.chunks = [];
   }
@@ -366,10 +366,6 @@ export function observe(
   entry.mtime = mtime;
   entry.ctime = ctime;
   entry.size = obs.size;
-}
-
-function size(obs: { size: number }): number {
-  return obs.size;
 }
 
 /**

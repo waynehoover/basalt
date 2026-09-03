@@ -193,7 +193,7 @@ describe("loading", () => {
       secret: "AAAA",
     });
     expect(plugin.currentState.kind).toBe("stopped");
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/root secret is 32 bytes, or 20/);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/root secret is 32 bytes/);
   });
 });
 
@@ -286,11 +286,14 @@ describe("pairing", () => {
       const saved = plugin.savedData as Record<string, unknown> | null;
       return saved !== null && saved["bootstrap"] === undefined;
     });
+    // `wrapped` is the vault's data key as the server holds it, pinned on the
+    // first connection so a later `ready` carrying a different blob is refused.
     expect(Object.keys(plugin.savedData as object).sort()).toEqual([
       "device",
       "secret",
       "url",
       "vaultId",
+      "wrapped",
     ]);
   }, 300_000);
 
@@ -344,8 +347,9 @@ describe("pairing", () => {
 
   it("refuses a pairing string that was mangled", async () => {
     const { plugin } = await load();
-    await expect(plugin.pair("basalt1_notreally", "d")).rejects.toThrow();
-    await expect(plugin.pair("hello", "d")).rejects.toThrow(/basalt2_/);
+    await expect(plugin.pair("basalt1_notreally", "d")).rejects.toThrow(/before protocol 3/);
+    await expect(plugin.pair("basalt2_notreally", "d")).rejects.toThrow(/before protocol 3/);
+    await expect(plugin.pair("hello", "d")).rejects.toThrow(/basalt3_/);
     expect(plugin.paired).toBe(false);
     expect(plugin.savedData).toBe(null);
   });
@@ -852,7 +856,7 @@ describe("on a device with no status bar", () => {
   }, 300_000);
 
   /**
-   * P13 in TODO.md. A connection that was up and went is network loss, and
+   * review finding P13. A connection that was up and went is network loss, and
    * the origin was demonstrably fine. Advice about it on every offline state
    * sent people to restart a server that had nothing wrong with it.
    */
@@ -992,7 +996,7 @@ function slowIndexLoad(app: App, ms: number): { began: Promise<void> } {
 }
 
 /**
- * P1 and P12 in TODO.md. A run inside `connect()` used to survive `unlink`:
+ * P1 and review finding P12. A run inside `connect()` used to survive `unlink`:
  * the shell was handed the client only once the handshake had succeeded, so
  * a vault unlinked during a slow handshake had nothing to close, and the
  * connection went on to complete with the old secret. The two tests this
@@ -1027,15 +1031,16 @@ describe("unlinking during the handshake (P1)", () => {
       // the claim, so the vault is still unclaimed and holds nothing.
       void oldPairing;
       const { Client } = await import("../core/client.ts");
-      const { authToken, deriveKeys } = await import("../core/crypto.ts");
+      const { authToken, deriveRootKeys } = await import("../core/crypto.ts");
+      const { testWrapped } = await import("../core/test-keys.ts");
       const { MemoryIndexStore, MemoryVault } = await import("../core/vault.ts");
-      const keys = await deriveKeys(new Uint8Array(20).fill(3));
+      const secret = new Uint8Array(32).fill(3);
       const checker = new Client({
         vault: new MemoryVault(),
         store: new MemoryIndexStore(),
-        keys,
+        secret,
         url: server.wsUrl,
-        ...server.credentials(authToken(keys)),
+        ...server.credentials(authToken(await deriveRootKeys(secret)), await testWrapped(secret)),
         vaultId: "default",
         device: "checker",
       });
@@ -1074,7 +1079,7 @@ describe("unlinking during the handshake (P1)", () => {
 });
 
 /**
- * P15 and P23 in TODO.md, the plugin half of C13. Unlink used to discard the
+ * P15 and review finding P23, the plugin half of C13. Unlink used to discard the
  * promise from `close()`, clear the saved config, and then remove the index,
  * so a pass in flight could recreate the index after its removal and an
  * adapter failure left the vault unpaired on disk and paired in memory.
@@ -1231,7 +1236,7 @@ describe("unlink, in order and all the way (P15)", () => {
 });
 
 /**
- * P16 in TODO.md, the plugin half of C15. The first device claims the vault
+ * review finding P16, the plugin half of C15. The first device claims the vault
  * with the server's bootstrap token and then drops the token. If the drop
  * never saved, or the claim's reply was lost, the next start offered the
  * spent token first and was refused for ever.
@@ -1281,7 +1286,7 @@ describe("a spent bootstrap (P16)", () => {
     await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
     await until("the failure to be noticed", () =>
-      notices.some((n) => /could not be removed/.test(n.message)),
+      notices.some((n) => /could not be brought up to date/.test(n.message)),
     );
     // On disk and in memory, the token is still there.
     expect((plugin.savedData as Record<string, unknown>)["bootstrap"]).toBe(server.token);
@@ -1307,7 +1312,7 @@ describe("a spent bootstrap (P16)", () => {
 });
 
 /**
- * P3 in TODO.md. An unreadable data.json set the state to stopped, but the
+ * review finding P3. An unreadable data.json set the state to stopped, but the
  * panel branched on `paired` and offered the pairing form, and pairing
  * overwrote the file with a new secret.
  */
@@ -1322,7 +1327,7 @@ describe("a config that cannot be read (P3)", () => {
     plugin.ribbonIcons[0]!.callback();
     expect(built.map((s) => s.name)).not.toContain("Pairing string");
     const shown = modals.at(-1)!.contentEl.allText();
-    expect(shown).toMatch(/root secret is 32 bytes, or 20/);
+    expect(shown).toMatch(/root secret is 32 bytes/);
     expect(shown).toContain(".obsidian/plugins/basalt/data.json");
 
     await expect(plugin.pairFirst(server.setup, "laptop")).rejects.toThrow(/could not be read/);
@@ -1332,7 +1337,7 @@ describe("a config that cannot be read (P3)", () => {
 });
 
 /**
- * P4 in TODO.md. "Working on X" stuck after any pass the plugin did not
+ * review finding P4. "Working on X" stuck after any pass the plugin did not
  * start: the ticker and an arriving batch. Every pass now reports through one
  * hook, and the state follows it.
  */
@@ -1364,7 +1369,7 @@ describe("passes the plugin did not start (P4)", () => {
 });
 
 /**
- * P5 in TODO.md. "Cannot sync N file(s)" fired on every pass for a file that
+ * review finding P5. "Cannot sync N file(s)" fired on every pass for a file that
  * would never sync, and a notice on every pass is a notice nobody reads.
  */
 describe("what is announced, and how often (P5)", () => {
@@ -1393,7 +1398,7 @@ describe("what is announced, and how often (P5)", () => {
 });
 
 /**
- * P7 in TODO.md. `syncNow` could reject with the promise discarded by both
+ * review finding P7. `syncNow` could reject with the promise discarded by both
  * callers, so a pass that threw was a button that did nothing.
  */
 describe("a sync that fails (P7)", () => {
@@ -1424,7 +1429,7 @@ describe("a sync that fails (P7)", () => {
 });
 
 /**
- * P8 in TODO.md. "It will sync as soon as it reconnects" was shown while
+ * review finding P8. "It will sync as soon as it reconnects" was shown while
  * stopped, which is the one state in which it will not.
  */
 describe("what is said while stopped (P8)", () => {
@@ -1441,7 +1446,7 @@ describe("what is said while stopped (P8)", () => {
     const { decodeConfig, encodeConfig } = await import("../core/pairing.ts");
     const wrong = encodeConfig({
       ...decodeConfig(saved, "test"),
-      secret: new Uint8Array(20).fill(7),
+      secret: new Uint8Array(32).fill(7),
     });
     const other = await load(wrong);
     await until("it to stop", () => other.plugin.currentState.kind === "stopped");
@@ -1457,7 +1462,7 @@ describe("what is said while stopped (P8)", () => {
 });
 
 /**
- * P9 in TODO.md. A folder rename is one event, for the folder, and every
+ * review finding P9. A folder rename is one event, for the folder, and every
  * path under it moved without a word. Each file inside used to be reported
  * deleted at its old path and new at its new one.
  */
@@ -1484,7 +1489,7 @@ describe("renaming a folder (P9)", () => {
 });
 
 /**
- * P10 in TODO.md. `basalt:restore` looked at one page of two hundred
+ * review finding P10. `basalt:restore` looked at one page of two hundred
  * versions, so a version older than that was one `basalt:history` would list
  * and this would then say did not exist.
  */
@@ -1530,7 +1535,7 @@ describe("restoring by uid from the command line (P10)", () => {
 });
 
 /**
- * P11 in TODO.md and P32 in TODO-NEW.md. A pairing string was saved and
+ * review finding P11 and P32 in TODO-NEW.md. A pairing string was saved and
  * announced as paired before the server had been reached, and two presses of
  * Pair made two secrets.
  */
@@ -1564,7 +1569,7 @@ describe("pairing honestly (P11, P32)", () => {
     const wrong = formatPairing({
       url: server.wsUrl,
       vaultId: "default",
-      secret: new Uint8Array(20).fill(9),
+      secret: new Uint8Array(32).fill(9),
     });
     const second = await load();
     await expect(second.plugin.pair(wrong, "desktop")).rejects.toThrow(/auth/i);
@@ -1616,7 +1621,7 @@ describe("pairing honestly (P11, P32)", () => {
 });
 
 /**
- * P13 in TODO.md. `addStatusBarItem` is declared "not available on mobile"
+ * review finding P13. `addStatusBarItem` is declared "not available on mobile"
  * and was called unguarded.
  */
 describe("on a phone (P13)", () => {
@@ -1636,7 +1641,7 @@ describe("on a phone (P13)", () => {
 });
 
 /**
- * P22 in TODO.md. Every row was called recoverable, including the ones drawn
+ * review finding P22. Every row was called recoverable, including the ones drawn
  * a few lines down as purged.
  */
 describe("the recovery header (P22)", () => {
@@ -1874,7 +1879,7 @@ it("tints only the state that is actually wrong", async () => {
 });
 
 /**
- * I22 in TODO.md. Adding a device is an invite: the panel makes one, the new
+ * review finding I22. Adding a device is an invite: the panel makes one, the new
  * device pastes it, and the root secret is never on screen for it. The
  * recovery key is shown once when a vault is started and otherwise only behind
  * a warning, off the path anybody takes to add a device.

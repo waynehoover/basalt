@@ -80,7 +80,7 @@ import {
   type WireEntry,
 } from "./transport.ts";
 import { validateStoredState } from "./stored-state.ts";
-import { isNeverSynced } from "./paths.ts";
+import { foldPath, foldsTogether, isNeverSynced, splitName } from "./paths.ts";
 import { parents, type IndexStore, type Vault } from "./vault.ts";
 
 /**
@@ -186,6 +186,60 @@ export function boundedBy(fromServer: number, own: number): number {
 }
 
 /**
+ * Refuses a list of entries holding one this vault's key did not sign.
+ *
+ * The nine fields are exactly what the writer signed, and reading them out of
+ * a `WireEntry` is the whole check: a field left out here is a field the
+ * server may set freely. A parent of "" is a real value, so a server omitting
+ * the field means the same thing. A mac cannot be defaulted that way: an
+ * absent one fails, which is the point.
+ *
+ * Every path that acts on an entry comes through here, and the reason it is
+ * one function is that for a while it was two and only one of them existed.
+ * The sync path checked every batch entry; recovery did not (C32), so a
+ * `history` was shown, a `deleted` list was offered for restore, and the
+ * version chosen was fetched and written, all on the server's word. The
+ * server holds every sealed path and could name any file; an entry it
+ * invented would decrypt, being made of real chunks, and be written into the
+ * vault as a restored note.
+ *
+ * `suffix` is for a caller whose refusal has something more to say, such as
+ * recovery adding that the entry is not being shown either.
+ */
+export async function mustBeOurs(
+  keys: VaultKeys,
+  entries: readonly WireEntry[],
+  suffix = "",
+): Promise<void> {
+  const ours = await Promise.all(
+    entries.map((e) =>
+      entryIsOurs(
+        keys,
+        {
+          path: e.path,
+          size: e.size,
+          ctime: e.ctime,
+          mtime: e.mtime,
+          folder: e.folder,
+          deleted: e.deleted,
+          prev: e.prev,
+          chunks: e.chunks,
+          parent: e.parent ?? "",
+        },
+        e.mac,
+      ),
+    ),
+  );
+  const forged = ours.indexOf(false);
+  if (forged >= 0) {
+    throw new Error(
+      `version ${entries[forged]!.uid} is not authenticated by this vault's key, ` +
+        `so nothing that holds the key wrote it${suffix}`,
+    );
+  }
+}
+
+/**
  * Refuses a batch entry that contradicts itself, before anything acts on it.
  *
  * Everything here except the sealed path arrives in the clear and unsigned, and
@@ -233,36 +287,37 @@ export interface EngineOptions {
   readonly vault: Vault;
   readonly store: IndexStore;
   /**
-   * The keys derived from the root secret alone.
+   * The root secret. Every key this engine uses comes from it and from the
+   * wrapped data key `ready` returns, and none of them exist before that.
    *
-   * What the engine starts with, and what it keeps for a vault claimed under
-   * protocol 2. For a vault with a data key the content keys are replaced
-   * after `ready`, from `secret` and the wrapped key the server returns, and
-   * these are used only for the handshake.
+   * The engine holds no keys until the handshake, which is deliberate: there
+   * is one key schedule per vault and one moment it becomes known, so there
+   * is no window in which something could be sealed under the wrong one.
    */
-  readonly keys: VaultKeys;
-  /**
-   * The root secret, for unwrapping the data key `ready` returns.
-   *
-   * Optional only for a caller that knows the vault has no data key, which
-   * is a test; a shell always passes it, because whether the vault has one is
-   * the server's to say and the engine has to be able to answer either way.
-   */
-  readonly secret?: Uint8Array;
+  readonly secret: Uint8Array;
   readonly transport: Transport;
   readonly device: string;
   readonly vaultId: string;
   readonly token: string;
-  /** The auth key to bind the vault to, if it has not been claimed yet. */
-  readonly claim?: string;
   /**
-   * A fresh data key wrapped under this device's root, offered with `claim`.
+   * What to bind the vault to if it has not been claimed: the auth key, and
+   * the data key this device is claiming with, wrapped under its root.
    *
-   * Stored by the server only if this device's claim is the one that binds
-   * the vault, and ignored otherwise, exactly like `claim`. The engine never
-   * uses this copy: the key it seals under is the one `ready` returns, so a
-   * claim that committed with a reply lost still leaves every device on the
-   * same key.
+   * Sent only while this device is still claiming, which is while it holds the
+   * server's first-run token, and the same pair every time: a retry after a
+   * lost reply must offer the key it offered before, or the vault can be bound
+   * to one candidate while this device goes on proposing another. Absent
+   * everywhere else, because a vault that is known to be claimed has nothing to
+   * claim and a claim sent anyway is a wrapping handed to the server for free.
+   *
+   * The engine never seals anything under this copy: the key it uses is the one
+   * `ready` returns, so a claim that committed with its reply lost still leaves
+   * every device on the same key.
+   */
+  readonly claim?: { auth: string; wrapped: string };
+  /**
+   * The vault's wrapped data key as this device last saw it, when it has seen
+   * it. A `ready` carrying a different blob is refused; see DeviceConfig.
    */
   readonly wrapped?: string;
   readonly now?: () => number;
@@ -403,9 +458,10 @@ export class Engine {
   /** Plaintext paths with inbound work outstanding. */
   private readonly pending = new Set<string>();
   private readonly retries = new Map<string, Retry>();
-  /** Paths that can never sync. Kept apart from retries on purpose. */
   /**
-   * Paths written off, and what the file looked like when they were.
+   * Paths written off, and what the file looked like when they were. Kept
+   * apart from `retries` on purpose, because a file that can never work and a
+   * file that failed once want opposite treatment.
    *
    * The fingerprint is the point. "Permanent" describes the file, not the
    * path, and a file can be changed: somebody whose note is refused for being
@@ -439,9 +495,8 @@ export class Engine {
    */
   private cannotStream = false;
 
-  /** Writes waiting to go up together, and what they will cost to hold. */
+  /** Writes waiting to go up together. */
   private outbox: Queued[] = [];
-  private outboxBytes = 0;
   /** And what they cost against the server's two batch caps. */
   private outboxBudget = 0;
   private outboxFrame = 0;
@@ -451,17 +506,14 @@ export class Engine {
   private inboxBytes = 0;
 
   /**
-   * What the server said it would accept, kept so a download can be held to
-   * it.
+   * What the server said it will take, learned at the handshake, and kept so
+   * a download can be held to it.
    *
    * The limits arrive at hello and were previously logged and dropped. They
    * bound what this device sends; nothing bounded what it would take. A chunk
    * list is a number the server chooses, and a device that fetches and buffers
    * however many are named runs out of memory on a corrupt row as readily as
    * on a hostile one.
-   */
-  /**
-   * What the server said it will take, learned at the handshake.
    *
    * Readable because a shell has to be able to say why a file was written
    * off, and "too large" is only meaningful next to the number.
@@ -471,16 +523,17 @@ export class Engine {
   private readonly unsealed = new Map<string, string>();
 
   /**
-   * The keys in use: the root's until `ready`, and the data key's after it
-   * when the vault has one. Everything that seals or opens goes through here
-   * rather than `opts.keys`, so the swap reaches every use.
+   * The vault's keys, known from `ready` onwards and not before.
+   *
+   * Undefined until the handshake has handed over the wrapped data key. Read
+   * through `keys`, which refuses rather than sealing anything under a
+   * schedule nobody has agreed on yet.
    */
-  private keys: VaultKeys;
+  private derived: VaultKeys | undefined;
   /**
-   * Settled once `keys` is final, which is after `ready` has said whether
-   * the vault has a data key. The first batch can arrive in the same
-   * moment, and a batch opened under the wrong schedule fails its
-   * authenticator and ends the session, so `acceptBatch` waits here.
+   * Settled once `derived` is set, which is after `ready`. The first batch can
+   * arrive in the same moment, and a batch opened under the wrong schedule
+   * fails its authenticator and ends the session, so `acceptBatch` waits here.
    */
   private readonly keysReady: Promise<void>;
   private settleKeys!: () => void;
@@ -492,7 +545,6 @@ export class Engine {
   private started = false;
 
   constructor(private readonly opts: EngineOptions) {
-    this.keys = opts.keys;
     this.keysReady = new Promise<void>((resolve, reject) => {
       this.settleKeys = resolve;
       this.failKeys = reject;
@@ -500,6 +552,22 @@ export class Engine {
     // Awaited by acceptBatch and by nothing before start; a start that
     // never happens must not surface as an unhandled rejection.
     this.keysReady.catch(() => {});
+  }
+
+  /**
+   * The vault's keys, or a refusal.
+   *
+   * Everything that seals, opens or authenticates goes through here. A caller
+   * that reaches it before the handshake is a bug, and the message says which
+   * bug rather than letting WebCrypto complain about an undefined key.
+   */
+  private get keys(): VaultKeys {
+    if (this.derived === undefined) {
+      throw new Error(
+        "this engine has not finished its handshake, so the vault's keys are not known yet",
+      );
+    }
+    return this.derived;
   }
 
   /** The keys in use, which a shell needs to seal a path for recovery. */
@@ -599,7 +667,7 @@ export class Engine {
         device: this.opts.device,
         cursor: this.cursor,
         ...(this.opts.claim !== undefined ? { claim: this.opts.claim } : {}),
-        ...(this.opts.wrapped !== undefined ? { wrapped: this.opts.wrapped } : {}),
+        ...(this.opts.wrapped !== undefined ? { knownWrapped: this.opts.wrapped } : {}),
       });
       // The docs present the client-ahead case as what catches a server
       // restored from an old backup or pointed at the wrong vault, and the
@@ -608,18 +676,12 @@ export class Engine {
       // the status line reported `behind` clamped at zero, so it looked like
       // being up to date.
       refuseIfBehind(limits.cursor, this.cursor);
-      // Which key schedule this vault uses, decided by the server's answer
-      // and never by the pairing string: a vault with a data key seals
-      // everything under keys derived from it, and this device has to derive
-      // the same ones before it opens the first path a batch names.
-      if (limits.wrapped !== undefined) {
-        if (this.opts.secret === undefined) {
-          throw new Error(
-            "this vault has a data key and this device was given no root secret to unwrap it with",
-          );
-        }
-        this.keys = await deriveKeys(this.opts.secret, limits.wrapped);
-      }
+      // The vault's keys, from the data key the server just handed over. This
+      // is the only place they are set, and it happens before the first batch
+      // is opened: a batch unsealed under any other schedule fails its
+      // authenticator. A `ready` carrying no wrapped key never reaches here,
+      // because the transport ends the session on one; see readReady, C40.
+      this.derived = await deriveKeys(this.opts.secret, limits.wrapped);
     } catch (err) {
       this.failKeys(err instanceof Error ? err : new Error(String(err)));
       throw err;
@@ -630,16 +692,6 @@ export class Engine {
     return limits;
   }
 
-  /**
-   * Takes a batch from the transport into the remote index.
-   *
-   * Wired to the transport's `onBatch`. The transport has already checked that
-   * the range continues this device's cursor, so what is left here is unsealing
-   * the paths and remembering that these paths have work outstanding.
-   *
-   * A batch with no entries is this device's own write coming back: it carries
-   * the cursor advance and nothing to apply.
-   */
   /**
    * Authenticates one outgoing entry.
    *
@@ -668,6 +720,16 @@ export class Engine {
     return { mac, parent };
   }
 
+  /**
+   * Takes a batch from the transport into the remote index.
+   *
+   * Wired to the transport's `onBatch`. The transport has already checked that
+   * the range continues this device's cursor, so what is left here is unsealing
+   * the paths and remembering that these paths have work outstanding.
+   *
+   * A batch with no entries is this device's own write coming back: it carries
+   * the cursor advance and nothing to apply.
+   */
   async acceptBatch(batch: { from: number; to: number; entries: WireEntry[] }): Promise<void> {
     // Not before the handshake has said which keys this vault uses; see
     // `keysReady`.
@@ -690,30 +752,7 @@ export class Engine {
     // and 8.4 ms. The staging map already commits at the end, so checking
     // the whole batch before touching anything is the same all-or-nothing
     // it already had.
-    const facts = batch.entries.map((e) => ({
-      path: e.path,
-      size: e.size,
-      ctime: e.ctime,
-      mtime: e.mtime,
-      folder: e.folder,
-      deleted: e.deleted,
-      prev: e.prev,
-      chunks: e.chunks,
-      // A parent of "" is a real value, so a server omitting the field
-      // means the same thing. A mac cannot be defaulted that way: an
-      // absent one fails, which is the point.
-      parent: e.parent ?? "",
-    }));
-    const ours = await Promise.all(
-      facts.map((f, i) => entryIsOurs(this.keys, f, batch.entries[i]!.mac)),
-    );
-    const forged = ours.indexOf(false);
-    if (forged >= 0) {
-      throw new Error(
-        `version ${batch.entries[forged]!.uid} is not authenticated by this vault's key, ` +
-          `so nothing that holds the key wrote it`,
-      );
-    }
+    await mustBeOurs(this.keys, batch.entries);
     for (const e of batch.entries) checkEntryShape(e);
 
     const paths = await Promise.all(batch.entries.map((e) => this.plaintextPath(e.path)));
@@ -831,7 +870,6 @@ export class Engine {
         reads: this.inbox.length,
       });
       this.outbox = [];
-      this.outboxBytes = 0;
       this.outboxBudget = 0;
       this.outboxFrame = 0;
       this.inbox = [];
@@ -977,8 +1015,8 @@ export class Engine {
     // over the limit costs several times its own size in memory to produce
     // an error that its size alone predicted. On a phone that is not a
     // wasted pass, it is the end of the process.
-    const perFileMax = this.limits?.perFileMax ?? 0;
-    if (stat && !stat.folder && perFileMax > 0 && stat.size > perFileMax) {
+    const perFileMax = this.limitOn("perFileMax");
+    if (stat && !stat.folder && stat.size > perFileMax) {
       this.recordFailure(path, tooLarge(stat.size, perFileMax), report);
       return;
     }
@@ -1050,7 +1088,8 @@ export class Engine {
 
     // Too big to keep the bodies even for a moment, so only the names are
     // taken and the sealed copies are dropped a window at a time.
-    entry.chunks = await this.namesOf(parts);
+    // Chunk names without keeping the bodies. See `sealedNames`.
+    entry.chunks = await sealedNames(this.keys, parts);
     entry.hash = contentId(entry.chunks);
     entry.size = bytes.length;
     return { bytes, pieces, names: entry.chunks };
@@ -1124,11 +1163,6 @@ export class Engine {
     entry.hash = contentId(names);
     entry.size = size;
     return { names, spans, path, size };
-  }
-
-  /** Chunk names without keeping the bodies. See `sealedNames`. */
-  private namesOf(parts: Uint8Array[]): Promise<string[]> {
-    return sealedNames(this.keys, parts);
   }
 
   private async act(
@@ -1365,13 +1399,16 @@ export class Engine {
   /**
    * Adds a write to the outbox, flushing when the batch is full.
    *
-   * Two bounds, because they guard different things. The count is the
+   * Three bounds, because they guard different things. The count is the
    * server's, and it is what makes a vault of notes one exchange instead of
-   * hundreds. The byte bound is this device's: a queued file pins roughly its
-   * own size in memory until the batch goes, either as sealed bodies or as the
-   * plaintext its offsets point into, so batching two hundred and fifty-six
-   * attachments would hold all of them at once. Notes batch to the count;
-   * attachments flush almost every file, which is what this did before.
+   * hundreds. The other two are the server's caps on a batched write, one on
+   * the summed ciphertext budget of the entries and one on the encoded frame,
+   * and between them they bound this device's memory as well: a queued file
+   * pins roughly its own size until the batch goes, either as sealed bodies or
+   * as the plaintext its offsets point into, so batching two hundred and
+   * fifty-six attachments would otherwise hold all of them at once. Notes
+   * batch to the count; attachments flush almost every file, which is what
+   * this did before.
    */
   private async queue(q: Queued, report: SyncReport): Promise<void> {
     // Two caps from `ready`, both on the whole batch: the summed ciphertext
@@ -1393,7 +1430,6 @@ export class Engine {
       await this.flush(report);
     }
     this.outbox.push(q);
-    this.outboxBytes += q.size;
     this.outboxBudget += budget;
     this.outboxFrame += encoded;
     if (
@@ -1405,14 +1441,29 @@ export class Engine {
     }
   }
 
+  /**
+   * One limit, held to the tighter of what the server asked for and what this
+   * device allows.
+   *
+   * The rule lives here rather than at each guard because it was written out
+   * by hand at every guard and one of them was written differently: the
+   * outbound size pre-check read the server's raw number and gated on `> 0`,
+   * so a server advertising `perFileMax: 0` turned it off. Every reader of a
+   * limit goes through this, so the next limit added cannot be added with the
+   * fallback forgotten.
+   */
+  private limitOn(which: keyof typeof OWN_LIMITS): number {
+    return boundedBy(this.limits?.[which] ?? 0, OWN_LIMITS[which]);
+  }
+
   /** The batched-write cap this device keeps to: the server's, or its own if smaller. */
   private get batchCap(): number {
-    return boundedBy(this.limits?.maxBatchBytes ?? 0, OWN_LIMITS.maxBatchBytes);
+    return this.limitOn("maxBatchBytes");
   }
 
   /** The fetch cap this device keeps to, the same way. */
   private get fetchCap(): number {
-    return boundedBy(this.limits?.maxFetchBytes ?? 0, OWN_LIMITS.maxFetchBytes);
+    return this.limitOn("maxFetchBytes");
   }
 
   /**
@@ -1426,7 +1477,6 @@ export class Engine {
     if (this.outbox.length === 0) return;
     const batch = this.outbox;
     this.outbox = [];
-    this.outboxBytes = 0;
     this.outboxBudget = 0;
     this.outboxFrame = 0;
 
@@ -1510,7 +1560,6 @@ export class Engine {
     }
   }
 
-  /** The sealed chunks for a file, re-sealing only if the cache cannot serve. */
   /**
    * Works out what a file's chunks are called, and how to produce one.
    *
@@ -1537,7 +1586,10 @@ export class Engine {
     // sealed it. Doing that again was the single largest cost of sending a
     // large attachment: a 64 MiB file was read twice, chunked twice and
     // sealed twice, and the garbage from both passes was live at once.
-    const scan = fresh ?? (await this.scan(entry, path));
+    // Read and cut here when the caller had no fresh scan to hand over. A
+    // merge and a conflict copy both rewrite the file before uploading it, so
+    // whatever the pass scanned is stale by the time they are done.
+    const scan = fresh ?? (await this.rehash(entry, path));
 
     if (scan.sealed) {
       const byName = new Map(scan.sealed.map((c) => [c.name, c.bytes]));
@@ -1598,28 +1650,6 @@ export class Engine {
     };
   }
 
-  /**
-   * Reads and cuts a file, for an upload that arrived without a fresh scan.
-   *
-   * A merge and a conflict copy both rewrite the file before uploading it, so
-   * whatever the pass scanned is stale by the time they are done.
-   */
-  private scan(entry: IndexEntry, path: string): Promise<Scanned> {
-    return this.rehash(entry, path);
-  }
-
-  /**
-   * Downloads one version, in one round trip.
-   *
-   * It used to take three: ask the server for the chunk list, fetch the
-   * bodies, then ask for the same chunk list again to fill the cache. Both
-   * questions were already answered. A batch carries the chunk list of every
-   * entry in it, and `remote.hash` *is* that list, so the only thing the
-   * server still has to be asked for is the bodies.
-   *
-   * On a fast link that was invisible. At four hundred milliseconds it was
-   * two thirds of the time a download took.
-   */
   /**
    * Queues a version to come down with the next fetch.
    *
@@ -1735,9 +1765,7 @@ export class Engine {
 
   /** What the disk will file a path under. The vault knows; otherwise the safe guess. */
   private identity(path: string): string {
-    return this.opts.vault.canonical
-      ? this.opts.vault.canonical(path)
-      : path.normalize("NFC").toLowerCase();
+    return this.opts.vault.canonical ? this.opts.vault.canonical(path) : foldPath(path);
   }
 
   /**
@@ -1818,9 +1846,7 @@ export class Engine {
     const vault = this.opts.vault;
     for (const wrote of this.wroteThisPass) {
       if (wrote === path) continue;
-      const same = vault.sameFile
-        ? await vault.sameFile(wrote, path)
-        : wrote.normalize("NFC").toLowerCase() === path.normalize("NFC").toLowerCase();
+      const same = vault.sameFile ? await vault.sameFile(wrote, path) : foldsTogether(wrote, path);
       if (same) return wrote;
     }
     return undefined;
@@ -1993,12 +2019,8 @@ export class Engine {
    * its content and writing it back, and there is no reason for a second copy
    * of the reassembly to exist for that.
    */
-  async contentOf(uid: number, known?: readonly string[], expected?: string): Promise<Uint8Array> {
-    // `known` is what a caller already has. A download does: the batch that
-    // announced the version carried its chunk list, so asking for it again
-    // is a round trip spent learning something already known. A restore
-    // works from a uid alone and has to ask.
-    const meta = known !== undefined ? { chunks: known } : await this.opts.transport.get(uid);
+  async contentOf(uid: number, expected?: string): Promise<Uint8Array> {
+    const meta = await this.opts.transport.get(uid);
     // `expected` is a content id the caller already holds for this uid, and
     // the one that matters is the merge ancestor's. A three-way merge
     // decides which side's changes are already present, so whoever chooses
@@ -2021,12 +2043,7 @@ export class Engine {
     }
     if (meta.chunks.length === 0) return new Uint8Array(0);
     this.checkChunkCount(uid, meta.chunks.length);
-    // A caller that already knows the chunk list has not asked the server
-    // for the size, so each chunk is costed at the largest a chunk can be.
-    const each =
-      "size" in meta
-        ? perChunkBudget(meta.size, meta.chunks.length)
-        : entryBudget(boundedBy(this.limits?.chunkMax ?? 0, OWN_LIMITS.chunkMax), 1);
+    const each = perChunkBudget(meta.size, meta.chunks.length);
     return this.assemble(uid, await this.fetchAll(meta.chunks, () => each));
   }
 
@@ -2036,7 +2053,7 @@ export class Engine {
    * declining to be told two different things.
    */
   private checkChunkCount(uid: number, count: number): void {
-    const maxChunks = boundedBy(this.limits?.maxChunks ?? 0, OWN_LIMITS.maxChunks);
+    const maxChunks = this.limitOn("maxChunks");
     if (count > maxChunks) {
       throw new Error(
         `version ${uid} names ${count} chunks, and this server said it stores at most ${maxChunks}`,
@@ -2049,7 +2066,7 @@ export class Engine {
     if (bodies.length === 0) return new Uint8Array(0);
     const opened: Uint8Array[] = [];
     let total = 0;
-    const perFileMax = boundedBy(this.limits?.perFileMax ?? 0, OWN_LIMITS.perFileMax);
+    const perFileMax = this.limitOn("perFileMax");
     // A window at a time, for the reason sealChunks takes one: opening is
     // mostly waiting on WebCrypto, and one at a time leaves it idle. The
     // window is what keeps a large file from holding every opened chunk at
@@ -2109,7 +2126,7 @@ export class Engine {
     // server has purged is a fact, and it gets said as what it is.
     let baseBytes: Uint8Array;
     try {
-      baseBytes = await this.contentOf(entry.syncuid, undefined, entry.synchash);
+      baseBytes = await this.contentOf(entry.syncuid, entry.synchash);
     } catch (err) {
       if (!ancestorIsGone(err)) throw err;
       const why =
@@ -2119,7 +2136,7 @@ export class Engine {
       return;
     }
     const mineBytes = await this.opts.vault.read(path);
-    const theirsBytes = await this.contentOf(remote.uid, undefined, remote.hash);
+    const theirsBytes = await this.contentOf(remote.uid, remote.hash);
 
     const dec = new TextDecoder("utf-8", { fatal: true });
     let base: string;
@@ -2199,7 +2216,7 @@ export class Engine {
     why: string,
   ): Promise<void> {
     if (!remote) return;
-    const incoming = await this.contentOf(remote.uid, undefined, remote.hash);
+    const incoming = await this.contentOf(remote.uid, remote.hash);
     const copyPath = await placeBeside(
       () => this.freeConflictPath(path),
       incoming,
@@ -2259,7 +2276,6 @@ export class Engine {
     this.log("will retry", path, { attempt: retry.count, error: message });
   }
 
-  /** Forgets index entries for paths that exist nowhere any more. */
   /**
    * Forgets what nothing can act on any more.
    *
@@ -2418,10 +2434,14 @@ export class Engine {
  * Two passes of one sync, as one report.
  *
  * The work counters add, because they count things that happened. The state
- * counters do not: `unchanged`, `waiting`, `retrying`, `skipped` and `blocked`
- * describe how the vault looks at the end of a pass, and adding them reported
- * one file held back in two passes as two waiting (C35). The newest pass has
- * the last word on those, as `accumulate` in client.ts does for a settle.
+ * counters do not: `unchanged`, `waiting`, `retrying`, `skipped`, `blocked`
+ * and `inTheWay` describe how the vault looks at the end of a pass, and adding
+ * them reported one file held back in two passes as two waiting (C35), and one
+ * unchanged file looked at four times as four unchanged. The newest pass has
+ * the last word on those.
+ *
+ * This is also how a settle adds its passes up, which for a while it did
+ * through a second copy of this function.
  */
 export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
   return {
@@ -2595,11 +2615,7 @@ export async function firstFreeName(
 ): Promise<string> {
   if (!(await taken(base))) return base;
 
-  const dot = base.lastIndexOf(".");
-  const slash = base.lastIndexOf("/");
-  const hasExt = dot > slash;
-  const stem = hasExt ? base.slice(0, dot) : base;
-  const ext = hasExt ? base.slice(dot) : "";
+  const { stem, ext } = splitName(base);
 
   for (let n = 2; n < 1000; n++) {
     const candidate = `${stem} ${n}${ext}`;
