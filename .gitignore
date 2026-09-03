@@ -10,3 +10,6 @@
 client/dist/
 release/
 client/release/
+
+# Locally built server binary
+/server/basaltd
