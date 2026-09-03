@@ -43,6 +43,25 @@ jobs:
         working-directory: server
         run: go test -race ./...
 
+      # The systemd unit `basaltd service` prints is a deployment artifact, so
+      # it is rendered here and checked by systemd itself rather than by eye.
+      # The binary and user are real ones on this runner, because verify
+      # checks that ExecStart exists and that User resolves. Skipped, saying
+      # so, on a runner without systemd.
+      - name: the systemd unit verifies
+        working-directory: server
+        run: |
+          if ! command -v systemd-analyze >/dev/null; then
+            echo "systemd-analyze is not on this runner; skipping the unit check"
+            exit 0
+          fi
+          go build -o "$RUNNER_TEMP/basaltd" ./cmd/basaltd
+          "$RUNNER_TEMP/basaltd" service \
+            -data "$RUNNER_TEMP/basalt-data" -addr 127.0.0.1:3003 \
+            -binary "$RUNNER_TEMP/basaltd" -user "$(id -un)" > "$RUNNER_TEMP/basalt.service"
+          cat "$RUNNER_TEMP/basalt.service"
+          systemd-analyze verify "$RUNNER_TEMP/basalt.service"
+
   client:
     name: client
     runs-on: ubuntu-latest
@@ -76,6 +95,15 @@ jobs:
       - name: test
         working-directory: client
         run: bun run test
+
+      # The sealed-chunk format, byte for byte, under a second runtime. A chunk
+      # is named by the hash of its sealed bytes, so a compressor or cipher
+      # that differed between Node and Bun would give one chunk two names and
+      # dedup would silently stop; the vitest run above checks the same table
+      # under Node.
+      - name: compression golden, under bun
+        working-directory: client
+        run: bun run src/core/compression-golden.run.ts
 
       # A plugin bundle that reaches for a node: builtin compiles, passes every
       # other test, and fails only on a phone.
@@ -121,3 +149,8 @@ jobs:
         run: docker build -t basalt:ci .
       - name: it runs
         run: docker run --rm basalt:ci version
+
+      # compose.yaml is what the docs tell people to run. A file that does not
+      # parse is found here rather than on somebody's homelab.
+      - name: the compose file is valid
+        run: docker compose -f compose.yaml config -q

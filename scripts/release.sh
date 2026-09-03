@@ -123,6 +123,23 @@ echo
 echo "release/"
 sed 's/^/  /' "$out/SHA256SUMS"
 
+# ---- for the release notes -----------------------------------------------
+# One line per asset that the attest workflow signs, so the release notes can
+# carry them as they are and a reader can check what they downloaded came from
+# this repository at that commit. Printed here because this is the one place
+# that knows every asset name.
+echo
+echo "For the release notes, so anyone can verify what they downloaded:"
+echo
+echo '  ```bash'
+for asset in main.js manifest.json styles.css; do
+  echo "  gh attestation verify $asset --repo waynehoover/basalt-sync"
+done
+for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64; do
+  echo "  gh attestation verify basaltd-${target%/*}-${target#*/} --repo waynehoover/basalt-sync"
+done
+echo '  ```'
+
 # ---- what to do with them ------------------------------------------------
 # Printed rather than done. The tag is the decision and this is only what
 # follows from it.

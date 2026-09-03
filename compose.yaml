@@ -3,14 +3,20 @@
 # No TLS here on purpose: no key material lives in this binary. Put
 # `tailscale serve`, Caddy or a tunnel in front, and leave this published only
 # where that can reach it.
+#
+# To run from source instead of the published image, replace `image:` with
+#   build: { context: ., args: { VERSION: dev } }
 
 services:
   basalt:
-    build:
-      context: .
-      args:
-        VERSION: "0.1.2"
-    image: basalt:0.1.2
+    # Pinned to a release and to its digest, so `docker compose pull` cannot
+    # quietly move you to an image nobody tested against your devices. To
+    # upgrade, change both, and change the server before the clients: it speaks
+    # the old protocol and the new one for a release, the clients speak one.
+    #
+    # The digest came from:
+    #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.2.1
+    image: ghcr.io/waynehoover/basalt-sync:0.2.1@sha256:8a29dea9d47899e070f23aef188197fb610b7cd390ee79f59533e5e5820add8e
     container_name: basalt
     restart: unless-stopped
 
@@ -30,7 +36,7 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    # The token to pair the first device is in here, once:
+    # The line to paste into your first device is in here, once:
     #   docker compose logs basalt | grep '#'
     logging:
       driver: json-file
