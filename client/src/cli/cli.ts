@@ -108,7 +108,9 @@ Options
   --to PATH        restore somewhere other than where it came from
   --limit N        how many versions history or deleted shows (default: 20, or all deletions)
   --config-dir DIR Obsidian's config folder, if it is not .obsidian
-  --ignore NAME    a folder or file name never to sync, at any depth, repeatable; local to this device
+  --ignore NAME    a folder or file name never to sync, at any depth, repeatable; local to this
+                   device. A path another device syncs and this one ignores is reported as
+                   ignored rather than failed, and does not affect the exit code
 `;
 
 export async function run(argv: readonly string[], io: Console): Promise<number> {
@@ -584,14 +586,16 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
   const local = stored?.cursor ?? 0;
 
   // The server's cursor, asked for from a connection that carries no index
-  // and so cannot be refused for being ahead.
+  // and so cannot be refused for being ahead. The backlog is not waited for:
+  // this connection is closed again the moment the number is out of the
+  // handshake, and with an empty index the backlog is the whole vault.
   const probe = new Client({
     ...(await clientOptions(config, args, io)),
     store: new MemoryIndexStore(),
   });
   let serverCursor: number;
   try {
-    await probe.connect();
+    await probe.connect({ waitForBacklog: false });
     serverCursor = probe.serverCursor;
   } finally {
     await probe.close();
@@ -655,6 +659,13 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
  * any of those is how a broken vault stays broken quietly in somebody's cron,
  * and it is how a sync that lost its connection half way through once
  * reported that it had finished.
+ *
+ * `ignored` is deliberately not in that list (R2). A path another device
+ * syncs and `--ignore` keeps out of this one is the configuration doing what
+ * it was asked, and it never stops being true: counting it made one ignored
+ * folder exit every future sync 1, which is a cron job alerting for ever
+ * about a decision its owner made on purpose. It is printed on every run
+ * instead.
  */
 export function exitCodeFor(report: SyncReport): number {
   return report.skipped > 0 || report.retrying > 0 || report.blocked > 0 ? 1 : 0;
@@ -716,7 +727,10 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   // could not reach the server is the kind of status rule 7 is about.
   let server: { reachable: boolean; cursor?: number; behind?: number; error?: string };
   try {
-    const client = await open(config, args, io, false);
+    // The handshake and nothing after it. What is printed below is the
+    // server's own cursor out of `ready`, and waiting for the backlog first
+    // meant a device weeks behind unsealed all of it before saying a word.
+    const client = await open(config, args, io, false, { waitForBacklog: false });
     // Signed, not clamped. Clamping at zero made a server behind its own
     // clients, which is a restored backup or the wrong vault, read exactly
     // like being up to date.
@@ -952,14 +966,31 @@ async function cmdUnlink(args: Args, io: Console): Promise<number> {
  * ---------------------------------------------------------------- */
 
 /**
+ * How much of a connection a command needs.
+ *
+ * A command that only reads a number off the handshake passes
+ * `waitForBacklog: false` and closes; see `Client.connect`. Anything that
+ * syncs takes the default and waits.
+ */
+interface ConnectHow {
+  readonly waitForBacklog?: boolean;
+}
+
+/**
  * Assembles the four objects, which is the whole of what a shell does.
  *
  * `forget` is whether a spent bootstrap may be removed from the config here.
  * Only a command holding the vault's lock may write the config, so a reading
  * command connects with whatever works and leaves the file alone.
  */
-async function open(config: Config, args: Args, io?: Console, forget = true): Promise<Client> {
-  const connected = await connectWith(config, args, io);
+async function open(
+  config: Config,
+  args: Args,
+  io?: Console,
+  forget = true,
+  opts: ConnectHow = {},
+): Promise<Client> {
+  const connected = await connectWith(config, args, io, opts);
   const settled = settle(config, connected.config, connected.client);
   if (settled === undefined) return connected.client;
 
@@ -1033,12 +1064,13 @@ async function connectWith(
   config: Config,
   args: Args,
   io?: Console,
+  how: ConnectHow = {},
 ): Promise<{ client: Client; config: Config }> {
   let first: Error | undefined;
   for (const candidate of candidates(config)) {
     const client = new Client(await clientOptions(candidate, args, io));
     try {
-      await client.connect();
+      await client.connect(how);
       return { client, config: candidate };
     } catch (err) {
       await client.close();
@@ -1153,6 +1185,7 @@ function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): 
   say(r.waiting, "waiting for a write to settle");
   say(r.retrying, "failed, will try again");
   say(r.skipped, "cannot sync and will not be retried");
+  say(r.ignored, "ignored here, and synced by another device");
   say(r.blocked, "waiting on a name that is a file here and a folder elsewhere");
 
   if (lines.length === 0) {

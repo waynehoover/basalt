@@ -68,6 +68,8 @@ import {
   configFolderName,
   foldPath,
   foldsTogether,
+  ignoredHere,
+  ignoredHereError,
   isNeverSynced,
   neverSync,
 } from "../core/paths.ts";
@@ -512,7 +514,14 @@ export class ObsidianVault implements Vault {
     // folder that means `main.js` of an installed plugin, which Obsidian
     // executes on the next reload, and this plugin's own `data.json`.
     if (this.ignored(normalized)) {
-      throw neverSync(`refusing to write inside a folder that is never synced: ${path}`);
+      // Two refusals, because they mean different things to the engine (R2).
+      // A dot-prefixed name cannot work here and never will. The config
+      // folder is this device's configuration: a peer whose config folder is
+      // named something else uploads paths under it, and this device saying
+      // no to those is the arrangement working, not a fault.
+      throw ignoredHere(normalized, this.ignore)
+        ? ignoredHereError(`not writing under a name this device does not sync: ${path}`)
+        : neverSync(`refusing to write inside a folder that is never synced: ${path}`);
     }
     return this.actualName.get(normalized) ?? normalized;
   }
@@ -589,6 +598,12 @@ export class ObsidianVault implements Vault {
    * index could be saved over notes that had never been made durable. Now
    * every file is attempted, the ones that failed stay for the next pass, and
    * the first failure is what the pass fails with.
+   *
+   * Keeping failures is only safe while a path that has gone is not one of
+   * them. A file written and then deleted, here or by anybody else, cannot be
+   * opened to be synced and has nothing left to make durable; counted as a
+   * failure it would stay in the set, fail again on every later flush, and
+   * block index saves for the rest of the session (R6).
    */
   async flush(): Promise<void> {
     const files = [...this.unsynced.files];
@@ -613,6 +628,14 @@ export class ObsidianVault implements Vault {
         // while this was running is still waiting for the next flush.
         this.unsynced.files.delete(path);
       } catch (err) {
+        // Gone rather than unopenable: there is nothing to make durable, so
+        // the name is dropped and the pass carries on. Asked of the adapter
+        // rather than read off the error, because a platform is free to
+        // report a missing file however it likes.
+        if (!(await this.adapter.exists(path))) {
+          this.unsynced.files.delete(path);
+          continue;
+        }
         failure ??= err;
       }
     }
@@ -829,7 +852,7 @@ export class ObsidianVault implements Vault {
     // save the index without ever fsyncing the directory it changed.
     try {
       if (await this.adapter.trashSystem(normalized)) {
-        this.entryChanged(normalized);
+        this.wentAway(normalized);
         return;
       }
     } catch {
@@ -838,6 +861,21 @@ export class ObsidianVault implements Vault {
       // deletion.
     }
     await this.adapter.trashLocal(normalized);
+    this.wentAway(normalized);
+  }
+
+  /**
+   * Records a path that has left the vault.
+   *
+   * Its directory has a changed entry, as any deletion does. The file itself
+   * is dropped from what the flush owes: there is nothing at that name to open
+   * and sync, and a write earlier in the same pass may well have left one
+   * owed. Kept, it would fail every flush from here on and block the index
+   * saves that follow them (R6). Only after the deletion has actually
+   * happened, so a trash that refused still leaves the file owed.
+   */
+  private wentAway(normalized: string): void {
+    this.unsynced.files.delete(normalized);
     this.entryChanged(normalized);
   }
 
@@ -945,6 +983,7 @@ export class ObsidianIndexStore implements IndexStore {
       // changes nothing writes nothing. Only from the live file: a state
       // read out of the staging copy is not what the live file holds.
       this.lastWritten = live.text;
+      this.lastStamp = await this.stamp();
       return live.state;
     }
     const staged = await this.readIndex(this.temp);
@@ -987,16 +1026,40 @@ export class ObsidianIndexStore implements IndexStore {
    * lose anything: the failure it would cause is the failure it prevents.
    *
    * That last sentence is only true while the bytes are still there, which is
-   * why the file is asked for as well. An index removed from outside during a
+   * why the file is asked about as well. An index removed from outside during a
    * session used to be skipped by every later unchanged pass, and the restart
    * after it started cold over a vault this device had already synced.
+   *
+   * Asking whether it exists was not enough either (R3). Something overwriting
+   * the index in place leaves a file that is there and is not what was
+   * written, and every later unchanged pass would skip over it and preserve it
+   * for the rest of the session. So what is remembered is its size and
+   * modification time, and the skip needs both to match. Not the content:
+   * reading nine megabytes back on every settled pass is the cost this skip
+   * exists to avoid, while a stat is one call whatever the index weighs.
    */
   private lastWritten: string | undefined;
+  /** The live file as it stood when this session last saw its own bytes in it. */
+  private lastStamp: { size: number; mtime: number } | undefined;
+
+  /** The live index's size and modification time, or undefined if it is not a file. */
+  private async stamp(): Promise<{ size: number; mtime: number } | undefined> {
+    const stat = await this.adapter.stat(this.live);
+    if (stat === null || stat.type !== "file") return undefined;
+    return { size: stat.size, mtime: stat.mtime };
+  }
+
+  private async unchangedOnDisk(): Promise<boolean> {
+    const was = this.lastStamp;
+    if (was === undefined) return false;
+    const now = await this.stamp();
+    return now !== undefined && now.size === was.size && now.mtime === was.mtime;
+  }
 
   async save(state: StoredState): Promise<void> {
     const text = JSON.stringify(state);
     const live = this.live;
-    if (text === this.lastWritten && (await this.adapter.exists(live))) return;
+    if (text === this.lastWritten && (await this.unchangedOnDisk())) return;
     const parts = live.split("/");
     parts.pop();
     if (parts.length > 0) {
@@ -1028,6 +1091,7 @@ export class ObsidianIndexStore implements IndexStore {
       await this.adapter.remove(temp).catch(() => undefined);
     }
     this.lastWritten = text;
+    this.lastStamp = await this.stamp();
   }
 
   /**
@@ -1045,6 +1109,7 @@ export class ObsidianIndexStore implements IndexStore {
       }
     }
     this.lastWritten = undefined;
+    this.lastStamp = undefined;
   }
 }
 

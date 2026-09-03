@@ -216,14 +216,23 @@ export class Client {
   /**
    * Connects, says hello, and waits for the backlog.
    *
-   * The wait is not optional. A pass that runs before catch-up finishes sees a
-   * vault the server already has files for, decides they are local-only, and
-   * uploads the lot.
+   * The wait is not optional for anything that then syncs. A pass that runs
+   * before catch-up finishes sees a vault the server already has files for,
+   * decides they are local-only, and uploads the lot.
+   *
+   * `waitForBacklog: false` is for the two callers that ask a question and
+   * close: `basalt status` and the cursor probe in `basalt rebase`. Both want
+   * `ready.cursor`, which is the server's own number and is already here when
+   * `start` returns, and a device weeks behind was paying minutes of unsealing
+   * and MAC checking to print one line (R1). Closing straight after is what
+   * makes it cheap on the other end too: the server stops streaming. Nothing
+   * that syncs may pass it.
    */
-  async connect(): Promise<ServerLimits> {
+  async connect(opts: { waitForBacklog?: boolean } = {}): Promise<ServerLimits> {
     await this.transport.connect();
     this.lastBatchAt = Date.now();
     this.limits = await this.engine.start();
+    if (opts.waitForBacklog === false) return this.limits;
 
     // An inactivity bound, not a total one. A device that has been away for
     // a while has a long backlog, and over a slow link the whole of it can
@@ -1084,6 +1093,7 @@ export function summarise(r: SyncReport): string {
   add(r.restored, "restored");
   add(r.retrying, "retrying");
   add(r.skipped, "stuck");
+  add(r.ignored, "ignored");
   add(r.blocked, "in the way");
   return bits.length === 0 ? "up to date" : bits.join(", ");
 }

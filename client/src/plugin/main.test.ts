@@ -1722,6 +1722,73 @@ describe("a restore whose upload fails (P31)", () => {
  * nothing pinned the shape the plugin itself produces: this does, through the
  * modal, by pressing the button a person presses.
  */
+/**
+ * P-D8 in the 0.3.0 review. Obsidian Sync puts version history on the file
+ * menu, so this plugin does too, and until now the only thing asserted about
+ * it was that a handler had been registered: what the entry says and what
+ * clicking it does were untested, which is the whole of the feature.
+ */
+describe("version history on the file menu (P-D8)", () => {
+  /**
+   * Just enough of Obsidian's `Menu`: `addItem` hands a builder to the
+   * caller and keeps what it built. The real one returns `this` from every
+   * setter so they chain, which is the only shape the plugin depends on.
+   */
+  function fakeMenu() {
+    const items: { title: string; icon: string; click(): void }[] = [];
+    const menu = {
+      addItem(build: (item: unknown) => void): void {
+        const item = { title: "", icon: "", click: () => {} };
+        build({
+          setTitle(title: string) {
+            item.title = title;
+            return this;
+          },
+          setIcon(icon: string) {
+            item.icon = icon;
+            return this;
+          },
+          onClick(fn: () => void) {
+            item.click = fn;
+            return this;
+          },
+        });
+        items.push(item);
+      },
+    };
+    return { menu, items };
+  }
+
+  it("opens the history of the file the menu was opened on", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("daily/note.md", "text");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+
+    const { menu, items } = fakeMenu();
+    app.workspace.fire("file-menu", menu, { path: "daily/note.md", extension: "md" });
+    expect(items.map((i) => i.title)).toEqual(["Basalt: version history"]);
+    expect(items[0]!.icon).toBe("history");
+
+    modals.length = 0;
+    items[0]!.click();
+    // That file, not whichever one happens to be open: the menu is the one
+    // place where the file acted on is not the active one.
+    await until("the history modal", () => modals.length > 0);
+    expect(modals.at(-1)!.titleEl.allText()).toBe("History of daily/note.md");
+  }, 300_000);
+
+  it("puts nothing on the menu of a folder", async () => {
+    const { plugin, app } = await load();
+    expect(plugin.paired).toBe(false);
+    const { menu, items } = fakeMenu();
+    // A TFolder has no extension, and there is no history of a folder.
+    app.workspace.fire("file-menu", menu, { path: "daily" });
+    expect(items).toEqual([]);
+  });
+});
+
 describe("what History says after a restore (P-D1)", () => {
   /** The buttons the newest modal drew, in the order it drew them. */
   function buttons(): { text: string; click(): void }[] {
@@ -1829,6 +1896,50 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
     // The one that matters: what a restart would read. A pairing here means
     // the next start syncs a vault the person removed.
     expect(plugin.savedData, "the settle save landed on top of the unlink").toBe(null);
+    expect(plugin.paired).toBe(false);
+    expect(plugin.currentState.kind).toBe("unpaired");
+  }, 300_000);
+
+  /**
+   * R10. The same race with two saves in the air. A device that loses its
+   * connection and comes back twice while somebody is unlinking starts two
+   * settle saves, and holding only the newest let the older one land its
+   * pairing on top of the null that unlink had just written.
+   */
+  it("waits for every settle save in flight, not just the newest (R10)", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    expect(plugin.savedData).not.toBe(null);
+
+    const { decodeConfig } = await import("../core/pairing.ts");
+    const inner = plugin as unknown as {
+      config: unknown;
+      generation: number;
+      settleConfig(wrapped: string | undefined, mine: number): Promise<void>;
+    };
+    const config = decodeConfig(plugin.savedData, "test") as { wrapped?: string };
+    inner.config = { ...config, bootstrap: "spent" };
+
+    // The first save is the slow one and the second is quick, so the newest
+    // is not the one still in the air when unlink asks.
+    let saves = 0;
+    const realSave = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data: unknown) => {
+      if (++saves === 1) await sleep(400);
+      return realSave(data);
+    };
+
+    const first = inner.settleConfig(config.wrapped, inner.generation);
+    await until("the first settle save to start", () => saves === 1);
+    const second = inner.settleConfig(config.wrapped, inner.generation);
+    await until("the second settle save to finish", () => saves === 2);
+
+    const unlinking = plugin.unlink();
+    await Promise.all([first, second, unlinking]);
+
+    expect(plugin.savedData, "an older settle save landed on top of the unlink").toBe(null);
     expect(plugin.paired).toBe(false);
     expect(plugin.currentState.kind).toBe("unpaired");
   }, 300_000);

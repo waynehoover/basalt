@@ -64,7 +64,7 @@ basalt --version                          which release this is
 | `--json` | machine-readable output, on every command |
 | `--timeout MS` | how long to wait on the server (default 30000) |
 | `--config-dir DIR` | Obsidian's config folder, if it is not `.obsidian` |
-| `--ignore NAME` | a folder or file name never to sync, matched at any depth, repeatable |
+| `--ignore NAME` | a folder or file name never to sync, matched at any depth, repeatable; local to this device |
 | `--uid N` | restore one exact version, from `basalt history` |
 | `--to PATH` | restore somewhere other than where it came from |
 | `--limit N` | how many versions `history` shows (default 20), or how many deletions `deleted` lists (default: all) |
@@ -73,7 +73,8 @@ basalt --version                          which release this is
 **Exit codes.** 0 worked. 1 failed, could not reach the server, finished with
 files that can never sync, or is blocked by a name that is a file here and a
 folder elsewhere. 2 the command line was wrong. A sync that gave up on a file
-exits non-zero on purpose, so a broken vault in cron is heard about.
+exits non-zero on purpose, so a broken vault in cron is heard about. Files this
+device ignores are not in that list: they are reported as ignored and exit 0.
 
 **Watching.** `sync --watch` reconnects with backoff when the connection drops,
 and when the server says it is busy, at the device limit or shutting down, it
@@ -131,7 +132,15 @@ working on purpose, but it is a flag to type deliberately rather than a
 supported arrangement.
 
 `--ignore NAME` adds one more name, matched at any depth. One name per flag
-rather than a comma-separated list, because a filename can contain a comma.
+rather than a comma-separated list, because a filename can contain a comma. It
+is local to this device.
+
+A path another device syncs and this one ignores is counted and printed on its
+own line, and it does not change the exit code. Refusing it is the
+configuration doing what it was told, and it never stops being true, so
+counting it as a failure made every later sync of that vault exit 1 for ever.
+A path that cannot work here, such as a name that is a file on this device and
+a folder on another, still does.
 
 ### Sync output
 
@@ -140,6 +149,7 @@ $ basalt sync
     3  uploaded
     1  downloaded
     1  kept both versions
+    1  ignored here, and synced by another device
     2  chunks sent, 1.4 KiB
 Look for files with "Conflicted copy" in the name. Both versions are kept.
 ```

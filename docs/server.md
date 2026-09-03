@@ -430,15 +430,19 @@ whether a purge would help.
 are an array, so the shape is worth having in front of you:
 
 ```json
-{ "version": "0.3.0", "bodies": 21117, "graceMs": 3600000,
+{ "version": "0.3.1", "bodies": 21117, "graceMs": 3600000,
   "vaults": [ { "vault": "default", "claimed": true, "files": 1834,
                 "folders": 212, "bytes": 64193000, "deleted": 17,
                 "recoverable": 17, "purged": 0, "versions": 9120,
                 "history": 7057, "chunkRefs": 22384, "latestUid": 9120,
-                "allocatedTo": "laptop", "invites": 0 } ] }
+                "allocatedTo": 9120, "invites": 0 } ] }
 ```
 
-The numbers above are an example, not a measurement of anything.
+The numbers above are an example, not a measurement of anything. Two of the
+fields are not guessable from their names: `latestUid` is the newest version
+the vault still holds, and `allocatedTo` is the highest uid ever handed out,
+including ones a purge has since removed, so the two are equal until you
+purge and `allocatedTo` is the one that never goes backwards.
 
 ## What to alert on
 
@@ -452,10 +456,11 @@ job or whatever watches your machines, all readable without a key.
 | Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, which is the expected state after restoring an older backup. On the headless client, `basalt rebase --backup-taken` rejoins without losing what only that device holds. The plugin has no rebase, so those devices are unlinked and paired again. The log names the device. |
 | `nospace` | `journalctl -u basalt | grep nospace` | The disk is full. Nothing is lost, uploads are refused until it is not. Purge after a backup, or give it a bigger disk. |
 
-The startup line is the other thing to grep for after a restart:
+The startup line is the other thing to grep for after a restart, with the same
+made-up numbers as the example above:
 
 ```
-msg=starting version=0.3.0 vault=default latest=9120 claimed=true
+msg=starting version=0.3.1 vault=default latest=9120 claimed=true
 ```
 
 `latest` is the uid every device compares itself against. If a device says it

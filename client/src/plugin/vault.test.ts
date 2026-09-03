@@ -1270,6 +1270,85 @@ describe("what flush must not forget (P-D4, P-D5)", () => {
     await v.flush!();
     expect(synced).toContain("/home/me/vault/daily");
   });
+
+  /**
+   * A Node fs that answers for what the adapter actually holds, which is what
+   * a real one does and what `recordingFs` above does not: it opens anything.
+   * A path that is not there fails the way the platform fails it.
+   */
+  function fsOver(adapter: DesktopAdapter | FoldingDesktopAdapter) {
+    const synced: string[] = [];
+    const tried: string[] = [];
+    const fs = {
+      promises: {
+        async open(path: string) {
+          tried.push(path);
+          const rel = path.slice("/home/me/vault".length).replace(/^\//, "");
+          if (rel !== "" && !(await adapter.exists(rel))) {
+            const err = new Error(`ENOENT: no such file or directory, open '${path}'`);
+            (err as NodeJS.ErrnoException).code = "ENOENT";
+            throw err;
+          }
+          return {
+            async sync() {
+              synced.push(path);
+            },
+            async close() {},
+          };
+        },
+      },
+    };
+    return { fs, synced, tried };
+  }
+
+  it("stops owing a file the same pass deleted (R6)", async () => {
+    const desktop = new DesktopAdapter();
+    const { fs, synced, tried } = fsOver(desktop);
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+
+    // Arriving and then withdrawn: a note downloaded in a pass that also
+    // applies the deletion another device sent for it.
+    await v.write("daily/note.md", enc.encode("one"), times);
+    await v.remove("daily/note.md");
+
+    await expect(v.flush!()).resolves.toBeUndefined();
+    expect(tried, "a name with nothing at it was opened to be synced").not.toContain(
+      "/home/me/vault/daily/note.md",
+    );
+    expect(synced, "the directory the deletion changed").toContain("/home/me/vault/daily");
+  });
+
+  it("treats a file that has gone as flushed rather than as a failure, for ever (R6)", async () => {
+    const INDEX = ".obsidian/plugins/basalt/index.json";
+    const state = { cursor: 1, entries: {}, remote: {}, pending: [] };
+    const desktop = new DesktopAdapter();
+    const { fs, synced } = fsOver(desktop);
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+    const store = new ObsidianIndexStore(desktop, INDEX);
+
+    // Removed from under the vault: another program, or Obsidian's own
+    // trash on a device where the person emptied it.
+    await v.write("note.md", enc.encode("one"), times);
+    await desktop.remove("note.md");
+
+    // The engine's order, twice. A flush that keeps failing over a name
+    // nothing can open never lets the save after it run again.
+    await expect(v.flush!()).resolves.toBeUndefined();
+    await store.save(state);
+    await v.write("other.md", enc.encode("two"), times);
+    await expect(
+      v.flush!(),
+      "the second flush still owed the missing file",
+    ).resolves.toBeUndefined();
+    await store.save({ ...state, cursor: 2 });
+
+    expect(synced).toContain("/home/me/vault/other.md");
+    expect(await new ObsidianIndexStore(desktop, INDEX).load()).toEqual({ ...state, cursor: 2 });
+  });
 });
 
 /**
@@ -1315,5 +1394,35 @@ describe("the index write that is skipped because nothing changed (P-D6)", () =>
     };
     await store.save(state(1));
     expect(writes, "an identical index was written again on the first pass").toBe(0);
+  });
+
+  it("writes again when the index has been overwritten in place (R3)", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+
+    // Still there, and no longer what was written: half an index, a
+    // conflicted copy of one, a tidy-up script's idea of tidy. The file
+    // exists, so existence alone said nothing was wrong and every later
+    // unchanged pass kept it for the rest of the session.
+    adapter.now += 1000;
+    await adapter.write(INDEX, "{}");
+    await store.save(state(1));
+
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
+  });
+
+  it("writes again when a same-length overwrite lands at the same instant (R3)", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+
+    // The clock does not move, so the size is the half of the stamp that has
+    // to notice. A rewrite of exactly the same length in the same
+    // millisecond is the one this cannot see, and it is why the index is
+    // written through a staging copy in the first place.
+    const corrupt = "!".repeat(JSON.stringify(state(1)).length - 1);
+    await adapter.write(INDEX, corrupt);
+    await store.save(state(1));
+
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
   });
 });

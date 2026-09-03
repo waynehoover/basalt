@@ -11,7 +11,7 @@
  * the argument parsing were wrong, none of which those tests touch.
  */
 
-import { mkdtemp, readFile, rm, stat, writeFile, mkdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile, mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -428,6 +428,31 @@ describe("status", () => {
     const human = await cli("status", "--dir", a);
     expect(human.stdout).toMatch(/cannot reach the server/);
     expect(human.stdout).not.toMatch(/up to date/);
+  }, 300_000);
+
+  /**
+   * R1. Status asks for one number and closes, so it connects only as far as
+   * the handshake. The number has to stay the server's own: a device that has
+   * never synced has the whole vault as backlog, and reading the cursor off
+   * its own index instead would print zero and call it up to date.
+   */
+  it("reports the server's cursor from a device that has not caught up (R1)", async () => {
+    await fresh();
+    const { a, b } = await twoDevices();
+    await write(a, "one.md", "1\n");
+    await write(a, "two.md", "2\n");
+    await write(a, "three.md", "3\n");
+    await cli("sync", "--dir", a);
+
+    const s = await cli("status", "--dir", b, "--json");
+    expect(s.code, s.all).toBe(0);
+    const server_ = s.json()["server"] as Record<string, unknown>;
+    expect(server_["reachable"]).toBe(true);
+    expect(server_["cursor"]).toBe(3);
+    expect(s.json()["cursor"]).toBe(0);
+    expect(server_["behind"]).toBe(3);
+    // And it stayed a question: nothing of the backlog was written here.
+    expect((await readdir(b)).sort()).toEqual([".basalt"]);
   }, 300_000);
 
   /**
@@ -1129,6 +1154,58 @@ describe("rotating the secret (I5)", () => {
 });
 
 /**
+ * R2. A folder one device syncs and another is told to ignore is an ordinary
+ * arrangement: the laptop keeps `Drafts`, the server-side client does not
+ * want it. The refusal used to be filed as a permanent skip, and a skip
+ * exits 1, so from the first pass onwards every sync of that vault failed
+ * for ever. The path is still refused, still counted and still printed; what
+ * changed is that obeying the configuration is not a failure.
+ */
+describe("a folder this device ignores and another device syncs (R2)", () => {
+  it("counts it as ignored, keeps it out of the exit code, and stays that way", async () => {
+    await fresh();
+    const { a, b } = await twoDevices();
+    await write(a, "Drafts/plan.md", "not for the other one\n");
+    await write(a, "keep.md", "for everybody\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+
+    for (const pass of [1, 2, 3]) {
+      const r = await cli("sync", "--dir", b, "--ignore", "Drafts", "--json");
+      expect(r.code, `pass ${pass}: ${r.all}`).toBe(0);
+      const report = r.json();
+      expect(report["ignored"], `pass ${pass}`).toBeGreaterThan(0);
+      expect(report["skipped"], `pass ${pass}`).toBe(0);
+      expect(report["retrying"], `pass ${pass}`).toBe(0);
+    }
+
+    // Refused, not written: the ignore list still means what it says.
+    await expect(stat(join(b, "Drafts", "plan.md"))).rejects.toThrow(/ENOENT/);
+    // And the rest of the vault syncs, which is the other half of it.
+    expect(await read(b, "keep.md")).toBe("for everybody\n");
+
+    // Printed rather than swallowed. A count that disappears is how somebody
+    // loses track of a folder they stopped syncing years ago.
+    const human = await cli("sync", "--dir", b, "--ignore", "Drafts");
+    expect(human.code, human.all).toBe(0);
+    expect(human.stdout).toMatch(/ignored here, and synced by another device/);
+  }, 300_000);
+
+  it("still fails for a path that cannot work here, ignore list or not (R2)", async () => {
+    await fresh();
+    const { a, b } = await twoDevices();
+    // `notes` is a folder on a and a file on b: nobody can apply that, and it
+    // is nothing the person configured.
+    await write(a, "notes/inside.md", "in the folder\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    await writeFile(join(b, "notes"), "a file\n");
+
+    const r = await cli("sync", "--dir", b, "--ignore", "Drafts", "--json");
+    expect(r.code, r.all).toBe(1);
+    expect(r.json()["ignored"]).toBe(0);
+  }, 300_000);
+});
+
+/**
  * I11, I14, I15, I24 and review finding C33: the smaller CLI contracts.
  */
 describe("what the CLI says about itself and the vault", () => {
@@ -1214,6 +1291,7 @@ describe("what the CLI says about itself and the vault", () => {
       waiting: 0,
       retrying: 0,
       skipped: 0,
+      ignored: 0,
       blocked: 0,
       inTheWay: [],
       chunksSent: 0,
@@ -1226,6 +1304,9 @@ describe("what the CLI says about itself and the vault", () => {
     );
     expect(exitCodeFor({ ...clean, skipped: 1 })).toBe(1);
     expect(exitCodeFor({ ...clean, retrying: 1 })).toBe(1);
+    // A path this device is set to ignore is the configuration working, and
+    // a run is not a failure for having obeyed it (R2).
+    expect(exitCodeFor({ ...clean, ignored: 4 })).toBe(0);
   });
 
   it("exits non-zero when a path is blocked by a name that is a file here and a folder elsewhere (C33)", async () => {

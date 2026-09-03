@@ -1,4 +1,14 @@
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -221,10 +231,21 @@ describe("paths from elsewhere", () => {
       "deep/er/.hidden.md",
     ];
     for (const path of nested) {
-      await expect(v.write(path, enc.encode("x"), { mtime: 1, ctime: 1 }), path).rejects.toThrow(
-        /never synced/,
-      );
-      await expect(v.mkdir(path), path).rejects.toThrow(/never synced/);
+      // Refused either way. Which code it carries is R2: a dot-prefixed name
+      // cannot work here, and a name on this device's own ignore list is the
+      // configuration doing what it was told, which is not a failure.
+      const expected = path.includes("node_modules") ? "ignored" : "neversync";
+      for (const attempt of [
+        () => v.write(path, enc.encode("x"), { mtime: 1, ctime: 1 }),
+        () => v.mkdir(path),
+      ]) {
+        const err = await attempt().then(
+          () => undefined,
+          (e: Error & { code?: string }) => e,
+        );
+        expect(err, `${path} was accepted`).toBeDefined();
+        expect(err!.code, path).toBe(expected);
+      }
       await expect(readFile(join(root, path)), `${path} was written`).rejects.toThrow();
     }
     // Written behind the vault's back, the way a git checkout or an npm
@@ -299,6 +320,34 @@ describe("what this disk files a name under", () => {
   it("assumes folding until it has asked, which refuses rather than overwrites", () => {
     const v = new NodeVault(root);
     expect(v.canonical("Note.md")).toBe(v.canonical("note.md"));
+  });
+
+  /**
+   * R9. Every command asks this at startup, `basalt status` included, and a
+   * command that only reads must leave the vault as it found it: the probe
+   * used to make `.basalt/` on its way, which is a write into somebody's
+   * vault to print two lines and a failure on a read-only mount.
+   */
+  it("leaves nothing behind in the vault, not even a folder (R9)", async () => {
+    const v = new NodeVault(root);
+    await v.probeCase();
+    expect(await readdir(root)).toEqual([]);
+  });
+
+  it("keeps the safe default when the vault cannot be written to (R9)", async () => {
+    const readOnly = await mkdtemp(join(tmpdir(), "basalt-ro-"));
+    await chmod(readOnly, 0o555);
+    try {
+      const v = new NodeVault(readOnly);
+      await v.probeCase();
+      // Unanswerable, so the answer is the side that refuses two files where
+      // one would do rather than overwriting one with the other.
+      expect(v.canonical("Note.md")).toBe(v.canonical("note.md"));
+      expect(await readdir(readOnly)).toEqual([]);
+    } finally {
+      await chmod(readOnly, 0o755);
+      await rm(readOnly, { recursive: true, force: true });
+    }
   });
 });
 

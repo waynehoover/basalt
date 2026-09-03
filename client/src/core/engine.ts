@@ -391,6 +391,17 @@ export interface SyncReport {
   /** Files that can never work and will not be tried again. */
   skipped: number;
   /**
+   * Paths another device syncs that this one is set to ignore.
+   *
+   * Its own counter rather than folded into `skipped`, and deliberately not
+   * part of the exit code (R2). Refusing them is the configuration doing what
+   * it was told, so calling the run a failure meant one `--ignore` made every
+   * later sync exit 1 for ever. Counted and printed all the same: a number
+   * that quietly disappears is how somebody loses track of a folder they
+   * stopped syncing years ago.
+   */
+  ignored: number;
+  /**
    * Paths a file is standing in the way of.
    *
    * Its own counter rather than folded into `skipped`, whose label says a file
@@ -437,6 +448,7 @@ function emptyReport(): SyncReport {
     waiting: 0,
     retrying: 0,
     skipped: 0,
+    ignored: 0,
     blocked: 0,
     inTheWay: [],
     chunksSent: 0,
@@ -476,6 +488,16 @@ export class Engine {
    * retried, since nothing about them changes by waiting.
    */
   private readonly refusedInbound = new Map<string, string>();
+
+  /**
+   * Paths another device syncs that this device is configured to ignore, and
+   * why.
+   *
+   * Kept apart from `skipped` because this is not a failure (R2). Kept at all
+   * for the same reason `skipped` is: without it, every pass would fetch the
+   * file again to be told the same thing by the same vault.
+   */
+  private readonly ignoredPaths = new Map<string, string>();
 
   /**
    * Paths a file is standing in the way of, as of the last pass.
@@ -912,6 +934,13 @@ export class Engine {
     ]);
 
     for (const path of [...paths].sort()) {
+      if (this.ignoredPaths.has(path)) {
+        // Settled, and settled by the person who configured this device. It
+        // is counted every pass so it stays visible, and nothing is fetched
+        // to find out what is already known.
+        report.ignored++;
+        continue;
+      }
       const skip = this.skipped.get(path);
       if (skip) {
         if (fingerprintOf(this.entries.get(path)) === skip.fingerprint) {
@@ -2328,6 +2357,15 @@ export class Engine {
   private recordFailure(path: string, err: unknown, report: SyncReport): void {
     const message = err instanceof Error ? err.message : String(err);
     const code = (err as { code?: string })?.code;
+    // Not a failure at all: this device was told not to sync under that name
+    // and did not (R2). Remembered so no later pass fetches it again, counted
+    // so it stays visible, and out of the exit code.
+    if (code === "ignored") {
+      if (!this.ignoredPaths.has(path)) this.log("ignored here", path, message);
+      this.ignoredPaths.set(path, message);
+      report.ignored++;
+      return;
+    }
     // `neversync` is a vault refusing to write under a name its shell never
     // syncs, which no retry changes (C29); the other three are the server's.
     const permanent =
@@ -2507,11 +2545,11 @@ export class Engine {
  * Two passes of one sync, as one report.
  *
  * The work counters add, because they count things that happened. The state
- * counters do not: `unchanged`, `waiting`, `retrying`, `skipped`, `blocked`
- * and `inTheWay` describe how the vault looks at the end of a pass, and adding
- * them reported one file held back in two passes as two waiting (C35), and one
- * unchanged file looked at four times as four unchanged. The newest pass has
- * the last word on those.
+ * counters do not: `unchanged`, `waiting`, `retrying`, `skipped`, `ignored`,
+ * `blocked` and `inTheWay` describe how the vault looks at the end of a pass,
+ * and adding them reported one file held back in two passes as two waiting
+ * (C35), and one unchanged file looked at four times as four unchanged. The
+ * newest pass has the last word on those.
  *
  * This is also how a settle adds its passes up, which for a while it did
  * through a second copy of this function.
@@ -2532,6 +2570,7 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     waiting: b.waiting,
     retrying: b.retrying,
     skipped: b.skipped,
+    ignored: b.ignored,
     blocked: b.blocked,
     inTheWay: b.inTheWay,
   };

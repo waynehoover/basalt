@@ -148,8 +148,14 @@ export default class BasaltPlugin extends Plugin {
   private announced = { skipped: 0, inTheWay: "" };
   /** What `onunload` started and could not wait for, for anything that can. */
   closing: Promise<void> | undefined;
-  /** The settle save in flight, so `unlink` cannot be overtaken by it. */
-  private settling: Promise<void> | undefined;
+  /**
+   * Every settle save in flight, so `unlink` cannot be overtaken by one.
+   *
+   * All of them, not the newest. Two reconnects inside one unlink window
+   * start two saves, and holding only the second left the first free to land
+   * its pairing on top of the null that unlink had just written (R10).
+   */
+  private readonly settling = new Set<Promise<void>>();
 
   override async onload(): Promise<void> {
     // Obsidian mobile has no status bar, and the declaration says so:
@@ -488,10 +494,12 @@ export default class BasaltPlugin extends Plugin {
    */
   private settleConfig(wrapped: string | undefined, mine: number): Promise<void> {
     // Recorded here rather than at the call site, so that however this comes
-    // to be called there is one save for `unlink` to wait for. The catch is
-    // what `void` used to do: the write below reports its own failure.
+    // to be called every save is one `unlink` can wait for, and forgotten
+    // again as soon as it lands so the set is the ones still owed. The catch
+    // is what `void` used to do: the write below reports its own failure.
     const saving = this.writeSettledConfig(wrapped, mine).catch(() => undefined);
-    this.settling = saving;
+    this.settling.add(saving);
+    void saving.finally(() => this.settling.delete(saving));
     return saving;
   }
 
@@ -1085,8 +1093,10 @@ export default class BasaltPlugin extends Plugin {
     await live?.close();
     await client?.close();
     // A settle save already past its generation check is a write to the same
-    // file this is about to empty. It is waited for here rather than raced.
-    await this.settling;
+    // file this is about to empty. Every one of them is waited for here
+    // rather than raced, and the bumped generation above is what stops
+    // another starting.
+    await Promise.all([...this.settling]);
 
     try {
       await this.indexStore().remove();

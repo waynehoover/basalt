@@ -25,7 +25,15 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
-import { configFolderName, foldPath, isNeverSynced, neverSync, splitName } from "../core/paths.ts";
+import {
+  configFolderName,
+  foldPath,
+  ignoredHere,
+  ignoredHereError,
+  isNeverSynced,
+  neverSync,
+  splitName,
+} from "../core/paths.ts";
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
 
 /**
@@ -217,8 +225,17 @@ export class NodeVault implements Vault {
     // `list` skipped every depth, so `notes/.git/hooks/post-checkout` from
     // a peer was written, never listed, and reported deleted on the next
     // pass. One predicate, the same one `list` and `watch` use.
-    if (this.neverSynced(outside.split(sep).join("/"))) {
-      throw neverSync(`refusing to write inside a folder that is never synced: ${path}`);
+    const rel = outside.split(sep).join("/");
+    if (this.neverSynced(rel)) {
+      // Two refusals, because they mean opposite things to whoever reads the
+      // exit status (R2). A dot-prefixed name is one this client would write
+      // and then never list again, which is a fault in the vault it came
+      // from. A name in this device's own ignore list is the person who
+      // passed `--ignore` getting what they asked for, and a peer that syncs
+      // it is not doing anything wrong either.
+      throw ignoredHere(rel, this.ignore)
+        ? ignoredHereError(`not writing under a name this device is set to ignore: ${path}`)
+        : neverSync(`refusing to write inside a folder that is never synced: ${path}`);
     }
     return full;
   }
@@ -588,16 +605,28 @@ export class NodeVault implements Vault {
   private foldsCaseSync = true;
   private probed: Promise<void> | undefined;
 
-  /** Runs the case probe, so `canonical` answers for this disk rather than for the worst one. */
+  /**
+   * Runs the case probe, so `canonical` answers for this disk rather than for
+   * the worst one.
+   *
+   * In the vault root, which is the one directory that is always already
+   * there. It used to make `.basalt/` on the way, and every command goes
+   * through here: `basalt status` reads and prints and should leave nothing
+   * behind, and on a read-only mount the mkdir was a failure where there had
+   * been none (R9). The name is dot-prefixed, so both clients pass over it by
+   * the dot rule for the moment it exists, and carries the pid so two runs
+   * over one vault cannot take each other's probe away.
+   *
+   * A probe that cannot be made at all, on that read-only mount or anywhere
+   * else, leaves the default standing, and the default is the safe side.
+   */
   probeCase(): Promise<void> {
     return (this.probed ??= (async () => {
-      const dir = join(this.root, ".basalt");
-      const probe = join(dir, `.CaseProbe-${process.pid}`);
+      const probe = join(this.root, `.basalt-CaseProbe-${process.pid}`);
       try {
-        await mkdir(dir, { recursive: true });
         await (await open(probe, "wx")).close();
         try {
-          await access(join(dir, `.caseprobe-${process.pid}`), constants.F_OK);
+          await access(join(this.root, `.basalt-caseprobe-${process.pid}`), constants.F_OK);
           this.foldsCaseSync = true;
         } catch {
           this.foldsCaseSync = false;

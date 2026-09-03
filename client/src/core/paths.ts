@@ -109,6 +109,41 @@ export function neverSync(message: string): Error {
 }
 
 /**
+ * A refusal to write under a name this device has been told to leave alone,
+ * with the code the engine reads it by.
+ *
+ * Its own code because the two refusals mean opposite things to whoever reads
+ * the exit status (R2). A path that cannot work here, such as one under a
+ * dot-prefixed name this client would write and never list again, is a
+ * failure. A path refused because somebody passed `--ignore` for it is the
+ * configuration doing what it was asked, and counting it as a failure made
+ * every later sync of that vault exit 1 for ever: a cron job alerting until
+ * the end of time about a folder its owner chose not to sync.
+ */
+export function ignoredHereError(message: string): Error {
+  const err = new Error(message) as Error & { code: string };
+  err.code = "ignored";
+  return err;
+}
+
+/**
+ * Whether the only thing keeping a path out of this vault is the shell's own
+ * ignore list.
+ *
+ * The dot rule wins wherever it applies: a dot segment is refused by both
+ * clients in both directions, and no ignore list makes that a choice. What is
+ * left is a name somebody named, which is what `--ignore` is.
+ */
+export function ignoredHere(relPath: string, extra: ReadonlySet<string>): boolean {
+  let byList = false;
+  for (const part of relPath.split("/")) {
+    if (part.startsWith(".") && part !== "." && part !== "..") return false;
+    if (extra.has(part)) byList = true;
+  }
+  return byList;
+}
+
+/**
  * The config folder as a single name at the vault root, or a refusal.
  *
  * Obsidian's config folder is one folder at the root, and if it were ever

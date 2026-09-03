@@ -25,6 +25,7 @@ function report(over: Partial<SyncReport>): SyncReport {
     waiting: 0,
     retrying: 0,
     skipped: 0,
+    ignored: 0,
     blocked: 0,
     inTheWay: [],
     chunksSent: 0,
@@ -41,6 +42,7 @@ describe("two passes of one sync, combined (C35)", () => {
       unchanged: 10,
       retrying: 1,
       skipped: 1,
+      ignored: 2,
       blocked: 1,
       inTheWay: [{ path: "a", blockedBy: "b" }],
       chunksSent: 4,
@@ -52,6 +54,7 @@ describe("two passes of one sync, combined (C35)", () => {
       unchanged: 12,
       retrying: 0,
       skipped: 1,
+      ignored: 2,
       blocked: 0,
       chunksSent: 1,
       bytesSent: 50,
@@ -65,6 +68,9 @@ describe("two passes of one sync, combined (C35)", () => {
     expect(both.unchanged).toBe(12);
     expect(both.retrying).toBe(0);
     expect(both.skipped).toBe(1);
+    // A state, like the rest of them: the same two ignored paths seen twice
+    // are two, not four.
+    expect(both.ignored).toBe(2);
     expect(both.blocked).toBe(0);
     expect(both.inTheWay).toEqual([]);
   });
