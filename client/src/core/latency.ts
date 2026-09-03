@@ -25,6 +25,14 @@ export interface Wire {
   readonly bytesPerSecond?: number;
 }
 
+/**
+ * How much a direction may hold before the sender is paused, and how far it
+ * drains before the sender is resumed. About one socket buffer's worth, which
+ * is what a real link lets a sender get ahead by.
+ */
+const BACKPRESSURE_HIGH = 256 * 1024;
+const BACKPRESSURE_LOW = 64 * 1024;
+
 export class LatencyProxy {
   private server: Server | undefined;
   private readonly sockets = new Set<Socket>();
@@ -45,8 +53,8 @@ export class LatencyProxy {
       // Each direction gets its own queue, because a delayed write must
       // not overtake one queued before it: a stream delivered out of
       // order is a different stream.
-      const forward = this.delayed(upstream);
-      const back = this.delayed(client);
+      const forward = this.delayed(client, upstream);
+      const back = this.delayed(upstream, client);
 
       client.on("data", forward);
       upstream.on("data", back);
@@ -89,9 +97,10 @@ export class LatencyProxy {
    * time its own bytes take on the wire, and lands one way later. Departures
    * are therefore monotonic and so are arrivals.
    */
-  private delayed(to: Socket): (chunk: Buffer) => void {
+  private delayed(from: Socket, to: Socket): (chunk: Buffer) => void {
     const oneWayMs = this.wire.rttMs / 2;
     const queue: Array<{ at: number; chunk: Buffer }> = [];
+    let queued = 0;
     let lastDeparture = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -100,8 +109,18 @@ export class LatencyProxy {
       const now = Date.now();
       while (queue.length > 0 && queue[0]!.at <= now) {
         const next = queue.shift()!;
+        queued -= next.chunk.length;
         if (!to.destroyed) to.write(next.chunk);
       }
+      // Back-pressure, which is the half of a slow link a plain queue
+      // leaves out. A real network lets a sender push only as far as its
+      // socket buffer and the receiver's window, so the sender's own
+      // "bytes not yet sent" number tracks the wire. A proxy that read the
+      // sender dry and queued everything reported all of it sent at once,
+      // and the transport's pacing, which watches that number, saw a
+      // two megabyte upload leave in a moment and then waited on an ack
+      // the wire would take four seconds to carry.
+      if (queued < BACKPRESSURE_LOW && from.isPaused()) from.resume();
       if (queue.length > 0) {
         timer = setTimeout(drain, Math.max(1, queue[0]!.at - Date.now()));
       }
@@ -115,6 +134,8 @@ export class LatencyProxy {
       const departure = Math.max(now, lastDeparture) + serialiseMs;
       lastDeparture = departure;
       queue.push({ at: departure + oneWayMs, chunk });
+      queued += chunk.length;
+      if (queued >= BACKPRESSURE_HIGH && !from.isPaused()) from.pause();
       if (timer === undefined) {
         timer = setTimeout(drain, Math.max(0, queue[0]!.at - Date.now()));
       }

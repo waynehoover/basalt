@@ -15,9 +15,17 @@
  * below: `Client` is one connection, and `runForever` is the loop.
  */
 
-import { Engine, type SyncOptions, type SyncReport } from "./engine.ts";
+import {
+  Engine,
+  contentId,
+  firstFreeName,
+  placeBeside,
+  type SyncOptions,
+  type SyncReport,
+} from "./engine.ts";
 import {
   Backoff,
+  ConnectionError,
   ProtocolError,
   Transport,
   type ServerLimits,
@@ -25,17 +33,41 @@ import {
   type WireEntry,
 } from "./transport.ts";
 import type { IndexStore, Vault } from "./vault.ts";
-import { openPath, sealPath, type VaultKeys } from "./crypto.ts";
+import {
+  authToken,
+  base64urlEncode as encodeBase64url,
+  deriveKeys,
+  entryIsOurs,
+  generateDataKey,
+  openPath,
+  randomBytes,
+  sealPath,
+  sealSecret,
+  unsealSecret,
+  unwrapDataKey,
+  wrapDataKey,
+  type VaultKeys,
+} from "./crypto.ts";
+import { INVITE_ID_LENGTH, INVITE_KEY_LENGTH, formatInvite, type Invite } from "./pairing.ts";
 
 export interface ClientOptions {
   readonly vault: Vault;
   readonly store: IndexStore;
+  /** The keys derived from the root secret alone. See EngineOptions. */
   readonly keys: VaultKeys;
+  /**
+   * The root secret, so the data key `ready` returns can be unwrapped, an
+   * invite can seal it, and a rotation can replace it. A shell always passes
+   * it; only a test that knows its vault has no data key leaves it out.
+   */
+  readonly secret?: Uint8Array;
   /** WebSocket URL of the server. */
   readonly url: string;
   readonly token: string;
   /** The auth key to bind the vault to, if it has not been claimed yet. */
   readonly claim?: string;
+  /** A fresh wrapped data key to store with the claim. See EngineOptions. */
+  readonly wrapped?: string;
   readonly vaultId: string;
   readonly device: string;
   readonly timeoutMs?: number;
@@ -44,6 +76,16 @@ export interface ClientOptions {
   readonly log?: (message: string, ...rest: unknown[]) => void;
   /** The path being worked on, and undefined when a pass ends. */
   readonly onProgress?: (path: string | undefined) => void;
+  /**
+   * Called with the report of every pass, whatever started it.
+   *
+   * A pass can start from the ticker, from a batch arriving, from the
+   * watcher, from a shell asking, or from `settle`, and a shell that wants
+   * to say what the vault looks like had to hook each of those separately
+   * and missed some. One place, every pass. A pass that threw reports
+   * nothing here; the error goes to whoever asked for it.
+   */
+  readonly onPass?: (report: SyncReport) => void;
   /** Injectable for tests, and for a platform whose WebSocket is not global. */
   readonly socketFactory?: (url: string) => SocketLike;
 }
@@ -63,6 +105,8 @@ export class Client {
   private limits: ServerLimits | undefined;
   private soonTimer: ReturnType<typeof setTimeout> | undefined;
   private caughtUp = false;
+  /** When the last batch arrived, for the catch-up wait in `connect`. */
+  private lastBatchAt = Date.now();
   private endedWith: Error | undefined;
   private notifyEnded: ((cause: Error) => void) | undefined;
 
@@ -70,6 +114,7 @@ export class Client {
     let engine!: Engine;
     this.transport = new Transport(opts.url, {
       onBatch: async (batch) => {
+        this.lastBatchAt = Date.now();
         await engine.acceptBatch(batch);
         // Accepting a batch records what the server has; it does not
         // fetch it. Without this the download waited for the next tick,
@@ -97,11 +142,13 @@ export class Client {
       vault: opts.vault,
       store: opts.store,
       keys: opts.keys,
+      ...(opts.secret !== undefined ? { secret: opts.secret } : {}),
       transport: this.transport,
       device: opts.device,
       vaultId: opts.vaultId,
       token: opts.token,
       ...(opts.claim !== undefined ? { claim: opts.claim } : {}),
+      ...(opts.wrapped !== undefined ? { wrapped: opts.wrapped } : {}),
       ...(opts.coalesceWrites !== undefined ? { coalesceWrites: opts.coalesceWrites } : {}),
       ...(opts.log !== undefined ? { log: opts.log } : {}),
       ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
@@ -143,6 +190,24 @@ export class Client {
     return this.limits?.cursor ?? 0;
   }
 
+  /** Everything the server advertised at hello, or undefined before it. */
+  get serverLimits(): ServerLimits | undefined {
+    return this.limits;
+  }
+
+  /**
+   * The vault's wrapped data key as the server holds it, or undefined for a
+   * vault claimed under protocol 2, which has none.
+   */
+  get wrapped(): string | undefined {
+    return this.limits?.wrapped;
+  }
+
+  /** The keys in use, which after `ready` may be the data key's rather than the root's. */
+  get keys(): VaultKeys {
+    return this.engine.vaultKeys;
+  }
+
   /**
    * Connects, says hello, and waits for the backlog.
    *
@@ -152,15 +217,23 @@ export class Client {
    */
   async connect(): Promise<ServerLimits> {
     await this.transport.connect();
+    this.lastBatchAt = Date.now();
     this.limits = await this.engine.start();
 
+    // An inactivity bound, not a total one. A device that has been away for
+    // a while has a long backlog, and over a slow link the whole of it can
+    // take longer than the timeout while batches arrive steadily the entire
+    // time. Bounding the total made that device reconnect into the same
+    // backlog for ever; what a timeout is for is a server that has stopped
+    // talking, and that is measured from the last thing it said.
     const timeout = this.opts.timeoutMs ?? 30_000;
-    const deadline = Date.now() + timeout;
-    while (!this.caughtUp && Date.now() < deadline) {
+    while (!this.caughtUp) {
       if (this.endedWith) throw this.endedWith;
+      if (Date.now() - this.lastBatchAt > timeout) {
+        throw new Error("the server never finished sending what it already had");
+      }
       await sleep(25);
     }
-    if (!this.caughtUp) throw new Error("the server never finished sending what it already had");
     return this.limits;
   }
 
@@ -186,7 +259,34 @@ export class Client {
   }
 
   private pass(opts: SyncOptions): Promise<SyncReport> {
-    return this.serial(() => this.engine.sync(opts));
+    return this.serial(async () => {
+      // A closed client starts no pass. `close` drains the queue, and a
+      // settle sleeping between two passes was not in the queue: it woke
+      // after the drain, ran a pass against the closed transport, and saved
+      // the index that unlink had just removed.
+      if (this.closing) throw new ConnectionError("this client has been closed");
+      const report = await this.engine.sync(opts);
+      this.opts.onPass?.(report);
+      return report;
+    });
+  }
+
+  /**
+   * Waits for everything queued on the wire to finish, including work queued
+   * while waiting.
+   *
+   * `runUntilClosed` used to resolve the moment the transport closed, while a
+   * pass started by the ticker or the watcher could still be writing the
+   * vault and the index. `runForever` then built a new client that loaded
+   * the index the old engine was about to overwrite. Two engines on one
+   * index is the state the single-flight rule exists to prevent.
+   */
+  private async drain(): Promise<void> {
+    let seen: Promise<unknown> | undefined;
+    while (this.queue !== seen) {
+      seen = this.queue;
+      await seen;
+    }
   }
 
   /**
@@ -212,14 +312,19 @@ export class Client {
     const ticker = setInterval(() => {
       void this.sync().then(() => this.keepalive());
     }, tickMs);
+    let cause: Error;
     try {
-      return await new Promise<Error>((resolve) => {
+      cause = await new Promise<Error>((resolve) => {
         this.notifyEnded = resolve;
       });
     } finally {
       clearInterval(ticker);
       stop?.();
     }
+    // Nothing else starts a pass now, and the one that may be running gets
+    // to finish writing before this client is reported gone.
+    await this.drain();
+    return cause;
   }
 
   /**
@@ -270,6 +375,20 @@ export class Client {
     }
   }
 
+  /**
+   * Records a rename the host reported, once nothing else is touching the
+   * index.
+   *
+   * `Engine.noteRename` rewrites entries synchronously, and a shell that
+   * called it directly did so between the awaits of whatever pass was
+   * running: the pass had an entry in hand for the old name, the rename
+   * moved it, and the pass went on to upload under the old name while the
+   * new one held a stale copy. Queued like a pass, it lands between them.
+   */
+  noteRename(from: string, to: string): Promise<void> {
+    return this.serial(async () => this.engine.noteRename(from, to));
+  }
+
   /* ------------------------------------------------------------ *
    * Recovery
    * ------------------------------------------------------------ */
@@ -282,9 +401,50 @@ export class Client {
    * a key in a table.
    */
   async history(path: string, opts: { before?: number; limit?: number } = {}): Promise<Version[]> {
-    const sealed = await sealPath(this.opts.keys, path);
+    const sealed = await sealPath(this.keys, path);
     const entries = await this.serial(() => this.transport.history(sealed, opts));
+    await this.mustBeOurs(entries);
     return entries.map((e) => this.asVersion(e, path));
+  }
+
+  /**
+   * Refuses a recovery list holding an entry this vault's key did not sign.
+   *
+   * The ordinary sync path checks every batch entry's authenticator before it
+   * acts on it. Recovery did not (C32): a `history` was shown, a `deleted`
+   * list was offered for restore, and the version chosen was fetched and
+   * written, all on the server's word. The server holds every sealed path
+   * and could name any file; an entry it invented would decrypt, being made
+   * of real chunks, and be written into the vault as a restored note.
+   */
+  private async mustBeOurs(entries: readonly WireEntry[]): Promise<void> {
+    const keys = this.keys;
+    const ours = await Promise.all(
+      entries.map((e) =>
+        entryIsOurs(
+          keys,
+          {
+            path: e.path,
+            size: e.size,
+            ctime: e.ctime,
+            mtime: e.mtime,
+            folder: e.folder,
+            deleted: e.deleted,
+            prev: e.prev,
+            chunks: e.chunks,
+            parent: e.parent ?? "",
+          },
+          e.mac,
+        ),
+      ),
+    );
+    const forged = ours.indexOf(false);
+    if (forged >= 0) {
+      throw new Error(
+        `version ${entries[forged]!.uid} is not authenticated by this vault's key, ` +
+          `so nothing that holds the key wrote it, and it is not shown`,
+      );
+    }
   }
 
   /**
@@ -296,10 +456,11 @@ export class Client {
    */
   async deleted(limit?: number): Promise<DeletedList> {
     const answer = await this.serial(() => this.transport.deleted(limit));
+    await this.mustBeOurs(answer.entries);
     const notes: Deletion[] = [];
     for (const e of answer.entries) {
       notes.push({
-        ...this.asVersion(e, await openPath(this.opts.keys, e.path)),
+        ...this.asVersion(e, await openPath(this.keys, e.path)),
         // Zero means purge has taken every version that had content.
         // The note is still listed, and there is nothing to bring back.
         restorable: e.restorable ?? 0,
@@ -335,7 +496,7 @@ export class Client {
    */
   async contentAt(version: Version): Promise<Uint8Array> {
     if (version.deleted || version.folder) return new Uint8Array(0);
-    return this.serial(() => this.engine.contentOf(version.uid));
+    return this.serial(() => this.engine.contentOf(version.uid, undefined, version.contentId));
   }
 
   async restore(version: Version, to?: string): Promise<{ path: string; bytes: number }> {
@@ -351,11 +512,27 @@ export class Client {
     }
 
     // Queued like a pass, because reassembling a version is several
-    // requests and a sync starting in the middle of them would collide.
-    const content = await this.serial(() => this.engine.contentOf(version.uid));
+    // requests and a sync starting in the middle of them would collide. The
+    // chunk list the signed history entry named is what `get` must answer
+    // with; anything else is not this version (C32).
+    const content = await this.serial(() =>
+      this.engine.contentOf(version.uid, undefined, version.contentId),
+    );
     const wanted = to ?? version.path;
-    const at = (await this.opts.vault.exists(wanted)) ? restoredCopyPath(wanted, version) : wanted;
-    await this.opts.vault.write(at, content, { mtime: version.mtime, ctime: version.ctime });
+    const vault = this.opts.vault;
+    const exists = (p: string) => vault.exists(p);
+    const times = { mtime: version.mtime, ctime: version.ctime };
+    // Never over what is there, and never in the gap between looking and
+    // writing either. The copy's name is numbered past whatever exists:
+    // restoring the same version twice is ordinary, and the second copy
+    // landing on the first replaced the one thing a restore gives back.
+    const at = await placeBeside(
+      async () =>
+        (await exists(wanted)) ? firstFreeName(restoredCopyPath(wanted, version), exists) : wanted,
+      content,
+      times,
+      vault,
+    );
     return { path: at, bytes: content.length };
   }
 
@@ -366,8 +543,39 @@ export class Client {
    * well would be a lock waiting for itself.
    */
   async newestContentVersion(path: string): Promise<Version | undefined> {
-    const versions = await this.history(path, { limit: 50 });
-    return versions.find((v) => !v.deleted);
+    return this.findVersion(path, (v) => !v.deleted);
+  }
+
+  /**
+   * The newest version of a path that satisfies `match`, paging as far back as
+   * it has to.
+   *
+   * A single page used to be all anybody looked at: fifty versions for the
+   * newest with content, five hundred for a version by uid. A note edited
+   * more often than that, or deleted and re-created enough times, had older
+   * versions that `basalt history` would list and `basalt restore --uid`
+   * would then say did not exist. Recovery is the one place that answer must
+   * not be a page size.
+   *
+   * `pageSize` is a parameter so a test can make the paging happen with a
+   * handful of versions rather than hundreds.
+   */
+  async findVersion(
+    path: string,
+    match: (v: Version) => boolean,
+    pageSize = 100,
+  ): Promise<Version | undefined> {
+    let before: number | undefined;
+    for (;;) {
+      const page = await this.history(
+        path,
+        before === undefined ? { limit: pageSize } : { before, limit: pageSize },
+      );
+      const found = page.find(match);
+      if (found) return found;
+      if (page.length < pageSize) return undefined;
+      before = page[page.length - 1]!.uid;
+    }
   }
 
   private asVersion(e: WireEntry, path: string): Version {
@@ -381,10 +589,87 @@ export class Client {
       deleted: e.deleted,
       device: e.device,
       chunks: e.chunks?.length ?? 0,
+      contentId: contentId(e.chunks ?? []),
     };
   }
 
-  close(): void {
+  /* ------------------------------------------------------------ *
+   * Adding a device, and retiring a leaked secret
+   * ------------------------------------------------------------ */
+
+  /**
+   * Issues a single-use invite for another device.
+   *
+   * The root secret is sealed under a fresh key the server never sees and
+   * stored under a fresh identifier it cannot guess, for `ttlMs` (the
+   * server's default and cap apply when this is absent or over). What comes
+   * back is the string to hand over and the moment it stops working, in
+   * server milliseconds. The string is the only copy of the key; nothing here
+   * keeps it.
+   */
+  async invite(ttlMs?: number): Promise<{ invite: string; expiresAt: number }> {
+    const secret = this.opts.secret;
+    if (secret === undefined) {
+      throw new Error(
+        "this client was given no root secret, so it has nothing to put in an invite",
+      );
+    }
+    const id = randomBytes(INVITE_ID_LENGTH);
+    const key = randomBytes(INVITE_KEY_LENGTH);
+    const sealed = await sealSecret(key, secret);
+    const expiresAt = await this.serial(() =>
+      this.transport.invite({
+        invite: base64url(id),
+        sealed,
+        ...(ttlMs !== undefined ? { ttlMs } : {}),
+      }),
+    );
+    const invite: Invite = { url: this.opts.url, vaultId: this.opts.vaultId, id, key };
+    return { invite: formatInvite(invite), expiresAt };
+  }
+
+  /**
+   * Gives the vault a new root secret, keeping its history.
+   *
+   * The data key does not change; it is unwrapped under the old root and
+   * wrapped again under the new one, and the server swaps the auth hash and
+   * the blob together. Only a vault with a data key can do this: one claimed
+   * under protocol 2 seals its content under the root itself, so for it the
+   * only rotation is a new vault, and this says so rather than doing anything.
+   * The caller saves the new secret once this returns; until then nothing has
+   * changed on either end.
+   */
+  async rotate(newSecret: Uint8Array): Promise<void> {
+    const secret = this.opts.secret;
+    if (secret === undefined) {
+      throw new Error("this client was given no root secret, so it cannot rotate one");
+    }
+    const wrapped = this.wrapped;
+    if (wrapped === undefined) {
+      throw new Error(
+        "this vault was claimed under protocol 2, rotation is a new vault, see docs/server.md",
+      );
+    }
+    const old = await deriveKeys(secret);
+    const dataKey = await unwrapDataKey(old.wrap, wrapped);
+    const fresh = await deriveKeys(newSecret);
+    const rewrapped = await wrapDataKey(fresh.wrap, dataKey);
+    await this.serial(() => this.transport.rotate({ auth: authToken(fresh), wrapped: rewrapped }));
+  }
+
+  /**
+   * Closes the connection and resolves once nothing of this client is still
+   * running.
+   *
+   * The transport is closed first, so a pass in flight fails its remaining
+   * wire work quickly and records it for retry rather than waiting out a
+   * timeout. Then that pass is waited for, because it may still be writing
+   * files and the index, and whoever called this is about to reuse both.
+   */
+  private closing = false;
+
+  async close(): Promise<void> {
+    this.closing = true;
     // Or a pass fires against a closed transport after the caller has
     // finished with this client, which in a test is a leak and in a plugin
     // is a sync running after the vault was unlinked.
@@ -393,6 +678,7 @@ export class Client {
       this.soonTimer = undefined;
     }
     this.transport.close();
+    await this.drain();
   }
 }
 
@@ -436,6 +722,12 @@ export interface Version {
   readonly device: string;
   /** How many chunks it is stored in. Zero for a folder, a deletion, or empty. */
   readonly chunks: number;
+  /**
+   * The chunk list as the signed entry named it, in the engine's content id
+   * form. What a restore holds `get` to, so the server cannot answer with
+   * another file's chunks.
+   */
+  readonly contentId: string;
 }
 
 /**
@@ -461,6 +753,17 @@ export interface ForeverHooks {
   /** After each settle, whether or not it did anything. */
   onSynced?(report: SyncReport, serverCursor: number): void;
   /**
+   * A client that is about to connect, before it has.
+   *
+   * `onClient` fires only once the handshake has succeeded, which is right
+   * for a shell that reads success into it, and too late for one that needs
+   * to stop the attempt: a vault unlinked or a plugin unloaded during a slow
+   * handshake had no handle on the client doing it, so the connection went
+   * on to succeed and the loop went on to sync. This hands the shell the
+   * client while it can still be closed.
+   */
+  onConnecting?(client: Client): void;
+  /**
    * The live client, each time a new one connects, and undefined when it goes.
    *
    * For a shell that has its own reason to sync: the plugin gets file events
@@ -481,7 +784,20 @@ export interface ForeverHooks {
   onFatal?(cause: Error): void;
   /** Whether to keep going. Lets a shell stop the loop without an exception. */
   keepGoing?(): boolean;
+  /** How the loop waits between attempts. Injectable so a test need not. */
+  sleep?(ms: number): Promise<void>;
 }
+
+/**
+ * How many times the same failure may end a connection before the loop
+ * stops and says so.
+ *
+ * A batch the engine cannot apply ends the session, the loop reconnects, the
+ * server sends the same batch, and round it goes for ever with nothing said
+ * (C28). Three identical failures in a row are not a network; they are a
+ * wall, and the person is told where it is.
+ */
+export const IDENTICAL_FAILURES_BEFORE_STOPPING = 3;
 
 /**
  * Syncs, then keeps syncing, reconnecting for as long as it is worth it.
@@ -496,6 +812,9 @@ export interface ForeverHooks {
  */
 export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}): Promise<void> {
   const backoff = new Backoff(0, 300_000, 5_000, true);
+  const wait = hooks.sleep ?? sleep;
+  let lastFailure = "";
+  let repeats = 0;
 
   while (hooks.keepGoing?.() ?? true) {
     let client: Client | undefined;
@@ -504,31 +823,70 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
 
     try {
       client = new Client(opts);
+      hooks.onConnecting?.(client);
       await client.connect();
       reachedTheServer = true;
       backoff.success(Date.now());
+      // Asked again here, not only at the top of the loop. A shell that
+      // said stop during the handshake has nothing else to say it with,
+      // and a settle on a vault somebody has just unlinked is exactly the
+      // sync they were trying to prevent.
+      if (!(hooks.keepGoing?.() ?? true)) return;
       hooks.onClient?.(client);
-      hooks.onSynced?.(await client.settle(), client.serverCursor);
+      // Settled first, then reported. Written as one line before, with the
+      // settle as the hook's argument, which meant a shell that passed no
+      // `onSynced` never had the settle run at all: an optional call skips
+      // its arguments, and the first sync waited for the ticker.
+      const report = await client.settle();
+      hooks.onSynced?.(report, client.serverCursor);
       cause = await client.runUntilClosed();
     } catch (err) {
       cause = err as Error;
     } finally {
       hooks.onClient?.(undefined);
-      client?.close();
+      // Awaited: the next client loads the index this one may still be
+      // writing, and two engines on one index is the state the
+      // single-flight rule exists to prevent.
+      await client?.close();
     }
 
     if (cause && isFatal(cause)) {
       hooks.onFatal?.(cause);
       return;
     }
+    // The same failure, word for word, on consecutive connections is not a
+    // network coming and going; it is something the server sends every time
+    // and this device cannot take, and retrying it is a loop that never ends
+    // and never tells anybody why (C28). A dropped connection is excused,
+    // because that is what a network does, and so is a refusal the server
+    // marked retryable, because `busy` on a full vault is the same words
+    // every time and is still meant to be waited out. What is left is this
+    // device's own failure to apply what it was sent.
+    if (cause && !(cause instanceof ConnectionError) && !(cause instanceof ProtocolError)) {
+      repeats = cause.message === lastFailure ? repeats + 1 : 1;
+      lastFailure = cause.message;
+      if (repeats >= IDENTICAL_FAILURES_BEFORE_STOPPING) {
+        hooks.onFatal?.(
+          new Error(
+            `${cause.message}. This has failed ${repeats} times in a row with this device at cursor ` +
+              `${client?.engine.status().cursor ?? 0}, so waiting will not help; ` +
+              `docs/server.md says how to recover from an entry no device can apply`,
+          ),
+        );
+        return;
+      }
+    } else {
+      repeats = 0;
+      lastFailure = "";
+    }
     if (!(hooks.keepGoing?.() ?? true)) return;
 
     backoff.fail(Date.now());
-    const wait = backoff.delay();
     const why = cause ?? new Error("the connection ended");
-    if (reachedTheServer) hooks.onDisconnected?.(why, wait);
-    else hooks.onUnreachable?.(why, wait);
-    await sleep(wait);
+    const delay = retryWait(why, backoff.delay());
+    if (reachedTheServer) hooks.onDisconnected?.(why, delay);
+    else hooks.onUnreachable?.(why, delay);
+    await wait(delay);
   }
 }
 
@@ -536,12 +894,82 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
  * Whether trying again could ever help.
  *
  * "Closed by this device" is not a failure, it is this client shutting down, and
- * treating it as fatal would stop a loop that was asked to stop anyway. Anything
- * the protocol marked fatal is a refusal that will be repeated word for word
- * forever.
+ * treating it as fatal would stop a loop that was asked to stop anyway. A
+ * refusal the server marked as not retryable will be repeated word for word
+ * forever; one it marked retryable, `busy` on a restart above all, is the
+ * connection ending for a reason a retry outlives (C27).
  */
 export function isFatal(cause: Error): boolean {
   return cause instanceof ProtocolError && cause.fatal;
+}
+
+/**
+ * How long to wait before the next attempt: the backoff, or longer if the
+ * server said so.
+ *
+ * `retryAfterMs` travels with `busy`. A device refused for the vault's device
+ * limit is told thirty seconds, because the other devices' sessions have to
+ * go away first; one refused for a shutdown is told five, because the server
+ * is about to be back. Neither is a reason to wait less than the backoff
+ * already would, so the longer of the two wins.
+ */
+export function retryWait(cause: Error, backoffMs: number): number {
+  const hint = cause instanceof ProtocolError ? cause.retryAfterMs : undefined;
+  return Math.max(backoffMs, hint ?? 0);
+}
+
+/**
+ * A fresh data key for a vault this device is about to claim, wrapped under
+ * its root so the server can store it.
+ *
+ * Made once per connection attempt and used only if the claim goes through,
+ * because the key a vault actually has comes back in `ready`. A claim that
+ * committed while its reply was lost leaves the server holding the key it
+ * stored, and the next attempt's fresh one is ignored like the claim it came
+ * with.
+ */
+export async function wrappedForClaim(keys: VaultKeys): Promise<string> {
+  return wrapDataKey(keys.wrap, generateDataKey());
+}
+
+/**
+ * Redeems an invite: one connection that carries the invite in place of a
+ * token, takes the sealed root, and closes.
+ *
+ * Returns the root secret and, for a vault with a data key, the wrapped key
+ * the server holds. The caller stores the secret and connects again as a
+ * device. Nothing here is a device: the connection proved only that it held
+ * an unused invite, which the server burned before answering, so a reply lost
+ * on the way leaves the invite spent and the caller with nothing saved, which
+ * is a usable state: the issuing device makes another.
+ */
+export async function redeemInvite(
+  invite: Invite,
+  device: string,
+  opts: { timeoutMs?: number; socketFactory?: (url: string) => SocketLike } = {},
+): Promise<{ secret: Uint8Array; wrapped?: string }> {
+  const transport = new Transport(invite.url, {
+    onBatch: () => {},
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
+  });
+  try {
+    await transport.connect();
+    const redeemed = await transport.redeem({
+      vault: invite.vaultId,
+      device,
+      invite: base64url(invite.id),
+    });
+    const secret = await unsealSecret(invite.key, redeemed.sealed);
+    return { secret, ...(redeemed.wrapped !== undefined ? { wrapped: redeemed.wrapped } : {}) };
+  } finally {
+    transport.close();
+  }
+}
+
+function base64url(bytes: Uint8Array): string {
+  // The same alphabet crypto.ts uses, imported from there to keep one copy.
+  return encodeBase64url(bytes);
 }
 
 /**

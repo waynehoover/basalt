@@ -73,15 +73,21 @@ describe("the headless client refuses to write where it would never read", () =>
 
   it("still writes ordinary notes, including ones that look close", async () => {
     const vault = await nodeVault();
-    for (const path of [
-      "note.md",
-      "Projects/deep/note.md",
-      ".obsidian-notes/n.md",
-      "obsidian/n.md",
-    ]) {
+    for (const path of ["note.md", "Projects/deep/note.md", "obsidian/n.md"]) {
       await vault.write(path, body, times);
       expect(await vault.read(path)).toEqual(body);
     }
+  });
+
+  /**
+   * T4 in TODO.md: the contract is that any dot-prefixed segment never syncs,
+   * in either direction, in both clients. Obsidian's own index never lists
+   * one, so a headless client that accepted `.obsidian-notes/n.md` from a
+   * peer would hold a file it could never report, and report it deleted.
+   */
+  it("refuses a dot-prefixed folder even when it is not the config folder", async () => {
+    const vault = await nodeVault();
+    await expect(vault.write(".obsidian-notes/n.md", body, times)).rejects.toThrow(/never synced/);
   });
 });
 
@@ -108,9 +114,10 @@ describe("the plugin refuses the same paths", () => {
 });
 
 /**
- * A note whose name merely begins with two dots is a note, not an escape.
- * `relative()` returns "..hidden.md" for it, and a `startsWith("..")` test
- * refuses it: a file that can never sync, for the lifetime of the vault.
+ * A name beginning with two dots is not an escape, and containment must not
+ * call it one: the refusal it gets is the dot rule's, which is a different
+ * reason with a different message, and the distinction is what tells a person
+ * whether a peer is misbehaving or a file simply does not sync (T4).
  */
 describe("what containment should and should not refuse", () => {
   it("refuses real escapes", async () => {
@@ -122,9 +129,10 @@ describe("what containment should and should not refuse", () => {
     }
   });
 
-  it("accepts a note that starts with two dots", async () => {
+  it("refuses a note that starts with two dots as never synced, not as an escape", async () => {
     const vault = await nodeVault();
-    await vault.write("..hidden.md", body, times);
-    expect(await vault.read("..hidden.md")).toEqual(body);
+    const attempt = vault.write("..hidden.md", body, times);
+    await expect(attempt).rejects.toThrow(/never synced/);
+    await expect(attempt).rejects.not.toThrow(/outside the vault/);
   });
 });

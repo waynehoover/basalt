@@ -9,9 +9,11 @@
  */
 
 import { constants, watch as fsWatch, type FSWatcher } from "node:fs";
+import { createHash } from "node:crypto";
 import {
   access,
   cp,
+  link,
   mkdir,
   open,
   readFile,
@@ -20,53 +22,43 @@ import {
   rename,
   rm,
   stat,
-  utimes,
 } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
+import { configFolderName, isNeverSynced } from "../core/paths.ts";
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
 
 /**
- * Names never synced.
+ * Where a deletion arriving from another device goes, rather than away.
  *
- * The config folder is skipped because syncing plugins and settings is not
- * done here. That is an open question rather than a closed refusal, and
- * docs/philosophy.md now argues both sides of it; the short version is that
- * Obsidian rewrites those files from memory, so an arriving change would be
- * silently undone. One device disabling every plugin on another is also where
- * one of the durability rules came from. Which folder it is comes from
- * --config-dir, since only Obsidian knows for certain and this cannot ask.
- *
- * `.basalt` is this client's own bookkeeping, and syncing it would sync the
- * index to itself.
+ * Dot-prefixed, so `isNeverSynced` keeps it out of the listing and what lands
+ * there does not travel back out and undo the deletion everywhere else.
  */
-/** Where a deletion arriving from another device goes, rather than away. */
 const TRASH_DIR = ".trash";
 
-const NEVER_SYNC = new Set([".basalt", TRASH_DIR, ".git", ".DS_Store", "node_modules"]);
+/**
+ * Names this client leaves alone on top of the rule in core/paths.ts.
+ *
+ * Every dot-prefixed segment is already refused there: the config folder,
+ * `.basalt` (this client's own bookkeeping, and syncing it would sync the
+ * index to itself), the trash, `.git`. What is left is the one name a headless
+ * client meets that Obsidian does not.
+ *
+ * The config folder is added too, because somebody can rename it to something
+ * without a dot. Syncing plugins and settings is not done here; that is an
+ * open question rather than a closed refusal, and docs/design.md argues both
+ * sides of it. Which folder it is comes from --config-dir, since only Obsidian
+ * knows for certain and this cannot ask.
+ */
+const NEVER_SYNC = new Set(["node_modules"]);
 
 /** What Obsidian calls its config folder unless the user has overridden it. */
 export const DEFAULT_CONFIG_DIR = ".obsidian";
 
-/**
- * The config folder as a single name at the vault root, or a refusal.
- *
- * The same rule the plugin applies, and for the same reason: Obsidian's config
- * folder is one folder at the root, and if it were ever anything else then
- * quietly ignoring the wrong thing is how a vault's settings get uploaded.
- */
-export function configFolderName(configDir: string): string {
-  const name = configDir.replace(/^\/+|\/+$/g, "");
-  if (name === "" || name.includes("/")) {
-    throw new Error(
-      `refusing to sync: the config folder ${JSON.stringify(configDir)} is not a plain name`,
-    );
-  }
-  return name;
-}
+export { configFolderName };
 
 export interface NodeVaultOptions {
-  /** Extra top-level names to leave alone. */
+  /** Extra names to leave alone, at any depth. */
   readonly alsoIgnore?: readonly string[];
   /**
    * Obsidian's config folder, which is `.obsidian` until somebody overrides
@@ -119,7 +111,55 @@ export class NodeVault implements Vault {
   async flush(): Promise<void> {
     const dirs = [...this.unflushed];
     this.unflushed.clear();
-    await Promise.all(dirs.map((d) => syncDirectory(d)));
+    // Every directory is attempted, and the ones that failed go back on
+    // the list. Clearing first and syncing second lost the retry: a sync
+    // that failed once was never asked for again, and the next otherwise
+    // clean pass saved an index naming files whose directory entries had
+    // never been made durable.
+    const outcomes = await Promise.allSettled(dirs.map((d) => syncDirectory(d)));
+    let first: unknown;
+    outcomes.forEach((o, i) => {
+      if (o.status === "rejected") {
+        this.unflushed.add(dirs[i]!);
+        first ??= o.reason;
+      }
+    });
+    if (first !== undefined) throw first;
+  }
+
+  /**
+   * Remembers that a path's directory entries changed, so `flush` makes them
+   * durable before the index is saved.
+   *
+   * Every ancestor that did not exist before is new content in *its* parent,
+   * so the directories from the deepest one that already existed down to the
+   * path's parent are all dirty. Only writes used to register, so a folder
+   * made for a note, a case rename, a move into the trash and the copy across
+   * a mount all changed names on disk that nothing then synced.
+   */
+  private async dirty(full: string, deepestExisting: string): Promise<void> {
+    let at = dirname(full);
+    this.unflushed.add(at);
+    while (at !== deepestExisting && at.startsWith(this.root) && at !== this.root) {
+      at = dirname(at);
+      this.unflushed.add(at);
+    }
+  }
+
+  /** The deepest ancestor of a path that exists now, before anything is created. */
+  private async deepestExisting(full: string): Promise<string> {
+    let at = dirname(full);
+    for (;;) {
+      try {
+        await access(at, constants.F_OK);
+        return at;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
+      const up = dirname(at);
+      if (up === at) return at;
+      at = up;
+    }
   }
 
   /**
@@ -160,10 +200,8 @@ export class NodeVault implements Vault {
 
   private absolute(path: string): string {
     const full = resolve(this.root, path);
-    const rel = relative(this.root, full);
-    // `startsWith("..")` also refused a note called `..hidden.md`, which is
-    // a note, not an escape, and could never sync for the life of the vault.
-    if (rel === "" || rel === ".." || rel.startsWith(`..${sep}`)) {
+    const outside = relative(this.root, full);
+    if (outside === "" || outside === ".." || outside.startsWith(`..${sep}`)) {
       throw new Error(`refusing a path outside the vault: ${path}`);
     }
     // A path this client would never upload is one it must never accept.
@@ -174,11 +212,20 @@ export class NodeVault implements Vault {
     // that file on the next reload in a renderer with Node integration.
     // `.basalt/config.json` holds this device's own secret and server URL,
     // and `.git/hooks/` runs on the next checkout.
-    const first = rel.split(sep)[0]!;
-    if (this.ignore.has(first)) {
-      throw new Error(`refusing to write inside ${first}, which is never synced: ${path}`);
+    //
+    // Then it was read on the way in for the first segment only, while
+    // `list` skipped every depth, so `notes/.git/hooks/post-checkout` from
+    // a peer was written, never listed, and reported deleted on the next
+    // pass. One predicate, the same one `list` and `watch` use.
+    if (this.neverSynced(outside.split(sep).join("/"))) {
+      throw neverSync(`refusing to write inside a folder that is never synced: ${path}`);
     }
     return full;
+  }
+
+  /** The one answer to "does this path sync", asked the same way in every direction. */
+  private neverSynced(rel: string): boolean {
+    return isNeverSynced(rel, this.ignore);
   }
 
   /**
@@ -202,7 +249,43 @@ export class NodeVault implements Vault {
    * Do not raise UV_THREADPOOL_SIZE to go further. Measured at 16 it made this
    * 2.6x worse than the default 4.
    */
+  /** Temporary files of a crashed earlier run that `list` has removed. */
+  reaped = 0;
+
+  /**
+   * Removes staged temporaries that nothing is writing and that are old.
+   *
+   * A crash mid-write leaves its temporary behind, and the staging folder is
+   * never listed, so left alone it would sit there for ever, unseen. Anything
+   * older than the grace period and not open in this process cannot be an
+   * in-flight write, so it is removed and counted. Read errors here are
+   * ignored: the folder may not exist yet, and a reaper that stops a sync is
+   * worse than a temporary that waits.
+   */
+  private async reapStaleTemps(): Promise<void> {
+    let names: string[];
+    try {
+      names = await readdir(this.staging);
+    } catch {
+      return;
+    }
+    const cutoff = Date.now() - STALE_TEMP_MS;
+    for (const name of names) {
+      const full = join(this.staging, name);
+      if (liveTemps.has(full)) continue;
+      try {
+        if ((await stat(full)).mtimeMs < cutoff) {
+          await rm(full, { force: true });
+          this.reaped++;
+        }
+      } catch {
+        // Gone, or not ours to judge. Next time.
+      }
+    }
+  }
+
   async list(): Promise<FileStat[]> {
+    await this.reapStaleTemps();
     const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
       let items;
       try {
@@ -221,11 +304,26 @@ export class NodeVault implements Vault {
       // A write in flight from this client is skipped too. Listing one
       // would sync a half-written note under a name about to vanish.
       const kept = items.filter(
-        (i) => !this.ignore.has(i.name) && !isTemporary(i.name) && (i.isDirectory() || i.isFile()),
+        (i) =>
+          !this.neverSynced(prefix ? `${prefix}/${i.name}` : i.name) &&
+          !isTemporary(i.name, join(dir, i.name)) &&
+          (i.isDirectory() || i.isFile()),
       );
 
+      // A file deleted between the readdir and its stat is absent, which is
+      // an ordinary state and not a failure of the listing. Anything else
+      // the stat says is still rule 2: unreadable is not the same as gone,
+      // and one unreadable file is a reason to stop rather than to report
+      // the rest of the vault as the whole of it.
       const stats = await Promise.all(
-        kept.map((i) => (i.isFile() ? stat(join(dir, i.name)) : undefined)),
+        kept.map((i) =>
+          i.isFile()
+            ? stat(join(dir, i.name)).catch((err: NodeJS.ErrnoException) => {
+                if (err.code === "ENOENT") return undefined;
+                throw err;
+              })
+            : undefined,
+        ),
       );
       const children = await Promise.all(
         kept.map((i) =>
@@ -243,7 +341,8 @@ export class NodeVault implements Vault {
           out.push({ path, folder: true, mtime: 0, ctime: 0, size: 0 });
           out.push(...children[k]!);
         } else {
-          const s = stats[k]!;
+          const s = stats[k];
+          if (s === undefined) continue; // gone since the readdir
           out.push({
             path,
             folder: false,
@@ -323,14 +422,16 @@ export class NodeVault implements Vault {
   ): Promise<void> {
     const full = this.absolute(path);
     await this.insideForReal(full);
+    const had = await this.deepestExisting(full);
     await mkdir(dirname(full), { recursive: true });
     await this.matchCase(full);
-    await writeDurably(full, bytes, false);
-    this.unflushed.add(dirname(full));
-    if (times.mtime > 0) {
-      const seconds = times.mtime / 1000;
-      await utimes(full, seconds, seconds);
-    }
+    await writeDurably(full, bytes, false, { mtime: times.mtime, stageIn: this.staging });
+    await this.dirty(full, had);
+  }
+
+  /** Where this vault's temporary files live: under its own state folder, never beside a note. */
+  private get staging(): string {
+    return join(this.root, ".basalt", "tmp");
   }
 
   /**
@@ -350,25 +451,25 @@ export class NodeVault implements Vault {
     let there;
     try {
       there = await stat(full);
-    } catch {
-      return; // Nothing there under any spelling.
+    } catch (err) {
+      // Only absence means absent. Anything else is a disk that would not
+      // answer, and writing on top of an answer it did not give is how a
+      // note ends up spelled one way on disk and another in the index.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
     }
     if (there.isDirectory()) return;
 
     const dir = dirname(full);
     const want = basename(full);
-    let entries: string[];
-    try {
-      entries = await readdir(dir);
-    } catch {
-      return;
-    }
+    const entries = await readdir(dir);
     if (entries.includes(want)) return; // Spelled the way it is being written.
 
     const folded = want.normalize("NFC").toLowerCase();
     const actual = entries.find((e) => e.normalize("NFC").toLowerCase() === folded);
     if (actual === undefined) return;
     await rename(join(dir, actual), full);
+    this.unflushed.add(dir);
   }
 
   /**
@@ -389,24 +490,30 @@ export class NodeVault implements Vault {
     await this.insideForReal(full);
     try {
       await access(full, constants.F_OK);
-    } catch {
-      // Two devices deleting the same file produces this routinely.
-      return;
+    } catch (err) {
+      // Two devices deleting the same file produces this routinely. Only
+      // this, though: a file that cannot be looked at is not a file that
+      // is gone, and saying it was removed would have the index agree.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw err;
     }
 
     const target = await this.freeTrashPath(path);
+    const had = await this.deepestExisting(target);
     await mkdir(dirname(target), { recursive: true });
     try {
       await rename(full, target);
+      this.unflushed.add(dirname(full));
+      await this.dirty(target, had);
       return;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
     }
     // The trash is on another filesystem, which happens when a vault spans
-    // mounts. Copy and then remove, so the copy exists before the original
-    // stops existing.
-    await cp(full, target, { recursive: true });
-    await rm(full, { recursive: true, force: true });
+    // mounts. Copied, checked byte for byte, and only then removed.
+    await copyVerifiedThenRemove(full, target);
+    this.unflushed.add(dirname(full));
+    await this.dirty(target, had);
   }
 
   /**
@@ -430,8 +537,11 @@ export class NodeVault implements Vault {
       const candidate = n === 0 ? base : `${stem} (${n})${ext}`;
       try {
         await access(candidate, constants.F_OK);
-      } catch {
-        return candidate;
+      } catch (err) {
+        // Free only if absent. A name that cannot be looked at may well be
+        // occupied, and moving a note onto it would replace what is there.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return candidate;
+        throw err;
       }
     }
     throw new Error(`the trash already holds a thousand copies of ${path}`);
@@ -440,15 +550,124 @@ export class NodeVault implements Vault {
   async mkdir(path: string): Promise<void> {
     const full = this.absolute(path);
     await this.insideForReal(full);
+    const had = await this.deepestExisting(join(full, "x"));
     await mkdir(full, { recursive: true });
+    await this.dirty(join(full, "x"), had);
   }
 
   async exists(path: string): Promise<boolean> {
     try {
       await access(this.absolute(path), constants.F_OK);
       return true;
-    } catch {
-      return false;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      // Not "no": a disk that would not answer. The callers here go on to
+      // write beside or over the answer, so an honest error beats a guess.
+      throw err;
+    }
+  }
+
+  /**
+   * The name this filesystem will actually file a path under.
+   *
+   * Case folding is asked of the disk once, by creating a probe under the
+   * state folder and looking for it under the other spelling. Unicode is
+   * folded to NFC whatever the disk does: HFS+ normalises and APFS does
+   * not, and a note that syncs between the two is one file on one and two
+   * on the other, so treating them as one everywhere is the side that keeps
+   * both copies.
+   */
+  canonical(path: string): string {
+    const nfc = path.normalize("NFC");
+    return this.foldsCaseSync ? nfc.toLowerCase() : nfc;
+  }
+
+  /**
+   * Whether this filesystem folds case, worked out on first use.
+   *
+   * Synchronous once known, because `canonical` is called per path inside a
+   * loop. Until the probe has run the answer is "yes", which is the safe
+   * side: it refuses two files where one would do, never the reverse.
+   */
+  private foldsCaseSync = true;
+  private probed: Promise<void> | undefined;
+
+  /** Runs the case probe, so `canonical` answers for this disk rather than for the worst one. */
+  probeCase(): Promise<void> {
+    return (this.probed ??= (async () => {
+      const dir = join(this.root, ".basalt");
+      const probe = join(dir, `.CaseProbe-${process.pid}`);
+      try {
+        await mkdir(dir, { recursive: true });
+        await (await open(probe, "wx")).close();
+        try {
+          await access(join(dir, `.caseprobe-${process.pid}`), constants.F_OK);
+          this.foldsCaseSync = true;
+        } catch {
+          this.foldsCaseSync = false;
+        }
+      } catch {
+        // Could not probe. The default stands, and it is the safe one.
+      } finally {
+        await rm(probe, { force: true }).catch(() => {});
+      }
+    })());
+  }
+
+  /**
+   * Writes a file only if nothing is at the path, atomically.
+   *
+   * The bytes go to a temporary first, as every write does, and then a hard
+   * link puts them under the final name: `link` fails with EEXIST if the name
+   * is taken, and there is no moment in which the name exists half written.
+   * Where the filesystem has no hard links, the file is opened exclusively
+   * instead, which is exclusive but can leave a partial file after a crash.
+   */
+  async create(
+    path: string,
+    bytes: Uint8Array,
+    times: { mtime: number; ctime: number },
+  ): Promise<boolean> {
+    const full = this.absolute(path);
+    await this.insideForReal(full);
+    const had = await this.deepestExisting(full);
+    await mkdir(dirname(full), { recursive: true });
+    const { tmp, handle } = await openTemp(full, undefined, this.staging);
+    try {
+      try {
+        await writeAll(handle, bytes);
+        if (times.mtime > 0) await handle.utimes(times.mtime / 1000, times.mtime / 1000);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try {
+        await link(tmp, full);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EEXIST") return false;
+        if (code !== "EPERM" && code !== "ENOTSUP" && code !== "EOPNOTSUPP") throw err;
+        // No hard links here. Exclusive open, then the bytes again.
+        let exclusive;
+        try {
+          exclusive = await open(full, "wx");
+        } catch (e) {
+          if ((e as NodeJS.ErrnoException).code === "EEXIST") return false;
+          throw e;
+        }
+        try {
+          await writeAll(exclusive, bytes);
+          if (times.mtime > 0) await exclusive.utimes(times.mtime / 1000, times.mtime / 1000);
+          await exclusive.sync();
+        } finally {
+          await exclusive.close();
+        }
+      }
+      await this.dirty(full, had);
+      return true;
+    } finally {
+      await rm(tmp, { force: true }).catch(() => {});
+      liveTemps.delete(tmp);
     }
   }
 
@@ -466,8 +685,12 @@ export class NodeVault implements Vault {
     try {
       const [x, y] = await Promise.all([stat(this.absolute(a)), stat(this.absolute(b))]);
       return x.dev === y.dev && x.ino === y.ino;
-    } catch {
-      return false;
+    } catch (err) {
+      // Absent is not the same file as anything. Anything else is thrown,
+      // and the caller, which is deciding whether a deletion would remove a
+      // file this pass wrote, records a failure and keeps the file.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
     }
   }
 
@@ -497,8 +720,8 @@ export class NodeVault implements Vault {
         // The state folder changes on every single pass, because that is
         // where the index is written. Watching it would mean each pass
         // scheduled the next one, forever.
-        if (path.split("/").some((part) => this.ignore.has(part))) return;
-        if (isTemporary(path)) return;
+        if (this.neverSynced(path)) return;
+        if (isTemporary(basename(path), join(this.root, path))) return;
         last = path;
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => {
@@ -594,7 +817,9 @@ export class JsonIndexStore implements IndexStore {
     const text = JSON.stringify(state);
     if (text === this.lastWritten) return;
     await mkdir(dirname(this.file), { recursive: true });
-    await writeDurably(this.file, new TextEncoder().encode(text));
+    await writeDurably(this.file, new TextEncoder().encode(text), true, {
+      stageIn: join(dirname(this.file), "tmp"),
+    });
     // Only after it is durable. Recording it first would skip the write
     // that a failed one still owes.
     this.lastWritten = text;
@@ -602,7 +827,7 @@ export class JsonIndexStore implements IndexStore {
 }
 
 /**
- * Marks this client's in-progress writes. Anything matching is not a note.
+ * Marks this client's in-progress writes.
  *
  * A vault is somebody's own directory and they can name a file whatever they
  * like, so the suffix alone is not enough: the temp name used to be exactly
@@ -610,33 +835,63 @@ export class JsonIndexStore implements IndexStore {
  * overwritten by the next write of `<file>` and then renamed away. Unique names
  * make that a coincidence rather than a certainty, and creating them
  * exclusively makes it impossible.
+ *
+ * Temporaries live under the vault's own state folder, which is never listed,
+ * so ordinarily none of this touches the listing at all. The marker still
+ * matters for the one case a temporary is made beside its destination, when
+ * the destination is on another filesystem and a rename from the staging
+ * folder would not work.
  */
 export const TEMP_MARK = ".basalt-tmp-";
 
-/** Whether a vault-relative path is one of this client's temporary files. */
-export function isTemporary(path: string): boolean {
-  return path.includes(TEMP_MARK);
+/** Temporaries open in this process, by full path. Exact, so a note is never mistaken for one. */
+const liveTemps = new Set<string>();
+
+/** How old a staged temporary must be before it is taken for a crash's leftover. */
+const STALE_TEMP_MS = 60 * 60 * 1000;
+
+/**
+ * Whether a directory entry is one of this client's temporary files.
+ *
+ * Exactly, not by containing the marker. `notes.basalt-tmp-1.md` is a note
+ * with an odd name, and it used to vanish from the listing for the life of the
+ * vault. A temporary of ours ends with the marker and its counter and nothing
+ * after, and while it is being written this process knows its full path.
+ */
+export function isTemporary(name: string, full?: string): boolean {
+  if (full !== undefined && liveTemps.has(full)) return true;
+  return /\.basalt-tmp-[0-9a-z]+(-\d+)?$/.test(name);
 }
 
 let tempCounter = 0;
 
 /**
- * Creates a temporary file next to its destination, and never opens one that
- * already exists: `wx` fails rather than truncating, so a file somebody else
- * put there is refused instead of destroyed.
+ * Creates a temporary file, and never opens one that already exists: `wx`
+ * fails rather than truncating, so a file somebody else put there is refused
+ * instead of destroyed.
+ *
+ * Under `stageIn` when given, and beside the destination otherwise. The
+ * staging folder is the ordinary case; beside is the fallback for a
+ * destination on another filesystem, where the rename into place would fail.
  */
 async function openTemp(
   full: string,
+  mode?: number,
+  stageIn?: string,
 ): Promise<{ tmp: string; handle: Awaited<ReturnType<typeof open>> }> {
+  if (stageIn !== undefined) await mkdir(stageIn, { recursive: true });
+  const base = stageIn !== undefined ? join(stageIn, basename(full)) : full;
   for (let attempt = 0; attempt < 64; attempt++) {
-    const tmp = `${full}${TEMP_MARK}${(tempCounter++).toString(36)}${attempt ? `-${attempt}` : ""}`;
+    const tmp = `${base}${TEMP_MARK}${(tempCounter++).toString(36)}${attempt ? `-${attempt}` : ""}`;
     try {
-      return { tmp, handle: await open(tmp, "wx") };
+      const handle = await open(tmp, "wx", mode);
+      liveTemps.add(tmp);
+      return { tmp, handle };
     } catch (err) {
       if ((err as { code?: string }).code !== "EEXIST") throw err;
     }
   }
-  throw new Error(`could not find an unused temporary name beside ${full}`);
+  throw new Error(`could not find an unused temporary name for ${full}`);
 }
 
 /**
@@ -672,17 +927,155 @@ export async function writeDurably(
    * the next pass fetches it again. Nothing claims to hold what it does not.
    */
   syncDir = true,
+  opts: {
+    /** Permission bits for the file, set on the temporary before it is renamed into place. */
+    mode?: number;
+    /** Modification time in milliseconds, set on the handle before it is synced. */
+    mtime?: number;
+    /** A folder to stage the temporary in, rather than beside the destination. */
+    stageIn?: string;
+  } = {},
 ): Promise<void> {
-  const { tmp, handle } = await openTemp(full);
+  const staged = await writeTemp(full, bytes, opts, opts.stageIn);
   try {
-    await handle.write(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
+    await rename(staged, full);
+  } catch (err) {
+    await rm(staged, { force: true }).catch(() => {});
+    liveTemps.delete(staged);
+    if ((err as NodeJS.ErrnoException).code !== "EXDEV" || opts.stageIn === undefined) throw err;
+    // The destination is on another filesystem than the staging folder,
+    // which a vault spanning mounts produces. Beside it, then.
+    const beside = await writeTemp(full, bytes, opts, undefined);
+    try {
+      await rename(beside, full);
+    } catch (again) {
+      await rm(beside, { force: true }).catch(() => {});
+      throw again;
+    } finally {
+      liveTemps.delete(beside);
+    }
   }
-  await rename(tmp, full);
+  liveTemps.delete(staged);
 
   if (syncDir) await syncDirectory(dirname(full));
+}
+
+/** Writes and syncs a temporary holding `bytes`, cleaning up after itself on failure. */
+async function writeTemp(
+  full: string,
+  bytes: Uint8Array,
+  opts: { mode?: number; mtime?: number },
+  stageIn: string | undefined,
+): Promise<string> {
+  const { tmp, handle } = await openTemp(full, opts.mode, stageIn);
+  try {
+    try {
+      await writeAll(handle, bytes);
+      if (opts.mode !== undefined) await handle.chmod(opts.mode);
+      // Set through the handle, before the sync, so the timestamp is part
+      // of what the sync makes durable. Set afterwards on the path, it was
+      // metadata changed after the last fsync with none following.
+      if (opts.mtime !== undefined && opts.mtime > 0) {
+        await handle.utimes(opts.mtime / 1000, opts.mtime / 1000);
+      }
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    return tmp;
+  } catch (err) {
+    // A failed attempt leaves nothing behind. The temporary is invisible
+    // to the listing, so left in place it would sit there for ever.
+    await rm(tmp, { force: true }).catch(() => {});
+    liveTemps.delete(tmp);
+    throw err;
+  }
+}
+
+/**
+ * Moves a file or tree across filesystems the long way: copy, prove the copy,
+ * then remove the original.
+ *
+ * Rule 3, literally. `cp` followed by `rm` trusted the copy, and a short copy,
+ * a descendant the copy missed, a source changed while it was being read or a
+ * name taken at the destination all ended with the original gone and the
+ * "copy" not what it was. Every file is compared by size and digest, every
+ * directory by presence, and a copy that does not prove out is removed so it
+ * cannot be mistaken for the real thing later.
+ *
+ * Exported for the tests, which are the only way to reach this on a machine
+ * with one filesystem.
+ */
+export async function copyVerifiedThenRemove(source: string, target: string): Promise<void> {
+  await cp(source, target, {
+    recursive: true,
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: true,
+  });
+  try {
+    await sameTree(source, target);
+  } catch (err) {
+    await rm(target, { recursive: true, force: true }).catch(() => {});
+    throw new Error(
+      `refusing to remove ${source}: its copy at ${target} does not match: ${(err as Error).message}`,
+    );
+  }
+  await rm(source, { recursive: true, force: true });
+}
+
+async function sameTree(source: string, target: string): Promise<void> {
+  const s = await stat(source);
+  const t = await stat(target).catch(() => undefined);
+  if (t === undefined) throw new Error(`${target} is missing`);
+  if (s.isDirectory()) {
+    if (!t.isDirectory()) throw new Error(`${target} is not a directory`);
+    for (const name of await readdir(source))
+      await sameTree(join(source, name), join(target, name));
+    return;
+  }
+  if (!s.isFile()) return; // Anything else was not copied and is not a note.
+  if (!t.isFile() || t.size !== s.size)
+    throw new Error(`${target} is ${t.size} bytes, not ${s.size}`);
+  const [a, b] = await Promise.all([digestOf(source), digestOf(target)]);
+  if (a !== b) throw new Error(`${target} does not have the same bytes as ${source}`);
+}
+
+async function digestOf(path: string): Promise<string> {
+  const handle = await open(path, "r");
+  try {
+    const hash = createHash("sha256");
+    for await (const chunk of handle.createReadStream()) hash.update(chunk as Buffer);
+    return hash.digest("hex");
+  } finally {
+    // createReadStream closes the handle itself.
+  }
+}
+
+/**
+ * Writes every byte, or fails.
+ *
+ * `FileHandle.write` reports how much it wrote and may report less than it
+ * was given. The count was ignored, so a short write was fsynced and renamed
+ * into place as a complete note, or a complete index. Rule 5 in its smallest
+ * form: a result shorter than its input is a bug until shown otherwise, and
+ * here it is shown by writing the rest. Zero progress is refused rather than
+ * looped on for ever.
+ */
+export async function writeAll(
+  handle: { write(data: Uint8Array): Promise<{ bytesWritten: number }> },
+  bytes: Uint8Array,
+): Promise<void> {
+  let at = 0;
+  while (at < bytes.length) {
+    const { bytesWritten } = await handle.write(bytes.subarray(at));
+    if (bytesWritten <= 0) {
+      throw new Error(
+        `wrote 0 of the ${bytes.length - at} bytes remaining, so the write is not progressing`,
+      );
+    }
+    at += bytesWritten;
+  }
 }
 
 /** Makes a directory's own entries durable. */
@@ -693,4 +1086,19 @@ export async function syncDirectory(dir: string): Promise<void> {
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * A refusal to write under a name this shell never syncs, with the code the
+ * engine reads it by.
+ *
+ * The engine classifies a failure by its code and had none for this one, so
+ * an inbound path under a folder this device ignores was filed for retry and
+ * retried on every pass for ever, each time exiting 1 (C29). The code says
+ * it is a fact about the path.
+ */
+function neverSync(message: string): Error {
+  const err = new Error(message) as Error & { code: string };
+  err.code = "neversync";
+  return err;
 }

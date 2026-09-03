@@ -20,8 +20,8 @@ import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
-import { App, Plugin as StubPlugin, built, modals, notices, resetStub } from "./stub.ts";
-import BasaltPlugin from "./main.ts";
+import { App, Platform, Plugin as StubPlugin, built, modals, notices, resetStub } from "./stub.ts";
+import BasaltPlugin, { describeDeleted } from "./main.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -58,9 +58,17 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  while (loaded.length) loaded.pop()!.onunload();
+  const closing: Promise<void>[] = [];
+  while (loaded.length) {
+    const p = loaded.pop()!;
+    p.onunload();
+    if (p.closing) closing.push(p.closing);
+  }
+  await Promise.all(closing);
   if (server) await server.cleanup();
 });
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function fresh(): Promise<void> {
   server = new TestServer();
@@ -95,7 +103,10 @@ async function until(what: string, cond: () => boolean, ms = 20_000): Promise<vo
   throw new Error(`timed out waiting for ${what}`);
 }
 
-const synced = (p: Testable) => until("a sync", () => p.currentState.kind === "synced");
+const synced = (p: Testable) =>
+  until("a sync", () => p.currentState.kind === "synced").catch((err: Error) => {
+    throw new Error(`${err.message}; the state is ${JSON.stringify(p.currentState)}`);
+  });
 /**
  * What the status bar says, which is now a tooltip rather than text: the item
  * itself is a glyph the size of its neighbours.
@@ -182,7 +193,7 @@ describe("loading", () => {
       secret: "AAAA",
     });
     expect(plugin.currentState.kind).toBe("stopped");
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/root secret is 20/);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/root secret is 32 bytes, or 20/);
   });
 });
 
@@ -196,7 +207,7 @@ describe("where its own state goes", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("note.md", "x");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     expect(app.vault.adapter.filePaths()).toContain(".obsidian/plugins/basalt/index.json");
@@ -213,7 +224,7 @@ describe("where its own state goes", () => {
       ".my-config",
     );
     app.vault.adapter.seed("note.md", "x");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     expect(app.vault.adapter.filePaths()).toContain(".my-config/plugins/basalt/index.json");
@@ -232,7 +243,7 @@ describe("where its own state goes", () => {
     await fresh();
     const { plugin, app } = await load(null, { id: "basalt" });
     app.vault.adapter.seed("note.md", "x");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     expect(app.vault.adapter.filePaths()).toContain(".obsidian/plugins/basalt/index.json");
@@ -245,7 +256,7 @@ describe("where its own state goes", () => {
     // sync, with a status bar still saying "connecting".
     await fresh();
     const { plugin } = await load(null, { id: "basalt", dir: "somewhere/else" });
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await until("it to give up", () => plugin.currentState.kind === "stopped");
     expect(notices.map((n) => n.message).join(" ")).toMatch(/would sync/);
     expect(statusIcon(plugin)).toBe("alert-triangle");
@@ -259,8 +270,8 @@ describe("pairing", () => {
     const { plugin, app } = await load();
     app.vault.adapter.seed("note.md", "# Hello\n");
 
-    const pairing = await plugin.pairFirst(server.wsUrl, server.token, "laptop");
-    expect(pairing).toMatch(/^basalt2_/);
+    const pairing = await plugin.pairFirst(server.setup, "laptop");
+    expect(pairing).toMatch(/^basalt3_/);
     await synced(plugin);
 
     expect(plugin.paired).toBe(true);
@@ -287,7 +298,7 @@ describe("pairing", () => {
     await fresh();
     const first = await load();
     first.app.vault.adapter.seed("note.md", "# Hello\n");
-    const pairing = await first.plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    const pairing = await first.plugin.pairFirst(server.setup, "laptop");
     await synced(first.plugin);
 
     const second = await load();
@@ -303,7 +314,7 @@ describe("pairing", () => {
     await fresh();
     const first = await load();
     first.app.vault.adapter.seed("note.md", "x");
-    await first.plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await first.plugin.pairFirst(server.setup, "laptop");
     await synced(first.plugin);
     const saved = first.plugin.savedData;
     first.plugin.onunload();
@@ -324,12 +335,10 @@ describe("pairing", () => {
   it("refuses to pair a vault that is already paired", async () => {
     await fresh();
     const { plugin } = await load();
-    const pairing = await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    const pairing = await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
-    await expect(plugin.pairFirst(server.wsUrl, server.token, "again")).rejects.toThrow(
-      /already paired/,
-    );
+    await expect(plugin.pairFirst(server.setup, "again")).rejects.toThrow(/already paired/);
     await expect(plugin.pair(pairing, "again")).rejects.toThrow(/already paired/);
   }, 300_000);
 
@@ -343,21 +352,22 @@ describe("pairing", () => {
 
   it("needs a server to start a vault against", async () => {
     const { plugin } = await load();
-    await expect(plugin.pairFirst("", "token", "d")).rejects.toThrow(/server address/);
-    await expect(plugin.pairFirst("ws://host", "  ", "d")).rejects.toThrow(/token/);
+    await expect(plugin.pairFirst("#token", "d")).rejects.toThrow(/server address/);
+    await expect(plugin.pairFirst("ws://host#  ", "d")).rejects.toThrow(/token/);
+    await expect(plugin.pairFirst("ws://host", "d")).rejects.toThrow(/host:3003#TOKEN/);
     expect(plugin.paired).toBe(false);
   });
 
   it("reprints the pairing string for a third device", async () => {
     await fresh();
     const { plugin } = await load();
-    const pairing = await plugin.pairFirst(server.wsUrl, server.token, "laptop");
-    expect(plugin.invite()).toBe(pairing);
+    const pairing = await plugin.pairFirst(server.setup, "laptop");
+    expect(plugin.recoveryKey()).toBe(pairing);
   }, 300_000);
 
   it("has nothing to invite anybody with before it is paired", async () => {
     const { plugin } = await load();
-    expect(plugin.invite()).toBeUndefined();
+    expect(plugin.recoveryKey()).toBeUndefined();
   });
 });
 
@@ -365,11 +375,11 @@ describe("syncing while it runs", () => {
   it("syncs when Obsidian says a file changed", async () => {
     await fresh();
     const a = await load();
-    await a.plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await a.plugin.pairFirst(server.setup, "laptop");
     await synced(a.plugin);
 
     const b = await load();
-    await b.plugin.pair(a.plugin.invite()!, "desktop");
+    await b.plugin.pair(a.plugin.recoveryKey()!, "desktop");
     await synced(b.plugin);
 
     // A note appears, and Obsidian says so. Nothing else prompts a sync
@@ -393,7 +403,7 @@ describe("syncing while it runs", () => {
   it("says what happened when asked to sync", async () => {
     await fresh();
     const { plugin, app } = await load();
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     app.vault.adapter.seed("another.md", "x");
@@ -421,11 +431,11 @@ describe("syncing while it runs", () => {
     await fresh();
     const a = await load();
     a.app.vault.adapter.seed("note.md", "# Note\n\nThe original sentence.\n");
-    await a.plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await a.plugin.pairFirst(server.setup, "laptop");
     await synced(a.plugin);
 
     const b = await load();
-    await b.plugin.pair(a.plugin.invite()!, "desktop");
+    await b.plugin.pair(a.plugin.recoveryKey()!, "desktop");
     await synced(b.plugin);
     await until("the note to arrive", () => b.app.vault.adapter.text("note.md") !== undefined);
 
@@ -469,7 +479,7 @@ describe("when things go wrong", () => {
   it("says it is offline rather than reaching for a dead connection", async () => {
     await fresh();
     const { plugin } = await load();
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     await server.cleanup();
@@ -497,15 +507,18 @@ describe("when things go wrong", () => {
     app.vault.adapter.seed("fine.md", "this one is ok");
     app.vault.adapter.seed(`${"far/".repeat(1200)}too-deep.md`, "this one is not");
 
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
-    notices.length = 0;
+    // Said once, when the refusal first appears (P5), so it is looked for
+    // rather than provoked again.
+    await until("the refusal to be announced", () =>
+      notices.some((n) => /cannot sync/.test(n.message)),
+    );
     await plugin.syncNow();
-
-    const said = notices.map((n) => n.message).join(" ");
-    expect(said, `notices were: ${said}`).toMatch(/cannot sync/);
-    // And the refusal did not stop the file that was fine.
+    // And the refusal did not stop the file that was fine, and the status
+    // says the vault needs a person (P33).
     expect(status(plugin)).toMatch(/stuck/);
+    expect(status(plugin)).toMatch(/attention/);
   }, 300_000);
 });
 
@@ -515,7 +528,7 @@ describe("recovering a deleted note from the app", () => {
     const { plugin, app } = await load();
     app.vault.adapter.seed("keep.md", "still here");
     app.vault.adapter.seed("gone.md", "# Gone\n\nBut not forgotten.\n");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     await app.vault.adapter.remove("gone.md");
@@ -544,7 +557,7 @@ describe("recovering a deleted note from the app", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("keep.md", "here");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     await plugin.runCommand("recover-deleted");
@@ -561,7 +574,7 @@ describe("recovering a deleted note from the app", () => {
   it("says it could not ask, rather than showing an empty list", async () => {
     await fresh();
     const { plugin } = await load();
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
     await server.cleanup();
     await until("it to notice", () => plugin.currentState.kind === "offline");
@@ -591,7 +604,7 @@ describe("renames, which only Obsidian can report", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("old-name.md", "the same content throughout");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     // Obsidian moves the file and says so, old path included.
@@ -614,7 +627,7 @@ describe("renames, which only Obsidian can report", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("before.md", "content that moves");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     await app.vault.adapter.rename("before.md", "after.md");
@@ -635,7 +648,7 @@ describe("unlinking", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("keep.md", "still here");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     expect(app.vault.adapter.filePaths()).toContain(".obsidian/plugins/basalt/index.json");
@@ -665,7 +678,7 @@ describe("unlinking", () => {
     await fresh();
     const { plugin, app } = await load();
     app.vault.adapter.seed("note.md", "the only note");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
     await plugin.unlink();
 
@@ -673,14 +686,14 @@ describe("unlinking", () => {
     const second = new TestServer();
     await second.start();
     try {
-      await plugin.pairFirst(second.wsUrl, second.token, "laptop-again");
+      await plugin.pairFirst(second.setup, "laptop-again");
       await synced(plugin);
       await plugin.syncNow();
 
       // The note must have been uploaded to the new server, not assumed
       // to be there already.
       const elsewhere = await load();
-      await elsewhere.plugin.pair(plugin.invite()!, "other");
+      await elsewhere.plugin.pair(plugin.recoveryKey()!, "other");
       await synced(elsewhere.plugin);
       await until(
         "the note to arrive",
@@ -699,10 +712,14 @@ describe("the modal, which is not a settings tab", () => {
     plugin.ribbonIcons[0]!.callback();
 
     const names = built.map((s) => s.name);
-    expect(names).toContain("Pairing string");
+    expect(names).toContain("Invite or recovery key");
     expect(names).toContain("Device name");
-    expect(names).toContain("Server");
-    // No options anywhere in it. docs/philosophy.md refuses a settings
+    // One field for the first device, holding the line the server printed,
+    // rather than a Server and a Token to split it into by hand.
+    expect(names).toContain("Setup string");
+    expect(names).not.toContain("Server");
+    expect(names).not.toContain("Token");
+    // No options anywhere in it. docs/design.md refuses a settings
     // screen, and this is the thing that would quietly become one.
     expect(names.filter((n) => n.toLowerCase().includes("enable"))).toEqual([]);
   });
@@ -710,14 +727,14 @@ describe("the modal, which is not a settings tab", () => {
   it("pairs from what was typed into it", async () => {
     await fresh();
     const first = await load();
-    const pairing = await first.plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    const pairing = await first.plugin.pairFirst(server.setup, "laptop");
     await synced(first.plugin);
 
     const second = await load();
     second.plugin.ribbonIcons[0]!.callback();
 
     built.find((s) => s.name === "Device name")!.texts[0]!.type("desktop");
-    built.find((s) => s.name === "Pairing string")!.texts[0]!.type(pairing);
+    built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(pairing);
     await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
 
     expect(second.plugin.paired).toBe(true);
@@ -728,31 +745,36 @@ describe("the modal, which is not a settings tab", () => {
   /**
    * Not every place this runs has a clipboard: mobile webviews and anything
    * outside a secure context do not. A copy button that silently does nothing
-   * is how somebody concludes the pairing string cannot be got at.
+   * is how somebody concludes the invite cannot be got at.
    */
-  it("shows the pairing string when there is no clipboard to copy it to", async () => {
+  it("shows the invite on screen when there is no clipboard to copy it to", async () => {
     await fresh();
     const { plugin } = await load();
-    const pairing = await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     built.length = 0;
     notices.length = 0;
     plugin.ribbonIcons[0]!.callback();
-    const copy = built.find((s) => s.name === "Add another device")!.buttons[0]!;
-    await copy.click();
+    const [create, copy] = built.find((s) => s.name === "Add another device")!.buttons;
+    await create!.click();
 
     // Node has no navigator.clipboard, which is the case being tested.
     expect(notices.map((n) => n.message).join(" ")).toMatch(/no clipboard/);
     // And the whole string is on screen instead, so it can still be copied
     // by hand. Truncating it would be the same as not showing it.
-    expect(modals.at(-1)!.contentEl.allText()).toContain(pairing);
+    const shown = modals.at(-1)!.contentEl.allText();
+    expect(shown).toMatch(/basalt3i_[A-Za-z0-9_-]+/);
+    expect(shown).toMatch(/works once and expires at/);
+    notices.length = 0;
+    await copy!.click();
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/no clipboard/);
   }, 300_000);
 
   it("shows what is happening once it is paired", async () => {
     await fresh();
     const { plugin } = await load();
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     built.length = 0;
@@ -760,18 +782,21 @@ describe("the modal, which is not a settings tab", () => {
     const names = built.map((s) => s.name);
     expect(names).toContain("Sync now");
     expect(names).toContain("Add another device");
+    expect(names).toContain("Recovery key");
     expect(names).toContain("Unlink this vault");
-    expect(names).not.toContain("Pairing string");
+    expect(names).not.toContain("Invite or recovery key");
   }, 300_000);
 
   it("says what went wrong rather than failing quietly", async () => {
     const { plugin } = await load();
     plugin.ribbonIcons[0]!.callback();
-    built.find((s) => s.name === "Pairing string")!.texts[0]!.type("this is not a pairing string");
+    built
+      .find((s) => s.name === "Invite or recovery key")!
+      .texts[0]!.type("this is not a pairing string");
     notices.length = 0;
     await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
 
-    expect(notices.map((n) => n.message).join(" ")).toMatch(/basalt2_/);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/basalt3_/);
     expect(plugin.paired).toBe(false);
   });
 });
@@ -789,7 +814,7 @@ describe("on a device with no status bar", () => {
     const ribbon = plugin.ribbonIcons[0]!;
     expect(ribbon.title).toBe("Basalt Sync");
 
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     // The same sentence the status bar carries, somewhere a phone shows it.
@@ -805,12 +830,15 @@ describe("on a device with no status bar", () => {
    * checked against a device, so an offline phone has to be able to say what
    * to add rather than leaving somebody guessing.
    */
-  it("says what to allow when it cannot connect", async () => {
+  it("says what to allow when it has never got through", async () => {
+    // A server that is not there from the start looks the same as one that
+    // refuses this origin, and this plugin cannot tell them apart, so the
+    // advice is offered while nothing has ever connected.
     await fresh();
-    const { plugin } = await load();
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
-    await synced(plugin);
+    const setup = server.setup;
     await server.cleanup();
+    const { plugin } = await load();
+    await plugin.pairFirst(setup, "laptop");
     await until("it to notice", () => plugin.currentState.kind === "offline");
 
     built.length = 0;
@@ -823,10 +851,29 @@ describe("on a device with no status bar", () => {
     expect(shown, "it did not say what this device's origin actually is").toMatch(/origin is \S+/);
   }, 300_000);
 
+  /**
+   * P13 in TODO.md. A connection that was up and went is network loss, and
+   * the origin was demonstrably fine. Advice about it on every offline state
+   * sent people to restart a server that had nothing wrong with it.
+   */
+  it("says nothing about origins when a working connection is lost (P13)", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await server.cleanup();
+    await until("it to notice", () => plugin.currentState.kind === "offline");
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    await sleep(100);
+    expect(modals.at(-1)!.contentEl.allText()).not.toMatch(/allow-origin/);
+  }, 300_000);
+
   it("says nothing about origins while it is working", async () => {
     await fresh();
     const { plugin } = await load();
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     built.length = 0;
@@ -849,7 +896,7 @@ describe("saying what it is working on", () => {
   it("reports the file it is on, once it has been on it a while", async () => {
     await fresh();
     const { plugin, app } = await load();
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
     const seen: string[] = [];
@@ -888,7 +935,7 @@ describe("saying what it is working on", () => {
     const { plugin, app } = await load();
     app.vault.adapter.seed("a.md", "one");
     app.vault.adapter.seed("b.md", "two");
-    await plugin.pairFirst(server.wsUrl, server.token, "laptop");
+    await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
     await plugin.syncNow();
 
@@ -903,45 +950,817 @@ describe("saying what it is working on", () => {
 });
 
 /**
- * Re-pairing, and the run that would not stop.
+ * Every socket the plugin opens, so a test can see whether one is still open.
  *
- * Found by running the plugin against a real server. Unlinking and pairing
- * again left the previous run alive: `keepGoing` was one boolean shared by every
- * run, so the old one woke from its backoff, read the *new* run's flag, and
- * carried on with the old vault's secret. It reconnected, failed authentication,
- * and its refusal put "Basalt has stopped: not authorised for this vault" on
- * screen while the real client was syncing perfectly well behind it.
+ * The plugin uses the platform's WebSocket, and this wraps it for the duration
+ * of a test. `readyState` 2 and 3 are closing and closed, per the standard.
  */
-describe("pairing again after unlinking", () => {
-  it("retires the previous run so it cannot speak for the plugin", async () => {
-    const { plugin } = await load();
-    const p = plugin as unknown as {
-      generation: number;
-      running: boolean;
-      unlink(): Promise<void>;
-      setState(s: unknown): void;
-      state: { kind: string; why?: string };
+function recordSockets(): { sockets: WebSocket[]; restore: () => void } {
+  const Real = globalThis.WebSocket;
+  const sockets: WebSocket[] = [];
+  class Recording extends Real {
+    constructor(url: string | URL, protocols?: string | string[]) {
+      super(url, protocols);
+      sockets.push(this);
+    }
+  }
+  globalThis.WebSocket = Recording as typeof WebSocket;
+  return {
+    sockets,
+    restore: () => {
+      globalThis.WebSocket = Real;
+    },
+  };
+}
+
+/** Slows the plugin's index load, which runs inside `connect()`, so a test can act during the handshake. */
+function slowIndexLoad(app: App, ms: number): { began: Promise<void> } {
+  const adapter = app.vault.adapter;
+  const realExists = adapter.exists.bind(adapter);
+  let begin!: () => void;
+  const began = new Promise<void>((r) => {
+    begin = r;
+  });
+  adapter.exists = async (path: string) => {
+    if (path.endsWith("/index.json")) {
+      begin();
+      await sleep(ms);
+    }
+    return realExists(path);
+  };
+  return { began };
+}
+
+/**
+ * P1 and P12 in TODO.md. A run inside `connect()` used to survive `unlink`:
+ * the shell was handed the client only once the handshake had succeeded, so
+ * a vault unlinked during a slow handshake had nothing to close, and the
+ * connection went on to complete with the old secret. The two tests this
+ * replaces asserted that a counter had moved, which is not the property.
+ */
+describe("unlinking during the handshake (P1)", () => {
+  it("closes the connecting client, and nothing of the old pairing is written afterwards", async () => {
+    await fresh();
+    const { sockets, restore } = recordSockets();
+    try {
+      const { plugin, app } = await load();
+      app.vault.adapter.seed("secret-note.md", "must never reach the old server after unlink");
+      const { began } = slowIndexLoad(app, 1500);
+
+      const oldPairing = await plugin.pairFirst(server.setup, "laptop");
+      await began;
+      expect(plugin.currentState.kind).toBe("connecting");
+      await plugin.unlink();
+
+      // Quiescent: when unlink resolves, no socket of the plugin's is open.
+      expect(sockets.length).toBeGreaterThan(0);
+      for (const s of sockets)
+        expect(s.readyState, "a socket was still open after unlink").toBeGreaterThanOrEqual(2);
+      expect(plugin.paired).toBe(false);
+
+      // And after the slow handshake would have finished, still nothing.
+      await sleep(2500);
+      expect(await app.vault.adapter.exists(".obsidian/plugins/basalt/index.json")).toBe(false);
+      expect(plugin.currentState.kind).toBe("unpaired");
+
+      // The old server never heard a word: the handshake was cut off before
+      // the claim, so the vault is still unclaimed and holds nothing.
+      void oldPairing;
+      const { Client } = await import("../core/client.ts");
+      const { authToken, deriveKeys } = await import("../core/crypto.ts");
+      const { MemoryIndexStore, MemoryVault } = await import("../core/vault.ts");
+      const keys = await deriveKeys(new Uint8Array(20).fill(3));
+      const checker = new Client({
+        vault: new MemoryVault(),
+        store: new MemoryIndexStore(),
+        keys,
+        url: server.wsUrl,
+        ...server.credentials(authToken(keys)),
+        vaultId: "default",
+        device: "checker",
+      });
+      try {
+        await checker.connect();
+        expect(checker.serverCursor, "the old run uploaded after unlink").toBe(0);
+      } finally {
+        await checker.close();
+      }
+    } finally {
+      restore();
+    }
+  }, 300_000);
+
+  it("unloading during the handshake retires the run and closes it (P1)", async () => {
+    await fresh();
+    const { sockets, restore } = recordSockets();
+    try {
+      const { plugin, app } = await load();
+      const { began } = slowIndexLoad(app, 1000);
+      await plugin.pairFirst(server.setup, "laptop");
+      await began;
+      const seen: string[] = [];
+      plugin.watchState((s) => void seen.push(s.kind));
+      plugin.onunload();
+      await plugin.closing;
+      for (const s of sockets) expect(s.readyState).toBeGreaterThanOrEqual(2);
+      await sleep(2000);
+      // The retired run said nothing: the only state seen is the one the
+      // watcher was handed on subscribing.
+      expect(seen).toEqual(["connecting"]);
+    } finally {
+      restore();
+    }
+  }, 300_000);
+});
+
+/**
+ * P15 and P23 in TODO.md, the plugin half of C13. Unlink used to discard the
+ * promise from `close()`, clear the saved config, and then remove the index,
+ * so a pass in flight could recreate the index after its removal and an
+ * adapter failure left the vault unpaired on disk and paired in memory.
+ */
+describe("unlink, in order and all the way (P15)", () => {
+  const INDEX = ".obsidian/plugins/basalt/index.json";
+  const STAGED = ".obsidian/plugins/basalt/.basalt-tmp-index-index.json";
+
+  it("closes, then removes the index, then forgets the pairing", async () => {
+    await fresh();
+    const { sockets, restore } = recordSockets();
+    try {
+      const { plugin, app } = await load();
+      app.vault.adapter.seed("note.md", "x");
+      await plugin.pairFirst(server.setup, "laptop");
+      await synced(plugin);
+
+      const order: string[] = [];
+      const adapter = app.vault.adapter;
+      const realRemove = adapter.remove.bind(adapter);
+      adapter.remove = async (path) => {
+        if (path === INDEX) order.push("remove index");
+        return realRemove(path);
+      };
+      const realSave = plugin.saveData.bind(plugin);
+      plugin.saveData = async (data) => {
+        if (data === null) {
+          order.push("forget pairing");
+          expect(await adapter.exists(INDEX), "the pairing went before the index").toBe(false);
+        }
+        return realSave(data);
+      };
+      const socket = sockets[sockets.length - 1]!;
+      const realClose = socket.close.bind(socket);
+      socket.close = (...args) => {
+        order.push("close");
+        return realClose(...args);
+      };
+
+      await plugin.unlink();
+      expect(order).toEqual(["close", "remove index", "forget pairing"]);
+    } finally {
+      restore();
+    }
+  }, 300_000);
+
+  it("waits for the pass in flight, so the index it saves is the one removed", async () => {
+    await fresh();
+    const a = await load();
+    await a.plugin.pairFirst(server.setup, "laptop");
+    await synced(a.plugin);
+    const b = await load();
+    await b.plugin.pair(a.plugin.recoveryKey()!, "desktop");
+    await synced(b.plugin);
+
+    // A download on b that takes a while, and an unlink in the middle of it.
+    let writing!: () => void;
+    const began = new Promise<void>((r) => {
+      writing = r;
+    });
+    const adapter = b.app.vault.adapter;
+    const realWrite = adapter.writeBinary.bind(adapter);
+    adapter.writeBinary = async (path, data, options) => {
+      if (path.includes("slow.md")) {
+        writing();
+        await sleep(1500);
+      }
+      return realWrite(path, data, options);
     };
+    a.app.vault.adapter.seed("slow.md", "arrives slowly");
+    await a.plugin.syncNow();
+    await began;
 
-    const before = p.generation;
-    await p.unlink();
-    // Unlink alone has to retire it. Closing the client is not enough,
-    // because a run whose client closed simply reconnects.
-    expect(p.generation, "unlinking left the run in flight current").toBeGreaterThan(before);
-    expect(p.running).toBe(false);
-    expect(p.state.kind).toBe("unpaired");
-  });
+    await b.plugin.unlink();
+    expect(b.plugin.paired).toBe(false);
+    // The pass finished before the index was removed, so nothing of it comes
+    // back afterwards.
+    await sleep(2500);
+    expect(await adapter.exists(INDEX)).toBe(false);
+    expect(await adapter.exists(STAGED)).toBe(false);
+    expect(b.plugin.savedData).toBe(null);
+  }, 300_000);
 
-  it("keeps a superseded run from clobbering the state of the current one", async () => {
+  it("takes the staged index copy too (P23)", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await app.vault.adapter.write(
+      STAGED,
+      JSON.stringify({ cursor: 99, entries: {}, remote: {}, pending: [] }),
+    );
+    await plugin.unlink();
+    expect(await app.vault.adapter.exists(STAGED)).toBe(false);
+    expect(await app.vault.adapter.exists(INDEX)).toBe(false);
+  }, 300_000);
+
+  it("leaves memory and disk agreeing when a step fails, and can be tried again", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    const saved = plugin.savedData;
+
+    app.vault.adapter.fault = (op, path) =>
+      op === "remove" && path === INDEX ? new Error("EACCES: index is locked") : undefined;
+    await expect(plugin.unlink()).rejects.toThrow(/index could not be removed/);
+    // Still paired, both places, and honest about being stopped.
+    expect(plugin.paired).toBe(true);
+    expect(plugin.savedData).toEqual(saved);
+    expect(plugin.currentState.kind).toBe("stopped");
+    expect(status(plugin)).toMatch(/unlink did not finish/);
+
+    app.vault.adapter.fault = undefined;
+    await plugin.unlink();
+    expect(plugin.paired).toBe(false);
+    expect(plugin.savedData).toBe(null);
+    expect(await app.vault.adapter.exists(INDEX)).toBe(false);
+  }, 300_000);
+
+  it("leaves the index gone and the pairing kept when forgetting the pairing fails", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    const saved = plugin.savedData;
+    const realSave = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data) => {
+      if (data === null) throw new Error("EIO: data.json");
+      return realSave(data);
+    };
+    await expect(plugin.unlink()).rejects.toThrow(/pairing could not be removed/);
+    expect(plugin.paired).toBe(true);
+    expect(plugin.savedData).toEqual(saved);
+    // A missing index is the safe side: it only means starting over from
+    // the server, never skipping an upload.
+    expect(await app.vault.adapter.exists(INDEX)).toBe(false);
+  }, 300_000);
+
+  /**
+   * P26 in TODO-NEW.md. A "working on" timer armed before unlink fired after
+   * it and painted the bar back to syncing an unpaired vault.
+   */
+  it("clears the timers, so nothing paints over unpaired (P26)", async () => {
+    await fresh();
     const { plugin } = await load();
-    const p = plugin as unknown as { generation: number; state: { kind: string } };
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    (plugin as unknown as { working(p: string): void }).working("big.bin");
+    await plugin.unlink();
+    await sleep(600);
+    expect(plugin.currentState.kind).toBe("unpaired");
+  }, 300_000);
+});
 
-    // What the old run's onFatal did. Numbered runs make the check possible
-    // at all: without a generation there is nothing to compare against.
-    const stale = p.generation;
-    p.generation++;
-    expect(stale === p.generation, "a superseded run cannot tell it was superseded").toBe(false);
+/**
+ * P16 in TODO.md, the plugin half of C15. The first device claims the vault
+ * with the server's bootstrap token and then drops the token. If the drop
+ * never saved, or the claim's reply was lost, the next start offered the
+ * spent token first and was refused for ever.
+ */
+describe("a spent bootstrap (P16)", () => {
+  it("recovers when the claim went through but the token was never dropped", async () => {
+    await fresh();
+    const first = await load();
+    first.app.vault.adapter.seed("note.md", "x");
+    await first.plugin.pairFirst(server.setup, "laptop");
+    await synced(first.plugin);
+    await until("the token to be dropped", () => {
+      const saved = first.plugin.savedData as Record<string, unknown>;
+      return saved["bootstrap"] === undefined;
+    });
+    // What a lost `ready` leaves on disk: the config as it was saved before
+    // the claim, token and all.
+    const stale = {
+      ...(first.plugin.savedData as Record<string, unknown>),
+      bootstrap: server.token,
+    };
+    first.plugin.onunload();
+    await first.plugin.closing;
+
+    const again = await load(stale);
+    await synced(again.plugin);
+    expect(again.plugin.currentState.kind).toBe("synced");
+    await until("the token to be dropped this time", () => {
+      const saved = again.plugin.savedData as Record<string, unknown>;
+      return saved["bootstrap"] === undefined;
+    });
+  }, 300_000);
+
+  it("keeps memory and disk agreeing when the drop cannot be saved, and tries again", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("note.md", "x");
+    let failing = true;
+    const realSave = plugin.saveData.bind(plugin);
+    plugin.saveData = async (data) => {
+      const record = data as Record<string, unknown> | null;
+      if (failing && record !== null && record["bootstrap"] === undefined) {
+        throw new Error("EIO: data.json");
+      }
+      return realSave(data);
+    };
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await until("the failure to be noticed", () =>
+      notices.some((n) => /could not be removed/.test(n.message)),
+    );
+    // On disk and in memory, the token is still there.
+    expect((plugin.savedData as Record<string, unknown>)["bootstrap"]).toBe(server.token);
+    expect(
+      (plugin as unknown as { config: { bootstrap?: string } }).config.bootstrap,
+      "memory dropped the token while disk kept it",
+    ).toBe(server.token);
+
+    // The connection drops and comes back. The spent token is refused, the
+    // derived key proves the claim was ours, and the drop is saved this time.
+    failing = false;
+    await (plugin as unknown as { client: { close(): Promise<void> } }).client.close();
+    await until(
+      "the token to be dropped",
+      () => {
+        const saved = plugin.savedData as Record<string, unknown>;
+        return saved["bootstrap"] === undefined;
+      },
+      60_000,
+    );
+    await synced(plugin);
+  }, 300_000);
+});
+
+/**
+ * P3 in TODO.md. An unreadable data.json set the state to stopped, but the
+ * panel branched on `paired` and offered the pairing form, and pairing
+ * overwrote the file with a new secret.
+ */
+describe("a config that cannot be read (P3)", () => {
+  it("refuses to pair over it, and the panel shows why and where instead of the form", async () => {
+    await fresh();
+    const unreadable = { url: "ws://x", vaultId: "default", device: "d", secret: "AAAA" };
+    const { plugin } = await load(unreadable);
+    expect(plugin.currentState.kind).toBe("stopped");
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    expect(built.map((s) => s.name)).not.toContain("Pairing string");
+    const shown = modals.at(-1)!.contentEl.allText();
+    expect(shown).toMatch(/root secret is 32 bytes, or 20/);
+    expect(shown).toContain(".obsidian/plugins/basalt/data.json");
+
+    await expect(plugin.pairFirst(server.setup, "laptop")).rejects.toThrow(/could not be read/);
+    await expect(plugin.pair("basalt3_whatever", "laptop")).rejects.toThrow(/could not be read/);
+    expect(plugin.savedData).toEqual(unreadable);
+  }, 300_000);
+});
+
+/**
+ * P4 in TODO.md. "Working on X" stuck after any pass the plugin did not
+ * start: the ticker and an arriving batch. Every pass now reports through one
+ * hook, and the state follows it.
+ */
+describe("passes the plugin did not start (P4)", () => {
+  it("returns to synced after a slow download that a batch started", async () => {
+    await fresh();
+    const a = await load();
+    await a.plugin.pairFirst(server.setup, "laptop");
+    await synced(a.plugin);
+    const b = await load();
+    const adapter = b.app.vault.adapter;
+    const realWrite = adapter.writeBinary.bind(adapter);
+    adapter.writeBinary = async (path, data, options) => {
+      if (path.includes("slow.md")) await sleep(700);
+      return realWrite(path, data, options);
+    };
+    await b.plugin.pair(a.plugin.recoveryKey()!, "desktop");
+    await synced(b.plugin);
+
+    const seen: string[] = [];
+    b.plugin.watchState((s) => void seen.push(s.kind));
+    a.app.vault.adapter.seed("slow.md", "takes a while to land");
+    await a.plugin.syncNow();
+    await until("b to receive it", () => adapter.text("slow.md") !== undefined, 30_000);
+    await until("b to settle", () => b.plugin.currentState.kind === "synced", 5_000);
+    expect(seen, "b never said it was working").toContain("syncing");
+    expect(b.plugin.currentState.kind).toBe("synced");
+  }, 300_000);
+});
+
+/**
+ * P5 in TODO.md. "Cannot sync N file(s)" fired on every pass for a file that
+ * would never sync, and a notice on every pass is a notice nobody reads.
+ */
+describe("what is announced, and how often (P5)", () => {
+  it("says a file is stuck once, not on every pass", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("fine.md", "ok");
+    app.vault.adapter.seed(`${"far/".repeat(1200)}too-deep.md`, "nope");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await until("the refusal to be announced", () =>
+      notices.some((n) => /cannot sync/.test(n.message)),
+    );
+    notices.length = 0;
+    for (let i = 0; i < 4; i++) await plugin.syncNow();
+    expect(notices.filter((n) => /cannot sync/.test(n.message))).toHaveLength(0);
+
+    // And a save, which syncs through the nudge, says nothing new either.
+    app.vault.adapter.seed("fine.md", "edited", 9_000_000_000_000);
+    app.vault.fire("modify");
+    await sleep(1500);
+    expect(notices.filter((n) => /cannot sync/.test(n.message))).toHaveLength(0);
+    // The status still says so, because a status describes the vault.
+    expect(status(plugin)).toMatch(/attention/);
+  }, 300_000);
+});
+
+/**
+ * P7 in TODO.md. `syncNow` could reject with the promise discarded by both
+ * callers, so a pass that threw was a button that did nothing.
+ */
+describe("a sync that fails (P7)", () => {
+  it("says so, and the state is honest about it", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("note.md", "x");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+
+    // The index cannot be written: the pass throws on its way out.
+    app.vault.adapter.seed("another.md", "y");
+    app.vault.adapter.fault = (op, path) =>
+      op === "writeBinary" && path.includes("/plugins/basalt/")
+        ? new Error("EACCES: index")
+        : undefined;
+    notices.length = 0;
+    await plugin.syncNow();
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/sync failed.*EACCES/);
+    expect(plugin.currentState.kind).toBe("failed");
+    expect(statusIcon(plugin)).toBe("alert-triangle");
+    expect(status(plugin)).toMatch(/Last sync failed/);
+
+    app.vault.adapter.fault = undefined;
+    await plugin.syncNow();
+    expect(plugin.currentState.kind).toBe("synced");
+  }, 300_000);
+});
+
+/**
+ * P8 in TODO.md. "It will sync as soon as it reconnects" was shown while
+ * stopped, which is the one state in which it will not.
+ */
+describe("what is said while stopped (P8)", () => {
+  it("does not promise a reconnection that is not coming", async () => {
+    await fresh();
+    const first = await load();
+    await first.plugin.pairFirst(server.setup, "laptop");
+    await synced(first.plugin);
+    const saved = first.plugin.savedData as Record<string, unknown>;
+    first.plugin.onunload();
+    await first.plugin.closing;
+
+    // The same server, a different secret: refused for good.
+    const { decodeConfig, encodeConfig } = await import("../core/pairing.ts");
+    const wrong = encodeConfig({
+      ...decodeConfig(saved, "test"),
+      secret: new Uint8Array(20).fill(7),
+    });
+    const other = await load(wrong);
+    await until("it to stop", () => other.plugin.currentState.kind === "stopped");
+    notices.length = 0;
+    await other.plugin.syncNow();
+    const said = notices.map((n) => n.message).join(" ");
+    expect(said).toMatch(/has stopped/);
+    expect(said).not.toMatch(/reconnects/);
+    other.plugin.openHistory("note.md");
+    expect(notices.at(-1)!.message).toMatch(/has stopped/);
+    await expect(other.plugin.deletedNotes()).rejects.toThrow(/has stopped/);
+  }, 300_000);
+});
+
+/**
+ * P9 in TODO.md. A folder rename is one event, for the folder, and every
+ * path under it moved without a word. Each file inside used to be reported
+ * deleted at its old path and new at its new one.
+ */
+describe("renaming a folder (P9)", () => {
+  it("produces no phantom deletions for the files inside it", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("docs/one.md", "one");
+    app.vault.adapter.seed("docs/two.md", "two");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+
+    await app.vault.adapter.rename("docs", "moved");
+    app.vault.fire("rename", { path: "moved" }, "docs");
+    for (let i = 0; i < 4; i++) await plugin.syncNow();
+
+    const client = (
+      plugin as unknown as { client: { deleted(): Promise<{ notes: { path: string }[] }> } }
+    ).client;
+    const gone = (await client.deleted()).notes.map((v) => v.path);
+    expect(gone, `deleted list was ${JSON.stringify(gone)}`).toEqual([]);
+    expect(app.vault.adapter.text("moved/one.md")).toBe("one");
+  }, 300_000);
+});
+
+/**
+ * P10 in TODO.md. `basalt:restore` looked at one page of two hundred
+ * versions, so a version older than that was one `basalt:history` would list
+ * and this would then say did not exist.
+ */
+describe("restoring by uid from the command line (P10)", () => {
+  it("pages back as far as it has to", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("note.md", "first");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    app.vault.adapter.seed("note.md", "second", 9_000_000_000_000);
+    await plugin.syncNow();
+
+    const client = (plugin as unknown as { client: { findVersion: unknown; history: unknown } })
+      .client;
+    const versions = (await plugin.cliHandlers
+      .get("basalt:history")!
+      .handler({ path: "note.md" })) as string;
+    const oldest = Number(versions.trim().split("\n").at(-1)!.split("\t")[0]);
+    // Paged one at a time, so the version wanted is not on the first page.
+    let pages = 0;
+    const realHistory = (client.history as (p: string, o: unknown) => Promise<unknown[]>).bind(
+      client,
+    );
+    client.history = async (path: string, opts: { before?: number; limit?: number }) => {
+      pages++;
+      return realHistory(path, { ...opts, limit: 1 });
+    };
+    const realFind = client.findVersion as (
+      p: string,
+      m: (v: unknown) => boolean,
+      size?: number,
+    ) => unknown;
+    client.findVersion = (path: string, match: (v: unknown) => boolean) =>
+      realFind.call(client, path, match, 1);
+
+    const answer = (await plugin.cliHandlers
+      .get("basalt:restore")!
+      .handler({ path: "note.md", uid: oldest })) as string;
+    expect(answer).toMatch(/^Restored to note \(restored \d+\)\.md/);
+    expect(pages).toBeGreaterThan(1);
+  }, 300_000);
+});
+
+/**
+ * P11 in TODO.md and P32 in TODO-NEW.md. A pairing string was saved and
+ * announced as paired before the server had been reached, and two presses of
+ * Pair made two secrets.
+ */
+describe("pairing honestly (P11, P32)", () => {
+  it("reaches the server before saving a pairing, and saves nothing it could not reach", async () => {
+    await fresh();
+    const first = await load();
+    const pairing = await first.plugin.pairFirst(server.setup, "laptop");
+    await synced(first.plugin);
+
+    // A server that is not there.
+    const dead = pairing;
+    const second = await load();
+    const { url } = { url: server.wsUrl };
+    await server.cleanup();
+    await expect(second.plugin.pair(dead, "desktop")).rejects.toThrow(/could not connect|closed/);
+    expect(second.plugin.paired).toBe(false);
+    expect(second.plugin.savedData).toBe(null);
+    expect(second.plugin.currentState.kind).toBe("unpaired");
+    void url;
+  }, 300_000);
+
+  it("refuses a pairing the server refuses, and saves nothing", async () => {
+    await fresh();
+    const first = await load();
+    await first.plugin.pairFirst(server.setup, "laptop");
+    await synced(first.plugin);
+
+    // A string for the same server with a secret the vault was not claimed with.
+    const { formatPairing } = await import("../core/pairing.ts");
+    const wrong = formatPairing({
+      url: server.wsUrl,
+      vaultId: "default",
+      secret: new Uint8Array(20).fill(9),
+    });
+    const second = await load();
+    await expect(second.plugin.pair(wrong, "desktop")).rejects.toThrow(/auth/i);
+    expect(second.plugin.paired).toBe(false);
+    expect(second.plugin.savedData).toBe(null);
+  }, 300_000);
+
+  it("offers unlink when a new vault's first connection is refused for good", async () => {
+    await fresh();
+    const { plugin } = await load();
+    // A setup string with the wrong token: the claim is refused, for ever.
+    await plugin.pairFirst(`${server.wsUrl}#not-the-token`, "laptop");
+    await until("it to stop", () => plugin.currentState.kind === "stopped");
+    const said = notices.map((n) => n.message).join(" ");
+    expect(said).toMatch(/could not join/);
+    expect(said).toMatch(/unlink/i);
+    expect(said).not.toMatch(/syncing/);
+  }, 300_000);
+
+  it("runs one pairing at a time (P32)", async () => {
+    await fresh();
+    const { plugin } = await load();
+    const [a, b] = await Promise.allSettled([
+      plugin.pairFirst(server.setup, "one"),
+      plugin.pairFirst(server.setup, "two"),
+    ]);
+    const outcomes = [a.status, b.status].sort();
+    expect(outcomes).toEqual(["fulfilled", "rejected"]);
+    const rejected = [a, b].find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(rejected.reason)).toMatch(/already/);
+    // One secret, on disk and running.
+    await synced(plugin);
+    const saved = plugin.savedData as Record<string, string>;
+    expect(saved["device"]).toBe(plugin.deviceName);
+  }, 300_000);
+
+  it("makes up a device name that tells two blank ones apart", async () => {
+    await fresh();
+    const a = await load();
+    const pairing = await a.plugin.pairFirst(server.setup, "   ");
+    await synced(a.plugin);
+    const b = await load();
+    await b.plugin.pair(pairing, "");
+    await synced(b.plugin);
+    expect(a.plugin.deviceName).toMatch(/^obsidian-[0-9a-f]{4}$/);
+    expect(b.plugin.deviceName).toMatch(/^obsidian-[0-9a-f]{4}$/);
+    expect(a.plugin.deviceName).not.toBe(b.plugin.deviceName);
+  }, 300_000);
+});
+
+/**
+ * P13 in TODO.md. `addStatusBarItem` is declared "not available on mobile"
+ * and was called unguarded.
+ */
+describe("on a phone (P13)", () => {
+  it("adds no status bar item and still says everything on the ribbon", async () => {
+    await fresh();
+    Platform.isMobileApp = true;
+    try {
+      const { plugin } = await load();
+      expect(plugin.statusBarItems).toHaveLength(0);
+      await plugin.pairFirst(server.setup, "phone");
+      await until("a sync", () => plugin.currentState.kind === "synced");
+      expect(plugin.ribbonIcons[0]!.el.attributes.get("aria-label")).toMatch(/^Basalt: .*as of/);
+    } finally {
+      Platform.isMobileApp = false;
+    }
+  }, 300_000);
+});
+
+/**
+ * P22 in TODO.md. Every row was called recoverable, including the ones drawn
+ * a few lines down as purged.
+ */
+describe("the recovery header (P22)", () => {
+  const note = (path: string, restorable: number) => ({
+    uid: 1,
+    path,
+    size: 1,
+    ctime: 0,
+    mtime: 0,
+    folder: false,
+    deleted: true,
+    device: "d",
+    chunks: 0,
+    contentId: "-empty-",
+    restorable,
   });
+
+  it("counts what can come back and what cannot, separately", () => {
+    const text = describeDeleted({
+      notes: [note("a.md", 3), note("b.md", 0), note("c.md", 0)],
+      more: false,
+    });
+    expect(text).toMatch(/1 note is recoverable/);
+    expect(text).toMatch(/2 notes are listed but cannot be restored/);
+    expect(text).not.toMatch(/all/);
+  });
+
+  it("says when the list is cut short, without pointing at a command line", () => {
+    const text = describeDeleted({ notes: [note("a.md", 3)], more: true });
+    expect(text).toMatch(/older deletions than the 1 shown/);
+    expect(text).not.toMatch(/basalt deleted/);
+  });
+});
+
+/**
+ * P31 in TODO-NEW.md. A restore that landed on disk and then could not be
+ * uploaded was reported as a failure, and a retry made a second copy.
+ */
+describe("a restore whose upload fails (P31)", () => {
+  it("is reported as restored here and not yet sent", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("gone.md", "bring me back");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await app.vault.adapter.remove("gone.md");
+    await plugin.syncNow();
+    const deletion = (await plugin.deletedNotes()).notes.find((n) => n.path === "gone.md")!;
+
+    // The upload after the restore cannot save its index.
+    app.vault.adapter.fault = (op, path) =>
+      op === "writeBinary" && path.includes("/plugins/basalt/")
+        ? new Error("EACCES: index")
+        : undefined;
+    const done = await plugin.recover(deletion);
+    expect(done.path).toBe("gone.md");
+    expect(done.sent).toBe(false);
+    expect(done.why).toMatch(/EACCES/);
+    expect(app.vault.adapter.text("gone.md")).toBe("bring me back");
+  }, 300_000);
+});
+
+/**
+ * P33 in TODO-NEW.md. One permanently refused file showed the same green
+ * check as a clean vault.
+ */
+describe("synced, with files that need a person (P33)", () => {
+  it("is not the plain check", async () => {
+    const { plugin } = await load();
+    const set = (s: unknown) => (plugin as unknown as { setState(s: unknown): void }).setState(s);
+    set({ kind: "synced", summary: "up to date", at: 1_700_000_000_000, refused: 0 });
+    expect(statusIcon(plugin)).toBe("check");
+    expect(plugin.statusBarItems[0]!.cls).not.toContain("basalt-attention");
+    set({ kind: "synced", summary: "1 stuck", at: 1_700_000_000_000, refused: 1 });
+    expect(statusIcon(plugin)).not.toBe("check");
+    expect(plugin.statusBarItems[0]!.cls).toContain("basalt-attention");
+    expect(status(plugin)).toMatch(/1 file needs attention/);
+  });
+});
+
+/**
+ * P34 and P35 in TODO-NEW.md. The gap between `exists` and `read`, and the
+ * command-line handlers throwing out of their channel.
+ */
+describe("small honesties (P34, P35)", () => {
+  it("reads a note that is gone as nothing, not as a failure (P34)", async () => {
+    const { plugin, app } = await load();
+    const source = plugin.historySource();
+    expect(await source.currentText("never.md")).toBeUndefined();
+    app.vault.adapter.seed("here.md", "text");
+    expect(await source.currentText("here.md")).toBe("text");
+
+    // Deleted between being looked for and being read: what a person
+    // deleting the note while its history loads does.
+    app.vault.adapter.seed("gone.md", "about to go");
+    const adapter = app.vault.adapter;
+    const realExists = adapter.exists.bind(adapter);
+    adapter.exists = async (path: string) => {
+      const was = await realExists(path);
+      if (path === "gone.md") await adapter.remove(path);
+      return was;
+    };
+    await expect(source.currentText("gone.md")).resolves.not.toThrow();
+  });
+
+  it("answers the command line in words, whatever happens (P35)", async () => {
+    await fresh();
+    const { plugin } = await load();
+    const history = plugin.cliHandlers.get("basalt:history")!.handler;
+    const restore = plugin.cliHandlers.get("basalt:restore")!.handler;
+    expect(await history({})).toMatch(/needs a path/);
+    expect(await history({ path: "x.md" })).toMatch(/not paired/);
+    expect(await restore({ path: "x.md" })).toMatch(/needs a uid/);
+
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    expect(await history({ path: "nothing-here.md" })).toMatch(/No history/);
+    const client = (plugin as unknown as { client: { history: unknown } }).client;
+    client.history = async () => {
+      throw new Error("the wire broke");
+    };
+    expect(await history({ path: "x.md" })).toMatch(/could not ask: the wire broke/);
+    expect(await restore({ path: "x.md", uid: 1 })).toMatch(/could not restore: the wire broke/);
+  }, 300_000);
 });
 
 /**
@@ -988,8 +1807,10 @@ describe("what the status bar shows", () => {
     { kind: "unpaired" },
     { kind: "connecting" },
     { kind: "syncing", path: "Notes/one.md" },
-    { kind: "synced", summary: "up to date", at: 1_700_000_000_000 },
-    { kind: "offline", why: "no route to host", retryAt: 1_700_000_000_000 },
+    { kind: "synced", summary: "up to date", at: 1_700_000_000_000, refused: 0 },
+    { kind: "synced", summary: "1 stuck", at: 1_700_000_000_000, refused: 1 },
+    { kind: "failed", why: "could not save the index", at: 1_700_000_000_000 },
+    { kind: "offline", why: "no route to host", retryAt: 1_700_000_000_000, refused: false },
     { kind: "stopped", why: "not authorised" },
   ] as const;
 
@@ -1020,7 +1841,7 @@ it("does not draw the settled state the same as the working one", async () => {
   const set = (s: unknown) => (plugin as unknown as { setState(s: unknown): void }).setState(s);
   set({ kind: "syncing", path: "a.md" });
   const working = statusIcon(plugin);
-  set({ kind: "synced", summary: "up to date", at: 1_700_000_000_000 });
+  set({ kind: "synced", summary: "up to date", at: 1_700_000_000_000, refused: 0 });
   expect(statusIcon(plugin)).not.toBe(working);
 });
 
@@ -1041,10 +1862,122 @@ it("tints only the state that is actually wrong", async () => {
       .split(" ")
       .filter((c) => c.startsWith("basalt-") && c !== "basalt-status-icon");
 
-  for (const s of [{ kind: "unpaired" }, { kind: "offline", why: "x", retryAt: 1 }]) {
+  for (const s of [
+    { kind: "unpaired" },
+    { kind: "offline", why: "x", retryAt: 1, refused: false },
+  ]) {
     set(s);
     expect(tone(), `${s.kind} should carry no colour`).not.toContain("basalt-muted");
   }
   set({ kind: "stopped", why: "x" });
   expect(tone()).toContain("basalt-attention");
+});
+
+/**
+ * I22 in TODO.md. Adding a device is an invite: the panel makes one, the new
+ * device pastes it, and the root secret is never on screen for it. The
+ * recovery key is shown once when a vault is started and otherwise only behind
+ * a warning, off the path anybody takes to add a device.
+ */
+describe("invites from the panel (I22)", () => {
+  it("adds a device with an invite from the panel, once", async () => {
+    await fresh();
+    const first = await load();
+    first.app.vault.adapter.seed("note.md", "# From the first device\n");
+    await first.plugin.pairFirst(server.setup, "laptop");
+    await synced(first.plugin);
+
+    built.length = 0;
+    first.plugin.ribbonIcons[0]!.callback();
+    const [create] = built.find((s) => s.name === "Add another device")!.buttons;
+    await create!.click();
+    const invite = /basalt3i_[A-Za-z0-9_-]+/.exec(modals.at(-1)!.contentEl.allText())![0];
+
+    // The new device pastes it into the same field a recovery key goes in.
+    const second = await load();
+    built.length = 0;
+    second.plugin.ribbonIcons[0]!.callback();
+    built.find((s) => s.name === "Device name")!.texts[0]!.type("phone");
+    built.find((s) => s.name === "Invite or recovery key")!.texts[0]!.type(invite);
+    await built.find((s) => s.buttons.some((b) => b.label === "Pair"))!.buttons[0]!.click();
+    expect(second.plugin.paired).toBe(true);
+    await synced(second.plugin);
+    await until("the note to arrive", () => second.app.vault.adapter.text("note.md") !== undefined);
+    expect(second.app.vault.adapter.text("note.md")).toBe("# From the first device\n");
+
+    // Both devices hold the same root, and neither panel showed it.
+    const a = first.plugin.savedData as Record<string, string>;
+    const b = second.plugin.savedData as Record<string, string>;
+    expect(b["secret"]).toBe(a["secret"]);
+    expect(invite).not.toContain(a["secret"]);
+
+    // Once. A third device with the same invite is refused, and saves nothing.
+    const third = await load();
+    await expect(third.plugin.pair(invite, "tablet")).rejects.toThrow(/auth/i);
+    expect(third.plugin.paired).toBe(false);
+    expect(third.plugin.savedData).toBe(null);
+  }, 300_000);
+
+  it("shows the recovery key once when a vault is started, and says to write it down", async () => {
+    await fresh();
+    const { plugin } = await load();
+    plugin.ribbonIcons[0]!.callback();
+    built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+    built.find((s) => s.name === "Device name")!.texts[0]!.type("laptop");
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
+      .buttons[0]!.click();
+
+    const shown = modals.at(-1)!.contentEl.allText();
+    expect(shown).toMatch(/Write this down/);
+    expect(shown).toContain(plugin.recoveryKey()!);
+    expect(shown).toMatch(/only way back/);
+
+    // Acknowledged, it is gone from the panel, and reopening does not bring
+    // it back on its own.
+    await built
+      .find((s) => s.buttons.some((b) => b.label === "I have written it down"))!
+      .buttons[0]!.click();
+    expect(modals.at(-1)!.contentEl.allText()).not.toContain(plugin.recoveryKey()!);
+    modals.at(-1)!.close();
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    expect(modals.at(-1)!.contentEl.allText()).not.toContain(plugin.recoveryKey()!);
+    await synced(plugin);
+  }, 300_000);
+
+  it("keeps the recovery key behind a warning button, off the add-a-device path", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+
+    const key = plugin.recoveryKey()!;
+    expect(modals.at(-1)!.contentEl.allText(), "the key was on screen unasked").not.toContain(key);
+    const setting = built.find((s) => s.name === "Recovery key")!;
+    expect(setting.desc).toMatch(/Anyone who has it has the vault/);
+    expect(setting.desc).toMatch(/invite/);
+    const show = setting.buttons[0]!;
+    expect(show.label).toBe("Show recovery key");
+    expect(show.warning).toBe(true);
+    await show.click();
+    expect(modals.at(-1)!.contentEl.allText()).toContain(key);
+  }, 300_000);
+
+  it("shows both cursors in the panel (I11)", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("one.md", "1");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await until("the cursor to move", () => (plugin.cursors()?.local ?? 0) > 0);
+
+    plugin.ribbonIcons[0]!.callback();
+    const shown = modals.at(-1)!.contentEl.allText();
+    const at = plugin.cursors()!;
+    expect(at.local).toBeGreaterThan(0);
+    expect(shown).toContain(`Local cursor ${at.local}, server cursor ${at.server}.`);
+  }, 300_000);
 });

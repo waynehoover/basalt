@@ -251,7 +251,12 @@ describe("the handshake, against the real server", () => {
     const c = new Client(await deriveKeys(SECRET), "a");
     clients.push(c);
     const ready = await c.connect(server);
-    expect(ready.proto).toBe(2);
+    expect(ready.proto).toBe(3);
+    expect(ready.minProto).toBe(2);
+    expect(ready.serverVersion).not.toBe("");
+    // The two protocol 3 caps, at the server's own constants.
+    expect(ready.maxBatchBytes).toBe(16 * 1024 * 1024);
+    expect(ready.maxFetchBytes).toBe(64 * 1024 * 1024);
     expect(ready.chunkMax).toBe(1024 * 1024);
     // The default, which is a server's policy rather than the store's
     // ceiling: preparing a file to send costs the client several times the
@@ -715,23 +720,122 @@ describe("refusals that the session survives", () => {
   });
 
   it("classifies which refusals end the session", () => {
-    // The transport has to know, because a caller that retried a proto
-    // mismatch would loop and one that tore down over a badname would turn
-    // one bad file into a reconnect.
-    for (const code of ["proto", "auth", "cursor", "busy", "protostate", "badchunk", "internal"]) {
-      expect(new ProtocolError(code, "x").fatal, code).toBe(true);
+    // The transport has to know, because a caller that carried on after a
+    // busy would talk to a closed connection and one that tore down over a
+    // badname would turn one bad file into a reconnect.
+    for (const code of ["proto", "auth", "cursor", "busy", "protostate", "nospace", "internal"]) {
+      expect(new ProtocolError(code, "x").endsSession, code).toBe(true);
     }
-    for (const code of [
-      "badentry",
-      "badname",
-      "toolarge",
-      "nospace",
-      "nouid",
-      "nocontent",
-      "nochunk",
-    ]) {
-      expect(new ProtocolError(code, "x").fatal, code).toBe(false);
+    for (const code of ["badentry", "badname", "toolarge", "nouid", "nocontent", "nochunk"]) {
+      expect(new ProtocolError(code, "x").endsSession, code).toBe(false);
     }
+  });
+
+  /**
+   * I9 in TODO.md. Every reply from the real server echoes the id of the
+   * request it answers, on the handshake and on both halves of a put.
+   */
+  it("echoes the request id on ready, want and ack", async () => {
+    const frames: Record<string, unknown>[] = [];
+    const seen: Record<string, unknown>[] = [];
+    const t = new Transport(server.wsUrl, {
+      onBatch: () => {},
+      timeoutMs: 10_000,
+      socketFactory: (url) => {
+        const ws = new WebSocket(url) as unknown as import("./transport.ts").SocketLike & {
+          addEventListener(type: string, fn: (ev: { data: unknown }) => void): void;
+        };
+        const send = ws.send.bind(ws);
+        ws.send = (data) => {
+          if (typeof data === "string") frames.push(JSON.parse(data) as Record<string, unknown>);
+          send(data);
+        };
+        ws.addEventListener("message", (ev) => {
+          if (typeof ev.data === "string")
+            seen.push(JSON.parse(ev.data) as Record<string, unknown>);
+        });
+        return ws;
+      },
+    });
+    await t.connect();
+    const keys = await vaultKeys();
+    try {
+      await t.hello({
+        vault: "default",
+        device: "ids",
+        cursor: 0,
+        ...server.credentials(authToken(keys)),
+      });
+      const hello = frames.find((f) => f["op"] === "hello")!;
+      const ready = seen.find((f) => f["res"] === "ready")!;
+      expect(hello["id"]).toBe(1);
+      expect(ready["id"]).toBe(1);
+
+      const body = (await sealChunks(keys, [enc.encode("ids\n")]))[0]!;
+      const sealed = await sealPath(keys, "ids.md");
+      const facts = {
+        path: sealed,
+        size: 4,
+        ctime: 1,
+        mtime: 1,
+        folder: false,
+        deleted: false,
+        chunks: [body.name],
+        parent: "",
+      };
+      const mac = await macEntry(keys, facts);
+      await t.put(sealed, { size: 4, ctime: 1, mtime: 1 }, [body.name], async () => body.bytes, {
+        mac,
+        parent: "",
+      });
+      const put = frames.find((f) => f["op"] === "put")!;
+      const want = seen.find((f) => f["res"] === "want")!;
+      const ack = seen.find((f) => f["res"] === "ack")!;
+      expect(typeof put["id"]).toBe("number");
+      expect(want["id"]).toBe(put["id"]);
+      expect(ack["id"]).toBe(put["id"]);
+      // And the two protocol 3 caps travel on ready.
+      expect(ready["maxBatchBytes"]).toBe(16 * 1024 * 1024);
+    } finally {
+      t.close();
+    }
+  });
+
+  /**
+   * The upgrade window, from the server's side: a protocol 2 hello is still
+   * answered on a vault without a data key, in the protocol 2 shape. This is
+   * what lets a phone on the old release keep working for the week between
+   * upgrading the server and upgrading it.
+   */
+  it("still answers a protocol 2 hello, without ids", async () => {
+    const keys = await vaultKeys();
+    const creds = server.credentials(authToken(keys));
+    const ws = new WebSocket(server.wsUrl);
+    const answer = new Promise<Record<string, unknown>>((resolve, reject) => {
+      ws.addEventListener("message", (ev) => {
+        if (typeof ev.data === "string") resolve(JSON.parse(ev.data) as Record<string, unknown>);
+      });
+      ws.addEventListener("error", () => reject(new Error("socket error")));
+      ws.addEventListener("close", (ev) => reject(new Error(`closed ${ev.code}`)));
+    });
+    await new Promise<void>((r) => ws.addEventListener("open", () => r()));
+    ws.send(
+      JSON.stringify({
+        op: "hello",
+        proto: 2,
+        crypto: "basalt/hkdf-aes-gcm/1",
+        vault: "default",
+        device: "old-phone",
+        cursor: 0,
+        ...creds,
+      }),
+    );
+    const ready = await answer;
+    ws.close();
+    expect(ready["res"]).toBe("ready");
+    expect(ready["proto"]).toBe(2);
+    expect("id" in ready).toBe(false);
+    expect(ready["minProto"]).toBe(2);
   });
 });
 

@@ -102,10 +102,10 @@ describe("listing", () => {
     adapter.seed("real.md", "x");
     expect((await odd.list()).map((f) => f.path)).toEqual(["real.md"]);
 
-    // And the usual name is not special once the vault says otherwise: a
-    // stray `.obsidian` in a vault configured elsewhere is just a folder.
+    // And a stray `.obsidian` in a vault configured elsewhere still does not
+    // sync, because nothing dot-prefixed does, whatever it is called.
     adapter.seed(".obsidian/leftover.json", "{}");
-    expect((await odd.list()).map((f) => f.path)).toContain(".obsidian");
+    expect((await odd.list()).map((f) => f.path)).not.toContain(".obsidian");
   });
 
   it("refuses a config folder that is not a plain name", async () => {
@@ -372,10 +372,14 @@ describe("what a scan costs", () => {
     const listed = await v.list();
     expect(listed.length).toBe(210); // 200 notes and the 10 folders
 
+    // One `exists`, the case-folding probe, and that only on the first
+    // listing. Nothing per file.
     expect(
-      { stat: counting.stats, list: counting.lists },
-      `a 200 file vault cost ${counting.stats} stat and ${counting.lists} list calls`,
-    ).toEqual({ stat: 0, list: 0 });
+      { stat: counting.stats, list: counting.lists, exists: counting.exists_ },
+      `a 200 file vault cost ${counting.stats} stat, ${counting.lists} list and ${counting.exists_} exists calls`,
+    ).toEqual({ stat: 0, list: 0, exists: 1 });
+    await v.list();
+    expect(counting.exists_).toBe(1);
   });
 
   it("still reports what the walk did", async () => {
@@ -404,6 +408,7 @@ describe("what a scan costs", () => {
 class CountingAdapter {
   stats = 0;
   lists = 0;
+  exists_ = 0;
 
   constructor(private readonly inner: FakeAdapter) {}
 
@@ -417,6 +422,10 @@ class CountingAdapter {
   async list(p: string) {
     this.lists++;
     return this.inner.list(p);
+  }
+  async exists(p: string) {
+    this.exists_++;
+    return this.inner.exists(p);
   }
 }
 
@@ -647,5 +656,518 @@ describe("writing a name that differs only by case", () => {
     expect(await vault.sameFile("Note.md", "Note.md")).toBe(true);
     // Different names are different files whatever the filesystem does.
     expect(await vault.sameFile("Note.md", "Other.md")).toBe(false);
+  });
+});
+
+/**
+ * P17 in TODO.md. The adapter's own write truncates the destination and then
+ * fills it, read out of the shipped bundle, so a note used to be able to end up
+ * empty with no copy of the old bytes or the new. Every failure below is one a
+ * full disk or a killed process produces, and after each the note is either
+ * as it was or complete.
+ */
+/** Whether a path is a staging copy beside `note`, whatever its random part. */
+const isStaging = (path: string, note = "note.md") =>
+  new RegExp(`^\\.basalt-tmp-[0-9a-f]{8}-${note.replace(".", "\\.")}$`).test(path);
+/** The staging copies present, by name. */
+const stagingCopies = (a: FakeAdapter) => a.filePaths().filter((p) => p.includes(".basalt-tmp-"));
+
+describe("landing a note without a moment where it is half written (P17)", () => {
+  const times = { mtime: 1000, ctime: 1000 };
+
+  it("a new note arrives by rename, never by a write at its own path", async () => {
+    await vault.write("note.md", enc.encode("fresh"), times);
+    expect(adapter.text("note.md")).toBe("fresh");
+    expect(stagingCopies(adapter)).toEqual([]);
+    const writes = adapter.calls.filter((c) => c.op === "writeBinary").map((c) => c.path);
+    expect(writes.length).toBe(1);
+    expect(isStaging(writes[0]!)).toBe(true);
+    expect(adapter.calls.some((c) => c.op === "rename" && c.to === "note.md")).toBe(true);
+  });
+
+  it("a write refused before anything lands leaves the note as it was", async () => {
+    adapter.seed("note.md", "old");
+    adapter.fault = (op, path) =>
+      op === "writeBinary" && isStaging(path) ? new Error("EACCES: refused") : undefined;
+    await expect(vault.write("note.md", enc.encode("new"), times)).rejects.toThrow(/EACCES/);
+    expect(adapter.text("note.md")).toBe("old");
+    expect(stagingCopies(adapter)).toEqual([]);
+  });
+
+  it("a staging copy cut short is caught by reading it back, and the note is untouched", async () => {
+    adapter.seed("note.md", "old");
+    adapter.fault = (op, path) => (op === "writeBinary" && isStaging(path) ? 2 : undefined);
+    await expect(vault.write("note.md", enc.encode("new content"), times)).rejects.toThrow(
+      /wrote 2 of 11/,
+    );
+    expect(adapter.text("note.md")).toBe("old");
+    // Nothing half written is left lying about under a name that looks like a copy.
+    expect(stagingCopies(adapter)).toEqual([]);
+  });
+
+  it("a short staging copy that the adapter did not report is still caught", async () => {
+    // The adapter says the write succeeded and the file is short anyway. The
+    // read-back is the only thing that can see it. Rule 4.
+    adapter.seed("note.md", "old");
+    const realWrite = adapter.writeBinary.bind(adapter);
+    adapter.writeBinary = async (path, data, options) => {
+      if (isStaging(path)) return realWrite(path, data.slice(0, 3), options);
+      return realWrite(path, data, options);
+    };
+    await expect(vault.write("note.md", enc.encode("new content"), times)).rejects.toThrow(
+      /3 bytes after writing 11/,
+    );
+    expect(adapter.text("note.md")).toBe("old");
+    expect(stagingCopies(adapter)).toEqual([]);
+  });
+
+  it("a failure while replacing keeps the complete new copy beside the note and names it", async () => {
+    adapter.seed("note.md", "old");
+    adapter.fault = (op, path) => (op === "writeBinary" && path === "note.md" ? 1 : undefined);
+    await expect(vault.write("note.md", enc.encode("new content"), times)).rejects.toThrow(
+      /complete new content is beside it at \.basalt-tmp-[0-9a-f]{8}-note\.md/,
+    );
+    // The destination is what the adapter left, which is the failure this
+    // API cannot prevent; the new version is whole beside it, and the old one
+    // is on the server.
+    const [copy] = stagingCopies(adapter);
+    expect(copy).toBeDefined();
+    expect(adapter.text(copy!)).toBe("new content");
+  });
+
+  it("a failure removing the staging copy does not fail a verified write", async () => {
+    const logs: unknown[][] = [];
+    const logging = new ObsidianVault(
+      asVault(new FakeVaultIndex(adapter)),
+      ".obsidian",
+      (...rest) => void logs.push(rest),
+    );
+    adapter.seed("note.md", "old");
+    adapter.fault = (op, path) =>
+      op === "remove" && isStaging(path) ? new Error("EBUSY: in use") : undefined;
+    await expect(logging.write("note.md", enc.encode("new"), times)).resolves.toBeUndefined();
+    expect(adapter.text("note.md")).toBe("new");
+    expect(logs.flat().join(" ")).toMatch(/staging copy/);
+    // And the leftover is never listed as a note.
+    expect((await logging.list()).map((f) => f.path)).toEqual(["note.md"]);
+  });
+
+  it("keeps the mtime it was given through the staging copy", async () => {
+    await vault.write("note.md", enc.encode("x"), { mtime: 1_600_000_000_000, ctime: 0 });
+    expect((await adapter.stat("note.md"))?.mtime).toBe(1_600_000_000_000);
+  });
+});
+
+/**
+ * C17 in TODO.md, the adapter half. `exists` and then `write` is a gap, and a
+ * conflict copy or a restore landing in it replaced whatever appeared there.
+ * The claim has to be exclusive, and `rename` refusing an occupied destination
+ * is what makes it so.
+ */
+describe("creating a file only where nothing is (C17)", () => {
+  const times = { mtime: 1000, ctime: 1000 };
+
+  it("writes where nothing is, and refuses where something is", async () => {
+    expect(await vault.create("new.md", enc.encode("mine"), times)).toBe(true);
+    expect(adapter.text("new.md")).toBe("mine");
+    expect(await vault.create("new.md", enc.encode("again"), times)).toBe(false);
+    expect(adapter.text("new.md")).toBe("mine");
+    expect(stagingCopies(adapter)).toEqual([]);
+  });
+
+  it("loses to a file that appears between looking and claiming", async () => {
+    adapter.fault = (op, _path, to) => {
+      // Somebody else writes the very name, in the gap.
+      if (op === "rename" && to === "new.md") adapter.seed("new.md", "theirs");
+      return undefined;
+    };
+    expect(await vault.create("new.md", enc.encode("mine"), times)).toBe(false);
+    expect(adapter.text("new.md")).toBe("theirs");
+    expect(stagingCopies(adapter)).toEqual([]);
+  });
+
+  it("does not report a claim it cannot prove", async () => {
+    adapter.fault = (op, path) =>
+      op === "writeBinary" && isStaging(path, "new.md") ? 1 : undefined;
+    await expect(vault.create("new.md", enc.encode("mine"), times)).rejects.toThrow(/wrote 1/);
+    expect(await adapter.exists("new.md")).toBe(false);
+  });
+});
+
+/**
+ * P20 and C16 in TODO.md. Two raw names in Obsidian's index that normalize to
+ * one path used to be one entry in the map, the second winning silently.
+ */
+describe("two names the plugin cannot hold apart (P20)", () => {
+  it("refuses a listing where two raw names normalize to one path, and names both", async () => {
+    adapter.seed("a b.md", "nbsp");
+    adapter.seed("a b.md", "space");
+    adapter.seed("fine.md", "x");
+    await expect(vault.list()).rejects.toThrow(/"a b\.md".*"a b\.md"|"a b\.md".*"a b\.md"/);
+  });
+
+  it("refuses NFC and NFD spellings of one name", async () => {
+    adapter.seed("café.md", "nfc");
+    adapter.seed("café.md", "nfd");
+    await expect(vault.list()).rejects.toThrow(/only one of them can sync/);
+  });
+
+  it("folds normalization always, and case only where the adapter does", async () => {
+    // Until asked, the safe answer: two spellings are one file.
+    expect(vault.canonical("Note.md")).toBe(vault.canonical("note.md"));
+    expect(vault.canonical("café.md")).toBe(vault.canonical("café.md"));
+    expect(vault.canonical("a b.md")).toBe(vault.canonical("a b.md"));
+
+    // The fake is a Map, which is case-sensitive like Linux, and the probe
+    // finds that out from the first listing.
+    adapter.seed("Note.md", "x");
+    await vault.list();
+    expect(vault.canonical("Note.md")).not.toBe(vault.canonical("note.md"));
+    expect(vault.canonical("café.md")).toBe(vault.canonical("café.md"));
+
+    const folding = new FoldingAdapter();
+    const foldingVault = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
+    await foldingVault.write("Note.md", enc.encode("x"), { mtime: 1, ctime: 1 });
+    await foldingVault.list();
+    expect(foldingVault.canonical("Note.md")).toBe(foldingVault.canonical("note.md"));
+  });
+
+  it("two case spellings are two files where the adapter keeps them apart", async () => {
+    adapter.seed("Note.md", "one");
+    adapter.seed("note.md", "two");
+    const listed = (await vault.list()).map((f) => f.path).sort();
+    expect(listed).toEqual(["Note.md", "note.md"]);
+    expect(vault.canonical("Note.md")).not.toBe(vault.canonical("note.md"));
+  });
+});
+
+/**
+ * P21 in TODO.md. `matchCase` used to shrug at a listing that failed and write
+ * under a spelling nothing had checked, leaving the old spelling on disk while
+ * the engine recorded the new one as synced.
+ */
+describe("a spelling check that cannot be made (P21)", () => {
+  it("fails the write and leaves the note alone, then succeeds once it can", async () => {
+    const folding = new FoldingAdapter();
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
+    const times = { mtime: 1000, ctime: 1000 };
+    await v.write("Note.md", enc.encode("first"), times);
+
+    let failures = 1;
+    folding.fault = (op) => (op === "list" && failures-- > 0 ? new Error("EIO") : undefined);
+    await expect(v.write("NOTE.md", enc.encode("second"), times)).rejects.toThrow(
+      /cannot check how NOTE.md is spelled/,
+    );
+    expect((await folding.list("/")).files).toEqual(["Note.md"]);
+    expect(folding.text("Note.md")).toBe("first");
+
+    await v.write("NOTE.md", enc.encode("second"), times);
+    expect((await folding.list("/")).files).toEqual(["NOTE.md"]);
+    expect(folding.text("NOTE.md")).toBe("second");
+  });
+});
+
+/**
+ * P18 in TODO.md. The index is written with the same truncating write as a
+ * note, and an index cut short is not JSON, and an index that is not JSON stops
+ * the plugin on every load. A vault whose notes were all fine sat behind it.
+ */
+describe("the index, interrupted (P18)", () => {
+  const INDEX = ".obsidian/plugins/basalt/index.json";
+  const TEMP = ".obsidian/plugins/basalt/.basalt-tmp-index-index.json";
+  const state = (cursor: number) => ({
+    cursor,
+    entries: { "note.md": { path: "note.md", hash: `h${cursor}` } },
+    remote: {},
+    pending: [],
+  });
+
+  it("recovers from a live index cut short by reading the staged copy", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+    adapter.fault = (op, path) => (op === "write" && path === INDEX ? 5 : undefined);
+    await expect(store.save(state(2))).rejects.toThrow(/wrote 5 of/);
+    expect(() => JSON.parse(adapter.text(INDEX)!)).toThrow();
+
+    // A restart: a fresh store over the same files.
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(2));
+  });
+
+  it("keeps the live index when the staging copy is what was cut short", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+    adapter.fault = (op, path) => (op === "writeBinary" && path === TEMP ? 3 : undefined);
+    await expect(store.save(state(2))).rejects.toThrow(/wrote 3/);
+    expect(await adapter.exists(TEMP)).toBe(false);
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
+  });
+
+  it("loads the live index and tidies a staged copy left behind after a complete save", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+    adapter.fault = (op, path) =>
+      op === "remove" && path === TEMP ? new Error("EBUSY") : undefined;
+    await expect(store.save(state(2))).resolves.toBeUndefined();
+    expect(await adapter.exists(TEMP)).toBe(true);
+    adapter.fault = undefined;
+
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(2));
+    expect(await adapter.exists(TEMP)).toBe(false);
+  });
+
+  it("a first save that fails leaves no index at all, not a short one", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    adapter.fault = (op, path) => (op === "writeBinary" && path === TEMP ? 4 : undefined);
+    await expect(store.save(state(1))).rejects.toThrow();
+    expect(await adapter.exists(INDEX)).toBe(false);
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toBeUndefined();
+  });
+
+  it("still refuses an unreadable index when there is nothing to recover it from", async () => {
+    await adapter.write(INDEX, "{ cut sho");
+    await expect(new ObsidianIndexStore(adapter, INDEX).load()).rejects.toThrow(/not valid JSON/);
+  });
+
+  it("removes both copies and proves it, for unlink", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+    await adapter.write(TEMP, JSON.stringify(state(2)));
+    await store.remove();
+    expect(await adapter.exists(INDEX)).toBe(false);
+    expect(await adapter.exists(TEMP)).toBe(false);
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toBeUndefined();
+
+    await store.save(state(3));
+    adapter.fault = (op, path) =>
+      op === "remove" && path === INDEX ? new Error("EACCES") : undefined;
+    await expect(store.remove()).rejects.toThrow(/EACCES/);
+  });
+});
+
+/**
+ * P28 in TODO-NEW.md. A ranged read that came back short was handed on as if
+ * it were the range, sealed as a chunk it was not, and refused much later by
+ * name.
+ */
+describe("a ranged read that comes back short (P28)", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("is refused here, where the reason is knowable", async () => {
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(new FakeAdapter())), ".obsidian");
+    globalThis.fetch = (async () => ({
+      ok: true,
+      status: 206,
+      arrayBuffer: async () => new Uint8Array(100).buffer,
+    })) as never;
+    await expect(v.readRange("big.bin", 1000, 1200)).rejects.toThrow(
+      /answered 100 bytes for a read of 200/,
+    );
+  });
+});
+
+/**
+ * P29 in TODO-NEW.md. Above a few megabytes the read-back used to trust the
+ * length alone, so a staged copy of the right size and the wrong bytes would
+ * have become the note.
+ */
+describe("a large staged copy with the right length and the wrong bytes (P29)", () => {
+  it("is caught by reading every byte back", async () => {
+    const big = new Uint8Array(5 * 1024 * 1024);
+    for (let i = 0; i < big.length; i += 4096) big[i] = i & 0xff;
+    const realWrite = adapter.writeBinary.bind(adapter);
+    adapter.writeBinary = async (path, data, options) => {
+      if (isStaging(path, "big.bin")) {
+        const flipped = new Uint8Array(data.slice(0));
+        flipped[3 * 1024 * 1024] = flipped[3 * 1024 * 1024]! ^ 0xff;
+        return realWrite(path, flipped.buffer, options);
+      }
+      return realWrite(path, data, options);
+    };
+    await expect(vault.write("big.bin", big, { mtime: 1, ctime: 1 })).rejects.toThrow(
+      /reads back differently/,
+    );
+    expect(await adapter.exists("big.bin")).toBe(false);
+  });
+});
+
+/**
+ * P30 in TODO-NEW.md. A staging copy under a fixed name was a name a person
+ * could have given a real dotfile, which no listing shows and a sync of the
+ * note beside it would have overwritten.
+ */
+describe("a dotfile of the user's where a staging copy would go (P30)", () => {
+  it("is never written over", async () => {
+    // Every name the staging could pick is taken by a file of the user's:
+    // pin the random part so the collision is certain rather than lucky.
+    const realRandom = crypto.getRandomValues.bind(crypto);
+    let calls = 0;
+    crypto.getRandomValues = ((arr: Uint8Array) => {
+      arr.fill(calls++ < 1 ? 0xab : 0xcd);
+      return arr;
+    }) as typeof crypto.getRandomValues;
+    try {
+      adapter.seed(".basalt-tmp-abababab-note.md", "the user's own dotfile");
+      await vault.write("note.md", enc.encode("a note"), { mtime: 1, ctime: 1 });
+      expect(adapter.text("note.md")).toBe("a note");
+      expect(adapter.text(".basalt-tmp-abababab-note.md")).toBe("the user's own dotfile");
+      expect(stagingCopies(adapter)).toEqual([".basalt-tmp-abababab-note.md"]);
+    } finally {
+      crypto.getRandomValues = realRandom;
+    }
+  });
+});
+
+/**
+ * P25 in TODO.md. The engine saves the index after `flush`, so the index is
+ * never durable ahead of the notes it names, and the plugin's vault had no
+ * `flush` at all: on desktop the adapter's writes reached the disk when the
+ * operating system felt like it, and the index could be durable first. On
+ * desktop the adapter is Electron's, the vault is a directory, and Node's fs
+ * is reachable, so every written file and every changed directory is fsynced.
+ * On a phone there is no fs to reach and the flush is a no-op, which
+ * docs/plugin.md calls best effort.
+ */
+describe("making a pass durable on desktop (P25)", () => {
+  /** Electron's adapter, as far as the vault can tell: it knows the disk path. */
+  class DesktopAdapter extends FakeAdapter {
+    getBasePath(): string {
+      return "/home/me/vault";
+    }
+    getFullPath(normalizedPath: string): string {
+      return normalizedPath === "" ? this.getBasePath() : `${this.getBasePath()}/${normalizedPath}`;
+    }
+  }
+
+  /** A Node fs that records what was opened and synced. */
+  function recordingFs(failDirs = false) {
+    const synced: string[] = [];
+    const open: string[] = [];
+    const fs = {
+      promises: {
+        async open(path: string, flags: string) {
+          if (flags !== "r")
+            throw new Error(`opened ${path} with ${flags}, and a sync needs only r`);
+          if (failDirs && !path.includes(".")) throw new Error("EISDIR");
+          open.push(path);
+          return {
+            async sync() {
+              synced.push(path);
+            },
+            async close() {
+              open.splice(open.indexOf(path), 1);
+            },
+          };
+        },
+      },
+    };
+    return { fs, synced, open };
+  }
+
+  it("fsyncs every file written this pass and the directories their entries changed in", async () => {
+    const desktop = new DesktopAdapter();
+    const { fs, synced, open } = recordingFs();
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+    await v.write("daily/2026-09-02.md", enc.encode("one"), { mtime: 1, ctime: 1 });
+    await v.write("top.md", enc.encode("two"), { mtime: 1, ctime: 1 });
+    await v.mkdir("attachments");
+    expect(synced, "nothing is synced until flush").toEqual([]);
+
+    expect(v.flush).toBeDefined();
+    await v.flush!();
+    expect(synced).toContain("/home/me/vault/daily/2026-09-02.md");
+    expect(synced).toContain("/home/me/vault/top.md");
+    // The directories: the one the new note went in, and the root, whose
+    // entries gained a note, a folder and another folder.
+    expect(synced).toContain("/home/me/vault/daily");
+    expect(synced).toContain("/home/me/vault");
+    expect(open, "a handle was left open").toEqual([]);
+
+    // Once. A second flush with nothing written syncs nothing.
+    synced.length = 0;
+    await v.flush!();
+    expect(synced).toEqual([]);
+  });
+
+  it("syncs a file created beside an occupied name too", async () => {
+    const desktop = new DesktopAdapter();
+    const { fs, synced } = recordingFs();
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+    expect(await v.create("note.md", enc.encode("x"), { mtime: 1, ctime: 1 })).toBe(true);
+    await v.flush!();
+    expect(synced).toContain("/home/me/vault/note.md");
+  });
+
+  it("does not fail the pass when a directory cannot be synced, and says so once", async () => {
+    const desktop = new DesktopAdapter();
+    const { fs, synced } = recordingFs(true);
+    const said: string[] = [];
+    const v = new ObsidianVault(
+      asVault(new FakeVaultIndex(desktop)),
+      ".obsidian",
+      (m) => void said.push(m),
+      { fs },
+    );
+    await v.write("a.md", enc.encode("x"), { mtime: 1, ctime: 1 });
+    await v.write("b.md", enc.encode("y"), { mtime: 1, ctime: 1 });
+    await v.flush!();
+    expect(synced).toEqual(["/home/me/vault/a.md", "/home/me/vault/b.md"]);
+    expect(said.filter((m) => m.includes("will not sync a directory"))).toHaveLength(1);
+  });
+
+  it("fails the pass when a file cannot be synced, so the index is not saved ahead of it", async () => {
+    const desktop = new DesktopAdapter();
+    const fs = {
+      promises: {
+        async open(): Promise<never> {
+          throw new Error("EIO");
+        },
+      },
+    };
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+    await v.write("a.md", enc.encode("x"), { mtime: 1, ctime: 1 });
+    await expect(v.flush!()).rejects.toThrow(/EIO/);
+  });
+
+  it("does nothing on an adapter that is not the desktop one, whatever fs is given", async () => {
+    // Capacitor's adapter has no getFullPath: there is no path to sync and
+    // no fs to sync it with. Best effort, and documented as such.
+    const { fs, synced } = recordingFs();
+    const v = new ObsidianVault(
+      asVault(new FakeVaultIndex(new FakeAdapter())),
+      ".obsidian",
+      () => {},
+      { fs },
+    );
+    await v.write("a.md", enc.encode("x"), { mtime: 1, ctime: 1 });
+    await expect(v.flush!()).resolves.toBeUndefined();
+    expect(synced).toEqual([]);
+  });
+
+  it("does nothing on desktop when no fs can be reached, rather than failing every pass", async () => {
+    // A renderer whose `require` refuses, or has no fs: the flush has
+    // nothing to sync with and says nothing, rather than failing every pass.
+    const g = globalThis as { require?: unknown };
+    const had = g.require;
+    g.require = () => {
+      throw new Error("no such module");
+    };
+    try {
+      const desktop = new DesktopAdapter();
+      const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian");
+      await v.write("a.md", enc.encode("x"), { mtime: 1, ctime: 1 });
+      await expect(v.flush!()).resolves.toBeUndefined();
+    } finally {
+      if (had === undefined) delete g.require;
+      else g.require = had;
+    }
   });
 });

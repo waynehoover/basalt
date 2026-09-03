@@ -6,21 +6,28 @@
  * where a 66-method engine collaborates with a 20-method transport that decides
  * nothing.
  *
- * ## Shape, taken from Obsidian's transport
+ * ## Shape, taken from Obsidian's transport, and one thing not taken
  *
- * Read at `app.pretty.js:176823` onwards. Three decisions there are right and are
+ * Read at `app.pretty.js:176823` onwards. Two decisions there are right and are
  * kept:
  *
- *   - **One outstanding request, not a map of them.** A single promise slot,
- *     resolved by the next reply that is not a notification. It works because the
- *     protocol is sequential per session: the server reads one op, answers it,
- *     and reads the next. A correlation id would be machinery for a concurrency
- *     the protocol does not have.
- *   - **A queue for binary frames.** Bodies can arrive before anything asks for
- *     them, so they are buffered rather than dropped. Obsidian's `dataQueue`.
+ *   - **A queue for binary frames.** Bodies can arrive before the loop that
+ *     reads them is running, so they are buffered rather than dropped.
+ *     Obsidian's `dataQueue`.
  *   - **A timeout closes the connection.** A request that did not answer leaves
  *     the session's state unknown, and continuing on an unknown state is how two
  *     ends desync. Obsidian rejects and disconnects; so does this.
+ *
+ * The third, one promise slot resolved by the next reply that is not a
+ * notification, is what protocol 2 did and what protocol 3 removes. Matching a
+ * reply to a request by position produced three separate defects here: an
+ * acknowledgement arriving from inside the last `send`, before its waiter was
+ * armed, read as a reply nobody asked for (C11); a shutdown notice read as a bad
+ * reply (C26); and the bodies of a refused fetch consumed as the answer to the
+ * next one (C34). Every request now carries an `id` and every reply echoes it,
+ * so a reply is matched to its request by name and a reply with no name is a
+ * notification or the reason the connection is closing. docs/protocol.md,
+ * "Request ids".
  *
  * And one thing every client of this protocol has to do, which is worth saying
  * plainly because the first two written against it got it wrong: **replies are
@@ -37,11 +44,43 @@ import { CRYPTO_SUITE, chunkName } from "./crypto.ts";
  * 2 added the per-entry authenticator. Before it, everything a client acted on
  * except the bytes themselves travelled unsigned, so a server could say anything
  * about any file whose sealed path it held, which is all of them.
+ *
+ * 3 added request ids, the `bodies` header on a fetch, `retryable` on every
+ * error, the batch and fetch caps in `ready`, the wrapped data key, invites
+ * and `rotate`. This client speaks 3 only; a server that speaks only 2 refuses
+ * the hello and the refusal says to upgrade the server first.
  */
-export const PROTO = 2;
+export const PROTO = 3;
 
 /** How long a request may go unanswered before the connection is considered dead. */
 export const REQUEST_TIMEOUT_MS = 60_000;
+
+/**
+ * The most bytes a `vault` or `device` name may be, and the rule on what is in
+ * it: no byte below 0x20 and not 0x7f. Both land in the server's log lines and
+ * on every entry a device writes, and a newline in a log line is a forged log
+ * line. The server refuses either fault with `badname` and ends the session;
+ * checking here first means a bad name is one error at pairing rather than a
+ * connection that dies on every attempt.
+ */
+export const MAX_NAME_BYTES = 64;
+
+/**
+ * The most chunk names one `fetch` may carry. The server's own bound on a chunk
+ * list, and it refuses more with `toolarge`; a client splits before that.
+ */
+export const MAX_FETCH_NAMES = 65536;
+
+/**
+ * The ciphertext budget of one entry, as the server accounts it: its declared
+ * size plus 256 bytes for each chunk it names, which covers the sealing
+ * overhead and a little more. The server bounds a `putmany` by the sum of
+ * these and a `fetch` by the summed stored sizes, which this is never smaller
+ * than. One function, so the client and the server add the same thing up.
+ */
+export function entryBudget(size: number, chunkCount: number): number {
+  return size + 256 * chunkCount;
+}
 
 /** An entry as it arrives from the server. Paths and chunk names are sealed. */
 export interface WireDeletion extends WireEntry {
@@ -76,11 +115,27 @@ export interface Batch {
 /** What the server advertises in reply to hello. */
 export interface ServerLimits {
   readonly proto: number;
+  /** The oldest protocol the server still answers. */
+  readonly minProto: number;
+  /** The server's release, for an error that names both ends. */
+  readonly serverVersion: string;
   /** The newest uid the server holds. */
   readonly cursor: number;
   readonly perFileMax: number;
   readonly chunkMax: number;
   readonly maxChunks: number;
+  /** The largest encoded `putmany` frame, and the largest summed entry budget in one. */
+  readonly maxBatchBytes: number;
+  /** The most body bytes one `fetch` may ask for, as summed entry budget. */
+  readonly maxFetchBytes: number;
+  /**
+   * The vault's data key, wrapped under a key derived from the root secret.
+   *
+   * Present for a vault claimed under protocol 3, absent for one claimed under
+   * protocol 2, and that presence is what decides which key schedule this
+   * device uses; docs/protocol.md, "The data key".
+   */
+  readonly wrapped?: string;
 }
 
 /** Metadata for a put. Mirrors the protocol's `meta` object exactly. */
@@ -129,6 +184,70 @@ function wireMeta(meta: PutMeta): Record<string, unknown> {
   };
 }
 
+/** One entry as it travels inside a `putmany`. */
+function wireEntry(e: BatchEntry): Record<string, unknown> {
+  return {
+    path: e.path,
+    meta: wireMeta(e.meta),
+    chunks: [...e.names],
+    mac: e.mac,
+    parent: e.parent,
+  };
+}
+
+/**
+ * How many bytes one entry adds to an encoded `putmany` frame.
+ *
+ * Measured by encoding it, because an estimate is the kind of thing that is
+ * right until a path is long. Every field is ASCII on the wire (sealed paths
+ * are base64url, chunk names hex), so the string length is the byte length.
+ * The one byte is the comma between entries.
+ */
+export function encodedEntryBytes(e: BatchEntry): number {
+  return JSON.stringify(wireEntry(e)).length + 1;
+}
+
+/**
+ * What an encoded `putmany` costs before any entry is in it: the op, the id
+ * at its widest, and the brackets. Generous rather than exact, because the
+ * client has to stay under a cap it cannot measure until the frame exists.
+ */
+export const PUTMANY_FRAME_OVERHEAD = 64;
+
+/**
+ * Codes after which the session is over, whatever else is true.
+ *
+ * The "session" column of the error table in docs/protocol.md. A caller that
+ * carried on after one of these would be talking to a connection the server
+ * has closed, or one where the two ends no longer agree how many frames are
+ * outstanding. `internal` is in the list because the doc ends the session on
+ * it during handshake and catch-up, and a client cannot always tell which
+ * phase a reply belongs to; the cost of closing on the other kind is a
+ * reconnect, not a note.
+ */
+const ENDS_SESSION = new Set([
+  "proto",
+  "auth",
+  "cursor",
+  "busy",
+  "protostate",
+  "nospace",
+  "internal",
+]);
+
+/**
+ * Whether reconnecting later can succeed, by code alone.
+ *
+ * The "retryable" column of the error table, kept only for an error that
+ * arrives before the server knows which protocol the client speaks, which has
+ * the protocol 2 shape and no `retryable` field: a refusal at admission
+ * during shutdown, at the pre-auth cap, or a `proto` below the minimum.
+ * Everything after `ready` carries the field and this is not consulted.
+ */
+function retryableByCode(code: string): boolean {
+  return code === "busy" || code === "nospace" || code === "internal";
+}
+
 /**
  * A refusal from the server, carrying the code it sent.
  *
@@ -137,27 +256,57 @@ function wireMeta(meta: PutMeta): Record<string, unknown> {
  * person cannot read is how a silent failure starts.
  */
 export class ProtocolError extends Error {
+  /**
+   * Whether reconnecting later can succeed where retrying the same request
+   * cannot. The server says so on every protocol 3 error, and a watching
+   * client has nothing to interpret: back off and reconnect on true, stop on
+   * false. Read from the frame when it carries the field, and from the code
+   * table only for an error that arrived before the protocol was settled.
+   */
+  readonly retryable: boolean;
+  /** How long the server suggests waiting before reconnecting, when it said. */
+  readonly retryAfterMs: number | undefined;
+
   constructor(
     readonly code: string,
     message: string,
+    opts: { retryable?: boolean | undefined; retryAfterMs?: number | undefined } = {},
   ) {
     super(message);
     this.name = "ProtocolError";
+    this.retryable = opts.retryable ?? retryableByCode(code);
+    this.retryAfterMs = opts.retryAfterMs;
   }
 
   /**
-   * Whether this refusal ends the session.
+   * Whether trying again could never help.
    *
-   * The list is docs/protocol.md's, and it is the transport's job to know it:
+   * The complement of `retryable`, kept under the name the loops read it by:
    * a caller that retried a `proto` mismatch would loop forever, and one that
-   * tore down the connection over a `badname` would turn one bad file into a
-   * reconnect.
+   * stopped on a `busy` would stop on every server restart.
    */
   get fatal(): boolean {
-    return ["proto", "auth", "cursor", "busy", "protostate", "badchunk", "internal"].includes(
-      this.code,
-    );
+    return !this.retryable;
   }
+
+  /** Whether this refusal ends the session, as the protocol's table says. */
+  get endsSession(): boolean {
+    return ENDS_SESSION.has(this.code);
+  }
+}
+
+/** Builds the error a frame describes, reading every field it carries. */
+function errorFrom(frame: Reply): ProtocolError {
+  const retryable = frame["retryable"];
+  const after = frame["retryAfterMs"];
+  return new ProtocolError(
+    String(frame["code"] ?? "unknown"),
+    String(frame["msg"] ?? "no message"),
+    {
+      retryable: typeof retryable === "boolean" ? retryable : undefined,
+      retryAfterMs: typeof after === "number" && after > 0 ? after : undefined,
+    },
+  );
 }
 
 /**
@@ -203,8 +352,8 @@ export interface TransportOptions {
    * This class deliberately does not reconnect: a client that keeps running
    * wants backoff and a client that syncs once and exits wants to fail, and
    * that is a decision for whoever is running it. `Backoff` below is here for
-   * the first kind. `fatal` on the error says whether trying again could ever
-   * help.
+   * the first kind. `retryable` on the error says whether trying again could
+   * ever help.
    */
   readonly onClosed?: (cause: Error) => void;
   readonly log?: (message: string, ...rest: unknown[]) => void;
@@ -228,43 +377,62 @@ export interface SocketLike {
   onmessage: ((this: void, ev: { data: unknown }) => void) | null;
   send(data: string | ArrayBufferLike | Uint8Array): void;
   close(code?: number, reason?: string): void;
-}
-
-interface Waiter<T> {
-  resolve: (value: T) => void;
-  reject: (err: Error) => void;
+  /**
+   * Bytes handed to `send` and not yet on the wire, where the platform says.
+   *
+   * Browsers and Node's WebSocket both do. A socket that does not is sent to
+   * without pacing, which is what every socket was before this existed.
+   */
+  readonly bufferedAmount?: number;
 }
 
 type Reply = Record<string, unknown>;
 
+/**
+ * A request waiting for its reply, by id.
+ *
+ * Each carries its own inactivity clock. An inactivity timer rather than a
+ * deadline: a fetch is answered in bodies, and a large file over a slow link
+ * delivers them steadily for longer than any sensible timeout. A timer
+ * measuring the whole fetch killed it however well it was going, and the
+ * client reconnected into the same download for ever. What a timeout is for
+ * is a server that has stopped talking, so everything the server sends for a
+ * request starts its clock again.
+ */
+interface Pending {
+  readonly what: string;
+  resolve: (value: Reply) => void;
+  reject: (err: Error) => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  /** Whether the clock is running. A put's is stopped while its bodies go out. */
+  armed: boolean;
+}
+
 export class Transport {
   private socket: SocketLike | undefined;
-  private replyWaiter: Waiter<Reply> | undefined;
+
+  /** Requests in flight, by the id they were sent with. */
+  private readonly pending = new Map<number, Pending>();
+  /**
+   * The id the next request gets. Ids are 1 to 2^32-1 and wrap, which at one
+   * request a millisecond is a hundred and forty years per connection; a wrap
+   * onto an id still in flight is refused rather than reused.
+   */
+  private nextId = 1;
+  /**
+   * The ping waiting for its pong. Pings carry no id in either direction and
+   * pongs are matched by being the only thing a pong could answer, so at most
+   * one is in flight.
+   */
+  private pinging: Pending | undefined;
 
   /**
-   * The timeout armed for the request in flight.
-   *
-   * Held separately so it can be disarmed by a caller that resolves its own
-   * request, which `fetch` does: the answer to a fetch is binary frames, not
-   * a reply, so the reply never arrives and the timer that was waiting for it
-   * is left running. It fires later, mid-sync, and closes the connection.
-   *
-   * That went unnoticed because on loopback a sync finishes long before the
-   * timeout. Adding four hundred milliseconds of latency to the benchmark
-   * made every large sync die exactly one timeout after its first fetch.
+   * The fetch collecting bodies, if one is. The `bodies` header says exactly
+   * how many binary frames follow and this is what reads them; a body with no
+   * fetch collecting is a body nobody asked for.
    */
-  private replyTimer: ReturnType<typeof setTimeout> | undefined;
-  private bodyWaiter: Waiter<Uint8Array> | undefined;
-  /** Bodies that arrived before anything asked for them. Obsidian's dataQueue. */
-  private readonly bodyQueue: Uint8Array[] = [];
-
-  /**
-   * How many chunk bodies are still owed by a fetch in flight.
-   *
-   * Bodies arrive as bare binary frames with nothing tying them to a request,
-   * so this is the only thing that says whether one was asked for.
-   */
-  private expecting = 0;
+  private collecting: { pending: Pending; want: number; got: Uint8Array[] } | undefined;
+  private bodyWaiter: ((bytes: Uint8Array) => void) | undefined;
 
   /**
    * How many requests this connection has sent.
@@ -287,6 +455,8 @@ export class Transport {
   private cursor = 0;
   /** Notifications are handled in arrival order, never overlapped. */
   private notifying: Promise<void> = Promise.resolve();
+  /** What the server said at hello, for the bounds this side keeps to. */
+  private limits: ServerLimits | undefined;
 
   constructor(
     private readonly url: string,
@@ -302,6 +472,19 @@ export class Transport {
     return this.cursor;
   }
 
+  /** What the server advertised at hello, or undefined before it. */
+  get serverLimits(): ServerLimits | undefined {
+    return this.limits;
+  }
+
+  /**
+   * Opens the socket, within the timeout.
+   *
+   * The open used to have no deadline at all (C31). A server that accepts the
+   * TCP connection and never completes the handshake, or a firewall that
+   * swallows the SYN, left `connect` hanging for as long as the platform
+   * cared to wait, and the CLI held the vault's lock for the whole of it.
+   */
   async connect(): Promise<void> {
     if (this.socket) throw new Error("already connected");
     const factory = this.opts.socketFactory ?? defaultSocketFactory;
@@ -311,12 +494,29 @@ export class Transport {
     socket.binaryType = "arraybuffer";
     this.socket = socket;
 
+    const timeoutMs = this.timeoutMs;
     await new Promise<void>((resolve, reject) => {
-      socket.onopen = () => resolve();
+      const timer = setTimeout(() => {
+        reject(new ConnectionError(`no connection to ${this.url} within ${timeoutMs}ms`));
+        try {
+          socket.close();
+        } catch {
+          // Never opened, so there is nothing to close.
+        }
+      }, timeoutMs);
+      const done = (fn: () => void) => {
+        clearTimeout(timer);
+        fn();
+      };
+      socket.onopen = () => done(resolve);
       socket.onerror = () =>
-        reject(new ConnectionError(`could not connect to ${this.url}${plainTextHint(this.url)}`));
+        done(() =>
+          reject(new ConnectionError(`could not connect to ${this.url}${plainTextHint(this.url)}`)),
+        );
       socket.onclose = (ev) =>
-        reject(new ConnectionError(`connection closed before opening: ${describeClose(ev)}`));
+        done(() =>
+          reject(new ConnectionError(`connection closed before opening: ${describeClose(ev)}`)),
+        );
     });
 
     socket.onerror = () => this.die(new ConnectionError("the connection failed"));
@@ -336,13 +536,23 @@ export class Transport {
     this.closed = true;
     this.closeReason = cause;
     this.log("transport closed", cause.message);
-    this.disarmReply();
-    const reply = this.replyWaiter;
+    const waiting = [...this.pending.values()];
+    this.pending.clear();
+    const ping = this.pinging;
+    this.pinging = undefined;
     const body = this.bodyWaiter;
-    this.replyWaiter = undefined;
     this.bodyWaiter = undefined;
-    reply?.reject(cause);
-    body?.reject(cause);
+    this.collecting = undefined;
+    for (const p of waiting) {
+      this.disarm(p);
+      p.reject(cause);
+    }
+    if (ping) {
+      this.disarm(ping);
+      ping.reject(cause);
+    }
+    // A body reader is woken with nothing, and finds the transport closed.
+    body?.(new Uint8Array(0));
     try {
       this.socket?.close();
     } catch {
@@ -356,12 +566,24 @@ export class Transport {
     }
   }
 
-  /** Stops the timeout watching for a reply that is not coming. */
-  private disarmReply(): void {
-    if (this.replyTimer !== undefined) {
-      clearTimeout(this.replyTimer);
-      this.replyTimer = undefined;
-    }
+  private get timeoutMs(): number {
+    return this.opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  }
+
+  /** Starts, or restarts, the clock on one request's answer. */
+  private arm(p: Pending): void {
+    if (p.timer !== undefined) clearTimeout(p.timer);
+    p.armed = true;
+    const timeoutMs = this.timeoutMs;
+    p.timer = setTimeout(() => {
+      this.die(new ConnectionError(`no ${p.what} within ${timeoutMs}ms`));
+    }, timeoutMs);
+  }
+
+  private disarm(p: Pending): void {
+    if (p.timer !== undefined) clearTimeout(p.timer);
+    p.timer = undefined;
+    p.armed = false;
   }
 
   close(): void {
@@ -397,18 +619,13 @@ export class Transport {
       this.die(new ProtocolError("protostate", `server sent a frame of an unexpected type`));
       return;
     }
-    const waiter = this.bodyWaiter;
-    if (waiter) {
-      this.bodyWaiter = undefined;
-      waiter.resolve(bytes);
-      return;
-    }
-    if (this.bodyQueue.length >= this.expecting) {
-      // A body nobody asked for. The queue is bounded by what is
-      // outstanding rather than left to grow, because a peer that keeps
-      // sending them would otherwise be a way to exhaust this device's
-      // memory, and because a body arriving outside a fetch means the two
-      // ends no longer agree about what is being answered.
+    const fetch = this.collecting;
+    if (!fetch || fetch.got.length >= fetch.want) {
+      // A body nobody asked for. The `bodies` header said how many were
+      // coming and this is one more, or there was no header at all; either
+      // way the two ends no longer agree about what is being answered, and
+      // a queue not bounded by that would be a way for a peer to exhaust
+      // this device's memory.
       this.die(
         new ProtocolError(
           "protostate",
@@ -417,12 +634,19 @@ export class Transport {
       );
       return;
     }
-    this.bodyQueue.push(bytes);
+    // Progress on the fetch, so its clock restarts.
+    this.arm(fetch.pending);
+    fetch.got.push(bytes);
+    const waiter = this.bodyWaiter;
+    if (waiter) {
+      this.bodyWaiter = undefined;
+      waiter(bytes);
+    }
   }
 
   private onTextFrame(frame: Reply): void {
-    // Notifications first, and by name. Everything else is the answer to the
-    // request in flight; see the note at the top about why a client that
+    // Notifications first, and by name. Everything else is the answer to a
+    // request, matched by id; see the note at the top about why a client that
     // skips this reads a batch as its reply and hangs.
     if (frame["op"] === "batch") {
       this.queueNotification(() => this.onBatchFrame(frame));
@@ -448,21 +672,63 @@ export class Transport {
       return;
     }
 
-    const waiter = this.replyWaiter;
-    if (!waiter) {
-      // Nothing asked for this. Either the server sent an unsolicited
-      // reply or this client lost track, and both mean the two ends
-      // disagree about state.
-      this.die(
-        new ProtocolError(
-          "protostate",
-          `server sent an unexpected reply: ${JSON.stringify(frame)}`,
-        ),
-      );
+    const id = frame["id"];
+    if (id !== undefined) {
+      if (typeof id !== "number" || !Number.isInteger(id)) {
+        this.die(
+          new ProtocolError("protostate", `server sent a reply whose id is ${JSON.stringify(id)}`),
+        );
+        return;
+      }
+      const waiting = this.pending.get(id);
+      if (!waiting) {
+        // The server never sends an id it was not given, so this is an
+        // answer to a request this client does not have in flight: one it
+        // already answered, or one it never sent. Either way the two ends
+        // disagree about state, and the protocol says to end the session.
+        this.die(
+          new ProtocolError(
+            "protostate",
+            `server sent a reply to request ${id}, which is not in flight: ${JSON.stringify(frame)}`,
+          ),
+        );
+        return;
+      }
+      this.pending.delete(id);
+      this.disarm(waiting);
+      waiting.resolve(frame);
       return;
     }
-    this.replyWaiter = undefined;
-    waiter.resolve(frame);
+
+    if (frame["res"] === "pong") {
+      const ping = this.pinging;
+      if (!ping) {
+        this.die(new ProtocolError("protostate", "server sent a pong with no ping in flight"));
+        return;
+      }
+      this.pinging = undefined;
+      this.disarm(ping);
+      ping.resolve(frame);
+      return;
+    }
+
+    if (frame["res"] === "err") {
+      // An error nobody asked for is the server saying why it is about to
+      // hang up, and the protocol says so: on shutdown every idle session is
+      // sent `busy` and then closed, and a rotation sends every other
+      // device `auth`. Read as a stray reply this was a protocol violation,
+      // so a server restarting put every plugin into "stopped" when what it
+      // meant was "not now" (C26). Whether a loop retries is the error's
+      // own `retryable`, which the server set.
+      this.die(errorFrom(frame));
+      return;
+    }
+    // Nothing asked for this. Either the server sent an unsolicited reply
+    // or this client lost track, and both mean the two ends disagree about
+    // state.
+    this.die(
+      new ProtocolError("protostate", `server sent an unexpected reply: ${JSON.stringify(frame)}`),
+    );
   }
 
   /**
@@ -542,11 +808,11 @@ export class Transport {
    * Sending
    * ------------------------------------------------------------ */
 
-  private send(value: unknown): void {
+  private send(text: string): void {
     if (this.closed || !this.socket) {
       throw this.closeReason ?? new ConnectionError("not connected");
     }
-    this.socket.send(JSON.stringify(value));
+    this.socket.send(text);
   }
 
   private sendBody(bytes: Uint8Array): void {
@@ -556,65 +822,75 @@ export class Transport {
     this.socket.send(bytes);
   }
 
+  /** A fresh request id, never one still in flight. */
+  private takeId(): number {
+    for (let tries = 0; tries < 8; tries++) {
+      const id = this.nextId;
+      this.nextId = this.nextId >= 0xffffffff ? 1 : this.nextId + 1;
+      if (!this.pending.has(id)) return id;
+    }
+    throw new Error("every request id is in flight, which cannot happen");
+  }
+
   /**
-   * Sends a request and waits for the reply that is not a notification.
+   * Sends a request under a fresh id and waits for the reply that echoes it.
    *
    * A timeout closes the connection rather than only rejecting. The request
    * may have been received and acted on, so the session's state is unknown,
    * and the only safe next step is to start again.
+   *
+   * `clock` says whether the reply is expected straight away. A put's reply
+   * follows its bodies, and the sending phase has its own measure of progress
+   * (`drained`), so the clock on the reply starts once every body is with the
+   * socket, from `awaitReply`.
    */
-  private async request(value: unknown): Promise<Reply> {
-    if (this.replyWaiter) {
-      // Two requests in flight would resolve into each other's slot. The
-      // caller above is single-flight; this makes that a checked property
-      // rather than a convention.
-      throw new Error("a request is already in flight");
-    }
+  private begin(value: Record<string, unknown>, what: string, clock = true): Promise<Reply> {
+    const id = this.takeId();
+    const text = JSON.stringify({ ...value, id });
     this.requestsSent++;
-    const timeoutMs = this.opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
-    const reply = await new Promise<Reply>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.die(new ConnectionError(`no reply within ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.replyTimer = timer;
-      this.replyWaiter = {
-        resolve: (v) => {
-          this.disarmReply();
-          resolve(v);
-        },
-        reject: (e) => {
-          this.disarmReply();
-          reject(e);
-        },
-      };
+    const reply = new Promise<Reply>((resolve, reject) => {
+      if (this.closed) {
+        reject(this.closeReason ?? new ConnectionError("not connected"));
+        return;
+      }
+      const p: Pending = { what, resolve, reject, timer: undefined, armed: false };
+      this.pending.set(id, p);
+      if (clock) this.arm(p);
       try {
-        this.send(value);
+        this.send(text);
       } catch (err) {
-        this.disarmReply();
-        this.replyWaiter = undefined;
+        this.pending.delete(id);
+        this.disarm(p);
         reject(err instanceof Error ? err : new Error(String(err)));
       }
     });
-
-    if (reply["res"] === "err") {
-      const err = new ProtocolError(
-        String(reply["code"] ?? "unknown"),
-        String(reply["msg"] ?? "no message"),
-      );
-      if (err.fatal) this.die(err);
-      throw err;
-    }
+    // Nobody may await this until later, and a connection that dies before
+    // then rejects it now. The caller sees that failure through its own
+    // send; this only keeps the rejection from being reported as one nobody
+    // handled. `awaitReply` still sees it.
+    reply.catch(() => {});
     return reply;
   }
 
-  /** Waits for one binary frame, taking a queued one if there is any. */
-  private async body(): Promise<Uint8Array> {
-    const queued = this.bodyQueue.shift();
-    if (queued) return queued;
-    if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
-    return new Promise<Uint8Array>((resolve, reject) => {
-      this.bodyWaiter = { resolve, reject };
-    });
+  /**
+   * Waits for a reply and raises a refusal as an error.
+   *
+   * A refusal that ends the session closes the transport as well, so nothing
+   * else is sent down a connection the server is about to close.
+   */
+  private async awaitReply(reply: Promise<Reply>): Promise<Reply> {
+    const frame = await reply;
+    if (frame["res"] === "err") {
+      const err = errorFrom(frame);
+      if (err.endsSession) this.die(err);
+      throw err;
+    }
+    return frame;
+  }
+
+  /** One round trip: send, wait, and refuse a refusal. */
+  private async request(value: Record<string, unknown>, what: string): Promise<Reply> {
+    return this.awaitReply(this.begin(value, what));
   }
 
   /* ------------------------------------------------------------ *
@@ -641,34 +917,122 @@ export class Transport {
      * a device never has to know whether it is the first one.
      */
     claim?: string;
+    /**
+     * The vault's data key, wrapped under this device's root, offered with
+     * the claim. Stored by the server if the claim goes through and ignored
+     * otherwise, like the claim itself. Which key the vault actually has
+     * comes back in `ready`, never from here.
+     */
+    wrapped?: string;
   }): Promise<ServerLimits> {
+    checkName("vault", args.vault);
+    checkName("device", args.device);
     this.cursor = args.cursor;
-    const reply = await this.request({
-      op: "hello",
-      proto: PROTO,
-      crypto: CRYPTO_SUITE,
-      vault: args.vault,
-      token: args.token,
-      device: args.device,
-      cursor: args.cursor,
-      ...(args.claim !== undefined ? { claim: args.claim } : {}),
-    });
+    let reply: Reply;
+    try {
+      reply = await this.request(
+        {
+          op: "hello",
+          proto: PROTO,
+          crypto: CRYPTO_SUITE,
+          vault: args.vault,
+          token: args.token,
+          device: args.device,
+          cursor: args.cursor,
+          ...(args.claim !== undefined ? { claim: args.claim } : {}),
+          ...(args.wrapped !== undefined ? { wrapped: args.wrapped } : {}),
+        },
+        "ready",
+      );
+    } catch (err) {
+      throw protoRefusal(err);
+    }
+    return this.readReady(reply);
+  }
+
+  /**
+   * Redeems a single-use invite: a hello with the invite in place of a token.
+   *
+   * The server answers with the root secret sealed under the invite key and
+   * the vault's wrapped data key, then closes; this connection is not a device
+   * and never becomes one. The caller unseals, stores, and connects again with
+   * the derived key like any other device. docs/protocol.md, "Adding a device
+   * with a single-use invite".
+   */
+  async redeem(args: {
+    vault: string;
+    device: string;
+    invite: string;
+  }): Promise<{ sealed: string; wrapped?: string }> {
+    checkName("vault", args.vault);
+    checkName("device", args.device);
+    let reply: Reply;
+    try {
+      reply = await this.request(
+        {
+          op: "hello",
+          proto: PROTO,
+          crypto: CRYPTO_SUITE,
+          vault: args.vault,
+          device: args.device,
+          cursor: 0,
+          invite: args.invite,
+        },
+        "redeemed",
+      );
+    } catch (err) {
+      throw protoRefusal(err);
+    }
+    if (reply["res"] !== "redeemed") {
+      throw new ProtocolError("protostate", `expected redeemed, got ${JSON.stringify(reply)}`);
+    }
+    const sealed = reply["sealed"];
+    if (typeof sealed !== "string" || sealed === "") {
+      throw this.malformed("redeemed with no sealed secret");
+    }
+    const wrapped = reply["wrapped"];
+    if (wrapped !== undefined && typeof wrapped !== "string") {
+      throw this.malformed("redeemed whose wrapped key is not a string");
+    }
+    return {
+      sealed,
+      ...(typeof wrapped === "string" && wrapped !== "" ? { wrapped } : {}),
+    };
+  }
+
+  private readReady(reply: Reply): ServerLimits {
     if (reply["res"] !== "ready") {
       throw new ProtocolError("protostate", `expected ready, got ${JSON.stringify(reply)}`);
     }
+    const version = reply["serverVersion"];
+    const wrapped = reply["wrapped"];
+    if (wrapped !== undefined && typeof wrapped !== "string") {
+      throw this.malformed("ready whose wrapped key is not a string");
+    }
     const limits: ServerLimits = {
-      proto: numberOf(reply["proto"]),
-      cursor: numberOf(reply["cursor"]),
-      perFileMax: numberOf(reply["perFileMax"]),
-      chunkMax: numberOf(reply["chunkMax"]),
-      maxChunks: numberOf(reply["maxChunks"]),
+      proto: this.count(reply, "proto", "ready"),
+      minProto: this.count(reply, "minProto", "ready"),
+      serverVersion: typeof version === "string" ? version : "unknown",
+      cursor: this.count(reply, "cursor", "ready"),
+      perFileMax: this.count(reply, "perFileMax", "ready"),
+      chunkMax: this.count(reply, "chunkMax", "ready"),
+      maxChunks: this.count(reply, "maxChunks", "ready"),
+      maxBatchBytes: this.count(reply, "maxBatchBytes", "ready"),
+      maxFetchBytes: this.count(reply, "maxFetchBytes", "ready"),
+      ...(typeof wrapped === "string" && wrapped !== "" ? { wrapped } : {}),
     };
     if (limits.proto !== PROTO) {
-      throw new ProtocolError(
+      // A server answers in the version the client asked for, so a ready in
+      // another version is a server that did not understand the question.
+      const err = new ProtocolError(
         "proto",
-        `server speaks protocol ${limits.proto}, this client speaks ${PROTO}`,
+        `server (version ${limits.serverVersion}) answered in protocol ${limits.proto}, ` +
+          `this client speaks ${PROTO}; upgrade the server first`,
       );
+      this.die(err);
+      throw err;
     }
+    this.limits = limits;
     this.log("ready", limits);
     return limits;
   }
@@ -702,43 +1066,40 @@ export class Transport {
     /** The authenticator and parent this entry travels with. */
     auth: { mac: string; parent: string } = { mac: "", parent: "" },
   ): Promise<{ uid: number; uploaded: number; bytes: number }> {
-    const reply = await this.request({
-      op: "put",
-      path,
-      meta: wireMeta(meta),
-      chunks: [...names],
-      mac: auth.mac,
-      parent: auth.parent,
-    });
+    const reply = await this.request(
+      {
+        op: "put",
+        path,
+        meta: wireMeta(meta),
+        chunks: [...names],
+        mac: auth.mac,
+        parent: auth.parent,
+      },
+      "want or have",
+    );
 
     if (reply["res"] === "have") {
-      return { uid: numberOf(reply["uid"]), uploaded: 0, bytes: 0 };
+      return { uid: this.uid(reply, "have"), uploaded: 0, bytes: 0 };
     }
     if (reply["res"] !== "want") {
       throw new ProtocolError("protostate", `expected want or have, got ${JSON.stringify(reply)}`);
     }
 
-    const wanted = stringsOf(reply["chunks"]);
     const offered = new Set(names);
-    let bytes = 0;
+    const wanted = this.wanted(reply, offered);
 
-    // The reply names what to send. Sending anything else, or sending them in
-    // another order, is caught by the server, which hashes each body and
-    // matches it against what it asked for.
-    for (const name of wanted) {
-      if (!offered.has(name)) {
-        throw new ProtocolError(
-          "badchunk",
-          `server asked for ${name}, which this put does not contain`,
-        );
-      }
-      const body = await bodyOf(name);
-      this.sendBody(body);
-      bytes += body.length;
+    // The ack answers the same id as the put, so the waiter for it is the
+    // one taken out again here, before any body goes out: a loopback server
+    // acks from inside the last send (C11), and a waiter installed after
+    // the bodies found the answer already there.
+    const id = idOf(reply);
+    const ack = this.expectMore(id, "acknowledgement");
+    const bytes = await this.sendBodies(wanted, offered, bodyOf, "put");
+    const acked = await this.awaitPhase(ack, id);
+    if (acked["res"] !== "ack") {
+      throw new ProtocolError("protostate", `expected ack, got ${JSON.stringify(acked)}`);
     }
-
-    const ack = await this.awaitAck();
-    return { uid: ack, uploaded: wanted.length, bytes };
+    return { uid: this.uid(acked, "ack"), uploaded: wanted.length, bytes };
   }
 
   /**
@@ -755,6 +1116,10 @@ export class Transport {
    * An entry the server refuses does not refuse the batch. Its result carries
    * the error and the others carry their uids, because a batch that fails as a
    * unit leaves a client bisecting it to find out which note it was.
+   *
+   * The caller splits by the caps `ready` advertised (the engine does); this
+   * checks the count, which is the one bound that predates the caps, and the
+   * frame size, as a tripwire for a caller that did not.
    */
   async putMany(
     entries: readonly BatchEntry[],
@@ -767,40 +1132,37 @@ export class Transport {
         `${entries.length} entries in one batch, the limit is ${MAX_BATCH_ENTRIES}`,
       );
     }
+    const frame = { op: "putmany", entries: entries.map(wireEntry) };
+    const cap = this.limits?.maxBatchBytes;
+    if (cap !== undefined && cap > 0) {
+      // A plain error, not a refusal: the server would answer `toolarge`
+      // and the engine would write every note in the batch off for good,
+      // when what happened is that the caller did not split. Raised as a
+      // fault of this program, it is retried like a dropped connection.
+      const encoded = JSON.stringify(frame).length + 24;
+      if (encoded > cap) {
+        throw new Error(
+          `a putmany of ${entries.length} entries encodes to ${encoded} bytes, over the server's ${cap}; it should have been split`,
+        );
+      }
+    }
 
-    const reply = await this.request({
-      op: "putmany",
-      entries: entries.map((e) => ({
-        path: e.path,
-        meta: wireMeta(e.meta),
-        chunks: [...e.names],
-        mac: e.mac,
-        parent: e.parent,
-      })),
-    });
+    const reply = await this.request(frame, "want or acks");
 
     let acks = reply;
     let uploaded = 0;
     let bytes = 0;
 
     if (reply["res"] === "want") {
-      const wanted = stringsOf(reply["chunks"]);
       const offered = new Set<string>();
       for (const e of entries) for (const name of e.names) offered.add(name);
+      const wanted = this.wanted(reply, offered);
 
-      for (const name of wanted) {
-        if (!offered.has(name)) {
-          throw new ProtocolError(
-            "badchunk",
-            `server asked for ${name}, which this batch does not contain`,
-          );
-        }
-        const body = await bodyOf(name);
-        this.sendBody(body);
-        bytes += body.length;
-      }
+      const id = idOf(reply);
+      const pending = this.expectMore(id, "acknowledgement");
+      bytes = await this.sendBodies(wanted, offered, bodyOf, "batch");
       uploaded = wanted.length;
-      acks = await this.awaitReply();
+      acks = await this.awaitPhase(pending, id);
     }
 
     if (acks["res"] !== "acks") {
@@ -818,84 +1180,140 @@ export class Transport {
       );
     }
 
-    const results = raw.map((r): BatchResult => {
-      const row = (r ?? {}) as Record<string, unknown>;
-      if (row["code"] !== undefined) {
-        return {
-          uid: 0,
-          error: new ProtocolError(String(row["code"]), String(row["msg"] ?? "no message")),
-        };
+    const results = raw.map((r, i): BatchResult => {
+      if (typeof r !== "object" || r === null) {
+        throw this.malformed(`acks[${i}] is not an object`);
       }
-      return { uid: numberOf(row["uid"]) };
+      const row = r as Record<string, unknown>;
+      if (row["code"] !== undefined) {
+        if (typeof row["code"] !== "string")
+          throw this.malformed(`acks[${i}].code is not a string`);
+        return { uid: 0, error: errorFrom(row) };
+      }
+      return { uid: this.uid(row, `acks[${i}]`) };
     });
 
-    // A per-entry refusal is survivable; a fatal one is not, and the session
-    // has to end for the same reason it would on a single put.
+    // A per-entry refusal is survivable; one that ends the session is not,
+    // and the session has to end for the same reason it would on a single put.
     for (const r of results) {
-      if (r.error?.fatal) this.die(r.error);
+      if (r.error?.endsSession) this.die(r.error);
     }
 
     return { results, uploaded, bytes };
   }
 
   /**
-   * Waits for the ack that follows a body upload.
+   * Sends the bodies the server asked for, paced against the socket's buffer.
    *
-   * A separate wait rather than another request, because the bodies were sent
-   * without a reply between them: the protocol acknowledges the whole put once,
-   * after every body and the entry are durable.
+   * Every name is checked against what was offered before anything goes out,
+   * because sending a body the put never named is caught by the server as a
+   * protocol failure and ends the session.
    */
-  private async awaitAck(): Promise<number> {
-    const reply = await this.awaitReply();
-    if (reply["res"] !== "ack") {
-      throw new ProtocolError("protostate", `expected ack, got ${JSON.stringify(reply)}`);
+  private async sendBodies(
+    wanted: readonly string[],
+    offered: ReadonlySet<string>,
+    bodyOf: (name: string) => Promise<Uint8Array>,
+    what: string,
+  ): Promise<number> {
+    let bytes = 0;
+    for (const name of wanted) {
+      if (!offered.has(name)) {
+        // Already checked when the reply was read; kept because this is
+        // the line that sends bytes, and it should not trust a list.
+        throw new ProtocolError(
+          "badchunk",
+          `server asked for ${name}, which this ${what} does not contain`,
+        );
+      }
+      const body = await bodyOf(name);
+      this.sendBody(body);
+      bytes += body.length;
+      await this.drained(UPLOAD_HIGH_WATER);
     }
-    return numberOf(reply["uid"]);
+    // Every body is with the socket before the clock on the ack starts. The
+    // ack follows the last body, so a timer armed while bodies were still
+    // queued measured the upload rather than the server.
+    await this.drained(0);
+    return bytes;
   }
 
-  /** The next unsolicited reply, with a fatal error raised rather than returned. */
-  private async awaitReply(): Promise<Reply> {
-    const reply = await new Promise<Reply>((resolve, reject) => {
+  /**
+   * Waits until the socket has handed its queued bytes on, down to `below`.
+   *
+   * Bodies used to be pushed into the socket as fast as they could be sealed,
+   * and the timer for the ack was armed for the whole drain. A file larger
+   * than the link could carry inside one timeout could therefore never be
+   * sent: the ack was always late, the connection was closed, and the client
+   * reconnected to try the same file again. Pacing the sends against the
+   * socket's own buffer keeps memory bounded, and measuring progress rather
+   * than the total is what lets a slow link finish.
+   *
+   * A stall, meaning the buffer has not shrunk in a whole timeout, is the
+   * connection being dead, and is treated as one.
+   */
+  private async drained(below: number): Promise<void> {
+    const socket = this.socket;
+    if (!socket || socket.bufferedAmount === undefined) return;
+    let last = socket.bufferedAmount;
+    let movedAt = Date.now();
+    while (socket.bufferedAmount > below) {
+      if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
+      await sleep(DRAIN_POLL_MS);
+      const now = socket.bufferedAmount;
+      if (now < last) {
+        last = now;
+        movedAt = Date.now();
+      } else if (Date.now() - movedAt > this.timeoutMs) {
+        this.die(
+          new ConnectionError(`upload stalled: ${now} bytes unsent for ${this.timeoutMs}ms`),
+        );
+        throw this.closeReason ?? new ConnectionError("not connected");
+      }
+    }
+  }
+
+  /**
+   * Re-opens a request's slot for the second reply it will get, with no clock.
+   *
+   * A put is answered twice under one id: `want`, then `ack` after the bodies.
+   * The slot is taken again *before* the bodies go out, because a loopback
+   * server acks inside the same tick as the last send (C11), and a waiter
+   * installed afterwards found the answer already there. No timer, because
+   * the sending phase has its own: `drained` watches the socket for progress,
+   * which is the honest measure of an upload. The clock on the reply itself
+   * starts in `awaitPhase`, once every body is with the socket.
+   */
+  private expectMore(id: number, what: string): Promise<Reply> {
+    if (this.pending.has(id)) throw new Error(`request ${id} is already waiting for a reply`);
+    const pending = new Promise<Reply>((resolve, reject) => {
       if (this.closed) {
         reject(this.closeReason ?? new ConnectionError("not connected"));
         return;
       }
-      const timeoutMs = this.opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
-      const timer = setTimeout(() => {
-        this.die(new ConnectionError(`no acknowledgement within ${timeoutMs}ms`));
-      }, timeoutMs);
-      this.replyWaiter = {
-        resolve: (v) => {
-          clearTimeout(timer);
-          resolve(v);
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        },
-      };
+      this.pending.set(id, { what, resolve, reject, timer: undefined, armed: false });
     });
-    if (reply["res"] === "err") {
-      const err = new ProtocolError(
-        String(reply["code"] ?? "unknown"),
-        String(reply["msg"] ?? "no message"),
-      );
-      if (err.fatal) this.die(err);
-      throw err;
-    }
-    return reply;
+    pending.catch(() => {});
+    return pending;
+  }
+
+  /** Waits for a reply `expectMore` was told to expect, from now with a clock. */
+  private async awaitPhase(pending: Promise<Reply>, id: number): Promise<Reply> {
+    const p = this.pending.get(id);
+    // Still waiting: the clock starts now that the bodies are sent.
+    if (p) this.arm(p);
+    return this.awaitReply(pending);
   }
 
   /** Asks where a version's content lives. */
   async get(uid: number): Promise<{ uid: number; size: number; chunks: string[] }> {
-    const reply = await this.request({ op: "get", uid });
+    const reply = await this.request({ op: "get", uid }, "chunks");
     if (reply["res"] !== "chunks") {
       throw new ProtocolError("protostate", `expected chunks, got ${JSON.stringify(reply)}`);
     }
     return {
-      uid: numberOf(reply["uid"]),
-      size: numberOf(reply["size"]),
-      chunks: stringsOf(reply["chunks"]),
+      uid: this.uid(reply, "chunks"),
+      size: this.count(reply, "size", "chunks"),
+      chunks: this.chunkNames(reply["chunks"], "chunks"),
     };
   }
 
@@ -913,12 +1331,15 @@ export class Transport {
     sealedPath: string,
     opts: { before?: number; limit?: number } = {},
   ): Promise<WireEntry[]> {
-    const reply = await this.request({
-      op: "history",
-      path: sealedPath,
-      ...(opts.before !== undefined ? { before: opts.before } : {}),
-      ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
-    });
+    const reply = await this.request(
+      {
+        op: "history",
+        path: sealedPath,
+        ...(opts.before !== undefined ? { before: opts.before } : {}),
+        ...(opts.limit !== undefined ? { limit: opts.limit } : {}),
+      },
+      "history",
+    );
     if (reply["res"] !== "history") {
       throw new ProtocolError("protostate", `expected history, got ${JSON.stringify(reply)}`);
     }
@@ -933,7 +1354,10 @@ export class Transport {
    * phantom deletions of files that still exist is one nobody reads.
    */
   async deleted(limit?: number): Promise<{ entries: WireDeletion[]; more: boolean }> {
-    const reply = await this.request({ op: "deleted", ...(limit !== undefined ? { limit } : {}) });
+    const reply = await this.request(
+      { op: "deleted", ...(limit !== undefined ? { limit } : {}) },
+      "deleted",
+    );
     if (reply["res"] !== "deleted") {
       throw new ProtocolError("protostate", `expected deleted, got ${JSON.stringify(reply)}`);
     }
@@ -949,40 +1373,63 @@ export class Transport {
   /**
    * Downloads chunk bodies, in the order asked for.
    *
-   * The server refuses the whole fetch if it lacks any of them, so a partial
-   * answer is not a case to handle.
+   * The answer is `{res:"bodies", count}` and then exactly `count` binary
+   * frames, or an `err` and no frames; the server refuses the whole fetch if
+   * it lacks any of them, so a partial answer is not a case to handle and
+   * bodies from a refused fetch can no longer be taken as the answer to the
+   * next one (C34).
    *
    * Every body is checked against the name it was asked for, here rather than
-   * in the caller. That check used to be described as the caller's and no
-   * caller did it, which mattered more than it sounds: bodies arrive as bare
-   * binary frames with nothing tying them to a request, so a body left over
-   * from an abandoned fetch is consumed by the next one. It would decrypt
-   * perfectly, being a real chunk of a real file, and be assembled into the
-   * wrong note. The name is a hash of exactly these bytes, so the check is
-   * exact and costs one digest.
+   * in the caller. Bodies arrive as bare binary frames with nothing but their
+   * order tying them to a name, and the name is a hash of exactly these bytes,
+   * so the check is exact and costs one digest.
+   *
+   * The caller keeps within `maxFetchBytes` and `MAX_FETCH_NAMES`; this
+   * refuses a list over the count, which is the one bound it can see whole.
    */
   async fetch(names: readonly string[]): Promise<Uint8Array[]> {
     if (names.length === 0) return [];
-    this.expecting += names.length;
-    const reply = this.request({ op: "fetch", chunks: [...names] });
-
-    // The bodies come as binary frames with no reply frame in front of them,
-    // so this collects them while the request promise stays unresolved. It
-    // will only settle if the server refuses, which is why it is raced rather
-    // than awaited.
-    const bodies: Uint8Array[] = [];
+    if (names.length > MAX_FETCH_NAMES) {
+      throw new Error(
+        `a fetch of ${names.length} chunks is over the ${MAX_FETCH_NAMES} the server takes; it should have been split`,
+      );
+    }
+    if (this.collecting) {
+      // Two fetches at once would interleave their bodies on one stream with
+      // nothing but arrival order to tell them apart. The engine is
+      // single-flight and never does this; the check makes that a property.
+      throw new Error("a fetch is already collecting bodies");
+    }
+    // The collector is in place before the request goes, because the
+    // server sends the first body straight after the header, in the same
+    // instant on loopback, and a body arriving with nothing collecting is
+    // read as one nobody asked for. The bodies get a clock of their own,
+    // restarted by every frame that lands.
+    const collector: Pending = {
+      what: "chunk body",
+      resolve: () => {},
+      reject: () => {},
+      timer: undefined,
+      armed: false,
+    };
+    const got: Uint8Array[] = [];
+    this.collecting = { pending: collector, want: names.length, got };
     const checks: Promise<void>[] = [];
     try {
-      for (let i = 0; i < names.length; i++) {
-        const next = await Promise.race([
-          this.body(),
-          reply.then((r) => {
-            throw new ProtocolError(
-              "protostate",
-              `expected a chunk body, got ${JSON.stringify(r)}`,
-            );
-          }),
-        ]);
+      const started = this.begin({ op: "fetch", chunks: [...names] }, "bodies");
+      const header = await this.awaitReply(started);
+      if (header["res"] !== "bodies") {
+        throw new ProtocolError("protostate", `expected bodies, got ${JSON.stringify(header)}`);
+      }
+      const count = this.count(header, "count", "bodies");
+      if (count !== names.length) {
+        // The server promised a different number of frames from the number
+        // of names asked for. Whatever follows cannot be matched to a name.
+        throw this.malformed(`bodies announcing ${count} frames for a fetch of ${names.length}`);
+      }
+      this.arm(collector);
+      for (let i = 0; i < count; i++) {
+        const next = await this.body(i);
         // Hashed alongside the next body rather than in front of it.
         //
         // The bodies arrive in order and must be read in order, but
@@ -991,47 +1438,248 @@ export class Transport {
         // costs this side: 21.6 ms of a 23.9 ms fetch of 2000 bodies,
         // against 5.1 ms taken together.
         //
-        // Not dropped, only moved. It is what stops a body left over
-        // from an abandoned fetch being assembled into the wrong note.
-        // The session still ends on a mismatch, a few bodies later than
-        // it used to, and nothing is written before the check settles.
+        // Not dropped, only moved. The session still ends on a mismatch, a
+        // few bodies later than it used to, and nothing is written before
+        // the check settles.
         const want = names[i]!;
         checks.push(
-          chunkName(next).then((got) => {
-            if (got !== want) {
+          chunkName(next).then((hash) => {
+            if (hash !== want) {
               throw new ProtocolError(
                 "badchunk",
-                `asked for ${want} and received ${next.length} bytes that hash to ${got}`,
+                `asked for ${want} and received ${next.length} bytes that hash to ${hash}`,
               );
             }
           }),
         );
-        bodies.push(next);
       }
       await Promise.all(checks);
     } catch (err) {
-      this.expecting = 0;
-      this.disarmReply();
-      this.replyWaiter = undefined;
       if (err instanceof ProtocolError && err.code === "badchunk") this.die(err);
       throw err;
+    } finally {
+      this.disarm(collector);
+      this.collecting = undefined;
     }
-    this.expecting = Math.max(0, this.expecting - names.length);
-    // Nothing is coming for the request slot, so release it *and* disarm
-    // the timeout waiting on it. The fetch is answered entirely in binary
-    // frames, so the reply this timer is watching for will never come, and
-    // leaving it running means it fires mid-sync and closes the connection.
-    this.disarmReply();
-    this.replyWaiter = undefined;
-    return bodies;
+    return got;
   }
 
+  /** Waits for the i-th body of the fetch in progress. */
+  private async body(i: number): Promise<Uint8Array> {
+    const fetch = this.collecting;
+    if (!fetch || this.closed) throw this.closeReason ?? new ConnectionError("not connected");
+    if (fetch.got.length <= i) {
+      await new Promise<void>((resolve) => {
+        this.bodyWaiter = () => resolve();
+      });
+      if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
+    }
+    return fetch.got[i]!;
+  }
+
+  /**
+   * Registers a single-use invite: an identifier, and the root secret sealed
+   * under a key the server never sees. Returns when it expires, in server
+   * milliseconds.
+   */
+  async invite(args: { invite: string; sealed: string; ttlMs?: number }): Promise<number> {
+    const reply = await this.request(
+      {
+        op: "invite",
+        invite: args.invite,
+        sealed: args.sealed,
+        ...(args.ttlMs !== undefined ? { ttlMs: args.ttlMs } : {}),
+      },
+      "invited",
+    );
+    if (reply["res"] !== "invited") {
+      throw new ProtocolError("protostate", `expected invited, got ${JSON.stringify(reply)}`);
+    }
+    return this.count(reply, "expiresAt", "invited");
+  }
+
+  /**
+   * Replaces the vault's auth hash and wrapped data key together.
+   *
+   * `auth` is the new auth key and `wrapped` the same data key under the new
+   * root. Every other session on the vault is closed by the server with
+   * `auth` before this returns, so "rotated" also means nobody else is still
+   * writing under the old string.
+   */
+  async rotate(args: { auth: string; wrapped: string }): Promise<void> {
+    const reply = await this.request(
+      { op: "rotate", auth: args.auth, wrapped: args.wrapped },
+      "rotated",
+    );
+    if (reply["res"] !== "rotated") {
+      throw new ProtocolError("protostate", `expected rotated, got ${JSON.stringify(reply)}`);
+    }
+  }
+
+  /* ------------------------------------------------------------ *
+   * Strict reading of what the server answered
+   * ------------------------------------------------------------ */
+
+  /**
+   * A malformed reply ends the session.
+   *
+   * Success replies were read as leniently as the batch frames were read
+   * strictly: a missing or non-numeric uid became zero and was committed to
+   * the index as the version of a note, and a `want` with a malformed member
+   * dropped it and went on. A server that answers in a shape this client does
+   * not know is a server this client does not understand, and the only safe
+   * thing to do about that is stop.
+   */
+  private malformed(what: string): ProtocolError {
+    const err = new ProtocolError("protostate", `server sent ${what}`);
+    this.die(err);
+    return err;
+  }
+
+  /** A non-negative integer field, or the end of the session. */
+  private count(reply: Reply, field: string, of: string): number {
+    const v = reply[field];
+    if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) {
+      throw this.malformed(
+        `${of} with ${field} = ${JSON.stringify(v)}, not a non-negative integer`,
+      );
+    }
+    return v;
+  }
+
+  /** A version number, which is a positive integer, or the end of the session. */
+  private uid(reply: Reply, of: string): number {
+    const v = this.count(reply, "uid", of);
+    if (v === 0) throw this.malformed(`${of} with uid 0, which no version has`);
+    return v;
+  }
+
+  /** A list of chunk names, or the end of the session. */
+  private chunkNames(v: unknown, of: string): string[] {
+    if (!Array.isArray(v)) throw this.malformed(`${of} with no chunks list`);
+    for (const name of v) {
+      if (typeof name !== "string" || !/^[0-9a-f]{64}$/.test(name)) {
+        throw this.malformed(`${of} naming ${JSON.stringify(name)}, which is not a chunk name`);
+      }
+    }
+    return v as string[];
+  }
+
+  /**
+   * What a `want` asks for: chunk names, each offered by this put, none twice.
+   *
+   * A name that was never offered is the server asking for bytes this put
+   * does not have, which is `badchunk` and ends the session; a duplicate
+   * would have the same body sent twice under one name, which the server
+   * cannot mean.
+   */
+  private wanted(reply: Reply, offered: ReadonlySet<string>): string[] {
+    const names = reply["chunks"];
+    if (!Array.isArray(names)) throw this.malformed("want with no chunks list");
+    const seen = new Set<string>();
+    for (const name of names) {
+      if (typeof name !== "string") {
+        throw this.malformed(`want naming ${JSON.stringify(name)}, which is not a chunk name`);
+      }
+      // Offered is the test of a name here, not its shape: what was offered
+      // is by construction well formed, and anything else is the server
+      // asking for bytes this put does not have.
+      if (!offered.has(name)) {
+        const err = new ProtocolError(
+          "badchunk",
+          `server asked for ${name}, which this put does not contain`,
+        );
+        this.die(err);
+        throw err;
+      }
+      if (seen.has(name)) throw this.malformed(`want naming ${name} twice`);
+      seen.add(name);
+    }
+    return names as string[];
+  }
+
+  /**
+   * Says something, so the connection is not idle, and hears something back.
+   *
+   * Pings carry no id, in either direction, so this is the one exchange still
+   * matched by position: a pong answers the ping in flight, and there is at
+   * most one.
+   */
   async ping(): Promise<void> {
-    const reply = await this.request({ op: "ping" });
+    if (this.pinging) throw new Error("a ping is already in flight");
+    this.requestsSent++;
+    const reply = await new Promise<Reply>((resolve, reject) => {
+      if (this.closed) {
+        reject(this.closeReason ?? new ConnectionError("not connected"));
+        return;
+      }
+      const p: Pending = { what: "pong", resolve, reject, timer: undefined, armed: false };
+      this.pinging = p;
+      this.arm(p);
+      try {
+        this.send(JSON.stringify({ op: "ping" }));
+      } catch (err) {
+        this.pinging = undefined;
+        this.disarm(p);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    });
     if (reply["res"] !== "pong") {
       throw new ProtocolError("protostate", `expected pong, got ${JSON.stringify(reply)}`);
     }
   }
+}
+
+/**
+ * Refuses a `vault` or `device` name the server would refuse, before it goes.
+ *
+ * Bounded in bytes, not characters, because that is how the server counts,
+ * and a name of sixty-four accented letters is more than sixty-four bytes.
+ */
+export function checkName(what: "vault" | "device", name: string): void {
+  const bytes = new TextEncoder().encode(name).length;
+  if (bytes > MAX_NAME_BYTES) {
+    throw new ProtocolError(
+      "badname",
+      `the ${what} name is ${bytes} bytes, and the server takes at most ${MAX_NAME_BYTES}`,
+    );
+  }
+  for (let i = 0; i < name.length; i++) {
+    const c = name.charCodeAt(i);
+    if (c < 0x20 || c === 0x7f) {
+      throw new ProtocolError(
+        "badname",
+        `the ${what} name contains a control character at position ${i}, which the server refuses because the name lands in its log`,
+      );
+    }
+  }
+}
+
+/**
+ * Names both protocol versions in a `proto` refusal, and says which end to
+ * upgrade.
+ *
+ * A server that speaks only protocol 2 refuses a protocol 3 hello with an
+ * error in the protocol 2 shape, no id, which arrives here as the close
+ * reason. Its message names the server's range; this adds the client's
+ * version and the one instruction that follows from the upgrade order.
+ */
+function protoRefusal(err: unknown): unknown {
+  if (err instanceof ProtocolError && err.code === "proto") {
+    return new ProtocolError(
+      "proto",
+      `${err.message}. This client speaks protocol ${PROTO}; upgrade the server first`,
+      { retryable: false },
+    );
+  }
+  return err;
+}
+
+/** The id a reply came back under, which every reply reaching a caller has. */
+function idOf(reply: Reply): number {
+  const id = reply["id"];
+  if (typeof id !== "number") throw new Error("a matched reply lost its id, which cannot happen");
+  return id;
 }
 
 /* ---------------------------------------------------------------- *
@@ -1121,6 +1769,20 @@ export function urlForHost(hostAndPort: string): string {
   return `${local ? "ws" : "wss"}://${host}`;
 }
 
+/**
+ * How much may sit in the socket's buffer before the next body waits.
+ *
+ * Enough to keep the link busy between one body being sealed and the next,
+ * not so much that a large attachment is held twice, once by the caller and
+ * once by the socket.
+ */
+const UPLOAD_HIGH_WATER = 4 * 1024 * 1024;
+
+/** How often the socket buffer is looked at while an upload drains. */
+const DRAIN_POLL_MS = 5;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 function toBytes(data: unknown): Uint8Array | undefined {
   if (data instanceof Uint8Array) return data;
   if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -1131,11 +1793,6 @@ function toBytes(data: unknown): Uint8Array | undefined {
 
 function numberOf(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function stringsOf(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter((v): v is string => typeof v === "string");
 }
 
 function describeClose(ev: { code?: number; reason?: string }): string {
@@ -1156,5 +1813,30 @@ function entriesOf(value: unknown, what: string): WireEntry[] {
   if (!Array.isArray(value)) {
     throw new ProtocolError("protostate", `${what} came back without a list of entries`);
   }
+  value.forEach((e, i) => {
+    // The same shape a batch entry is held to. A recovery list is read by a
+    // person deciding what to bring back, and a version with no uid or no
+    // path is one they cannot act on and must not be shown as if they could.
+    const row = e as Partial<WireEntry> | null;
+    if (typeof row?.uid !== "number" || !Number.isSafeInteger(row.uid) || row.uid <= 0) {
+      throw new ProtocolError("protostate", `${what}[${i}] has no usable uid`);
+    }
+    if (typeof row.path !== "string" || row.path === "") {
+      throw new ProtocolError("protostate", `${what}[${i}] has no path`);
+    }
+    if (!Array.isArray(row.chunks)) {
+      throw new ProtocolError("protostate", `${what}[${i}] has no chunks list`);
+    }
+    // Every name the shape a chunk name has, before anything is fetched by
+    // it (C32). A `get` is held to this already; a recovery list was not.
+    for (const name of row.chunks) {
+      if (typeof name !== "string" || !/^[0-9a-f]{64}$/.test(name)) {
+        throw new ProtocolError(
+          "protostate",
+          `${what}[${i}] names ${JSON.stringify(name)}, which is not a chunk name`,
+        );
+      }
+    }
+  });
   return value as WireEntry[];
 }

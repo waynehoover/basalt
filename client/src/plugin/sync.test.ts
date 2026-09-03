@@ -16,6 +16,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "../core/client.ts";
 import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
+import { MemoryIndexStore, MemoryVault } from "../core/vault.ts";
 import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
@@ -317,4 +318,142 @@ describe("how soon the other device sees it", () => {
     }
     expect(b.text("live.md")).toBe(text);
   }, 60_000);
+});
+
+/** Obsidian's index does not hold dot-prefixed files or folders; model that. */
+class HidingIndex extends FakeVaultIndex {
+  override getAllLoadedFiles() {
+    return super
+      .getAllLoadedFiles()
+      .filter((f) => !f.path.split("/").some((p) => p.startsWith(".")));
+  }
+}
+
+/**
+ * P2 in TODO.md. The plugin's listing comes from Obsidian's index, which
+ * omits every dot-prefixed path, and the filter on the way in refused only
+ * five names. A peer's `.gitignore` was written here, never listed, reported
+ * deleted on the next pass, and the peer trashed its only copy.
+ */
+describe("a dotfile a headless peer holds (P2)", () => {
+  it("is neither written here nor deleted there", async () => {
+    await fresh();
+    // The headless client lists everything the way NodeVault does.
+    const cliVault = new MemoryVault();
+    await cliVault.edit(".gitignore", "node_modules\n");
+    await cliVault.edit("note.md", "hello\n");
+    const cli = new Client({
+      vault: cliVault,
+      store: new MemoryIndexStore(),
+      keys,
+      url: server.wsUrl,
+      ...server.credentials(authToken(keys)),
+      vaultId: "default",
+      device: "cli",
+      timeoutMs: 20_000,
+      coalesceWrites: false,
+    });
+    await cli.connect();
+
+    const adapter = new FakeAdapter();
+    const plugin = new Client({
+      vault: new ObsidianVault(asVault(new HidingIndex(adapter)), ".obsidian"),
+      store: new ObsidianIndexStore(adapter, ".obsidian/plugins/basalt/index.json"),
+      keys,
+      url: server.wsUrl,
+      ...server.credentials(authToken(keys)),
+      vaultId: "default",
+      device: "phone",
+      timeoutMs: 20_000,
+      coalesceWrites: false,
+    });
+    await plugin.connect();
+    try {
+      for (let i = 0; i < 5; i++) {
+        await cli.settle();
+        await new Promise((r) => setTimeout(r, 60));
+        await plugin.settle();
+        await new Promise((r) => setTimeout(r, 60));
+      }
+      // Rule 10: the property is that the peer keeps its file and this side
+      // never held it, not that the two agree.
+      expect(cliVault.text(".gitignore"), "the peer lost its dotfile").toBe("node_modules\n");
+      expect(
+        adapter.text(".gitignore"),
+        "the plugin wrote a path it can never list",
+      ).toBeUndefined();
+      expect(adapter.text("note.md")).toBe("hello\n");
+    } finally {
+      await cli.close();
+      await plugin.close();
+    }
+  }, 120_000);
+});
+
+/**
+ * Two devices that were both left called the same thing, conflicting.
+ *
+ * The conflict copy carries the device name, so two devices with one name
+ * produce two copies wanting one filename. `firstFreeName` numbers the second,
+ * and the property that matters is that both edits survive under distinct
+ * names, whatever they are called.
+ */
+describe("two devices with the same name (device-name collision)", () => {
+  it("keep both edits under distinct conflict copies", async () => {
+    await fresh();
+    const a = await device("laptop");
+    const b = await device("laptop");
+    a.adapter.seed("note.md", "# Note\n\nThe original sentence.\n");
+    await converge(a, b);
+
+    a.adapter.seed("note.md", "# Note\n\nA's completely different sentence.\n", 2_000_000);
+    b.adapter.seed("note.md", "# Note\n\nB's entirely other sentence.\n", 2_000_000);
+    await converge(a, b, 6);
+
+    for (const d of [a, b]) {
+      const copies = d.notes().filter((p) => p.includes("Conflicted copy"));
+      expect(copies.length, `${d.name} has ${JSON.stringify(d.notes())}`).toBeGreaterThan(0);
+      expect(new Set(copies).size).toBe(copies.length);
+      const all = d
+        .notes()
+        .map((p) => d.text(p))
+        .join("\n---\n");
+      expect(all, `${d.name} lost A's version`).toContain("A's completely different sentence");
+      expect(all, `${d.name} lost B's version`).toContain("B's entirely other sentence");
+    }
+  }, 300_000);
+});
+
+/**
+ * C17 in TODO.md, through the plugin's adapter. A restore chose its name with
+ * `exists` and then wrote with a replacing write, so a file appearing in the
+ * gap was replaced by the restore.
+ */
+describe("a restore whose name is taken in the gap (C17)", () => {
+  it("goes under the next free name rather than over what appeared", async () => {
+    await fresh();
+    const a = await device("a");
+    a.adapter.seed("note.md", "first\n");
+    await a.client.settle();
+    a.adapter.seed("note.md", "second\n", 2_000_000);
+    await a.client.settle();
+
+    const versions = await a.client.history("note.md", { limit: 10 });
+    const oldest = versions[versions.length - 1]!;
+    // Somebody writes the very name the restore is about to claim.
+    const raced: string[] = [];
+    a.adapter.fault = (op, _path, to) => {
+      if (op === "rename" && to !== undefined && to.includes("(restored") && raced.length === 0) {
+        raced.push(to);
+        a.adapter.seed(to, `somebody else's ${to}\n`);
+      }
+      return undefined;
+    };
+    const { path } = await a.client.restore(oldest);
+    expect(raced.length).toBeGreaterThan(0);
+    for (const taken of raced) expect(a.text(taken)).toBe(`somebody else's ${taken}\n`);
+    expect(path).not.toBe(raced[0]);
+    expect(a.text(path)).toBe("first\n");
+    expect(a.text("note.md")).toBe("second\n");
+  }, 300_000);
 });

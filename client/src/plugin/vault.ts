@@ -17,7 +17,7 @@
  * is the mapping onto Obsidian's API, and it will stay untested until the plugin
  * shell runs in a real vault.
  *
- * docs/philosophy.md says to verify against the artifact and never infer. The
+ * docs/design.md says to verify against the artifact and never infer. The
  * signatures used here were read out of `obsidian.d.ts` rather than remembered,
  * and `fake.ts` beside this file implements that interface so everything below
  * can actually be run.
@@ -42,6 +42,19 @@
  * What is below keeps one keyspace. Everything the engine sees is normalized,
  * and where the adapter's own name for a file differs, that mapping is kept so
  * reads and writes still land on the real file.
+ *
+ * ## What the adapter's own writes are
+ *
+ * Also read out of the shipped bundle (`obsidian-1.13.7.asar`), because the
+ * declarations do not say. `FileSystemAdapter.write` and `writeBinary` are
+ * `fs.promises.writeFile` on the destination itself: the file is opened with
+ * truncation and then written, so a full disk or a process killed between the
+ * two leaves a note empty or short with no copy of what it held. And
+ * `FileSystemAdapter.rename` throws "Destination file already exists!" when the
+ * target exists, unless the two names differ only by case on a filesystem that
+ * folds it; the Capacitor adapter hands `rename` to the platform plugin, whose
+ * answer differs by operating system. So there is no replace-by-rename through
+ * this API, and `replace` below says what is done instead.
  */
 
 import {
@@ -51,22 +64,8 @@ import {
   type Vault as ObsidianVaultApi,
 } from "obsidian";
 
+import { configFolderName, isNeverSynced } from "../core/paths.ts";
 import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
-
-/**
- * Names never synced, whatever the vault is configured to call things.
- *
- * `.trash` because a deletion arriving from another device is moved there, and
- * syncing it back would undo the deletion on every other device in turn.
- *
- * Obsidian's config folder is *not* in here, and that is deliberate: it is
- * `.obsidian` in almost every vault and the API says plainly that it could be
- * something else. Hardcoding the usual name would mean a vault with a custom one
- * uploaded the plugin's own folder, and that folder holds `data.json`, and
- * `data.json` holds the root secret. So the real name is passed in and there is
- * no default.
- */
-const NEVER_SYNC = new Set([".basalt", ".trash", ".git", ".DS_Store"]);
 
 /**
  * A file's size and times, or undefined when the thing is a folder.
@@ -78,6 +77,144 @@ const NEVER_SYNC = new Set([".basalt", ".trash", ".git", ".DS_Store"]);
 function statOf(item: TAbstractFile): { mtime: number; ctime: number; size: number } | undefined {
   const stat = (item as { stat?: { mtime: number; ctime: number; size: number } }).stat;
   return stat && typeof stat.size === "number" ? stat : undefined;
+}
+
+/**
+ * The name every staging copy carries, so one can be told from a file of the
+ * user's. Reserved: nothing else in a vault is expected to start with it.
+ */
+const STAGING_MARK = ".basalt-tmp-";
+
+/**
+ * Where a staged copy of `path` goes: beside it, under a name nothing syncs.
+ *
+ * Dot-prefixed, so `isNeverSynced` keeps it out of every listing and
+ * Obsidian's own index never shows it as a note. Beside the destination
+ * rather than in one folder, so the rename that lands it never crosses a
+ * mount and the copy a failure leaves behind is next to the note it was for.
+ *
+ * With a random part, and looked for before use. A fixed name was a name a
+ * person could have given a real dotfile, which the listing never shows and
+ * a sync of the note beside it would have overwritten without a word.
+ */
+function stagingPath(normalized: string, nonce: string): string {
+  const cut = normalized.lastIndexOf("/");
+  const dir = cut === -1 ? "" : normalized.slice(0, cut + 1);
+  const name = cut === -1 ? normalized : normalized.slice(cut + 1);
+  return `${dir}${STAGING_MARK}${nonce}-${name}`;
+}
+
+/** A staging name beside `normalized` that nothing occupies. */
+async function freeStagingPath(adapter: Writer, normalized: string): Promise<string> {
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const candidate = stagingPath(normalized, nonce());
+    if (!(await adapter.exists(candidate))) return candidate;
+  }
+  throw new Error(`cannot find a free staging name beside ${normalized}`);
+}
+
+function nonce(): string {
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Writes and reads, minus the paths: what staging needs from an adapter. */
+type Writer = Pick<
+  DataAdapter,
+  "writeBinary" | "readBinary" | "stat" | "exists" | "rename" | "remove"
+>;
+
+/**
+ * Puts a staged copy of `bytes` at `temp` and proves it is all there.
+ *
+ * A failure leaves nothing behind: a short or refused staging copy is removed
+ * before the error travels, because a temp that nothing will look at again is
+ * clutter and a temp somebody might mistake for the note is worse.
+ */
+async function stage(
+  adapter: Writer,
+  temp: string,
+  bytes: Uint8Array,
+  options: { mtime?: number; ctime?: number },
+): Promise<void> {
+  try {
+    await adapter.writeBinary(temp, bytes.slice().buffer, options);
+    await verify(adapter, temp, bytes);
+  } catch (err) {
+    await adapter.remove(temp).catch(() => undefined);
+    throw err;
+  }
+}
+
+/**
+ * Reads back what was written, or says how it differs. Rule 4.
+ *
+ * Every byte, whatever the size. A first version trusted the length alone
+ * above a few megabytes to spare a phone a second copy of a large attachment,
+ * and a staged copy of the right length with the wrong bytes would have been
+ * renamed into place and become the note. The memory is a moment; the
+ * corruption would have been for good.
+ */
+async function verify(adapter: Writer, path: string, bytes: Uint8Array): Promise<void> {
+  const stat = await adapter.stat(path);
+  if (stat === null || stat.type !== "file") {
+    throw new Error(`${path} is not there after writing it`);
+  }
+  if (stat.size !== bytes.length) {
+    throw new Error(`${path} is ${stat.size} bytes after writing ${bytes.length}`);
+  }
+  const back = new Uint8Array(await adapter.readBinary(path));
+  if (back.length !== bytes.length) {
+    throw new Error(`${path} reads back as ${back.length} bytes after writing ${bytes.length}`);
+  }
+  for (let i = 0; i < bytes.length; i++) {
+    if (back[i] !== bytes[i]) {
+      throw new Error(`${path} reads back differently from what was written, at byte ${i}`);
+    }
+  }
+}
+
+/**
+ * What a desktop fsync needs from Node's `fs`, so a test can hand in a fake.
+ *
+ * The shape of `fs.promises.open` and the handle it returns, and nothing
+ * else. Named rather than imported: the plugin bundle may not reference a
+ * `node:` module, because on a phone there is none, and the build test reads
+ * the bundle to make sure.
+ */
+export interface FsyncFs {
+  promises: {
+    open(path: string, flags: string): Promise<{ sync(): Promise<void>; close(): Promise<void> }>;
+  };
+}
+
+/**
+ * Node's `fs`, where Electron provides it, and nothing anywhere else.
+ *
+ * Obsidian's desktop renderer runs with Node integration, so `require` is a
+ * global there and hands over the real module. On a phone there is no such
+ * global, and the answer is undefined. Looked up through `globalThis` rather
+ * than written as `require("fs")`, because the bundler would try to resolve
+ * that and the build test would rightly refuse a bundle that names a Node
+ * module.
+ */
+function electronFs(): FsyncFs | undefined {
+  const req = (globalThis as { require?: (name: string) => unknown }).require;
+  if (typeof req !== "function") return undefined;
+  try {
+    const mod = req("fs") as Partial<FsyncFs> | undefined;
+    return mod?.promises && typeof mod.promises.open === "function" ? (mod as FsyncFs) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The one method a `FileSystemAdapter` has that the Capacitor adapter does not. */
+type DesktopAdapter = DataAdapter & { getFullPath(normalizedPath: string): string };
+
+function isDesktopAdapter(adapter: DataAdapter): adapter is DesktopAdapter {
+  return typeof (adapter as Partial<DesktopAdapter>).getFullPath === "function";
 }
 
 export class ObsidianVault implements Vault {
@@ -93,45 +230,44 @@ export class ObsidianVault implements Vault {
   private readonly actualName = new Map<string, string>();
   private readonly ignore: Set<string>;
   private readonly adapter: DataAdapter;
+  private readonly log: (message: string, ...rest: unknown[]) => void;
+
+  /**
+   * What this pass has written and not yet made durable: files, and the
+   * directories whose entries changed under them. Cleared by `flush`.
+   */
+  private readonly unsynced = { files: new Set<string>(), dirs: new Set<string>() };
+  /** Node's fs where there is one; resolved once, on the first flush. */
+  private fsync: FsyncFs | undefined | null = null;
+  private readonly fsOverride: FsyncFs | undefined;
+  private saidNoDirSync = false;
 
   /**
    * @param vault Obsidian's own vault, read for its index of what exists.
    * @param configDir Obsidian's own config folder, from `Vault.configDir`.
    *   Required rather than defaulted, because the default would be right
    *   almost always and catastrophic the rest of the time.
+   * @param log Where a non-fatal oddity is reported, such as a staging copy
+   *   that could not be removed after the note it staged was verified.
    */
   constructor(
     private readonly vault: ObsidianVaultApi,
     configDir: string,
+    log: (message: string, ...rest: unknown[]) => void = () => undefined,
+    /** A stand-in for Node's fs, for tests. Never set in the plugin. */
+    opts: { fs?: FsyncFs } = {},
   ) {
     this.adapter = vault.adapter;
-    const name = configDir.replace(/^\/+|\/+$/g, "");
-    if (name === "" || name.includes("/")) {
-      // Obsidian's config dir is a single folder at the vault root. If it
-      // were ever anything else, silently ignoring the wrong thing is how
-      // the root secret gets uploaded.
-      throw new Error(
-        `refusing to sync: the config folder ${JSON.stringify(configDir)} is not a plain name`,
-      );
-    }
-    this.ignore = new Set([...NEVER_SYNC, name]);
+    this.log = log;
+    this.fsOverride = opts.fs;
+    // Obsidian's config folder is *not* assumed to be `.obsidian`: the API
+    // says plainly that it could be something else, and that folder holds
+    // this plugin's `data.json`, which holds the root secret. So the real
+    // name is passed in, and it is the one thing added to the rule in
+    // core/paths.ts, which already covers every dot-prefixed name.
+    this.ignore = new Set([configFolderName(configDir)]);
   }
 
-  /**
-   * Everything in the vault, from Obsidian's own index.
-   *
-   * `getAllLoadedFiles` returns what the application already has in memory,
-   * with each file's size and times attached. The alternative, and what this
-   * did first, was to walk `adapter.list` and `stat` every file. That is one
-   * call per file per pass through the adapter, which on a desktop is merely
-   * wasteful and on a phone is the difference between a scan you do not
-   * notice and one you do. The walk is gone; nothing is read that Obsidian
-   * has not already read.
-   *
-   * A folder is told from a file structurally, by whether it carries a
-   * `stat`, rather than by `instanceof`. Class identity across a plugin
-   * boundary is a thing that works until a build changes.
-   */
   /**
    * The file in blocks, without `DataAdapter` having a streaming read.
    *
@@ -201,6 +337,15 @@ export class ObsidianVault implements Vault {
     if (got.length > end - start) {
       throw new Error(`this vault does not honour ranged reads, so ${path} cannot be streamed`);
     }
+    // And a short answer is not the range either. A file cut down between
+    // being scanned and being fetched used to hand back what was left, which
+    // was sealed as the chunk it no longer was and refused much later, by
+    // name, with nothing pointing back here. Rule 4.
+    if (got.length < end - start) {
+      throw new Error(
+        `${path} answered ${got.length} bytes for a read of ${end - start} at ${start}; it has changed since it was scanned`,
+      );
+    }
     return got;
   }
 
@@ -209,14 +354,46 @@ export class ObsidianVault implements Vault {
     return this.vault.adapter.getResourcePath(this.resolve(path));
   }
 
+  /**
+   * Everything in the vault, from Obsidian's own index.
+   *
+   * `getAllLoadedFiles` returns what the application already has in memory,
+   * with each file's size and times attached. The alternative, and what this
+   * did first, was to walk `adapter.list` and `stat` every file. That is one
+   * call per file per pass through the adapter, which on a desktop is merely
+   * wasteful and on a phone is the difference between a scan you do not
+   * notice and one you do. The walk is gone; nothing is read that Obsidian
+   * has not already read.
+   *
+   * A folder is told from a file structurally, by whether it carries a
+   * `stat`, rather than by `instanceof`. Class identity across a plugin
+   * boundary is a thing that works until a build changes.
+   *
+   * Two raw names that normalize to one path are refused, by name. The map
+   * used to let the second one win, so one of two real files was read and
+   * written under the other's name and recorded as synced, and the next scan
+   * called the loser deleted. Nothing syncs until somebody renames one,
+   * which is the only outcome that does not lose a note.
+   */
   async list(): Promise<FileStat[]> {
     const out: FileStat[] = [];
     this.actualName.clear();
+    const seen = new Map<string, string>();
+    const items = this.vault.getAllLoadedFiles();
+    await this.probeCase(items);
 
-    for (const item of this.vault.getAllLoadedFiles()) {
+    for (const item of items) {
       const raw = trimLeadingSlash(item.path);
       if (raw === "" || raw === "/") continue; // the vault root itself
       const path = this.register(raw);
+      const other = seen.get(path);
+      if (other !== undefined && other !== raw) {
+        throw new Error(
+          `two files in this vault are the same path once normalized, ${JSON.stringify(other)} and ` +
+            `${JSON.stringify(raw)}, and only one of them can sync. Rename one of them.`,
+        );
+      }
+      seen.set(path, raw);
       if (this.ignored(path)) continue;
 
       const stat = statOf(item);
@@ -244,6 +421,49 @@ export class ObsidianVault implements Vault {
     const normalized = normalizePath(raw);
     if (normalized !== raw) this.actualName.set(normalized, raw);
     return normalized;
+  }
+
+  /**
+   * What the disk files a path under, so two paths that are one file here can
+   * be told from two files.
+   *
+   * `normalizePath` first, because that is the keyspace everything else here
+   * uses and it already folds NFC and Obsidian's no-break spaces. Case is
+   * folded only where the adapter has been seen to fold it, and until it has
+   * been asked the answer is that it does, which refuses two files where one
+   * would have done rather than the reverse.
+   */
+  canonical(path: string): string {
+    const normalized = normalizePath(path);
+    return this.foldsCase ? normalized.toLowerCase() : normalized;
+  }
+
+  private foldsCase = true;
+  private probed = false;
+
+  /**
+   * Asks the adapter whether it folds case, once, without writing anything.
+   *
+   * `exists` on a folding filesystem answers yes for a spelling that differs
+   * from the real one only by case, and no on one that does not. So the
+   * first file in the index with a letter in it is asked about under a
+   * flipped spelling, provided nothing is really spelled that way. Obsidian
+   * itself knows the answer but does not expose it.
+   */
+  private async probeCase(items: TAbstractFile[]): Promise<void> {
+    if (this.probed) return;
+    const paths = new Set(items.map((i) => trimLeadingSlash(i.path)));
+    for (const item of items) {
+      if (statOf(item) === undefined) continue;
+      const raw = trimLeadingSlash(item.path);
+      const flipped = flipCase(raw);
+      if (flipped === raw) continue;
+      // Both spellings in the index is the answer already: a filesystem that
+      // folded case could not hold them both.
+      this.foldsCase = paths.has(flipped) ? false : await this.adapter.exists(flipped);
+      this.probed = true;
+      return;
+    }
   }
 
   /**
@@ -276,17 +496,21 @@ export class ObsidianVault implements Vault {
     // folder that means `main.js` of an installed plugin, which Obsidian
     // executes on the next reload, and this plugin's own `data.json`.
     if (this.ignored(normalized)) {
-      throw new Error(`refusing to write inside a folder that is never synced: ${path}`);
+      throw neverSync(`refusing to write inside a folder that is never synced: ${path}`);
     }
     return this.actualName.get(normalized) ?? normalized;
   }
 
-  /** Whether any part of a path is a name that never syncs. */
+  /**
+   * Whether any part of a path is a name that never syncs.
+   *
+   * The shared rule, so both shells and both directions agree. Obsidian's
+   * index omits every dot-prefixed path, so the listing here could never
+   * name one; a filter on the way in that refused only five names accepted
+   * the rest, and a file written and never listed is reported deleted.
+   */
   private ignored(path: string): boolean {
-    for (const part of path.split("/")) {
-      if (this.ignore.has(part)) return true;
-    }
-    return false;
+    return isNeverSynced(path, this.ignore);
   }
 
   async read(path: string): Promise<Uint8Array> {
@@ -304,11 +528,184 @@ export class ObsidianVault implements Vault {
     // Copied into its own buffer. A Uint8Array that is a view into a larger
     // one would hand over neighbouring bytes, and chunk reassembly produces
     // exactly that kind of view.
-    const buffer = bytes.slice().buffer;
-    await this.adapter.writeBinary(normalized, buffer, {
-      ...(times.mtime > 0 ? { mtime: times.mtime } : {}),
-      ...(times.ctime > 0 ? { ctime: times.ctime } : {}),
-    });
+    await this.replace(normalized, bytes.slice(), writeOptions(times));
+    this.wrote(normalized);
+  }
+
+  /** Remembers a file whose bytes or name changed, for `flush`. */
+  private wrote(normalized: string): void {
+    this.unsynced.files.add(normalized);
+    const cut = normalized.lastIndexOf("/");
+    this.unsynced.dirs.add(cut === -1 ? "" : normalized.slice(0, cut));
+  }
+
+  /**
+   * Makes this pass's writes durable, on desktop.
+   *
+   * The engine calls this before it saves the index, so the index is never
+   * durable ahead of the notes it names (rule 3, in the form the header of
+   * core/vault.ts gives it). `DataAdapter` has no way to ask for this, so
+   * for a long time the plugin's answer was nothing at all and the ordering
+   * the engine relies on held only by luck (P25).
+   *
+   * On desktop the adapter is Electron's `FileSystemAdapter`, the vault is
+   * a real directory, and Node's fs is a `require` away: every file written
+   * this pass is opened and fsynced, and so is every directory whose
+   * entries changed, because a rename or a create is durable only once its
+   * directory is. On a phone the adapter is Capacitor's, there is no fs to
+   * reach, and this does nothing: durability there is whatever the platform
+   * gives the adapter's own writes, which docs/plugin.md calls best effort.
+   *
+   * A directory that cannot be opened for syncing is logged once and not
+   * raised. Windows refuses it, and a note that is itself synced with its
+   * directory entry pending is a far better state than a pass that cannot
+   * finish.
+   */
+  async flush(): Promise<void> {
+    const files = [...this.unsynced.files];
+    const dirs = [...this.unsynced.dirs];
+    this.unsynced.files.clear();
+    this.unsynced.dirs.clear();
+    if (this.fsync === null) {
+      this.fsync = this.fsOverride ?? (isDesktopAdapter(this.adapter) ? electronFs() : undefined);
+    }
+    const fs = this.fsync;
+    if (fs === undefined || !isDesktopAdapter(this.adapter)) return;
+    for (const path of files) {
+      const handle = await fs.promises.open(this.adapter.getFullPath(path), "r");
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    }
+    for (const dir of dirs) {
+      try {
+        const handle = await fs.promises.open(this.adapter.getFullPath(dir), "r");
+        try {
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      } catch (err) {
+        if (!this.saidNoDirSync) {
+          this.saidNoDirSync = true;
+          this.log(
+            "this platform will not sync a directory, so a new file's name is durable when the disk says",
+            (err as Error).message,
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Lands bytes at a path without a moment in which the note is half written
+   * and nowhere complete.
+   *
+   * The adapter's own write truncates the destination and then fills it (see
+   * the header), so a failure in between used to leave the note empty with
+   * no copy of what it held or of what was arriving. Now the bytes go to a
+   * staged copy beside the destination first and are read back from it.
+   *
+   * Onto a path with nothing at it, the staged copy is renamed into place,
+   * which the desktop adapter does atomically. Onto an occupied path it
+   * cannot be: `rename` refuses an existing destination, verified in the
+   * shipped bundle, so the fallback is the adapter's own write in place,
+   * taken only once the staged copy has been proven complete and kept until
+   * the destination has been read back too. The window in which the
+   * destination is short still exists on that path, but for the whole of it
+   * a verified copy of the new bytes sits beside it and the old bytes are the
+   * server's newest version; a failure names the copy so a person can find
+   * it.
+   */
+  private async replace(
+    normalized: string,
+    bytes: Uint8Array,
+    options: { mtime?: number; ctime?: number },
+  ): Promise<void> {
+    const temp = await freeStagingPath(this.adapter, normalized);
+    await stage(this.adapter, temp, bytes, options);
+
+    if (!(await this.adapter.exists(normalized))) {
+      try {
+        await this.adapter.rename(temp, normalized);
+        await verify(this.adapter, normalized, bytes);
+      } catch (err) {
+        await this.adapter.remove(temp).catch(() => undefined);
+        throw err;
+      }
+      return;
+    }
+
+    try {
+      await this.adapter.writeBinary(normalized, bytes.slice().buffer, options);
+      await verify(this.adapter, normalized, bytes);
+    } catch (err) {
+      // The staged copy stays. It is the only complete copy of the new
+      // version on this device, and the destination may now be short.
+      throw new Error(
+        `writing ${normalized} failed: ${(err as Error).message}. ` +
+          `The complete new content is beside it at ${temp}`,
+      );
+    }
+    await this.discardStaging(temp);
+  }
+
+  /**
+   * Removes a staging copy the destination no longer needs.
+   *
+   * A failure here is logged and not raised. The note is complete and
+   * verified; raising would have the engine write it again next pass, fail
+   * the same cleanup, and go round for ever with a correct file on disk.
+   */
+  private async discardStaging(temp: string): Promise<void> {
+    try {
+      await this.adapter.remove(temp);
+    } catch (err) {
+      this.log(
+        "could not remove a staging copy after the note it staged was verified; it is safe to delete",
+        temp,
+        (err as Error).message,
+      );
+    }
+  }
+
+  /**
+   * Writes a file only if nothing is at the path, and says whether it did.
+   *
+   * The staged copy is renamed into place, and `rename` refusing an occupied
+   * destination is what makes the claim exclusive on desktop. The Capacitor
+   * adapter's answer to an occupied destination is the platform's, so the
+   * path is looked at once more just before the rename to make the gap as
+   * narrow as this API allows, and a refusal is read as "taken" whenever
+   * something is there afterwards.
+   */
+  async create(
+    path: string,
+    bytes: Uint8Array,
+    times: { mtime: number; ctime: number },
+  ): Promise<boolean> {
+    const normalized = this.resolve(path);
+    if (await this.adapter.exists(normalized)) return false;
+    await this.ensureParents(normalized);
+    const temp = await freeStagingPath(this.adapter, normalized);
+    await stage(this.adapter, temp, bytes.slice(), writeOptions(times));
+
+    if (await this.adapter.exists(normalized)) {
+      await this.discardStaging(temp);
+      return false;
+    }
+    try {
+      await this.adapter.rename(temp, normalized);
+    } catch (err) {
+      await this.adapter.remove(temp).catch(() => undefined);
+      if (await this.adapter.exists(normalized)) return false;
+      throw err;
+    }
+    await verify(this.adapter, normalized, bytes);
+    this.wrote(normalized);
+    return true;
   }
 
   /**
@@ -320,6 +717,11 @@ export class ObsidianVault implements Vault {
    * name missing, and the deletion that follows travels to every device. A
    * rename that changed only case lost the note, one pass after it looked
    * fine. Obsidian's own index is asked rather than the platform guessed at.
+   *
+   * A listing that fails fails the write. It used to be skipped, and the
+   * write went ahead under a spelling nothing had checked: the old spelling
+   * stayed on disk, the engine recorded the new one as synced, and the next
+   * scan reported it deleted.
    */
   private async matchCase(normalized: string): Promise<void> {
     if (!(await this.adapter.exists(normalized))) return;
@@ -329,8 +731,10 @@ export class ObsidianVault implements Vault {
     let listed;
     try {
       listed = await this.adapter.list(dir);
-    } catch {
-      return;
+    } catch (err) {
+      throw new Error(
+        `cannot check how ${normalized} is spelled on disk, so it was not written: ${(err as Error).message}`,
+      );
     }
     if (listed.files.includes(normalized)) return; // Already spelled this way.
 
@@ -397,6 +801,9 @@ export class ObsidianVault implements Vault {
     if (await this.adapter.exists(normalized)) return;
     await this.ensureParents(normalized);
     await this.adapter.mkdir(normalized);
+    // A new directory is an entry in its parent, durable when the parent is.
+    const cut = normalized.lastIndexOf("/");
+    this.unsynced.dirs.add(cut === -1 ? "" : normalized.slice(0, cut));
   }
 
   async exists(path: string): Promise<boolean> {
@@ -418,9 +825,34 @@ export class ObsidianVault implements Vault {
       at = at === "" ? part : `${at}/${part}`;
       if (!(await this.adapter.exists(at))) {
         await this.adapter.mkdir(at);
+        const cut = at.lastIndexOf("/");
+        this.unsynced.dirs.add(cut === -1 ? "" : at.slice(0, cut));
       }
     }
   }
+}
+
+/** The adapter's write options for the times the engine hands over. */
+function writeOptions(times: { mtime: number; ctime: number }): {
+  mtime?: number;
+  ctime?: number;
+} {
+  return {
+    ...(times.mtime > 0 ? { mtime: times.mtime } : {}),
+    ...(times.ctime > 0 ? { ctime: times.ctime } : {}),
+  };
+}
+
+/** The same path with the case of its first cased letter flipped, or itself. */
+function flipCase(path: string): string {
+  for (let i = 0; i < path.length; i++) {
+    const c = path[i]!;
+    const upper = c.toUpperCase();
+    const lower = c.toLowerCase();
+    if (upper === lower) continue;
+    return path.slice(0, i) + (c === upper ? lower : upper) + path.slice(i + 1);
+  }
+  return path;
 }
 
 /**
@@ -429,6 +861,14 @@ export class ObsidianVault implements Vault {
  * Kept out of the vault proper so it never syncs and never appears as a note.
  * Written through the adapter rather than the filesystem, because on mobile
  * there is no filesystem to write to.
+ *
+ * Written the way notes are, staged and read back, because the adapter's write
+ * truncates first. An index cut short by a crash was not valid JSON, and an
+ * index that is not valid JSON stops the plugin on every load (rule 2), so one
+ * bad moment put a vault whose notes were all fine behind a plugin that would
+ * not start. The staged copy is the way back: `load` reads it when the live
+ * file cannot be read, because it is complete and describes a state at least as
+ * new.
  */
 export class ObsidianIndexStore implements IndexStore {
   constructor(
@@ -436,17 +876,51 @@ export class ObsidianIndexStore implements IndexStore {
     private readonly path: string,
   ) {}
 
+  private get live(): string {
+    return normalizePath(this.path);
+  }
+
+  /**
+   * A fixed name, unlike a note's staging copy, because `load` has to find it
+   * after a restart. Inside the plugin's own folder, so nothing of the user's
+   * can be there under that name.
+   */
+  private get temp(): string {
+    return stagingPath(this.live, "index");
+  }
+
   async load(): Promise<StoredState | undefined> {
-    const normalized = normalizePath(this.path);
-    if (!(await this.adapter.exists(normalized))) return undefined;
-    // A read that fails is not an absent index. Rule 2, and the incident it
-    // came from: falling back to an empty result and writing it back
-    // disabled every plugin on a device.
-    const text = await this.adapter.read(normalized);
+    const live = await this.readIndex(this.live);
+    if (live.state !== undefined) {
+      // A staging copy left behind means a save was interrupted after the
+      // live file was complete, or never got as far as touching it. The
+      // live file is complete and parses, so it is the state to start
+      // from; an older index is always safe, because notes are durable
+      // before the index that names them.
+      if (await this.adapter.exists(this.temp)) await this.adapter.remove(this.temp);
+      return live.state;
+    }
+    const staged = await this.readIndex(this.temp);
+    if (staged.state !== undefined) return staged.state;
+    if (live.error !== undefined) {
+      // A read that fails is not an absent index. Rule 2, and the incident
+      // it came from: falling back to an empty result and writing it back
+      // disabled every plugin on a device.
+      throw new Error(`the index at ${this.path} is not valid JSON: ${live.error}`);
+    }
+    return undefined;
+  }
+
+  /** One index file: its state, or the reason it has none. */
+  private async readIndex(
+    path: string,
+  ): Promise<{ state?: StoredState; error?: string; absent?: true }> {
+    if (!(await this.adapter.exists(path))) return { absent: true };
+    const text = await this.adapter.read(path);
     try {
-      return JSON.parse(text) as StoredState;
+      return { state: JSON.parse(text) as StoredState };
     } catch (err) {
-      throw new Error(`the index at ${this.path} is not valid JSON: ${(err as Error).message}`);
+      return { error: (err as Error).message };
     }
   }
 
@@ -470,18 +944,73 @@ export class ObsidianIndexStore implements IndexStore {
   async save(state: StoredState): Promise<void> {
     const text = JSON.stringify(state);
     if (text === this.lastWritten) return;
-    const normalized = normalizePath(this.path);
-    const parts = normalized.split("/");
+    const live = this.live;
+    const parts = live.split("/");
     parts.pop();
     if (parts.length > 0) {
       const dir = parts.join("/");
       if (dir !== "" && !(await this.adapter.exists(dir))) await this.adapter.mkdir(dir);
     }
-    await this.adapter.write(normalized, text);
+
+    const temp = this.temp;
+    const bytes = new TextEncoder().encode(text);
+    await stage(this.adapter, temp, bytes, {});
+    if (!(await this.adapter.exists(live))) {
+      try {
+        await this.adapter.rename(temp, live);
+        await verify(this.adapter, live, bytes);
+      } catch (err) {
+        await this.adapter.remove(temp).catch(() => undefined);
+        throw err;
+      }
+    } else {
+      // In place, because rename refuses an occupied destination (see the
+      // header of this file). The staged copy stays until the live file has
+      // been read back, and stays for good if it never is: `load` finds it.
+      await this.adapter.write(live, text);
+      await verify(this.adapter, live, bytes);
+      // The live index is verified, so a staged copy that will not go is
+      // clutter and not a failure: raising here would have the next pass
+      // write the same index again and fail the same way, for ever. `load`
+      // removes it the next time the plugin starts.
+      await this.adapter.remove(temp).catch(() => undefined);
+    }
     this.lastWritten = text;
+  }
+
+  /**
+   * Removes the index, both copies, and proves they are gone.
+   *
+   * What unlink needs. An index left behind is read by the next pairing as
+   * the truth about a server that has never seen this device, and a staged
+   * copy left behind is read by `load` as the index.
+   */
+  async remove(): Promise<void> {
+    for (const path of [this.live, this.temp]) {
+      if (await this.adapter.exists(path)) await this.adapter.remove(path);
+      if (await this.adapter.exists(path)) {
+        throw new Error(`${path} is still there after removing it`);
+      }
+    }
+    this.lastWritten = undefined;
   }
 }
 
 function trimLeadingSlash(path: string): string {
   return path.startsWith("/") ? path.slice(1) : path;
+}
+
+/**
+ * A refusal to write under a name this shell never syncs, with the code the
+ * engine reads it by.
+ *
+ * The engine classifies a failure by its code and had none for this one, so
+ * an inbound path under a folder this device ignores was filed for retry and
+ * retried on every pass for ever, each time exiting 1 (C29). The code says
+ * it is a fact about the path.
+ */
+function neverSync(message: string): Error {
+  const err = new Error(message) as Error & { code: string };
+  err.code = "neversync";
+  return err;
 }

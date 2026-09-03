@@ -75,6 +75,20 @@ interface FakeFile {
   mtime: number;
 }
 
+/** The adapter operations a test can make fail. */
+export type FaultOp =
+  | "exists"
+  | "stat"
+  | "list"
+  | "read"
+  | "readBinary"
+  | "write"
+  | "writeBinary"
+  | "mkdir"
+  | "remove"
+  | "rename"
+  | "copy";
+
 /**
  * A vault held in memory, behind Obsidian's adapter interface.
  *
@@ -100,15 +114,38 @@ export class FakeAdapter implements DataAdapter {
   /** A clock the test controls, since a fake filesystem has no real one. */
   now = 1_700_000_000_000;
 
+  /**
+   * A fault to inject, asked before every operation.
+   *
+   * Return nothing to let the call through, an Error to fail it before it
+   * touches anything, or a byte count to have a write land that many bytes
+   * and then fail, which is what a full disk or a process killed mid-write
+   * leaves behind. The plugin's staged writes exist for exactly those
+   * moments, and without a way to produce them here they would be untested.
+   */
+  fault: ((op: FaultOp, path: string, to?: string) => Error | number | undefined) | undefined;
+
+  /** Every operation, in order, for a test that cares about sequence. */
+  readonly calls: { op: FaultOp; path: string; to?: string }[] = [];
+
+  private check(op: FaultOp, path: string, to?: string): number | undefined {
+    this.calls.push(to === undefined ? { op, path } : { op, path, to });
+    const fault = this.fault?.(op, path, to);
+    if (fault instanceof Error) throw fault;
+    return typeof fault === "number" ? fault : undefined;
+  }
+
   getName(): string {
     return "fake";
   }
 
   async exists(normalizedPath: string): Promise<boolean> {
+    this.check("exists", normalizedPath);
     return this.files.has(normalizedPath) || this.folders.has(normalizedPath);
   }
 
   async stat(normalizedPath: string): Promise<Stat | null> {
+    this.check("stat", normalizedPath);
     const file = this.files.get(normalizedPath);
     if (file) {
       return { type: "file", ctime: file.ctime, mtime: file.mtime, size: file.binary.length };
@@ -126,6 +163,7 @@ export class FakeAdapter implements DataAdapter {
    * plugin's walk can push a folder straight back onto its queue.
    */
   async list(normalizedPath: string): Promise<ListedFiles> {
+    this.check("list", normalizedPath);
     const prefix = normalizedPath === "/" || normalizedPath === "" ? "" : `${normalizedPath}/`;
     const files: string[] = [];
     const folders: string[] = [];
@@ -140,19 +178,26 @@ export class FakeAdapter implements DataAdapter {
   }
 
   async read(normalizedPath: string): Promise<string> {
-    return new TextDecoder().decode(await this.readBinary(normalizedPath));
+    this.check("read", normalizedPath);
+    return new TextDecoder().decode(this.bytesOf(normalizedPath));
   }
 
   async readBinary(normalizedPath: string): Promise<ArrayBuffer> {
+    this.check("readBinary", normalizedPath);
+    return this.bytesOf(normalizedPath).slice().buffer;
+  }
+
+  private bytesOf(normalizedPath: string): Uint8Array {
     const file = this.files.get(normalizedPath);
     // Obsidian throws for a missing file rather than returning empty, and
     // the difference is rule 2: an unreadable file is not an empty one.
     if (!file) throw new Error(`ENOENT: no such file or directory, open '${normalizedPath}'`);
-    return file.binary.slice().buffer;
+    return file.binary;
   }
 
   async write(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
-    await this.writeBinary(normalizedPath, new TextEncoder().encode(data).slice().buffer, options);
+    const short = this.check("write", normalizedPath);
+    this.store(normalizedPath, new TextEncoder().encode(data), options, short);
   }
 
   async writeBinary(
@@ -160,14 +205,34 @@ export class FakeAdapter implements DataAdapter {
     data: ArrayBuffer,
     options?: DataWriteOptions,
   ): Promise<void> {
+    const short = this.check("writeBinary", normalizedPath);
+    this.store(normalizedPath, new Uint8Array(data.slice(0)), options, short);
+  }
+
+  /**
+   * What Obsidian's own adapters do, read out of the shipped bundle: open
+   * the destination for writing, which truncates it, and then write. A
+   * failure between the two leaves the file short, so an injected short
+   * write lands its prefix before it fails rather than leaving the old
+   * bytes, because leaving them is the outcome the real adapter cannot give.
+   */
+  private store(
+    normalizedPath: string,
+    bytes: Uint8Array,
+    options: DataWriteOptions | undefined,
+    short: number | undefined,
+  ): void {
     // Obsidian creates the parent folder. The plugin does not rely on that
     // and creates them itself, which this does not undo.
     const existing = this.files.get(normalizedPath);
     this.files.set(normalizedPath, {
-      binary: new Uint8Array(data.slice(0)),
+      binary: short === undefined ? bytes.slice() : bytes.slice(0, short),
       ctime: options?.ctime ?? existing?.ctime ?? this.now,
       mtime: options?.mtime ?? this.now,
     });
+    if (short !== undefined) {
+      throw new Error(`ENOSPC: wrote ${short} of ${bytes.length} bytes to '${normalizedPath}'`);
+    }
   }
 
   async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
@@ -203,6 +268,7 @@ export class FakeAdapter implements DataAdapter {
   }
 
   async mkdir(normalizedPath: string): Promise<void> {
+    this.check("mkdir", normalizedPath);
     this.folders.add(normalizedPath);
   }
 
@@ -233,19 +299,57 @@ export class FakeAdapter implements DataAdapter {
   }
 
   async remove(normalizedPath: string): Promise<void> {
+    this.check("remove", normalizedPath);
     this.files.delete(normalizedPath);
     this.folders.delete(normalizedPath);
   }
 
+  /**
+   * Refuses an occupied destination, as the shipped adapter does.
+   *
+   * Read out of `obsidian-1.13.7.asar`: `FileSystemAdapter.rename` checks the
+   * destination and throws "Destination file already exists!" unless the two
+   * names differ only by case on a filesystem that folds it. The first
+   * version of this fake replaced the destination silently, which would have
+   * let a replace-by-rename pass every test here and fail in every vault.
+   *
+   * Folders move with everything under them, because Obsidian reports a
+   * folder rename as one event and the plugin has to handle it as one.
+   */
   async rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
+    this.check("rename", normalizedPath, normalizedNewPath);
+    if (normalizedPath === normalizedNewPath) return;
+    if (this.files.has(normalizedNewPath) || this.folders.has(normalizedNewPath)) {
+      throw new Error("Destination file already exists!");
+    }
     const file = this.files.get(normalizedPath);
     if (file) {
       this.files.delete(normalizedPath);
       this.files.set(normalizedNewPath, file);
+      return;
+    }
+    if (!this.folders.has(normalizedPath)) {
+      throw new Error(`ENOENT: no such file or directory, rename '${normalizedPath}'`);
+    }
+    this.folders.delete(normalizedPath);
+    this.folders.add(normalizedNewPath);
+    const under = `${normalizedPath}/`;
+    for (const path of [...this.folders]) {
+      if (path.startsWith(under)) {
+        this.folders.delete(path);
+        this.folders.add(normalizedNewPath + path.slice(normalizedPath.length));
+      }
+    }
+    for (const [path, f] of [...this.files]) {
+      if (path.startsWith(under)) {
+        this.files.delete(path);
+        this.files.set(normalizedNewPath + path.slice(normalizedPath.length), f);
+      }
     }
   }
 
   async copy(normalizedPath: string, normalizedNewPath: string): Promise<void> {
+    this.check("copy", normalizedPath, normalizedNewPath);
     const file = this.files.get(normalizedPath);
     if (file) this.files.set(normalizedNewPath, { ...file, binary: file.binary.slice() });
   }

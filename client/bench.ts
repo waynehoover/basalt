@@ -182,7 +182,7 @@ const NAME_ON_THE_WIRE = 67;
  * A sealed path, the meta object, and the authenticator, with no chunks.
  *
  * Checked against the two entries measured on the real wire in
- * `docs/benchmark.md`: 356 + 67 is the 423 B of a one-chunk note, and
+ * `docs/compared.md`: 356 + 67 is the 423 B of a one-chunk note, and
  * 356 + 1024 * 67 is the 68964 B of a 1024-chunk attachment.
  */
 const ENTRY_OVERHEAD = 356;

@@ -6,9 +6,16 @@ import {
   base64urlEncode,
   chunkName,
   deriveKeys,
+  deriveSchedule,
   entryIsOurs,
+  generateDataKey,
   generateSecret,
   hex,
+  randomBytes,
+  sealSecret,
+  unsealSecret,
+  unwrapDataKey,
+  wrapDataKey,
   open,
   openChunk,
   macEntry,
@@ -389,11 +396,104 @@ describe("base64url", () => {
 });
 
 describe("generateSecret", () => {
-  it("returns 20 unpredictable bytes", () => {
+  it("returns 32 unpredictable bytes", () => {
     const a = generateSecret();
     const b = generateSecret();
-    expect(a.length).toBe(20);
+    expect(a.length).toBe(32);
     expect(hex(a)).not.toBe(hex(b));
+  });
+
+  it("still derives keys from a 20-byte secret, which every version 2 vault has", async () => {
+    const k = await deriveKeys(new Uint8Array(20).fill(5));
+    expect(k.auth.length).toBe(32);
+    expect(k.hasDataKey).toBe(false);
+  });
+});
+
+/**
+ * I5 in TODO.md. A vault claimed under protocol 3 seals its content under keys
+ * derived from a data key, which the root only wraps. Two devices holding the
+ * root unwrap the same key and so agree about every sealed path; a device
+ * holding another root cannot open the wrapping, and the failure says so.
+ */
+describe("the data key", () => {
+  it("is unwrapped identically by two devices holding the same root", async () => {
+    const secret = generateSecret();
+    const first = await deriveKeys(secret);
+    const data = generateDataKey();
+    const wrapped = await wrapDataKey(first.wrap, data);
+    expect(wrapped.length).toBeLessThanOrEqual(256);
+
+    const a = await deriveKeys(secret, wrapped);
+    const b = await deriveKeys(secret, wrapped);
+    expect(a.hasDataKey).toBe(true);
+    expect(await sealPath(a, "notes/a.md")).toBe(await sealPath(b, "notes/a.md"));
+    // And the auth key is the root's, unchanged by the data key.
+    expect(hex(a.auth)).toBe(hex(first.auth));
+  });
+
+  it("seals under the data key, not under the root", async () => {
+    const secret = generateSecret();
+    const root = await deriveKeys(secret);
+    const wrapped = await wrapDataKey(root.wrap, generateDataKey());
+    const withData = await deriveKeys(secret, wrapped);
+    expect(await sealPath(withData, "notes/a.md")).not.toBe(await sealPath(root, "notes/a.md"));
+    // The same schedule function, from the data key directly, gives the same keys.
+    const data = await unwrapDataKey(root.wrap, wrapped);
+    const direct = await deriveSchedule(data);
+    expect(await sealPath({ ...withData, ...direct }, "x")).toBe(await sealPath(withData, "x"));
+  });
+
+  it("refuses to unwrap under another root, and says which thing is wrong", async () => {
+    const root = await deriveKeys(generateSecret());
+    const wrapped = await wrapDataKey(root.wrap, generateDataKey());
+    const stranger = await deriveKeys(generateSecret());
+    await expect(unwrapDataKey(stranger.wrap, wrapped)).rejects.toThrow(
+      /not this vault's current secret/,
+    );
+    await expect(deriveKeys(generateSecret(), wrapped)).rejects.toThrow(/current secret/);
+  });
+
+  it("survives a rotation of the root: re-wrapped under a new root, the same key comes out", async () => {
+    const oldSecret = generateSecret();
+    const newSecret = generateSecret();
+    const oldRoot = await deriveKeys(oldSecret);
+    const newRoot = await deriveKeys(newSecret);
+    const data = generateDataKey();
+    const wrapped = await wrapDataKey(oldRoot.wrap, data);
+    const rewrapped = await wrapDataKey(newRoot.wrap, await unwrapDataKey(oldRoot.wrap, wrapped));
+    const before = await deriveKeys(oldSecret, wrapped);
+    const after = await deriveKeys(newSecret, rewrapped);
+    expect(await sealPath(before, "history/stays.md")).toBe(
+      await sealPath(after, "history/stays.md"),
+    );
+    expect(hex(before.auth)).not.toBe(hex(after.auth));
+  });
+});
+
+/**
+ * I21 in TODO.md. An invite seals the root under a key the server never sees.
+ */
+describe("sealing a root for an invite", () => {
+  it("opens under the invite key and under nothing else", async () => {
+    const secret = generateSecret();
+    const key = randomBytes(32);
+    const sealed = await sealSecret(key, secret);
+    expect(sealed.length).toBeLessThanOrEqual(256);
+    expect([...(await unsealSecret(key, sealed))]).toEqual([...secret]);
+    await expect(unsealSecret(randomBytes(32), sealed)).rejects.toThrow(/invite key does not open/);
+  });
+
+  it("seals the same root differently each time, so two invites do not compare equal", async () => {
+    const secret = generateSecret();
+    const key = randomBytes(32);
+    expect(await sealSecret(key, secret)).not.toBe(await sealSecret(key, secret));
+  });
+
+  it("carries a 20-byte root as well as a 32-byte one", async () => {
+    const key = randomBytes(32);
+    const old = new Uint8Array(20).fill(9);
+    expect([...(await unsealSecret(key, await sealSecret(key, old)))]).toEqual([...old]);
   });
 });
 

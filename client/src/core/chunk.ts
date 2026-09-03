@@ -87,7 +87,7 @@ function atBoundary(hash: number, avg: number): boolean {
  * chunking it finely buys nothing but overhead.
  *
  * Every one of these is a constant with its reasoning attached rather than a
- * setting. docs/philosophy.md: a question with a right answer is answered once
+ * setting. docs/design.md: a question with a right answer is answered once
  * in the source.
  */
 export interface ChunkSizes {

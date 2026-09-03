@@ -29,7 +29,7 @@
  * And then the outcome is verified rather than trusted. The flags are the
  * library's claim about its own work; what matters is the property, which is
  * that no local edit vanished. So every insertion the patch was built from is
- * checked to be present in the result. Rule 4 of docs/philosophy.md is about
+ * checked to be present in the result. Rule 4 of docs/design.md is about
  * exactly this distance between an exit code and an outcome, and rule 10 is
  * about asserting the property that matters rather than a proxy for it: a
  * conflict test that asserts two devices *agree* passes while one side's edit

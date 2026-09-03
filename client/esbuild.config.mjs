@@ -8,10 +8,18 @@
  * breaks one of these two builds.
  */
 
-import { copyFile, mkdir } from "node:fs/promises";
+import { copyFile, mkdir, readFile } from "node:fs/promises";
 import { build } from "esbuild";
 
 const production = process.argv.includes("production");
+
+/**
+ * The release, from package.json, written into the headless client so that
+ * `basalt --version` names the file somebody actually installed. Read at build
+ * time rather than at run time, because the single file has no package.json
+ * beside it once it is copied somewhere.
+ */
+const { version } = JSON.parse(await readFile("package.json", "utf8"));
 
 /** The headless client, as one file a person can run. */
 const cli = {
@@ -24,6 +32,7 @@ const cli = {
   // before it will run is one more thing to go wrong on the machine you were
   // trying to make reliable.
   banner: { js: "#!/usr/bin/env node" },
+  define: { __BASALT_VERSION__: JSON.stringify(version) },
 };
 
 /**

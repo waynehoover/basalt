@@ -38,11 +38,12 @@
  *     downloads the winning version over its own text, and its own text is gone.
  *
  * None of the three is caught by asserting that two devices agree, which is
- * rule 10 of docs/philosophy.md in its natural habitat.
+ * rule 10 of docs/design.md in its natural habitat.
  */
 
 import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
 import {
+  deriveKeys,
   entryIsOurs,
   macEntry,
   openChunk,
@@ -69,11 +70,17 @@ import {
 } from "./index-state.ts";
 import {
   MAX_BATCH_ENTRIES,
+  MAX_FETCH_NAMES,
+  encodedEntryBytes,
+  entryBudget,
+  PUTMANY_FRAME_OVERHEAD,
   type BatchEntry,
   type ServerLimits,
   type Transport,
   type WireEntry,
 } from "./transport.ts";
+import { validateStoredState } from "./stored-state.ts";
+import { isNeverSynced } from "./paths.ts";
 import { parents, type IndexStore, type Vault } from "./vault.ts";
 
 /**
@@ -165,6 +172,12 @@ export const OWN_LIMITS = {
   perFileMax: 1 << 28,
   /** 65536, the most chunks any server records for one entry. */
   maxChunks: 1 << 16,
+  /** 16 MiB, the largest batched write any server takes, encoded or as summed budget. */
+  maxBatchBytes: 16 << 20,
+  /** 64 MiB, the most body bytes any server serves for one fetch. */
+  maxFetchBytes: 64 << 20,
+  /** 1 MiB, the largest sealed chunk any server stores. */
+  chunkMax: 1 << 20,
 } as const;
 
 /** The tighter of what the server asks for and what this device allows. */
@@ -219,13 +232,39 @@ export function chunkNamesOf(id: string): string[] {
 export interface EngineOptions {
   readonly vault: Vault;
   readonly store: IndexStore;
+  /**
+   * The keys derived from the root secret alone.
+   *
+   * What the engine starts with, and what it keeps for a vault claimed under
+   * protocol 2. For a vault with a data key the content keys are replaced
+   * after `ready`, from `secret` and the wrapped key the server returns, and
+   * these are used only for the handshake.
+   */
   readonly keys: VaultKeys;
+  /**
+   * The root secret, for unwrapping the data key `ready` returns.
+   *
+   * Optional only for a caller that knows the vault has no data key, which
+   * is a test; a shell always passes it, because whether the vault has one is
+   * the server's to say and the engine has to be able to answer either way.
+   */
+  readonly secret?: Uint8Array;
   readonly transport: Transport;
   readonly device: string;
   readonly vaultId: string;
   readonly token: string;
   /** The auth key to bind the vault to, if it has not been claimed yet. */
   readonly claim?: string;
+  /**
+   * A fresh data key wrapped under this device's root, offered with `claim`.
+   *
+   * Stored by the server only if this device's claim is the one that binds
+   * the vault, and ignored otherwise, exactly like `claim`. The engine never
+   * uses this copy: the key it seals under is the one `ready` returns, so a
+   * claim that committed with a reply lost still leaves every device on the
+   * same key.
+   */
+  readonly wrapped?: string;
   readonly now?: () => number;
   readonly log?: (message: string, ...rest: unknown[]) => void;
   /**
@@ -234,7 +273,7 @@ export interface EngineOptions {
    * Sending a large attachment is minutes of one await inside one pass, and
    * without this a shell has nothing to say for the whole of it: the status
    * it shows is the result of the *previous* pass, so working and idle look
-   * exactly alike. That is rule 7 of docs/philosophy.md, two conditions that
+   * exactly alike. That is rule 7 of docs/design.md, two conditions that
    * must be told apart collapsed into one.
    *
    * A path rather than a percentage. What somebody wants to know is whether
@@ -270,7 +309,7 @@ export interface SyncOptions {
  * What a sync did.
  *
  * Counted separately rather than summed, because rule 7 of
- * docs/philosophy.md is that a status which cannot distinguish the cases it
+ * docs/design.md is that a status which cannot distinguish the cases it
  * collapses is not a status. "12 files synced" hides whether anything conflicted.
  */
 export interface SyncReport {
@@ -287,7 +326,7 @@ export interface SyncReport {
    * Files held back by the write debounce, which will go on the next pass.
    *
    * Its own counter rather than folded into `unchanged`, because rule 7 of
-   * docs/philosophy.md is that a status collapsing cases it should distinguish
+   * docs/design.md is that a status collapsing cases it should distinguish
    * is not a status. "unchanged" for a file the user saved four seconds ago is
    * the exact lie that rule is about.
    */
@@ -376,6 +415,13 @@ export class Engine {
   private readonly skipped = new Map<string, { why: string; fingerprint: string }>();
 
   /**
+   * Paths from other devices this one will not act on, and why. Counted as
+   * skipped in every report, since a person may want to know, and never
+   * retried, since nothing about them changes by waiting.
+   */
+  private readonly refusedInbound = new Map<string, string>();
+
+  /**
    * Paths a file is standing in the way of, as of the last pass.
    *
    * Not written off, only noted: the condition belongs to the vault rather
@@ -383,6 +429,8 @@ export class Engine {
    * the file. Kept only so that the same complaint is not logged every pass.
    */
   private blocked = new Set<string>();
+  /** The blocked set being built by the pass in progress. */
+  private nowBlocked = new Set<string>();
 
   /**
    * Set once a vault that advertised streaming failed at it. See `streamScan`:
@@ -394,6 +442,9 @@ export class Engine {
   /** Writes waiting to go up together, and what they will cost to hold. */
   private outbox: Queued[] = [];
   private outboxBytes = 0;
+  /** And what they cost against the server's two batch caps. */
+  private outboxBudget = 0;
+  private outboxFrame = 0;
 
   /** Versions waiting to come down together, and what they will cost to hold. */
   private inbox: Incoming[] = [];
@@ -419,12 +470,42 @@ export class Engine {
   /** Sealed path to plaintext, so a path is unsealed once per session. */
   private readonly unsealed = new Map<string, string>();
 
+  /**
+   * The keys in use: the root's until `ready`, and the data key's after it
+   * when the vault has one. Everything that seals or opens goes through here
+   * rather than `opts.keys`, so the swap reaches every use.
+   */
+  private keys: VaultKeys;
+  /**
+   * Settled once `keys` is final, which is after `ready` has said whether
+   * the vault has a data key. The first batch can arrive in the same
+   * moment, and a batch opened under the wrong schedule fails its
+   * authenticator and ends the session, so `acceptBatch` waits here.
+   */
+  private readonly keysReady: Promise<void>;
+  private settleKeys!: () => void;
+  private failKeys!: (err: Error) => void;
+
   private cursor = 0;
   private syncing = false;
   private again = false;
   private started = false;
 
-  constructor(private readonly opts: EngineOptions) {}
+  constructor(private readonly opts: EngineOptions) {
+    this.keys = opts.keys;
+    this.keysReady = new Promise<void>((resolve, reject) => {
+      this.settleKeys = resolve;
+      this.failKeys = reject;
+    });
+    // Awaited by acceptBatch and by nothing before start; a start that
+    // never happens must not surface as an unhandled rejection.
+    this.keysReady.catch(() => {});
+  }
+
+  /** The keys in use, which a shell needs to seal a path for recovery. */
+  get vaultKeys(): VaultKeys {
+    return this.keys;
+  }
 
   private now(): number {
     return this.opts.now?.() ?? Date.now();
@@ -463,6 +544,8 @@ export class Engine {
     retrying: number;
     skipped: number;
     syncing: boolean;
+    /** How many sealed paths are cached, which prune keeps to what is referred to. */
+    cachedPaths: number;
   } {
     let files = 0;
     for (const e of this.entries.values()) if (!e.folder) files++;
@@ -471,8 +554,9 @@ export class Engine {
       files,
       pending: this.pending.size,
       retrying: this.retries.size,
-      skipped: this.skipped.size,
+      skipped: this.skipped.size + this.refusedInbound.size,
       syncing: this.syncing,
+      cachedPaths: this.unsealed.size,
     };
   }
 
@@ -487,7 +571,10 @@ export class Engine {
     if (this.started) throw new Error("already started");
     this.started = true;
 
-    const stored = await this.opts.store.load();
+    // Checked in full before any of it becomes state. See stored-state.ts:
+    // a store hands back whatever it parsed, and the casts below used to be
+    // the only thing between a corrupt file and a wrong decision.
+    const stored = validateStoredState(await this.opts.store.load());
     if (stored) {
       this.cursor = stored.cursor;
       for (const [path, raw] of Object.entries(stored.entries)) {
@@ -504,20 +591,40 @@ export class Engine {
       });
     }
 
-    const limits = await this.opts.transport.hello({
-      vault: this.opts.vaultId,
-      token: this.opts.token,
-      device: this.opts.device,
-      cursor: this.cursor,
-      ...(this.opts.claim !== undefined ? { claim: this.opts.claim } : {}),
-    });
-    // The docs present the client-ahead case as what catches a server
-    // restored from an old backup or pointed at the wrong vault, and the
-    // refusal lived only in the server, so it was missing exactly when it
-    // was needed. A server behind this device would answer no batches, and
-    // the status line reported `behind` clamped at zero, so it looked like
-    // being up to date.
-    refuseIfBehind(limits.cursor, this.cursor);
+    let limits: ServerLimits;
+    try {
+      limits = await this.opts.transport.hello({
+        vault: this.opts.vaultId,
+        token: this.opts.token,
+        device: this.opts.device,
+        cursor: this.cursor,
+        ...(this.opts.claim !== undefined ? { claim: this.opts.claim } : {}),
+        ...(this.opts.wrapped !== undefined ? { wrapped: this.opts.wrapped } : {}),
+      });
+      // The docs present the client-ahead case as what catches a server
+      // restored from an old backup or pointed at the wrong vault, and the
+      // refusal lived only in the server, so it was missing exactly when it
+      // was needed. A server behind this device would answer no batches, and
+      // the status line reported `behind` clamped at zero, so it looked like
+      // being up to date.
+      refuseIfBehind(limits.cursor, this.cursor);
+      // Which key schedule this vault uses, decided by the server's answer
+      // and never by the pairing string: a vault with a data key seals
+      // everything under keys derived from it, and this device has to derive
+      // the same ones before it opens the first path a batch names.
+      if (limits.wrapped !== undefined) {
+        if (this.opts.secret === undefined) {
+          throw new Error(
+            "this vault has a data key and this device was given no root secret to unwrap it with",
+          );
+        }
+        this.keys = await deriveKeys(this.opts.secret, limits.wrapped);
+      }
+    } catch (err) {
+      this.failKeys(err instanceof Error ? err : new Error(String(err)));
+      throw err;
+    }
+    this.settleKeys();
     this.limits = limits;
     this.log("connected", limits);
     return limits;
@@ -547,7 +654,7 @@ export class Engine {
     builtOn: string,
   ): Promise<{ mac: string; parent: string }> {
     const parent = await parentOf(builtOn);
-    const mac = await macEntry(this.opts.keys, {
+    const mac = await macEntry(this.keys, {
       path: entry.path,
       size: entry.meta.size,
       ctime: entry.meta.ctime,
@@ -562,6 +669,9 @@ export class Engine {
   }
 
   async acceptBatch(batch: { from: number; to: number; entries: WireEntry[] }): Promise<void> {
+    // Not before the handshake has said which keys this vault uses; see
+    // `keysReady`.
+    await this.keysReady;
     // Staged, then committed once every entry has unsealed and passed its
     // checks. Applied entry by entry, a batch that failed part way through
     // left the entries before the failure recorded and no way to undo them,
@@ -595,7 +705,7 @@ export class Engine {
       parent: e.parent ?? "",
     }));
     const ours = await Promise.all(
-      facts.map((f, i) => entryIsOurs(this.opts.keys, f, batch.entries[i]!.mac)),
+      facts.map((f, i) => entryIsOurs(this.keys, f, batch.entries[i]!.mac)),
     );
     const forged = ours.indexOf(false);
     if (forged >= 0) {
@@ -615,6 +725,22 @@ export class Engine {
     for (let at = 0; at < batch.entries.length; at++) {
       const e = batch.entries[at]!;
       const path = paths[at]!;
+      // A path this device would never list is refused here, once, as a
+      // fact about the path rather than filed for retry (C29): written, it
+      // would be invisible to the next scan and reported deleted. A path
+      // that is not in canonical form is refused the same way (C36): a
+      // filesystem collapses `a//b` onto `a/b`, and the engine keys its
+      // whole idea of a file on the string, so two spellings of one file
+      // would be two entries here and one file there. Neither ends the
+      // session: a peer that is wrong about one path is still the vault.
+      const why = refusedInboundPath(path);
+      if (why !== undefined) {
+        if (!this.refusedInbound.has(path)) {
+          this.log("refused a path from another device", path, why);
+        }
+        this.refusedInbound.set(path, why);
+        continue;
+      }
       staged.set(path, {
         uid: e.uid,
         folder: e.folder,
@@ -653,7 +779,7 @@ export class Engine {
   private async plaintextPath(sealed: string): Promise<string> {
     const known = this.unsealed.get(sealed);
     if (known !== undefined) return known;
-    const plain = await openPath(this.opts.keys, sealed);
+    const plain = await openPath(this.keys, sealed);
     this.unsealed.set(sealed, plain);
     return plain;
   }
@@ -677,7 +803,7 @@ export class Engine {
       while (this.again) {
         this.again = false;
         const next = await this.pass(opts);
-        report = add(report, next);
+        report = combinePasses(report, next);
       }
       return report;
     } finally {
@@ -706,6 +832,8 @@ export class Engine {
       });
       this.outbox = [];
       this.outboxBytes = 0;
+      this.outboxBudget = 0;
+      this.outboxFrame = 0;
       this.inbox = [];
       this.inboxBytes = 0;
     }
@@ -729,6 +857,14 @@ export class Engine {
       if (!stat.folder) filePaths.add(path);
     }
     const nowBlocked = new Set<string>();
+    this.nowBlocked = nowBlocked;
+
+    // What the disk will file each local path under, for the collision
+    // check in `fill`. Worked out here, once per pass, from the same listing
+    // the decisions are made from.
+    this.localByIdentity = new Map();
+    for (const path of onDisk.keys()) this.localByIdentity.set(this.identity(path), path);
+    this.deletingThisPass = new Set();
 
     // 2. Every path either side knows about.
     const paths = new Set<string>([
@@ -788,13 +924,20 @@ export class Engine {
 
     // Whatever is still queued moves now. Until these return, no write in
     // this pass has been acknowledged and no queued file is on disk.
-    this.wroteThisPass = [];
+    //
+    // `wroteThisPass` is not cleared here. `receive` already fills a full
+    // inbox part way through the loop, and those writes are the ones
+    // `applyDeletes` has to know about: clearing the list before the final
+    // fill forgot every file written by an earlier one, so a case-only rename
+    // arriving in a pass with more than a batch of downloads deleted the file
+    // it had just written. The reset after the deletes is the one that counts.
     await this.fill(report);
     await this.applyDeletes(report);
     this.wroteThisPass = [];
     await this.flush(report);
 
     this.opts.onProgress?.(undefined);
+    report.skipped += this.refusedInbound.size;
 
     // Replaced rather than added to, so a path stops being blocked the
     // moment the file in its way is gone.
@@ -898,7 +1041,7 @@ export class Engine {
     // Small enough to keep: seal it all, and the upload that is about to
     // want the bodies has them.
     if (bytes.length <= KEEP_SEALED_BELOW) {
-      const sealed = await sealChunks(this.opts.keys, parts);
+      const sealed = await sealChunks(this.keys, parts);
       entry.chunks = sealed.map((c) => c.name);
       entry.hash = contentId(entry.chunks);
       entry.size = bytes.length;
@@ -927,8 +1070,9 @@ export class Engine {
    * of memory is not a close trade.
    *
    * Returns undefined when the vault cannot do it, or when the file is small
-   * enough that holding it is cheaper than reading it twice. Obsidian's
-   * adapter is the first case: it has `readBinary` and nothing beside it.
+   * enough that holding it is cheaper than reading it twice. A platform whose
+   * resource fetch fails, which the plugin has seen on a phone, is the first
+   * case after its first failure.
    */
   private async streamScan(
     entry: IndexEntry,
@@ -970,7 +1114,7 @@ export class Engine {
       this.sizesFor(knownSize, isText),
       isText,
     )) {
-      const sealed = await sealChunks(this.opts.keys, [piece.bytes]);
+      const sealed = await sealChunks(this.keys, [piece.bytes]);
       names.push(sealed[0]!.name);
       spans.push({ start: piece.offset, end: piece.offset + piece.bytes.length });
       size += piece.bytes.length;
@@ -984,7 +1128,7 @@ export class Engine {
 
   /** Chunk names without keeping the bodies. See `sealedNames`. */
   private namesOf(parts: Uint8Array[]): Promise<string[]> {
-    return sealedNames(this.opts.keys, parts);
+    return sealedNames(this.keys, parts);
   }
 
   private async act(
@@ -1002,13 +1146,23 @@ export class Engine {
         report.unchanged++;
         // Two sides agreeing *is* a sync: the ancestor moves, or the next
         // divergence would merge against a version neither side has.
-        if (local && remote && !remote.deleted && local.hash === remote.hash) {
-          synced(entry, local.hash, entry.chunks, remote.uid, this.now());
+        if (local && remote && !remote.deleted) {
+          if (local.folder && remote.folder) {
+            // A folder has no content to compare, and the two sides spell
+            // that differently: "" from the scan, "-empty-" from a batch.
+            // Left to the hash comparison below, a folder both devices
+            // had before they paired never recorded a sync, and
+            // `decideFolder` reads no synctime as "never seen here", so
+            // removing it later put it straight back.
+            synced(entry, "", [], remote.uid, this.now());
+          } else if (local.hash === remote.hash) {
+            synced(entry, local.hash, entry.chunks, remote.uid, this.now());
+          }
         }
         return;
 
       case "upload":
-        await this.upload(path, entry, report, true, sealed);
+        await this.upload(path, entry, report, remote?.uid, true, sealed);
         return;
 
       case "download":
@@ -1045,6 +1199,7 @@ export class Engine {
         return;
 
       case "deleteLocal":
+        this.deletingThisPass.add(path);
         // Held until the pass has written everything it is going to.
         //
         // Rule 3 argues for this on its own: never delete until a
@@ -1072,6 +1227,7 @@ export class Engine {
             size: 0,
             entry: { ...facts, ...(await this.authFor(facts, entry.synchash)) },
             bodyOf: noBodies,
+            basedOn: remote?.uid,
             commit: (uid) => {
               // Recorded before the entry is forgotten. This
               // device's own writes come back with no payload, so
@@ -1116,6 +1272,8 @@ export class Engine {
     path: string,
     entry: IndexEntry,
     report: SyncReport,
+    /** The server's version this write answers, as the decision saw it. */
+    basedOn: number | undefined,
     count = false,
     /**
      * What the pass already read and cut for this exact content. Passed
@@ -1137,6 +1295,7 @@ export class Engine {
           // A folder has no content and so no lineage.
           entry: { ...facts, ...(await this.authFor(facts, "")) },
           bodyOf: noBodies,
+          basedOn,
           commit: (uid) => {
             synced(entry, "", [], uid, this.now());
             this.remote.set(path, {
@@ -1182,6 +1341,7 @@ export class Engine {
         // a receiver tell a new version from a replayed old one.
         entry: { ...facts, ...(await this.authFor(facts, entry.synchash)) },
         bodyOf: plan.bodyOf,
+        basedOn,
         commit: (uid) => {
           synced(entry, hash, chunks, uid, this.now());
           // Record what the server now holds, so the next pass sees
@@ -1214,11 +1374,45 @@ export class Engine {
    * attachments flush almost every file, which is what this did before.
    */
   private async queue(q: Queued, report: SyncReport): Promise<void> {
-    this.outbox.push(q);
-    this.outboxBytes += q.size;
-    if (this.outbox.length >= MAX_BATCH_ENTRIES || this.outboxBytes >= BATCH_BYTES) {
+    // Two caps from `ready`, both on the whole batch: the summed ciphertext
+    // budget of its entries, and the encoded size of the frame. A write that
+    // would take either over the cap goes in the next batch, and one whose
+    // own budget is over it goes alone, as a `put`, which the server bounds
+    // by the file limit instead. Added regardless, one attachment made one
+    // batch of everything, the server refused the batch by bytes, and every
+    // note in it was written off for the attachment's size.
+    const cap = this.batchCap;
+    const budget = entryBudget(q.size, q.entry.names.length);
+    const encoded = encodedEntryBytes(q.entry);
+    if (
+      this.outbox.length > 0 &&
+      (budget > cap ||
+        this.outboxBudget + budget > cap ||
+        this.outboxFrame + encoded > cap - PUTMANY_FRAME_OVERHEAD)
+    ) {
       await this.flush(report);
     }
+    this.outbox.push(q);
+    this.outboxBytes += q.size;
+    this.outboxBudget += budget;
+    this.outboxFrame += encoded;
+    if (
+      this.outbox.length >= MAX_BATCH_ENTRIES ||
+      this.outboxBudget >= cap ||
+      this.outboxFrame >= cap - PUTMANY_FRAME_OVERHEAD
+    ) {
+      await this.flush(report);
+    }
+  }
+
+  /** The batched-write cap this device keeps to: the server's, or its own if smaller. */
+  private get batchCap(): number {
+    return boundedBy(this.limits?.maxBatchBytes ?? 0, OWN_LIMITS.maxBatchBytes);
+  }
+
+  /** The fetch cap this device keeps to, the same way. */
+  private get fetchCap(): number {
+    return boundedBy(this.limits?.maxFetchBytes ?? 0, OWN_LIMITS.maxFetchBytes);
   }
 
   /**
@@ -1233,6 +1427,8 @@ export class Engine {
     const batch = this.outbox;
     this.outbox = [];
     this.outboxBytes = 0;
+    this.outboxBudget = 0;
+    this.outboxFrame = 0;
 
     // One producer per chunk name. Two notes sharing a chunk means the
     // server asks once, and it must not matter which of them is asked.
@@ -1243,16 +1439,34 @@ export class Engine {
       }
     }
 
+    const bodyOf = async (name: string) => {
+      const produce = producers.get(name);
+      if (!produce) throw new Error(`server asked for ${name}, which no queued file contains`);
+      return produce(name);
+    };
     let out;
     try {
-      out = await this.opts.transport.putMany(
-        batch.map((q) => q.entry),
-        async (name) => {
-          const produce = producers.get(name);
-          if (!produce) throw new Error(`server asked for ${name}, which no queued file contains`);
-          return produce(name);
-        },
-      );
+      const alone = batch.length === 1 ? batch[0]! : undefined;
+      if (
+        alone !== undefined &&
+        entryBudget(alone.size, alone.entry.names.length) > this.batchCap
+      ) {
+        // One large file is a `put`, not a batch of one. The server caps a
+        // batched write by budget and says so in its refusal: split the
+        // batch, and send a file over the limit on its own with put. A
+        // single put is bounded only by the per-file limit.
+        const { entry } = alone;
+        const one = await this.opts.transport.put(entry.path, entry.meta, entry.names, bodyOf, {
+          mac: entry.mac,
+          parent: entry.parent,
+        });
+        out = { results: [{ uid: one.uid }], uploaded: one.uploaded, bytes: one.bytes };
+      } else {
+        out = await this.opts.transport.putMany(
+          batch.map((q) => q.entry),
+          bodyOf,
+        );
+      }
     } catch (err) {
       // The exchange itself failed, so nothing in it committed. Every path
       // in the batch is retried, exactly as it would have been alone.
@@ -1267,6 +1481,29 @@ export class Engine {
       const result = out.results[i]!;
       if (result.error) {
         this.recordFailure(q.path, result.error, report);
+        continue;
+      }
+      if (this.remote.get(q.path)?.uid !== q.basedOn) {
+        // Another device committed a version of this path between the
+        // decision and now. Batches arrive on the transport's own chain, so
+        // `remote` moves under a running pass, and the server has just
+        // taken this write on top of a version it never saw. Recording it
+        // as synced would make the index say both sides agree, and the
+        // other device would then download this version cleanly over its
+        // own edit, with nothing conflicted and nothing merged: a lost
+        // update with a clean report.
+        //
+        // So nothing is recorded. The index still holds the old ancestor
+        // and the remote index the version that arrived, which is exactly
+        // the divergence the next pass merges or keeps both halves of. It
+        // runs straight away, because a client that syncs once and exits
+        // must not exit here.
+        report.waiting++;
+        this.again = true;
+        this.log("another device wrote first, reconciling next pass", q.path, {
+          decidedAgainst: q.basedOn ?? "nothing",
+          now: this.remote.get(q.path)?.uid,
+        });
         continue;
       }
       q.commit(result.uid);
@@ -1318,7 +1555,7 @@ export class Engine {
     // sealed again, which is deterministic and so gives back exactly what
     // was named: either from the bytes still in hand, or by reading the
     // range back off the disk if the file was never held at all.
-    const keys = this.opts.keys;
+    const keys = this.keys;
     const vault = this.opts.vault;
 
     if (scan.spans) {
@@ -1405,7 +1642,7 @@ export class Engine {
 
     this.inbox.push({ path, entry, remote, chunks, kind, why });
     this.inboxBytes += remote.size;
-    if (this.inbox.length >= MAX_BATCH_ENTRIES || this.inboxBytes >= BATCH_BYTES) {
+    if (this.inbox.length >= MAX_BATCH_ENTRIES || this.inboxBytes >= INBOX_BYTES) {
       await this.fill(report);
     }
   }
@@ -1419,9 +1656,10 @@ export class Engine {
    */
   private async fill(report: SyncReport): Promise<void> {
     if (this.inbox.length === 0) return;
-    const batch = this.inbox;
+    const batch = this.refuseAliases(this.inbox, report);
     this.inbox = [];
     this.inboxBytes = 0;
+    if (batch.length === 0) return;
 
     // Bytes this device already holds are not worth asking for again.
     //
@@ -1439,21 +1677,23 @@ export class Engine {
     }
 
     const wanted: string[] = [];
-    const seen = new Set<string>();
+    const budgets = new Map<string, number>();
     for (const d of batch) {
       if (local.has(d)) continue;
+      const each = perChunkBudget(d.remote.size, d.chunks.length);
       for (const name of d.chunks) {
-        if (!seen.has(name)) {
-          seen.add(name);
-          wanted.push(name);
-        }
+        const known = budgets.get(name);
+        if (known === undefined) wanted.push(name);
+        // A chunk two files share is fetched once, and costed at the larger
+        // of the two guesses, which is never under what it is.
+        if (known === undefined || each > known) budgets.set(name, each);
       }
     }
 
     const held = new Map<string, Uint8Array>();
     if (wanted.length > 0) {
       try {
-        const bodies = await this.opts.transport.fetch(wanted);
+        const bodies = await this.fetchAll(wanted, (name) => budgets.get(name)!);
         for (let i = 0; i < wanted.length; i++) held.set(wanted[i]!, bodies[i]!);
       } catch (err) {
         // The fetch failed, so no file in it arrived. Each is retried,
@@ -1486,6 +1726,67 @@ export class Engine {
         this.recordFailure(d.path, err, report);
       }
     }
+  }
+
+  /** Local paths as the disk files them, from this pass's listing. */
+  private localByIdentity = new Map<string, string>();
+  /** Paths this pass has decided to delete locally, which cannot collide with a write. */
+  private deletingThisPass = new Set<string>();
+
+  /** What the disk will file a path under. The vault knows; otherwise the safe guess. */
+  private identity(path: string): string {
+    return this.opts.vault.canonical
+      ? this.opts.vault.canonical(path)
+      : path.normalize("NFC").toLowerCase();
+  }
+
+  /**
+   * Drops incoming versions that would be filed as one local file.
+   *
+   * Two distinct paths on the server, `Note.md` and `note.md`, or one name in
+   * NFC and NFD, are one file on a disk that folds them. Written in turn, the
+   * second replaced the first, both were recorded as synced, and the next scan
+   * found the first missing and reported it deleted to every other device.
+   * That is not a move, which the case-only rename protection covers; it is
+   * two notes, and one of them was lost.
+   *
+   * Neither is written. Both are named, because only a person can say which
+   * spelling they meant, and the refusal clears itself the moment one of them
+   * is renamed on the device that has both. A path this pass is deleting is
+   * not in the way: that is the rename case, and it goes through as before.
+   */
+  private refuseAliases(batch: Incoming[], report: SyncReport): Incoming[] {
+    const byIdentity = new Map<string, Incoming[]>();
+    for (const d of batch) {
+      const key = this.identity(d.path);
+      const same = byIdentity.get(key) ?? [];
+      same.push(d);
+      byIdentity.set(key, same);
+    }
+    const kept: Incoming[] = [];
+    for (const [key, group] of byIdentity) {
+      const local = this.localByIdentity.get(key);
+      const localInTheWay =
+        local !== undefined &&
+        !this.deletingThisPass.has(local) &&
+        group.some((d) => d.path !== local);
+      if (!localInTheWay && group.length === 1) {
+        kept.push(group[0]!);
+        continue;
+      }
+      for (const d of group) {
+        const other = localInTheWay ? local! : group.find((g) => g.path !== d.path)!.path;
+        report.blocked++;
+        if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+          report.inTheWay.push({ path: d.path, blockedBy: other });
+        }
+        if (!this.blocked.has(d.path)) {
+          this.log("cannot be both", d.path, `${other} is the same file on this disk`);
+        }
+        this.nowBlocked.add(d.path);
+      }
+    }
+    return kept;
   }
 
   /**
@@ -1550,6 +1851,20 @@ export class Engine {
     }
   }
 
+  /**
+   * Records a write this pass made, for the two checks that read it.
+   *
+   * `wroteThisPass` is for the deletions applied at the end of the pass.
+   * `localByIdentity` is for the alias check in every later fill of this
+   * pass: it was built from the listing at the start and never updated, so a
+   * second spelling of a file the first fill had just landed was not "in the
+   * way" of anything and landed over it (C30).
+   */
+  private landed(path: string): void {
+    this.wroteThisPass.push(path);
+    this.localByIdentity.set(this.identity(path), path);
+  }
+
   /** Every path this device holds, by the content it holds, newest wins. */
   private heldByContent(): Map<string, string> {
     const by = new Map<string, string>();
@@ -1562,10 +1877,34 @@ export class Engine {
 
   /** The chunks for one entry, asked for on their own. */
   private async fetchFor(d: Incoming): Promise<Map<string, Uint8Array>> {
-    const bodies = await this.opts.transport.fetch([...d.chunks]);
+    const each = perChunkBudget(d.remote.size, d.chunks.length);
+    const bodies = await this.fetchAll([...d.chunks], () => each);
     const held = new Map<string, Uint8Array>();
     d.chunks.forEach((name, i) => held.set(name, bodies[i]!));
     return held;
+  }
+
+  /**
+   * Fetches a list of chunks in as many asks as the server's caps require.
+   *
+   * One `fetch` may carry at most `maxFetchBytes` of summed budget and at
+   * most 65536 names, and the server refuses more with `toolarge` and no
+   * bodies. This device does not know the stored size of a chunk it has not
+   * got, so it costs each at its share of the file's declared size plus the
+   * sealing allowance, which is what the server's own budget rule allows and
+   * is never under the truth. The bodies come back in the order asked, across
+   * every ask.
+   */
+  private async fetchAll(
+    names: readonly string[],
+    budgetOf: (name: string) => number,
+  ): Promise<Uint8Array[]> {
+    const out: Uint8Array[] = [];
+    for (const ask of planFetches(names, budgetOf, this.fetchCap, MAX_FETCH_NAMES)) {
+      const bodies = await this.opts.transport.fetch(ask);
+      for (const b of bodies) out.push(b);
+    }
+    return out;
   }
 
   /**
@@ -1595,11 +1934,11 @@ export class Engine {
     const parts = [...chunkBytes(bytes, this.sizesFor(bytes.length, isText), isText)].map(
       (c) => c.bytes,
     );
-    const names = (await sealChunks(this.opts.keys, parts)).map((c) => c.name);
+    const names = (await sealChunks(this.keys, parts)).map((c) => c.name);
     if (contentId(names) !== contentId(d.chunks)) return false;
 
     await this.opts.vault.write(d.path, bytes, { mtime: d.remote.mtime, ctime: d.remote.mtime });
-    this.wroteThisPass.push(d.path);
+    this.landed(d.path);
     observe(d.entry, {
       folder: false,
       mtime: d.remote.mtime,
@@ -1632,7 +1971,7 @@ export class Engine {
     }
 
     await this.opts.vault.write(d.path, content, { mtime: d.remote.mtime, ctime: d.remote.mtime });
-    this.wroteThisPass.push(d.path);
+    this.landed(d.path);
     observe(d.entry, {
       folder: false,
       mtime: d.remote.mtime,
@@ -1682,7 +2021,13 @@ export class Engine {
     }
     if (meta.chunks.length === 0) return new Uint8Array(0);
     this.checkChunkCount(uid, meta.chunks.length);
-    return this.assemble(uid, await this.opts.transport.fetch(meta.chunks));
+    // A caller that already knows the chunk list has not asked the server
+    // for the size, so each chunk is costed at the largest a chunk can be.
+    const each =
+      "size" in meta
+        ? perChunkBudget(meta.size, meta.chunks.length)
+        : entryBudget(boundedBy(this.limits?.chunkMax ?? 0, OWN_LIMITS.chunkMax), 1);
+    return this.assemble(uid, await this.fetchAll(meta.chunks, () => each));
   }
 
   /**
@@ -1711,7 +2056,7 @@ export class Engine {
     // once.
     for (let at = 0; at < bodies.length; at += SEAL_WINDOW) {
       const window = await Promise.all(
-        bodies.slice(at, at + SEAL_WINDOW).map((b) => openChunk(this.opts.keys, b)),
+        bodies.slice(at, at + SEAL_WINDOW).map((b) => openChunk(this.keys, b)),
       );
       for (const part of window) {
         total += part.length;
@@ -1750,18 +2095,40 @@ export class Engine {
     // So the merge is attempted only on text that really is text, and
     // anything else takes the conflict path, which keeps both versions
     // byte-for-byte and transforms neither.
+    // The ancestor, fetched by the uid the index remembered. This is what
+    // `synchash` and `syncuid` are for: one field to identify the common
+    // ancestor and one to go and get it, with no version history on the
+    // device.
+    //
+    // Fetched outside the decode's try, and the distinction matters. One
+    // catch used to cover the fetches, the local read and the decoding, so a
+    // dropped connection, a chunk the server no longer holds and bytes that
+    // were never UTF-8 all became a conflict copy labelled "not valid
+    // UTF-8". A transport error is not a fact about the file: it propagates,
+    // is recorded against the path and is tried again. An ancestor the
+    // server has purged is a fact, and it gets said as what it is.
+    let baseBytes: Uint8Array;
+    try {
+      baseBytes = await this.contentOf(entry.syncuid, undefined, entry.synchash);
+    } catch (err) {
+      if (!ancestorIsGone(err)) throw err;
+      const why =
+        "the version both sides edited from has been purged from the server, so there is nothing to merge against";
+      this.log("merge refused", path, why);
+      await this.conflict(path, entry, remote, report, why);
+      return;
+    }
+    const mineBytes = await this.opts.vault.read(path);
+    const theirsBytes = await this.contentOf(remote.uid, undefined, remote.hash);
+
     const dec = new TextDecoder("utf-8", { fatal: true });
     let base: string;
     let mine: string;
     let theirs: string;
     try {
-      // The ancestor, fetched by the uid the index remembered. This is
-      // what `synchash` and `syncuid` are for: one field to identify the
-      // common ancestor and one to go and get it, with no version history
-      // on the device.
-      base = dec.decode(await this.contentOf(entry.syncuid, undefined, entry.synchash));
-      mine = dec.decode(await this.opts.vault.read(path));
-      theirs = dec.decode(await this.contentOf(remote.uid, undefined, remote.hash));
+      base = dec.decode(baseBytes);
+      mine = dec.decode(mineBytes);
+      theirs = dec.decode(theirsBytes);
     } catch {
       const why = "one side is not valid UTF-8, so merging it would rewrite bytes nobody edited";
       this.log("merge refused", path, why);
@@ -1789,7 +2156,7 @@ export class Engine {
     // Uploaded whatever the outcome, because even "take theirs" has to be
     // acknowledged for this path before the ancestor can move.
     observe(entry, { folder: false, mtime: this.now(), ctime: entry.ctime, size: text.length });
-    await this.upload(path, entry, report);
+    await this.upload(path, entry, report, remote.uid);
     report.merged++;
     this.log("merged", path, outcome.kind === "merged" ? "three-way" : outcome.why);
   }
@@ -1832,9 +2199,13 @@ export class Engine {
     why: string,
   ): Promise<void> {
     if (!remote) return;
-    const copyPath = await this.freeConflictPath(path);
     const incoming = await this.contentOf(remote.uid, undefined, remote.hash);
-    await this.opts.vault.write(copyPath, incoming, { mtime: remote.mtime, ctime: remote.mtime });
+    const copyPath = await placeBeside(
+      () => this.freeConflictPath(path),
+      incoming,
+      { mtime: remote.mtime, ctime: remote.mtime },
+      this.opts.vault,
+    );
 
     const copyEntry = this.entryFor(copyPath);
     observe(copyEntry, {
@@ -1843,15 +2214,15 @@ export class Engine {
       ctime: remote.mtime,
       size: incoming.length,
     });
-    await this.upload(copyPath, copyEntry, report);
-    await this.upload(path, entry, report);
+    await this.upload(copyPath, copyEntry, report, this.remote.get(copyPath)?.uid);
+    await this.upload(path, entry, report, remote.uid);
 
     report.conflicted++;
     this.log("kept both", path, { copy: copyPath, why });
   }
 
   private async sealedPath(path: string): Promise<string> {
-    const sealed = await sealPath(this.opts.keys, path);
+    const sealed = await sealPath(this.keys, path);
     this.unsealed.set(sealed, path);
     return sealed;
   }
@@ -1867,7 +2238,10 @@ export class Engine {
   private recordFailure(path: string, err: unknown, report: SyncReport): void {
     const message = err instanceof Error ? err.message : String(err);
     const code = (err as { code?: string })?.code;
-    const permanent = code !== undefined && ["badentry", "badname", "toolarge"].includes(code);
+    // `neversync` is a vault refusing to write under a name its shell never
+    // syncs, which no retry changes (C29); the other three are the server's.
+    const permanent =
+      code !== undefined && ["badentry", "badname", "toolarge", "neversync"].includes(code);
 
     if (permanent) {
       this.skipped.set(path, { why: message, fingerprint: fingerprintOf(this.entries.get(path)) });
@@ -1933,6 +2307,22 @@ export class Engine {
       if (this.pending.has(path)) continue;
       this.remote.delete(path);
     }
+
+    // The sealed-path cache, kept to what the two indexes still name (C37).
+    // It was never pruned, so a device connected through months of renames
+    // held every name it had ever been told. Unsealing a path it meets again
+    // costs one cipher call, and forgetting one it will not is free.
+    if (this.unsealed.size > this.entries.size + this.remote.size + this.pending.size) {
+      const keep = new Set<string>([
+        ...this.entries.keys(),
+        ...this.remote.keys(),
+        ...this.pending,
+        ...this.refusedInbound.keys(),
+      ]);
+      for (const [sealed, plain] of this.unsealed) {
+        if (!keep.has(plain)) this.unsealed.delete(sealed);
+      }
+    }
   }
 
   private async save(): Promise<void> {
@@ -1948,8 +2338,56 @@ export class Engine {
     });
   }
 
-  /** Records a rename the vault reported, so it travels as one operation. */
+  /**
+   * Records a rename the vault reported, so it travels as one operation.
+   *
+   * A folder rename is one event in Obsidian, for the folder, and every path
+   * beneath it has moved without a word. So everything under `from` moves
+   * too: without that, each file inside read as deleted at its old path and
+   * new at its new one, and the whole subtree went over the wire again.
+   *
+   * The local bookkeeping keyed by path moves with it: the retry clock and
+   * the write-off, so a file that was stuck does not forget it was stuck by
+   * being renamed. What does not move is the server's word (`remote`) or the
+   * inbound work list (`pending`), because both describe the server's path,
+   * and the server has not heard of the rename yet: the next pass tells it,
+   * as an upload of the new name carrying `prev`, and a remote entry moved
+   * ahead of that made the new name look already synced and the rename was
+   * never sent.
+   *
+   * A destination that never syncs is refused rather than recorded. An entry
+   * under a dot folder is one the listing will never show again, and an
+   * entry that is never listed reconciles as a deletion.
+   */
   noteRename(from: string, to: string): void {
+    if (isNeverSynced(to, new Set())) {
+      this.log("rename into a path that never syncs, not recorded", from, to);
+      return;
+    }
+    this.movePath(from, to);
+    const under = `${from}/`;
+    const known = new Set([...this.entries.keys(), ...this.retries.keys(), ...this.skipped.keys()]);
+    for (const path of known) {
+      if (path.startsWith(under)) this.movePath(path, to + path.slice(from.length));
+    }
+  }
+
+  /** Moves the entry and the local bookkeeping from one name to another. */
+  private movePath(from: string, to: string): void {
+    this.moveEntry(from, to);
+    const retry = this.retries.get(from);
+    if (retry !== undefined) {
+      this.retries.delete(from);
+      this.retries.set(to, retry);
+    }
+    const skip = this.skipped.get(from);
+    if (skip !== undefined) {
+      this.skipped.delete(from);
+      this.skipped.set(to, skip);
+    }
+  }
+
+  private moveEntry(from: string, to: string): void {
     const entry = this.entries.get(from);
     if (!entry) return;
 
@@ -1976,14 +2414,57 @@ export class Engine {
   }
 }
 
-function add(a: SyncReport, b: SyncReport): SyncReport {
-  const out = { ...a };
-  for (const k of Object.keys(out) as (keyof SyncReport)[]) {
-    if (k === "inTheWay") continue; // A list of names, not a number to sum.
-    out[k] = a[k] + b[k];
+/**
+ * Two passes of one sync, as one report.
+ *
+ * The work counters add, because they count things that happened. The state
+ * counters do not: `unchanged`, `waiting`, `retrying`, `skipped` and `blocked`
+ * describe how the vault looks at the end of a pass, and adding them reported
+ * one file held back in two passes as two waiting (C35). The newest pass has
+ * the last word on those, as `accumulate` in client.ts does for a settle.
+ */
+export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
+  return {
+    uploaded: a.uploaded + b.uploaded,
+    downloaded: a.downloaded + b.downloaded,
+    merged: a.merged + b.merged,
+    conflicted: a.conflicted + b.conflicted,
+    deletedLocally: a.deletedLocally + b.deletedLocally,
+    deletedRemotely: a.deletedRemotely + b.deletedRemotely,
+    restored: a.restored + b.restored,
+    foldersCreated: a.foldersCreated + b.foldersCreated,
+    chunksSent: a.chunksSent + b.chunksSent,
+    bytesSent: a.bytesSent + b.bytesSent,
+    unchanged: b.unchanged,
+    waiting: b.waiting,
+    retrying: b.retrying,
+    skipped: b.skipped,
+    blocked: b.blocked,
+    inTheWay: b.inTheWay,
+  };
+}
+
+/**
+ * Why a path from another device is one this device will not act on, or
+ * undefined for a path it will.
+ *
+ * Two rules. The dot rule is the shared one from paths.ts: a dot-prefixed
+ * segment never syncs in either direction, because Obsidian's index does not
+ * list it and a file written and never listed is reported deleted. The
+ * canonical rule is that the path is exactly what a filesystem would file it
+ * under: no empty segment, no `.` or `..`, nothing leading or trailing.
+ */
+export function refusedInboundPath(path: string): string | undefined {
+  if (path === "") return "an empty path";
+  if (isNeverSynced(path, new Set())) return "a path under a dot-prefixed name never syncs";
+  if (path.startsWith("/")) return "a path starting with a slash is not canonical";
+  if (path.endsWith("/")) return "a path ending with a slash is not canonical";
+  for (const part of path.split("/")) {
+    if (part === "") return "a path with an empty segment (//) is not canonical";
+    if (part === "." || part === "..")
+      return `a path with a ${JSON.stringify(part)} segment is not canonical`;
   }
-  out.inTheWay = [...a.inTheWay, ...b.inTheWay].slice(0, IN_THE_WAY_SHOWN);
-  return out;
+  return undefined;
 }
 
 /**
@@ -2049,10 +2530,56 @@ export async function sealedNames(
 }
 
 /**
- * How many bytes of queued file this device will hold before sending a batch.
- * See `queue`: the count bound is the server's, this one is memory.
+ * How many bytes of incoming version this device will queue before fetching.
+ * See `receive`: the count bound is the server's and the fetch caps split
+ * what goes on the wire; this one is memory, since every queued body is held
+ * until its file is written.
  */
-const BATCH_BYTES = 8 * 1024 * 1024;
+const INBOX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * What one chunk of a file is costed at when only the file's size is known:
+ * its share of the declared size, plus the sealing allowance the server's
+ * budget rule grants per chunk. Never under the stored size, because the
+ * server's rule is what bounds that.
+ */
+function perChunkBudget(size: number, chunks: number): number {
+  return entryBudget(Math.ceil(size / Math.max(1, chunks)), 1);
+}
+
+/**
+ * Splits a chunk list into fetches, each within a byte budget and a count.
+ *
+ * Greedy and in order, so the bodies come back in the order the names were
+ * given when the asks are made in sequence. A single name over the byte
+ * budget goes on its own: the budget is a guess that is never too small, so
+ * a chunk the server holds is one the server will serve alone.
+ *
+ * Exported because the property worth testing is that nothing in any ask is
+ * over either bound and that every name is asked for exactly once.
+ */
+export function planFetches(
+  names: readonly string[],
+  budgetOf: (name: string) => number,
+  maxBytes: number,
+  maxNames: number,
+): string[][] {
+  const asks: string[][] = [];
+  let ask: string[] = [];
+  let bytes = 0;
+  for (const name of names) {
+    const cost = budgetOf(name);
+    if (ask.length > 0 && (bytes + cost > maxBytes || ask.length >= maxNames)) {
+      asks.push(ask);
+      ask = [];
+      bytes = 0;
+    }
+    ask.push(name);
+    bytes += cost;
+  }
+  if (ask.length > 0) asks.push(ask);
+  return asks;
+}
 
 /**
  * `base`, or the first numbered variant of it that nothing is using.
@@ -2082,6 +2609,37 @@ export async function firstFreeName(
   // for, and inventing one silently is how the thousand-and-first overwrites
   // something.
   throw new Error(`cannot find an unused name beside ${base}`);
+}
+
+/**
+ * Writes a copy under a free name, without ever replacing what is there.
+ *
+ * `exists` and then `write` is a gap, and another process, or the editor
+ * somebody is typing in, can put a file under that name inside it. A conflict
+ * copy or a restore landing there replaced the very file it existed to keep.
+ * So where the vault can create exclusively, the name is claimed and written
+ * in one step, and a name that turns out taken is passed over for the next.
+ *
+ * Exported because the engine's conflict copy and the client's restore are
+ * the same operation with a different name in hand.
+ */
+export async function placeBeside(
+  freeName: () => Promise<string>,
+  bytes: Uint8Array,
+  times: { mtime: number; ctime: number },
+  vault: Pick<Vault, "write" | "create">,
+): Promise<string> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const at = await freeName();
+    if (!vault.create) {
+      await vault.write(at, bytes, times);
+      return at;
+    }
+    if (await vault.create(at, bytes, times)) return at;
+    // Taken between choosing it and claiming it. The chooser looks again
+    // and finds the next free name, because this one now exists.
+  }
+  throw new Error("could not find a name beside the note that stayed free long enough to use");
 }
 
 /**
@@ -2145,6 +2703,12 @@ interface Queued {
   readonly size: number;
   readonly entry: BatchEntry;
   readonly bodyOf: (name: string) => Promise<Uint8Array>;
+  /**
+   * The server's newest version of this path when the write was decided, or
+   * undefined when it had none. Compared against the remote index again at
+   * commit time; see `flush` for what a difference means.
+   */
+  readonly basedOn: number | undefined;
   /** Run only once the server has committed it, with the uid it was given. */
   readonly commit: (uid: number) => void;
 }
@@ -2168,6 +2732,22 @@ interface UploadPlan {
 /** For a put that carries no bodies at all: a folder, or a deletion. */
 async function noBodies(name: string): Promise<Uint8Array> {
   throw new Error(`this put has no bodies, and the server asked for ${name}`);
+}
+
+/**
+ * Whether a failed fetch means the server no longer has the version at all.
+ *
+ * `nouid` is an entry purge has removed; `nochunk` is a body it no longer
+ * holds, which is what an old version's unshared chunks become. Both are the
+ * server telling the truth about its history, as opposed to a connection that
+ * went away or a server that answered strangely, which are not facts about
+ * the version and are retried.
+ */
+function ancestorIsGone(err: unknown): boolean {
+  const code = (err as { code?: string })?.code;
+  // `nocontent` is a uid that names a folder or a deletion, which an ancestor
+  // never should. If it does, there is equally nothing to merge against.
+  return code === "nouid" || code === "nochunk" || code === "nocontent";
 }
 
 /** Whether text is still JSON, for the formats where that is what it means to be usable. */

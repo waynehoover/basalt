@@ -118,6 +118,22 @@ export class FakeEl {
   }
 }
 
+/**
+ * Where the plugin is running, as far as it can tell.
+ *
+ * Desktop by default, and mutable so a test can make the host look like a
+ * phone: `addStatusBarItem` is declared unavailable there, and the guard
+ * around it is only tested if something can flip this.
+ */
+export const Platform = {
+  isDesktop: true,
+  isMobile: false,
+  isDesktopApp: true,
+  isMobileApp: false,
+  isIosApp: false,
+  isAndroidApp: false,
+};
+
 /* ---------------------------------------------------------------- *
  * The app
  * ---------------------------------------------------------------- */

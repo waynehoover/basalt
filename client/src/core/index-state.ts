@@ -110,7 +110,7 @@ export interface RemoteState {
  * What to do about one path.
  *
  * Every outcome carries `why`. A sync that acts silently is one nobody can
- * debug, and rule 7 of docs/philosophy.md is about statuses that cannot
+ * debug, and rule 7 of docs/design.md is about statuses that cannot
  * distinguish between the cases they collapse.
  */
 export type Action =

@@ -57,8 +57,28 @@ const TAG_BITS = 128;
  */
 export const SEAL_OVERHEAD = NONCE_LENGTH + TAG_BITS / 8 + 1;
 
-/** Root secret length in bytes. */
-export const SECRET_LENGTH = 20;
+/**
+ * Root secret length in bytes, for a secret made now.
+ *
+ * Thirty-two. It was twenty, which is enough through HKDF-SHA256 and unusual
+ * enough that everyone reading it asked whether it was a truncation bug, so
+ * pairing format 3 carries thirty-two and format 2 strings with their twenty
+ * are accepted for as long as the project exists. Both lengths are legal for
+ * every key derivation here; which schedule a vault uses is decided by the
+ * server's `ready`, never by the length of the secret.
+ */
+export const SECRET_LENGTH = 32;
+
+/** The root secret length a `basalt2_` pairing string carries. Still accepted. */
+export const LEGACY_SECRET_LENGTH = 20;
+
+/** Whether a root secret is one of the two lengths a pairing string can carry. */
+export function isSecretLength(n: number): boolean {
+  return n === SECRET_LENGTH || n === LEGACY_SECRET_LENGTH;
+}
+
+/** The data key length in bytes: what every content key derives from on a protocol 3 vault. */
+export const DATA_KEY_LENGTH = 32;
 
 import { deflateSync, inflateSync } from "fflate";
 
@@ -75,6 +95,7 @@ const dec = new TextDecoder();
  */
 const INFO = {
   auth: "basalt/auth/1",
+  wrap: "basalt/wrap/1",
   path: "basalt/path/1",
   content: "basalt/content/1",
   nonce: "basalt/nonce/1",
@@ -92,6 +113,17 @@ const INFO = {
 export interface VaultKeys {
   /** Sent to the server, which stores only a hash of it. */
   readonly auth: Uint8Array;
+  /**
+   * Wraps the data key. Derived from the root secret alone, like `auth`, so
+   * the two are all that changes when the root is rotated.
+   */
+  readonly wrap: CryptoKey;
+  /**
+   * Whether the four content keys below derive from a data key rather than
+   * from the root. A vault claimed under protocol 3 has one; a vault claimed
+   * under protocol 2 does not, and for it rotation is a new vault.
+   */
+  readonly hasDataKey: boolean;
   /** Seals paths. Deterministic, and reversible: a device must recover the name. */
   readonly path: CryptoKey;
   /** Seals chunk bodies. */
@@ -123,49 +155,84 @@ function subtle(): SubtleCrypto {
 
 /** A fresh root secret. This is the one thing the user has to keep. */
 export function generateSecret(): Uint8Array {
+  return randomBytes(SECRET_LENGTH);
+}
+
+/** A fresh data key, made once by the first device and wrapped for the server. */
+export function generateDataKey(): Uint8Array {
+  return randomBytes(DATA_KEY_LENGTH);
+}
+
+/** Random bytes from the platform, or a refusal. */
+export function randomBytes(n: number): Uint8Array {
   const c = globalThis.crypto;
   if (!c?.getRandomValues) {
-    // Same reasoning as `subtle` above, and more urgent: a secret from a
-    // weak source is worse than no secret, because it looks like one.
+    // Not a condition to work around, and more urgent than a missing
+    // `subtle`: a secret from a weak source is worse than no secret, because
+    // it looks like one.
     throw new Error("no secure random source is available, so a vault cannot be created here");
   }
-  return c.getRandomValues(new Uint8Array(SECRET_LENGTH));
+  return c.getRandomValues(new Uint8Array(n));
 }
 
 /**
- * Derives every key from a root secret.
+ * Derives every key a device needs from its root secret, and the vault's
+ * wrapped data key when it has one.
  *
  * The secret is used as HKDF input keying material directly, with no password
- * stretching, because it is 160 random bits rather than something a human chose.
- * A stretching function's job is to make guessing expensive, and there is
+ * stretching, because it is random rather than something a human chose. A
+ * stretching function's job is to make guessing expensive, and there is
  * nothing here to guess.
  *
  * Salt is empty and deliberately so. HKDF's salt defends against related-input
  * attacks on low-entropy material; with a uniformly random secret the info
  * string is doing the domain separation and a salt would be one more value to
  * transport, store and lose.
+ *
+ * Two keys always come from the root: `auth`, which the server stores a hash
+ * of, and `wrap`. Where the content keys come from depends on `wrapped`. With
+ * it, the root unwraps the vault's data key and the four content keys derive
+ * from that, which is what lets a leaked root be rotated without the history
+ * going with it. Without it the four derive from the root, as every protocol 2
+ * vault's do. Which applies is the server's to say, in `ready`, and never the
+ * pairing string's.
  */
-export async function deriveKeys(secret: Uint8Array): Promise<VaultKeys> {
-  if (secret.length < 16) {
-    // A short secret is a bug somewhere upstream, and silently accepting it
-    // would produce a vault that looks encrypted and is not.
-    throw new Error(`root secret is ${secret.length} bytes, need at least 16`);
+export async function deriveKeys(secret: Uint8Array, wrapped?: string): Promise<VaultKeys> {
+  const root = await deriveRoot(secret);
+  if (wrapped === undefined) {
+    return { ...root, hasDataKey: false, ...(await deriveSchedule(secret)) };
   }
-  const s = subtle();
-  const ikm = await s.importKey("raw", toBuffer(secret), "HKDF", false, [
-    "deriveKey",
-    "deriveBits",
-  ]);
+  const data = await unwrapDataKey(root.wrap, wrapped);
+  return { ...root, hasDataKey: true, ...(await deriveSchedule(data)) };
+}
 
-  const hkdf = (info: string) => ({
-    name: "HKDF",
-    hash: "SHA-256",
-    salt: new Uint8Array(0),
-    info: enc.encode(info),
-  });
-
-  const [auth, path, content, nonce, meta] = await Promise.all([
+/** The two keys that come from the root and nothing else. */
+async function deriveRoot(secret: Uint8Array): Promise<{ auth: Uint8Array; wrap: CryptoKey }> {
+  const { s, ikm, hkdf } = await ikmOf(secret);
+  const [auth, wrap] = await Promise.all([
     s.deriveBits(hkdf(INFO.auth), ikm, 256),
+    s.deriveKey(hkdf(INFO.wrap), ikm, { name: "AES-GCM", length: 256 }, false, [
+      "encrypt",
+      "decrypt",
+    ]),
+  ]);
+  return { auth: new Uint8Array(auth), wrap };
+}
+
+/** The four content keys, from whichever root the schedule hangs off. */
+type Schedule = Pick<VaultKeys, "path" | "content" | "nonce" | "meta">;
+
+/**
+ * The content key schedule, from one root.
+ *
+ * One function for both cases on purpose: a protocol 2 vault hands it the root
+ * secret and a protocol 3 vault hands it the data key, and the info strings
+ * are the same either way. Two copies of this would be two chances for the
+ * two kinds of vault to disagree about how a path is sealed.
+ */
+export async function deriveSchedule(root: Uint8Array): Promise<Schedule> {
+  const { s, ikm, hkdf } = await ikmOf(root);
+  const [path, content, nonce, meta] = await Promise.all([
     s.deriveKey(hkdf(INFO.path), ikm, { name: "AES-GCM", length: 256 }, false, [
       "encrypt",
       "decrypt",
@@ -177,8 +244,117 @@ export async function deriveKeys(secret: Uint8Array): Promise<VaultKeys> {
     s.deriveKey(hkdf(INFO.nonce), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
     s.deriveKey(hkdf(INFO.meta), ikm, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]),
   ]);
+  return { path, content, nonce, meta };
+}
 
-  return { auth: new Uint8Array(auth), path, content, nonce, meta };
+/** HKDF input keying material and the parameter builder, for the two derivations above. */
+async function ikmOf(root: Uint8Array) {
+  if (root.length < 16) {
+    // A short secret is a bug somewhere upstream, and silently accepting it
+    // would produce a vault that looks encrypted and is not.
+    throw new Error(`root secret is ${root.length} bytes, need at least 16`);
+  }
+  const s = subtle();
+  const ikm = await s.importKey("raw", toBuffer(root), "HKDF", false, ["deriveKey", "deriveBits"]);
+  const hkdf = (info: string) => ({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: enc.encode(info),
+  });
+  return { s, ikm, hkdf };
+}
+
+/**
+ * Wraps the data key for the server to hold: `n || AES-GCM-256(K_wrap, n, D)`,
+ * base64url, with a random nonce.
+ *
+ * Random rather than synthetic, unlike everything else sealed here, because
+ * nothing needs two wrappings of one key to compare equal and a fresh nonce
+ * costs nothing. The server stores the result and cannot open it; it holds
+ * neither the root nor the data key.
+ */
+export async function wrapDataKey(wrap: CryptoKey, dataKey: Uint8Array): Promise<string> {
+  if (dataKey.length !== DATA_KEY_LENGTH) {
+    throw new Error(`a data key is ${DATA_KEY_LENGTH} bytes, not ${dataKey.length}`);
+  }
+  return base64urlEncode(await sealRandom(wrap, dataKey));
+}
+
+/**
+ * Opens what `wrapDataKey` produced, under the root that wrapped it.
+ *
+ * A failure is a root that does not match: a pairing string for another
+ * vault, or one from before a rotation. Said as such, because "sealed value
+ * failed authentication" sends somebody looking at the wrong thing.
+ */
+export async function unwrapDataKey(wrap: CryptoKey, wrapped: string): Promise<Uint8Array> {
+  let dataKey: Uint8Array;
+  try {
+    dataKey = await open(wrap, base64urlDecode(wrapped));
+  } catch (cause) {
+    throw new Error(
+      "this root secret does not open the vault's data key, so it is not this vault's current secret",
+      { cause },
+    );
+  }
+  if (dataKey.length !== DATA_KEY_LENGTH) {
+    throw new Error(
+      `the vault's data key unwrapped to ${dataKey.length} bytes, not ${DATA_KEY_LENGTH}`,
+    );
+  }
+  return dataKey;
+}
+
+/**
+ * Seals a root secret under an invite key: `n || AES-GCM-256(K_inv, n, S)`,
+ * base64url. What an invite stores on the server, and what the server cannot
+ * open because the invite key travels in the invite string and never to it.
+ */
+export async function sealSecret(inviteKey: Uint8Array, secret: Uint8Array): Promise<string> {
+  const key = await importAesKey(inviteKey);
+  return base64urlEncode(await sealRandom(key, secret));
+}
+
+/** Opens what `sealSecret` produced. A failure is the wrong invite key. */
+export async function unsealSecret(inviteKey: Uint8Array, sealed: string): Promise<Uint8Array> {
+  const key = await importAesKey(inviteKey);
+  let secret: Uint8Array;
+  try {
+    secret = await open(key, base64urlDecode(sealed));
+  } catch (cause) {
+    throw new Error("the invite key does not open what the server holds for this invite", {
+      cause,
+    });
+  }
+  if (!isSecretLength(secret.length)) {
+    throw new Error(
+      `the invite unsealed to a ${secret.length} byte secret, which is not a root secret`,
+    );
+  }
+  return secret;
+}
+
+async function importAesKey(raw: Uint8Array): Promise<CryptoKey> {
+  if (raw.length !== 32) throw new Error(`an invite key is 32 bytes, not ${raw.length}`);
+  return subtle().importKey("raw", toBuffer(raw), { name: "AES-GCM" }, false, [
+    "encrypt",
+    "decrypt",
+  ]);
+}
+
+/** AES-GCM with a random nonce in front, for the two places determinism buys nothing. */
+async function sealRandom(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+  const nonce = randomBytes(NONCE_LENGTH);
+  const sealed = await subtle().encrypt(
+    { name: "AES-GCM", iv: toBuffer(nonce), tagLength: TAG_BITS },
+    key,
+    toBuffer(plaintext),
+  );
+  const out = new Uint8Array(NONCE_LENGTH + sealed.byteLength);
+  out.set(nonce, 0);
+  out.set(new Uint8Array(sealed), NONCE_LENGTH);
+  return out;
 }
 
 /**

@@ -44,23 +44,25 @@ describe("which config folder is left alone", () => {
   });
 
   it("skips the one it is told about, and syncs the one it is not", async () => {
-    const root = await vaultWith([".obsidian-work"]);
+    // A config folder renamed to something without a dot, which is the one
+    // case the dot rule in core/paths.ts cannot cover by itself.
+    const root = await vaultWith(["obsidian-work"]);
 
     // The bug: with no way to be told, this folder was ordinary content.
-    expect(await paths(new NodeVault(root))).toContain(".obsidian-work/app.json");
+    expect(await paths(new NodeVault(root))).toContain("obsidian-work/app.json");
 
-    const told = new NodeVault(root, { configDir: ".obsidian-work" });
+    const told = new NodeVault(root, { configDir: "obsidian-work" });
     expect(await paths(told)).toEqual(["note.md"]);
   });
 
-  it("leaves .obsidian to be synced when it is not the config folder", async () => {
-    // Renaming the config folder makes the old name an ordinary one. Keeping
-    // it hardcoded as well would be refusing to sync a folder the user may
-    // now be using for notes.
+  it("still leaves .obsidian alone when it is not the config folder", async () => {
+    // Nothing dot-prefixed syncs, whatever the config folder is called. The
+    // plugin lists from Obsidian's index, which never names a dot-prefixed
+    // path, so a headless client that uploaded one would be sending every
+    // plugin peer a file it can only refuse.
     const root = await vaultWith([".obsidian", ".config-here"]);
     const held = await paths(new NodeVault(root, { configDir: ".config-here" }));
-    expect(held).toContain(".obsidian/app.json");
-    expect(held.some((p) => p.startsWith(".config-here"))).toBe(false);
+    expect(held).toEqual(["note.md"]);
   });
 
   it("also leaves alone whatever --ignore named", async () => {

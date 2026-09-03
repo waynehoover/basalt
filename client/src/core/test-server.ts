@@ -267,6 +267,11 @@ export class TestServer {
   get wsUrl(): string {
     return `ws://127.0.0.1:${this.port}`;
   }
+
+  /** The one line the server prints for its first device: address#token. */
+  get setup(): string {
+    return `${this.wsUrl}#${this.token}`;
+  }
 }
 
 /** Waits for a condition rather than sleeping a guessed interval. */

@@ -99,6 +99,18 @@ describe("the headless bundle", () => {
     expect(stdout).toMatch(/basalt pair/);
   });
 
+  /**
+   * I24 in TODO.md. The version is written in at build time from package.json,
+   * so the one file somebody installs says which release it is and the
+   * version matrix in docs/server.md has a number to name.
+   */
+  it("says which release it is", async () => {
+    const pkg = JSON.parse(await readFile("package.json", "utf8")) as { version: string };
+    const { stdout } = await run("node", [CLI, "--version"]);
+    expect(stdout.trim()).toBe(pkg.version);
+    expect(stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
   it("has a shebang, once", () => {
     expect(cli.startsWith("#!/usr/bin/env node\n")).toBe(true);
     expect(cli.split("\n").filter((l) => l.startsWith("#!")).length).toBe(1);
@@ -167,9 +179,9 @@ describe("the plugin bundle, loaded and run", () => {
   ) => StubPlugin & {
     onload(): Promise<void>;
     onunload(): void;
-    pairFirst(url: string, token: string, device: string): Promise<string>;
+    pairFirst(setup: string, device: string): Promise<string>;
     pair(pairing: string, device: string): Promise<void>;
-    invite(): string | undefined;
+    recoveryKey(): string | undefined;
     currentState: { kind: string };
   } {
     const mod: { exports: Record<string, unknown> } = { exports: {} };
@@ -214,7 +226,7 @@ describe("the plugin bundle, loaded and run", () => {
       await b.onload();
       appA.vault.adapter.seed("From the bundle.md", "# Built\n\nThis came out of dist.\n");
 
-      const pairing = await a.pairFirst(server.wsUrl, server.token, "laptop");
+      const pairing = await a.pairFirst(server.setup, "laptop");
       await until(() => a.currentState.kind === "synced");
 
       await b.pair(pairing, "desktop");

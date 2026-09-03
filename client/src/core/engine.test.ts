@@ -2,7 +2,7 @@
  * Two engines, two vaults, one real server.
  *
  * This is the test the whole client exists to pass, and the one the predecessor's
- * notes warn about: rule 10 of docs/philosophy.md records a conflict test that
+ * notes warn about: rule 10 of docs/design.md records a conflict test that
  * asserted the two devices *agreed*, and passed while one side's edit had
  * silently vanished. Agreement is not the property. Not losing an edit is.
  *
@@ -46,7 +46,6 @@ afterAll(async () => {
 
 /** One device: an in-memory vault, an index, a transport and an engine. */
 class Device {
-  readonly vault = new MemoryVault();
   readonly store = new MemoryIndexStore();
   transport!: Transport;
   engine!: Engine;
@@ -55,7 +54,16 @@ class Device {
   caughtUp = false;
   clock = 1_000_000;
 
-  constructor(readonly name: string) {}
+  constructor(
+    readonly name: string,
+    /** Injectable, for a vault that misbehaves in a particular way. */
+    readonly vault: MemoryVault = new MemoryVault(),
+  ) {}
+
+  /** How many batches carried entries, which is how many times a peer wrote. */
+  get batchesWithEntries(): number {
+    return this.batches.filter((b) => b.entries.length > 0).length;
+  }
 
   async connect(server: TestServer, log?: (message: string) => void): Promise<void> {
     this.caughtUp = false;
@@ -112,11 +120,101 @@ async function fresh(): Promise<TestServer> {
   return server;
 }
 
-async function device(name: string, log?: (message: string) => void): Promise<Device> {
-  const d = new Device(name);
+async function device(
+  name: string,
+  log?: (message: string) => void,
+  vault?: MemoryVault,
+): Promise<Device> {
+  const d = new Device(name, vault);
   devices.push(d);
   await d.connect(server, log);
   return d;
+}
+
+/** A vault whose read of one path waits until the test says go. */
+class GatedVault extends MemoryVault {
+  gate: Promise<void> = Promise.resolve();
+  gatePath = "";
+  override async read(path: string): Promise<Uint8Array> {
+    if (path === this.gatePath) await this.gate;
+    return super.read(path);
+  }
+}
+
+/** A memory vault that folds case on remove, the way APFS and NTFS do. */
+class FoldingVault extends MemoryVault {
+  override async remove(path: string): Promise<void> {
+    const lower = path.toLowerCase();
+    for (const p of this.paths()) if (p.toLowerCase() === lower) await super.remove(p);
+  }
+  async sameFile(a: string, b: string): Promise<boolean> {
+    return a.toLowerCase() === b.toLowerCase();
+  }
+}
+
+/**
+ * A memory vault that files names the way a folding disk does: one file per
+ * case-folded, NFC-normalised name, so writing `note.md` over `Note.md`
+ * replaces it, and reading either spelling finds it.
+ */
+class AliasingVault extends MemoryVault {
+  private fold(path: string): string {
+    return path.normalize("NFC").toLowerCase();
+  }
+  private spelledAs(path: string): string | undefined {
+    const key = this.fold(path);
+    return this.paths().find((p) => this.fold(p) === key);
+  }
+  override async write(
+    path: string,
+    bytes: Uint8Array,
+    times: { mtime: number; ctime: number },
+  ): Promise<void> {
+    const there = this.spelledAs(path);
+    if (there !== undefined && there !== path) await super.remove(there);
+    await super.write(path, bytes, times);
+  }
+  override async read(path: string): Promise<Uint8Array> {
+    return super.read(this.spelledAs(path) ?? path);
+  }
+  override async exists(path: string): Promise<boolean> {
+    return this.spelledAs(path) !== undefined || super.exists(path);
+  }
+  override async remove(path: string): Promise<void> {
+    const there = this.spelledAs(path);
+    if (there !== undefined) await super.remove(there);
+  }
+  async sameFile(a: string, b: string): Promise<boolean> {
+    return this.fold(a) === this.fold(b);
+  }
+}
+
+/**
+ * A memory vault where the first free name a caller finds is taken by somebody
+ * else before the caller writes to it. What an editor saving, or another
+ * process, does in the gap between `exists` and `write`.
+ */
+class RacyVault extends MemoryVault {
+  /** Paths whose free name gets taken behind the caller's back. */
+  raceOn = (path: string) => path.includes("Conflicted copy") || path.includes("(restored");
+  raced: string[] = [];
+  override async exists(path: string): Promise<boolean> {
+    const was = await super.exists(path);
+    if (!was && this.raceOn(path) && this.raced.length === 0) {
+      this.raced.push(path);
+      // Reported free, and then taken, before the caller can act on it.
+      await super.write(path, new TextEncoder().encode(`somebody else's ${path}\n`), {
+        mtime: 1,
+        ctime: 1,
+      });
+    }
+    return was;
+  }
+}
+
+/** Everything both devices hold, joined, for asking whether a text survived anywhere. */
+function everywhere(...ds: Device[]): string {
+  return ds.flatMap((d) => Object.values(d.vault.snapshot())).join("\n---\n");
 }
 
 afterEach(async () => {
@@ -365,6 +463,116 @@ describe("concurrent edits, which is where notes get lost", () => {
       expect(copies.length, `${d.name} has no conflict copy`).toBeGreaterThan(0);
     }
   }, 240_000);
+
+  /**
+   * The other device commits between this device's decision and its flush.
+   *
+   * A pass decides every path first and sends the outbox at the end, and
+   * batches arrive on the transport's own chain the whole time. So A can
+   * decide "upload P, the server is unchanged", B's version of P can arrive,
+   * and A's flush then put its own version on top and record it as synced.
+   * B sees a clean download of a version built on its own and takes it over
+   * its edit, and nothing anywhere says conflict.
+   */
+  it("keeps the other device's edit when it landed mid-pass (C1)", async () => {
+    await fresh();
+    const av = new GatedVault();
+    const a = await device("a", undefined, av);
+    const b = await device("b");
+
+    await av.edit("P.md", "the original sentence\n");
+    await av.edit("zz-gate.md", "g0\n");
+    await convergeBoth(a, b);
+    expect(b.vault.text("P.md")).toBe("the original sentence\n");
+
+    // Both rewrite the same line, so a merge would have to keep both.
+    await av.edit("P.md", "A's completely different sentence\n");
+    await b.vault.edit("P.md", "B's entirely other sentence\n");
+
+    // A's pass decides P and then blocks reading zz-gate.md, which sorts
+    // last, so its outbox is not flushed until the test lets go.
+    let release!: () => void;
+    av.gatePath = "zz-gate.md";
+    av.gate = new Promise<void>((r) => (release = r));
+    await av.edit("zz-gate.md", "g1\n");
+    const seenBefore = a.batchesWithEntries;
+    const aPass = a.engine.sync();
+    await new Promise((r) => setTimeout(r, 300));
+
+    // B commits while A is mid-pass, and A receives the batch.
+    const bReport = await b.engine.sync();
+    expect(bReport.uploaded).toBe(1);
+    await until("a to receive b's version", () => a.batchesWithEntries > seenBefore);
+    await new Promise((r) => setTimeout(r, 100));
+
+    release();
+    const aReport = await aPass;
+
+    await convergeBoth(a, b, 6);
+    // The property that matters: both edits still exist somewhere, on both
+    // devices, as a merge or as a conflict copy.
+    for (const d of [a, b]) {
+      const all = everywhere(d);
+      expect(all, `${d.name} lost B's edit`).toContain("B's entirely other sentence");
+      expect(all, `${d.name} lost A's edit`).toContain("A's completely different sentence");
+    }
+    // And A's own pass did not call P a clean upload. It says so one way or
+    // the other: held for another pass, or already merged or kept both.
+    expect(aReport.waiting + aReport.merged + aReport.conflicted).toBeGreaterThan(0);
+  }, 240_000);
+});
+
+/**
+ * A case-only rename arriving in a pass that also downloads many other files.
+ *
+ * `applyDeletes` refuses a deletion that would remove a file this pass wrote,
+ * which is what keeps `Note.md` to `NOTE.md` from deleting the note on a
+ * filesystem that folds case. The list of writes was cleared just before the
+ * final fill, but a full inbox is filled part way through the loop, so the
+ * writes from that earlier fill were forgotten by the time the deletes ran.
+ */
+describe("a case-only rename on a receiving device (C2)", () => {
+  async function scenario(others: number): Promise<{ b: Device; report: SyncReport }> {
+    await fresh();
+    const a = await device("a", undefined, new FoldingVault());
+    const logs: string[] = [];
+    const b = await device("b", (m) => logs.push(m), new FoldingVault());
+
+    await a.vault.edit("Note.md", "the only copy of this text\n");
+    for (let i = 0; i < others; i++) {
+      await a.vault.edit(`n${String(i).padStart(3, "0")}.md`, `v1 ${i}\n`);
+    }
+    await convergeBoth(a, b);
+    expect(b.vault.text("Note.md")).toBe("the only copy of this text\n");
+
+    // A renames Note.md to NOTE.md, case only, and edits every other file.
+    await a.vault.remove("Note.md");
+    await a.vault.edit("NOTE.md", "the only copy of this text\n");
+    for (let i = 0; i < others; i++) {
+      await a.vault.edit(`n${String(i).padStart(3, "0")}.md`, `v2 ${i}\n`);
+    }
+    await a.settle();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const report = await b.engine.sync();
+    return { b, report };
+  }
+
+  it("keeps the note when the pass is small", async () => {
+    const { b, report } = await scenario(10);
+    expect(report.deletedLocally).toBe(0);
+    expect(b.vault.text("NOTE.md")).toBe("the only copy of this text\n");
+  }, 240_000);
+
+  it("keeps the note when the pass holds more than one batch of downloads", async () => {
+    const { b, report } = await scenario(300);
+    // The property: the text is still on device b, under either spelling.
+    const held = b.vault.paths().filter((p) => p.toLowerCase() === "note.md");
+    expect(held, `b holds ${held.join(",")}; deletedLocally=${report.deletedLocally}`).not.toEqual(
+      [],
+    );
+    expect(report.deletedLocally).toBe(0);
+  }, 240_000);
 });
 
 /**
@@ -539,6 +747,41 @@ describe("folders and renames", () => {
     expect(await a.vault.exists("Archive"), "the folder came back").toBe(false);
   }, 240_000);
 
+  /**
+   * The same folder, held by both devices before they ever paired.
+   *
+   * Neither device created it for the other, so neither took the path that
+   * records a folder as synced. The comparison that should have done it
+   * instead was between the scan's "" and the batch's "-empty-", which never
+   * agree, so the folder never got a synctime and read as one this device had
+   * never seen. Removing it then brought it back, every pass.
+   */
+  it("does not put back a folder both devices already had (C5)", async () => {
+    await fresh();
+    const a = await device("a");
+    await a.vault.edit("dir/a.md", "from a\n");
+    await a.settle();
+
+    const b = new Device("b");
+    devices.push(b);
+    await b.vault.edit("dir/b.md", "from b\n"); // b has dir/ before pairing
+    await b.connect(server);
+    await convergeBoth(a, b);
+    expect(b.vault.text("dir/a.md")).toBe("from a\n");
+
+    // b empties the folder and removes it.
+    await b.vault.remove("dir/a.md");
+    await b.vault.remove("dir/b.md");
+    await b.vault.remove("dir");
+    const r = await b.engine.sync();
+    expect(r.deletedRemotely).toBe(2);
+    const again = await b.engine.sync();
+    expect(r.foldersCreated + again.foldersCreated, "the folder b just removed was put back").toBe(
+      0,
+    );
+    expect(await b.vault.exists("dir")).toBe(false);
+  }, 240_000);
+
   it("creates a folder the other device made", async () => {
     await fresh();
     const a = await device("a");
@@ -584,6 +827,200 @@ describe("folders and renames", () => {
     // device could never see it.
     expect(a.vault.text("before.md"), "the moved file came back").toBeUndefined();
     expect(a.vault.text("after.md")).toBe("the same content throughout\n");
+  }, 240_000);
+
+  /**
+   * Obsidian reports a folder rename as one event, for the folder. Every
+   * file beneath it has moved without a word, and the engine used to move
+   * only the entry it was told about, so each file went over as new at its
+   * new path and deleted at its old one.
+   */
+  it("carries a folder rename as a rename of everything inside it (P9)", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+
+    const files = ["dir/one.md", "dir/two.md", "dir/sub/three.md"];
+    for (const f of files) await a.vault.edit(f, `content of ${f}\n`);
+    await convergeBoth(a, b);
+    expect(b.vault.text("dir/sub/three.md")).toBe("content of dir/sub/three.md\n");
+
+    // As the vault would do it, then the one event Obsidian fires.
+    for (const f of files) {
+      const bytes = await a.vault.read(f);
+      await a.vault.remove(f);
+      await a.vault.write(f.replace(/^dir\//, "moved/"), bytes, { mtime: 2000, ctime: 1000 });
+    }
+    await a.vault.remove("dir/sub");
+    await a.vault.remove("dir");
+    a.engine.noteRename("dir", "moved");
+
+    const before = b.batches.length;
+    await a.engine.sync();
+    await new Promise((r) => setTimeout(r, 200));
+    // Each file travelled as a rename, which is the `prev` field on the wire.
+    const renames = b.batches
+      .slice(before)
+      .flatMap((batch) => batch.entries as { prev?: string; folder: boolean }[])
+      .filter((e) => !e.folder && e.prev);
+    expect(renames.length).toBe(files.length);
+
+    await convergeBoth(a, b, 6);
+    for (const d of [a, b]) {
+      for (const f of files) {
+        expect(d.vault.text(f.replace(/^dir\//, "moved/")), `${d.name} lacks the moved ${f}`).toBe(
+          `content of ${f}\n`,
+        );
+        expect(d.vault.text(f), `${d.name} got ${f} back`).toBeUndefined();
+      }
+    }
+  }, 240_000);
+});
+
+/**
+ * C16 in TODO.md. Two distinct paths on the server that one disk files as a
+ * single name. Writing the second replaced the first, both were recorded as
+ * synced, and the next scan reported the first deleted to every device.
+ */
+describe("two notes the receiving disk cannot hold apart", () => {
+  async function aliased(first: string, second: string): Promise<void> {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b", undefined, new AliasingVault());
+
+    await a.vault.edit(first, `the ${first} text\n`);
+    await a.vault.edit(second, `the ${second} text\n`);
+    await a.settle();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const report = await b.engine.sync();
+    // Neither is written, both are named, and nothing is called synced.
+    expect(report.blocked).toBe(2);
+    expect(report.inTheWay.map((w) => w.path).sort()).toEqual([first, second].sort());
+    for (const w of report.inTheWay) expect([first, second]).toContain(w.blockedBy);
+    expect(b.vault.paths()).toEqual([]);
+
+    // The property: the device that has both still has both, whatever b did.
+    await convergeBoth(a, b, 4);
+    expect(a.vault.text(first), `a lost ${first}`).toBe(`the ${first} text\n`);
+    expect(a.vault.text(second), `a lost ${second}`).toBe(`the ${second} text\n`);
+
+    // Renaming one on the device that has both clears it, and both arrive.
+    const bytes = await a.vault.read(second);
+    await a.vault.remove(second);
+    await a.vault.write("renamed.md", bytes, { mtime: 3000, ctime: 3000 });
+    a.engine.noteRename(second, "renamed.md");
+    await convergeBoth(a, b, 6);
+    expect(b.vault.text(first)).toBe(`the ${first} text\n`);
+    expect(b.vault.text("renamed.md")).toBe(`the ${second} text\n`);
+  }
+
+  it("refuses two names that differ only by case, and names both", async () => {
+    await aliased("Note.md", "note.md");
+  }, 240_000);
+
+  it("refuses two names that differ only by Unicode normalisation", async () => {
+    await aliased("caf\u00e9.md", "cafe\u0301.md");
+  }, 240_000);
+
+  it("still lets a case-only rename through", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b", undefined, new AliasingVault());
+    await a.vault.edit("Note.md", "the note\n");
+    await convergeBoth(a, b);
+    const bytes = await a.vault.read("Note.md");
+    await a.vault.remove("Note.md");
+    await a.vault.write("NOTE.md", bytes, { mtime: 2000, ctime: 1000 });
+    a.engine.noteRename("Note.md", "NOTE.md");
+    await convergeBoth(a, b, 6);
+    expect(b.vault.text("NOTE.md")).toBe("the note\n");
+    expect(b.vault.paths()).toEqual(["NOTE.md"]);
+  }, 240_000);
+});
+
+/**
+ * C17 in TODO.md. The conflict copy is the only surviving record of one side
+ * of a divergence, and its name was chosen with `exists` and then written
+ * with an ordinary replacing write. A file appearing in between was replaced.
+ */
+describe("a conflict copy whose name is taken in the gap", () => {
+  it("goes under the next name rather than over what appeared", async () => {
+    await fresh();
+    const a = await device("a");
+    const racy = new RacyVault();
+    const b = await device("b", undefined, racy);
+
+    await a.vault.edit("note.md", "the original\n");
+    await convergeBoth(a, b);
+    await a.vault.edit("note.md", "A's rewrite\n");
+    await b.vault.edit("note.md", "B's rewrite\n");
+    await a.settle();
+    await new Promise((r) => setTimeout(r, 200));
+
+    const report = await b.engine.sync();
+    expect(report.conflicted).toBe(1);
+    expect(racy.raced.length).toBeGreaterThan(0);
+    // What appeared in the gap is untouched, and the incoming version is
+    // somewhere beside it.
+    for (const taken of racy.raced) {
+      expect(b.vault.text(taken)).toBe(`somebody else's ${taken}\n`);
+    }
+    const all = everywhere(b);
+    expect(all).toContain("A's rewrite");
+    expect(all).toContain("B's rewrite");
+  }, 240_000);
+});
+
+/**
+ * A merge whose ancestor the server no longer holds.
+ *
+ * One catch used to cover the ancestor fetch, the local read, the incoming
+ * fetch and the decoding, so every one of those failures became a conflict
+ * copy labelled "not valid UTF-8". A purged ancestor is the case that happens
+ * in practice: `basaltd purge` keeps the newest version of each path, and a
+ * device that was away holds a base the server has since let go of.
+ */
+describe("a merge against an ancestor that has been purged (C7)", () => {
+  it("keeps both and says why, rather than blaming the encoding", async () => {
+    await fresh();
+    const a = await device("a");
+    const logs: { message: string; rest: unknown[] }[] = [];
+    const log = (message: string, ...rest: unknown[]) => void logs.push({ message, rest });
+    const b = await device("b", log);
+
+    const base = "# Note\n\nFirst paragraph.\n\nSecond paragraph.\n";
+    await a.vault.edit("note.md", base);
+    await convergeBoth(a, b);
+    expect(b.vault.text("note.md")).toBe(base);
+
+    // a moves on and syncs; b edits the other paragraph but does not sync.
+    await a.vault.edit("note.md", base.replace("First paragraph.", "First, from a."));
+    await a.settle();
+    await new Promise((r) => setTimeout(r, 200));
+    await b.vault.edit("note.md", base.replace("Second paragraph.", "Second, from b."));
+
+    // The server forgets everything but the newest version of each path,
+    // which takes b's merge base with it.
+    a.close();
+    b.close();
+    await server.whileStopped(async () => {
+      await server.cli("purge", "-vault", "default", "-confirm", "default", "-no-backup-check");
+    });
+    await b.connect(server, log);
+
+    const report = await b.engine.sync();
+    expect(report.conflicted).toBe(1);
+    expect(report.retrying).toBe(0);
+    const kept = logs.find((l) => l.message === "kept both");
+    const why = String((kept?.rest[1] as { why?: string } | undefined)?.why ?? "");
+    expect(why, "the reason given").toMatch(/purged/);
+    expect(why).not.toMatch(/UTF-8/);
+
+    // The property: both edits are on b, the local one in place.
+    const all = everywhere(b);
+    expect(all).toContain("First, from a.");
+    expect(b.vault.text("note.md")).toContain("Second, from b.");
   }, 240_000);
 });
 

@@ -142,6 +142,30 @@ describe("history", () => {
     expect(h.code).toBe(1);
     expect(h.all).toMatch(/needs the path/);
   }, 300_000);
+
+  /**
+   * The server lists at most five hundred versions and answers a larger
+   * limit with its default page of a hundred, saying nothing. Passed
+   * through, `--limit 600` printed a hundred versions that read as all of
+   * them.
+   */
+  it("caps the limit at what the server will list, and says so", async () => {
+    const dir = await paired();
+    await write(dir, "note.md", "one\n");
+    await cli("sync", "--dir", dir);
+
+    const h = await cli("history", "note.md", "--dir", dir, "--limit", "600");
+    expect(h.code, h.all).toBe(0);
+    expect(h.stdout).toMatch(/at most 500 versions/);
+    expect(h.stdout).toMatch(/--limit 600 was capped/);
+
+    const j = await cli("history", "note.md", "--dir", dir, "--limit", "600", "--json");
+    expect(j.json()["limit"]).toBe(500);
+
+    // Within the cap nothing is said, because nothing was changed.
+    const small = await cli("history", "note.md", "--dir", dir, "--limit", "5");
+    expect(small.stdout).not.toMatch(/capped/);
+  }, 300_000);
 });
 
 describe("the list of what is gone", () => {
@@ -303,7 +327,9 @@ describe("restoring", () => {
     await cli("sync", "--dir", dir);
 
     const other = await vaultDir("b");
-    const pairing = (await cli("invite", "--dir", dir, "--json")).json()["pairing"] as string;
+    const pairing = (await cli("recovery-key", "--dir", dir, "--json")).json()[
+      "recoveryKey"
+    ] as string;
     await cli("pair", pairing, "--dir", other, "--device", "b");
     await cli("sync", "--dir", other);
     expect(await read(other, "shared.md")).toBe("the original\n");
@@ -442,7 +468,7 @@ describe("after the history has been purged", () => {
     // Purge needs the data directory to itself, which is what the
     // exclusive lock is for, so the server steps aside for it.
     await server.whileStopped(async () => {
-      await server.cli("purge", "-vault", "default");
+      await server.cli("purge", "-vault", "default", "-confirm", "default", "-no-backup-check");
     });
 
     const after = await cli("deleted", "--dir", dir, "--json");

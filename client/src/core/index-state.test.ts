@@ -377,3 +377,88 @@ describe("the write-coalescing debounce", () => {
     expect(readyToSyncAgain(large, 100_000 + 31_000)).toBe(true);
   });
 });
+
+/**
+ * I12 in TODO.md. Timestamps are client-asserted and clocks disagree, so they
+ * are hints and never the authority. The decision table reads `mtime` from
+ * neither side: ordering is uid order, agreement is content, and a device with
+ * a clock a year off makes exactly the decisions a device with the right time
+ * makes.
+ */
+describe("with skewed clocks", () => {
+  const YEAR = 365 * 24 * 3600 * 1000;
+  const base = "chunk-a";
+
+  function alreadySynced(hash = base): IndexEntry {
+    const e = newEntry("note.md");
+    e.hash = hash;
+    e.synchash = base;
+    e.syncuid = 7;
+    e.synctime = 1;
+    return e;
+  }
+
+  it("downloads a newer version even when the local file's clock says it is newer", () => {
+    // Local is unchanged since the last sync (hash equals the ancestor) but
+    // its mtime is a year ahead of the server's. A table that trusted
+    // clocks would keep the stale local file.
+    const action = decide({
+      local: { folder: false, mtime: 2 * YEAR, size: 5, hash: base },
+      remote: { uid: 9, folder: false, deleted: false, mtime: 1000, size: 6, hash: "chunk-b" },
+      index: alreadySynced(),
+      mergeable: true,
+    });
+    expect(action.kind).toBe("download");
+  });
+
+  it("uploads a local edit even when the server's version claims a later time", () => {
+    const action = decide({
+      local: { folder: false, mtime: 1000, size: 5, hash: "chunk-c" },
+      remote: { uid: 9, folder: false, deleted: false, mtime: 2 * YEAR, size: 6, hash: base },
+      index: alreadySynced("chunk-c"),
+      mergeable: true,
+    });
+    expect(action.kind).toBe("upload");
+  });
+
+  it("makes the same decision whatever either clock says", () => {
+    // Every combination of a clock far ahead and far behind on either side,
+    // for the case where both sides moved: the answer is a merge, and it
+    // never becomes a download or an upload because one side looks newer.
+    for (const localTime of [0, 1000, 2 * YEAR]) {
+      for (const remoteTime of [0, 1000, 2 * YEAR]) {
+        const action = decide({
+          local: { folder: false, mtime: localTime, size: 5, hash: "chunk-mine" },
+          remote: {
+            uid: 9,
+            folder: false,
+            deleted: false,
+            mtime: remoteTime,
+            size: 6,
+            hash: "chunk-theirs",
+          },
+          index: alreadySynced("chunk-mine"),
+          mergeable: true,
+        });
+        expect(action.kind, `local ${localTime} remote ${remoteTime}`).toBe("merge");
+      }
+    }
+  });
+
+  it("does not resolve a no-ancestor divergence by picking the newer clock", () => {
+    // Obsidian downloads whichever is newer, which silently discards the
+    // other. Here both are kept, and the clocks are not consulted.
+    for (const [localTime, remoteTime] of [
+      [0, YEAR],
+      [YEAR, 0],
+    ]) {
+      const action = decide({
+        local: { folder: false, mtime: localTime!, size: 5, hash: "one" },
+        remote: { uid: 3, folder: false, deleted: false, mtime: remoteTime!, size: 6, hash: "two" },
+        index: newEntry("note.md"),
+        mergeable: true,
+      });
+      expect(action.kind).toBe("conflict");
+    }
+  });
+});

@@ -205,6 +205,101 @@ describe("paths from elsewhere", () => {
     await v.write("notes/a..b.md", enc.encode("fine"), { mtime: 1, ctime: 1 });
     expect(dec.decode(await v.read("notes/a..b.md"))).toBe("fine");
   });
+
+  /**
+   * The ignore set was consulted for the first segment on the way in and for
+   * every segment on the way out. A peer's `notes/.git/hooks/post-checkout`
+   * was therefore written, never listed, and reported deleted on the next
+   * pass; the peer then deleted its own copy on this device's word.
+   */
+  it("refuses a never-synced name at any depth, exactly where list skips it (C3)", async () => {
+    const v = new NodeVault(root);
+    const nested = [
+      "notes/.git/hooks/post-checkout",
+      "notes/node_modules/lib.md",
+      "notes/.obsidian/plugins/x/main.js",
+      "deep/er/.hidden.md",
+    ];
+    for (const path of nested) {
+      await expect(v.write(path, enc.encode("x"), { mtime: 1, ctime: 1 }), path).rejects.toThrow(
+        /never synced/,
+      );
+      await expect(v.mkdir(path), path).rejects.toThrow(/never synced/);
+      await expect(readFile(join(root, path)), `${path} was written`).rejects.toThrow();
+    }
+    // Written behind the vault's back, the way a git checkout or an npm
+    // install does, none of it is listed either. What is not accepted is not
+    // offered, so nothing can be reported deleted that was never here.
+    for (const path of nested) {
+      await mkdir(join(root, path, ".."), { recursive: true });
+      await writeFile(join(root, path), "x");
+    }
+    await writeFile(join(root, "notes", "real.md"), "x");
+    const listed = (await v.list()).map((f) => f.path);
+    expect(listed).toContain("notes/real.md");
+    for (const path of nested) expect(listed, path).not.toContain(path);
+    expect(listed.some((p) => p.split("/").some((part) => part.startsWith(".")))).toBe(false);
+  });
+});
+
+/**
+ * C17 in TODO.md: a create that is exclusive, so the gap between choosing a
+ * free name and writing to it cannot swallow a file that appeared in it.
+ */
+describe("creating a file only if nothing is there", () => {
+  it("writes when the name is free, and says so", async () => {
+    const v = new NodeVault(root);
+    expect(await v.create("new/copy.md", enc.encode("copy"), { mtime: 5000, ctime: 5000 })).toBe(
+      true,
+    );
+    expect(dec.decode(await v.read("new/copy.md"))).toBe("copy");
+    expect(Math.round((await stat(join(root, "new", "copy.md"))).mtimeMs)).toBe(5000);
+    expect((await readdir(join(root, "new"))).filter((n) => n.includes(TEMP_MARK))).toEqual([]);
+  });
+
+  it("leaves what is there alone, and says it did not write", async () => {
+    const v = new NodeVault(root);
+    await writeFile(join(root, "taken.md"), "somebody else's");
+    expect(await v.create("taken.md", enc.encode("mine"), { mtime: 1, ctime: 1 })).toBe(false);
+    expect(await readFile(join(root, "taken.md"), "utf8")).toBe("somebody else's");
+    expect((await readdir(root)).filter((n) => n.includes(TEMP_MARK))).toEqual([]);
+  });
+
+  it("refuses the same paths a write refuses", async () => {
+    const v = new NodeVault(root);
+    await expect(v.create("../out.md", enc.encode("x"), { mtime: 1, ctime: 1 })).rejects.toThrow(
+      /outside the vault/,
+    );
+    await expect(
+      v.create(".obsidian/x.md", enc.encode("x"), { mtime: 1, ctime: 1 }),
+    ).rejects.toThrow(/never synced/);
+  });
+});
+
+/**
+ * C16 in TODO.md: the identity the disk gives a name, asked of the disk.
+ */
+describe("what this disk files a name under", () => {
+  it("folds Unicode normalisation always, and case as the disk does", async () => {
+    const v = new NodeVault(root);
+    await v.probeCase();
+    expect(v.canonical("caf\u00e9.md")).toBe(v.canonical("cafe\u0301.md"));
+    // Asked rather than assumed: the answer differs between a Mac and a
+    // Linux box, and the test runs on both.
+    await writeFile(join(root, "Probe.md"), "x");
+    let folds = true;
+    try {
+      await stat(join(root, "probe.md"));
+    } catch {
+      folds = false;
+    }
+    expect(v.canonical("Note.md") === v.canonical("note.md")).toBe(folds);
+  });
+
+  it("assumes folding until it has asked, which refuses rather than overwrites", () => {
+    const v = new NodeVault(root);
+    expect(v.canonical("Note.md")).toBe(v.canonical("note.md"));
+  });
 });
 
 describe("the index on disk", () => {
@@ -355,7 +450,7 @@ describe("writing durably", () => {
       await writeDurably(at, new TextEncoder().encode("the contents"));
       expect(await readFile(at, "utf8")).toBe("the contents");
 
-      const strays = (await readdir(dir)).filter(isTemporary);
+      const strays = (await readdir(dir)).filter((n) => isTemporary(n));
       expect(strays, `temporary files survived: ${strays.join(", ")}`).toEqual([]);
     } finally {
       await removeTree(dir);
@@ -402,7 +497,7 @@ describe("writing durably", () => {
       const vault = new NodeVault(dir);
       const paths = (await vault.list()).map((s) => s.path);
       expect(paths).toContain("real.md");
-      expect(paths.some(isTemporary)).toBe(false);
+      expect(paths.some((p) => isTemporary(p))).toBe(false);
     } finally {
       await removeTree(dir);
     }

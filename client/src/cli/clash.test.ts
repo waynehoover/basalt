@@ -8,7 +8,7 @@
  * is the question.
  */
 
-import { mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "../core/client.ts";
 import { authToken, deriveKeys, type VaultKeys } from "../core/crypto.ts";
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
+import { MemoryIndexStore, MemoryVault } from "../core/vault.ts";
 import { JsonIndexStore, NodeVault } from "./vault.ts";
 
 let keys: VaultKeys;
@@ -351,4 +352,81 @@ describe("a folder reorganised while a device was away", () => {
       `B is still working through it: ${JSON.stringify(report)}`,
     ).toEqual({ retrying: 0, skipped: 0 });
   }, 300_000);
+});
+
+/**
+ * A peer names a path under a folder this client never syncs.
+ *
+ * The headless client refused an ignored name only as the first segment on the
+ * way in and skipped it at every depth on the way out. So `proj/node_modules/
+ * readme.md` from another device was written, never listed, and reported
+ * deleted on the next pass, and the device that had it deleted its own copy on
+ * the word of one that never listed it.
+ */
+describe("a never-synced name nested inside an ordinary folder (C3, P2)", () => {
+  async function memoryDevice(name: string): Promise<{ c: Client; vault: MemoryVault }> {
+    const vault = new MemoryVault();
+    const c = new Client({
+      vault,
+      store: new MemoryIndexStore(),
+      keys,
+      url: server.wsUrl,
+      ...server.credentials(authToken(keys)),
+      vaultId: "default",
+      device: name,
+      timeoutMs: 20_000,
+      coalesceWrites: false,
+    });
+    open.push(c);
+    await c.connect();
+    return { c, vault };
+  }
+
+  it("is neither written nor reported deleted", async () => {
+    server = new TestServer();
+    await server.start();
+    const a = await memoryDevice("a");
+    const b = await device("b");
+
+    await a.vault.edit("proj/node_modules/readme.md", "kept by device a\n");
+    await a.vault.edit("proj/.hidden/note.md", "also kept by device a\n");
+    await a.vault.edit("proj/real.md", "an ordinary note\n");
+    await a.c.settle();
+
+    const r1 = await b.c.settle();
+    expect(r1.downloaded).toBe(1);
+    expect(await readFile(join(b.dir, "proj", "real.md"), "utf8")).toBe("an ordinary note\n");
+    await expect(readFile(join(b.dir, "proj", "node_modules", "readme.md"))).rejects.toThrow();
+    await expect(readFile(join(b.dir, "proj", ".hidden", "note.md"))).rejects.toThrow();
+
+    const r2 = await b.c.settle();
+    await new Promise((r) => setTimeout(r, 200));
+    await a.c.settle();
+    expect(r2.deletedRemotely, "b reported a deletion it never made").toBe(0);
+    expect(a.vault.text("proj/node_modules/readme.md"), "device a lost the file").toBe(
+      "kept by device a\n",
+    );
+    expect(a.vault.text("proj/.hidden/note.md"), "device a lost the file").toBe(
+      "also kept by device a\n",
+    );
+  }, 120_000);
+
+  it("is not uploaded from this device either", async () => {
+    server = new TestServer();
+    await server.start();
+    const b = await device("b");
+    const a = await memoryDevice("a");
+
+    await writeFile(join(b.dir, "note.md"), "a note\n");
+    await mkdir(join(b.dir, "proj", "node_modules"), { recursive: true });
+    await writeFile(join(b.dir, "proj", "node_modules", "readme.md"), "not a note\n");
+    await mkdir(join(b.dir, "proj", ".cache"), { recursive: true });
+    await writeFile(join(b.dir, "proj", ".cache", "state.md"), "not a note either\n");
+
+    // The note and the `proj` folder go up; nothing under the ignored names.
+    const report = await b.c.settle();
+    expect(report.uploaded).toBe(2);
+    await a.c.settle();
+    expect(a.vault.paths()).toEqual(["note.md"]);
+  }, 120_000);
 });

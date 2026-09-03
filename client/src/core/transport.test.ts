@@ -16,6 +16,7 @@
 
 import { describe, expect, it, vi } from "vitest";
 import { chunkName } from "./crypto.ts";
+import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
 import {
   Backoff,
   ConnectionError,
@@ -23,51 +24,7 @@ import {
   Transport,
   urlForHost,
   type Batch,
-  type SocketLike,
 } from "./transport.ts";
-
-/** A socket under the test's control, which can say anything at all. */
-class FakeSocket implements SocketLike {
-  binaryType = "";
-  onopen: ((ev: unknown) => void) | null = null;
-  onclose: ((ev: { code?: number; reason?: string }) => void) | null = null;
-  onerror: ((ev: unknown) => void) | null = null;
-  onmessage: ((ev: { data: unknown }) => void) | null = null;
-
-  /** Everything the client sent, in order. */
-  readonly sentText: Record<string, unknown>[] = [];
-  readonly sentBinary: Uint8Array[] = [];
-  closed = false;
-
-  send(data: string | ArrayBufferLike | Uint8Array): void {
-    if (typeof data === "string") this.sentText.push(JSON.parse(data) as Record<string, unknown>);
-    else
-      this.sentBinary.push(data instanceof Uint8Array ? data : new Uint8Array(data as ArrayBuffer));
-  }
-
-  close(): void {
-    this.closed = true;
-  }
-
-  open(): void {
-    this.onopen?.(undefined);
-  }
-
-  /** Delivers a text frame, as the server would. */
-  reply(frame: unknown): void {
-    this.onmessage?.({ data: JSON.stringify(frame) });
-  }
-
-  body(bytes: Uint8Array): void {
-    this.onmessage?.({
-      data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-    });
-  }
-
-  hangUp(code = 1006, reason = "gone"): void {
-    this.onclose?.({ code, reason });
-  }
-}
 
 /** A connected transport and the socket behind it. */
 async function connected(
@@ -95,14 +52,7 @@ async function connected(
 async function helloed(cursor = 0, opts: Parameters<typeof connected>[0] = {}) {
   const rig = await connected(opts);
   const hello = rig.t.hello({ vault: "v", token: "tok", device: "d", cursor });
-  rig.socket.reply({
-    res: "ready",
-    proto: 2,
-    cursor: 10,
-    perFileMax: 1,
-    chunkMax: 1,
-    maxChunks: 1,
-  });
+  rig.socket.reply(ready());
   await hello;
   return rig;
 }
@@ -111,9 +61,6 @@ async function helloed(cursor = 0, opts: Parameters<typeof connected>[0] = {}) {
 async function named(body: Uint8Array): Promise<{ body: Uint8Array; name: string }> {
   return { body, name: await chunkName(body) };
 }
-
-/** Lets queued notification work run before asserting on it. */
-const settle = () => new Promise((r) => setTimeout(r, 0));
 
 describe("batches from a server that skips one", () => {
   it("refuses a batch that does not continue the cursor", async () => {
@@ -226,14 +173,40 @@ describe("caught-up", () => {
 });
 
 describe("the handshake", () => {
-  it("refuses a server speaking another protocol version", async () => {
+  it("refuses a server answering in another protocol version, naming both", async () => {
     const { t, socket } = await connected();
     const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
-    socket.reply({ res: "ready", proto: 3, cursor: 0, perFileMax: 1, chunkMax: 1, maxChunks: 1 });
+    socket.reply(ready({ proto: 2, serverVersion: "0.2.2" }));
     await expect(hello).rejects.toMatchObject({ code: "proto" });
+    await expect(hello).rejects.toThrow(/protocol 2/);
+    await expect(hello).rejects.toThrow(/speaks 3/);
+    await expect(hello).rejects.toThrow(/upgrade the server first/);
   });
 
-  it("sends the crypto suite this client actually implements", async () => {
+  /**
+   * I9 in TODO.md. A server that speaks only protocol 2 refuses a protocol 3
+   * hello in the protocol 2 shape: no id, no retryable, a message naming its
+   * own range. The client has to turn that into a sentence naming both ends
+   * and the one thing to do about it, because the upgrade order is the
+   * server first and a person reading "protocol 3 not supported" on their
+   * phone has no way to know which end is behind.
+   */
+  it("names both versions when an older server refuses, and says which end to upgrade", async () => {
+    const { t, socket } = await connected();
+    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    socket.raw({
+      res: "err",
+      code: "proto",
+      msg: "protocol 3 not supported, this server (version 0.2.2) speaks 2 to 2",
+    });
+    await expect(hello).rejects.toMatchObject({ code: "proto", retryable: false });
+    await expect(hello).rejects.toThrow(/speaks 2 to 2/);
+    await expect(hello).rejects.toThrow(/This client speaks protocol 3/);
+    await expect(hello).rejects.toThrow(/upgrade the server first/);
+    expect(t.isClosed).toBe(true);
+  });
+
+  it("sends protocol 3, an id, and the crypto suite this client actually implements", async () => {
     // A client that names a scheme it does not implement gets a session it
     // cannot decrypt anything in.
     const { t, socket } = await connected();
@@ -241,9 +214,72 @@ describe("the handshake", () => {
     await settle();
     expect(socket.sentText[0]).toMatchObject({
       op: "hello",
-      proto: 2,
+      proto: 3,
       crypto: "basalt/hkdf-aes-gcm/1",
     });
+    expect(socket.sentText[0]!["id"]).toBe(1);
+  });
+
+  it("reads every ceiling ready carries, and the wrapped key when there is one", async () => {
+    const { t, socket } = await connected();
+    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    socket.reply(
+      ready({
+        minProto: 2,
+        serverVersion: "1.2.3",
+        maxBatchBytes: 1234,
+        maxFetchBytes: 5678,
+        wrapped: "AAAA",
+      }),
+    );
+    expect(await hello).toMatchObject({
+      proto: 3,
+      minProto: 2,
+      serverVersion: "1.2.3",
+      maxBatchBytes: 1234,
+      maxFetchBytes: 5678,
+      wrapped: "AAAA",
+    });
+    expect(t.serverLimits?.maxBatchBytes).toBe(1234);
+  });
+
+  it("leaves wrapped out for a vault that has no data key", async () => {
+    const { t, socket } = await connected();
+    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    socket.reply(ready());
+    expect("wrapped" in (await hello)).toBe(false);
+  });
+
+  /**
+   * I6 in TODO.md. Both names land in the server's log and on every entry
+   * this device writes; the server refuses over 64 bytes or a control
+   * character with `badname` and ends the session. Refused here first, so a
+   * bad name is one error at pairing rather than a connection that dies on
+   * every attempt with nothing to say.
+   */
+  it("refuses a vault or device name the server would refuse, before sending it", async () => {
+    for (const [what, name] of [
+      ["device", "x".repeat(65)],
+      ["device", "é".repeat(33)], // 66 bytes of 33 characters
+      ["vault", "y".repeat(65)],
+      ["device", "line\nbreak"],
+      ["vault", "tab\there"],
+      ["device", "del\x7f"],
+    ] as const) {
+      const { socket, t } = await connected();
+      const args = { vault: "v", token: "t", device: "d", cursor: 0, [what]: name };
+      await expect(t.hello(args), `${what} ${JSON.stringify(name)}`).rejects.toMatchObject({
+        code: "badname",
+      });
+      expect(socket.sentText, "the bad name was sent").toHaveLength(0);
+    }
+    // And exactly sixty-four bytes is fine, as is any printable character.
+    const { socket, t } = await connected();
+    void t
+      .hello({ vault: "v".repeat(64), token: "t", device: "café ~", cursor: 0 })
+      .catch(() => {});
+    await settle();
+    expect(socket.sentText).toHaveLength(1);
   });
 
   it("refuses anything other than ready", async () => {
@@ -335,6 +371,155 @@ describe("put, against a server that answers oddly", () => {
   });
 });
 
+/**
+ * C11 in TODO.md. The ack follows the last body, and a loopback server answers
+ * inside the same tick as the send. A waiter installed after the bodies went
+ * out found the answer already there, and with no waiter in place a valid
+ * acknowledgement read as a reply nobody asked for and closed the connection.
+ */
+describe("an acknowledgement that arrives as fast as a loopback server sends it", () => {
+  const one = { name: "a".repeat(64), bytes: new Uint8Array([1]) };
+  const two = { name: "b".repeat(64), bytes: new Uint8Array([2]) };
+
+  /** A socket that answers from inside `send`, the moment the last body lands. */
+  class InstantSocket extends FakeSocket {
+    answer: Record<string, unknown> = {};
+    after = 0;
+    override send(data: string | ArrayBufferLike | Uint8Array): void {
+      super.send(data);
+      if (typeof data !== "string" && this.sentBinary.length === this.after) {
+        this.reply(this.answer);
+      }
+    }
+  }
+
+  /** A socket whose buffer drains on a timer, with the answer arriving mid-drain. */
+  class DrainingSocket extends FakeSocket {
+    buffered = 0;
+    answer: Record<string, unknown> = {};
+    after = 0;
+    stepMs = 5;
+    stepBytes = 1;
+    get bufferedAmount(): number {
+      return this.buffered;
+    }
+    override send(data: string | ArrayBufferLike | Uint8Array): void {
+      super.send(data);
+      if (typeof data === "string") return;
+      this.buffered += this.sentBinary.at(-1)!.length;
+      const tick = () => {
+        this.buffered = Math.max(0, this.buffered - this.stepBytes);
+        if (this.buffered > 0) setTimeout(tick, this.stepMs);
+      };
+      setTimeout(tick, this.stepMs);
+      // The server has the bodies and answers while this side's buffer is
+      // still reported as draining.
+      if (this.sentBinary.length === this.after) setTimeout(() => this.reply(this.answer), 1);
+    }
+  }
+
+  async function rig(socket: FakeSocket, timeoutMs = 1000) {
+    const t = new Transport("ws://test", {
+      onBatch: () => {},
+      socketFactory: () => socket,
+      timeoutMs,
+    });
+    const connecting = t.connect();
+    socket.open();
+    await connecting;
+    const hello = t.hello({ vault: "v", token: "tok", device: "d", cursor: 0 });
+    socket.reply(ready());
+    await hello;
+    return t;
+  }
+
+  it("commits a put whose ack arrives from inside the last send", async () => {
+    const socket = new InstantSocket();
+    socket.answer = { res: "ack", uid: 7 };
+    socket.after = 2;
+    const t = await rig(socket);
+    const put = t.put("p", { size: 2, ctime: 0, mtime: 0 }, [one.name, two.name], async (n) =>
+      n === one.name ? one.bytes : two.bytes,
+    );
+    await settle();
+    socket.reply({ res: "want", chunks: [one.name, two.name] });
+    expect(await put).toMatchObject({ uid: 7, uploaded: 2 });
+    expect(t.isClosed).toBe(false);
+  });
+
+  it("commits a batch whose acks arrive from inside the last send", async () => {
+    const socket = new InstantSocket();
+    socket.answer = { res: "acks", results: [{ uid: 3 }, { uid: 4 }] };
+    socket.after = 2;
+    const t = await rig(socket);
+    const entry = (path: string, name: string) => ({
+      path,
+      meta: { size: 1, ctime: 0, mtime: 0 },
+      names: [name],
+      mac: "m",
+      parent: "",
+    });
+    const putting = t.putMany([entry("p", one.name), entry("q", two.name)], async (n) =>
+      n === one.name ? one.bytes : two.bytes,
+    );
+    await settle();
+    socket.reply({ res: "want", chunks: [one.name, two.name] });
+    const out = await putting;
+    expect(out.results.map((r) => r.uid)).toEqual([3, 4]);
+    expect(t.isClosed).toBe(false);
+  });
+
+  it("commits a put whose ack arrives while the socket buffer is still draining", async () => {
+    const socket = new DrainingSocket();
+    socket.answer = { res: "ack", uid: 8 };
+    socket.after = 1;
+    socket.stepBytes = 1;
+    socket.stepMs = 5;
+    const t = await rig(socket);
+    const body = new Uint8Array(20);
+    const put = t.put("p", { size: 20, ctime: 0, mtime: 0 }, [one.name], async () => body);
+    await settle();
+    socket.reply({ res: "want", chunks: [one.name] });
+    expect(await put).toMatchObject({ uid: 8, uploaded: 1, bytes: 20 });
+    expect(t.isClosed).toBe(false);
+  });
+
+  it("does not time out an upload that drains slowly but steadily", async () => {
+    // The drain takes several timeouts; every step is progress, and the ack
+    // clock starts only once the last byte has left. C4 and C11 together.
+    const socket = new DrainingSocket();
+    socket.answer = { res: "ack", uid: 9 };
+    socket.after = 1;
+    socket.stepBytes = 1;
+    socket.stepMs = 10;
+    const t = await rig(socket, 100);
+    const body = new Uint8Array(40); // 400 ms of drain against a 100 ms timeout
+    const put = t.put("p", { size: 40, ctime: 0, mtime: 0 }, [one.name], async () => body);
+    await settle();
+    socket.reply({ res: "want", chunks: [one.name] });
+    expect(await put).toMatchObject({ uid: 9, uploaded: 1 });
+    expect(t.isClosed).toBe(false);
+  });
+
+  it("still closes when the buffer stops moving for a whole timeout", async () => {
+    const socket = new DrainingSocket();
+    socket.answer = { res: "ack", uid: 9 };
+    socket.after = 99; // never answers
+    socket.stepBytes = 0; // never drains
+    const t = await rig(socket, 100);
+    const put = t.put(
+      "p",
+      { size: 4, ctime: 0, mtime: 0 },
+      [one.name],
+      async () => new Uint8Array(4),
+    );
+    await settle();
+    socket.reply({ res: "want", chunks: [one.name] });
+    await expect(put).rejects.toThrow(/stalled/);
+    expect(t.isClosed).toBe(true);
+  });
+});
+
 describe("errors", () => {
   it("raises a refusal rather than returning it as a reply", async () => {
     const { t, socket } = await helloed(0);
@@ -357,20 +542,48 @@ describe("errors", () => {
   });
 
   it("knows which codes end a session", () => {
-    for (const code of ["proto", "auth", "cursor", "busy", "protostate", "badchunk", "internal"]) {
-      expect(new ProtocolError(code, "x").fatal, code).toBe(true);
+    for (const code of ["proto", "auth", "cursor", "busy", "protostate", "nospace", "internal"]) {
+      expect(new ProtocolError(code, "x").endsSession, code).toBe(true);
     }
-    for (const code of [
-      "badentry",
-      "badname",
-      "toolarge",
-      "nospace",
-      "nouid",
-      "nocontent",
-      "nochunk",
-    ]) {
-      expect(new ProtocolError(code, "x").fatal, code).toBe(false);
+    for (const code of ["badentry", "badname", "toolarge", "nouid", "nocontent", "nochunk"]) {
+      expect(new ProtocolError(code, "x").endsSession, code).toBe(false);
     }
+  });
+
+  /**
+   * I2 in TODO.md. Whether a loop retries is the server's `retryable`, read
+   * off the frame, and the code table stands in only for an error that
+   * arrived before the protocol was settled and so has no field.
+   */
+  it("takes retryable from the frame when it is there, and from the code only when it is not", () => {
+    expect(new ProtocolError("busy", "x", { retryable: false }).fatal).toBe(true);
+    expect(new ProtocolError("badname", "x", { retryable: true }).fatal).toBe(false);
+    for (const code of ["busy", "nospace", "internal"]) {
+      expect(new ProtocolError(code, "x").fatal, `${code} with no field`).toBe(false);
+    }
+    for (const code of ["proto", "auth", "cursor", "protostate", "badchunk", "toolarge"]) {
+      expect(new ProtocolError(code, "x").fatal, `${code} with no field`).toBe(true);
+    }
+  });
+
+  it("carries the server's retry hint on a refusal in reply", async () => {
+    const { t, socket } = await helloed(0);
+    const get = t.get(1);
+    await settle();
+    socket.reply({
+      res: "err",
+      code: "busy",
+      msg: "8 devices connected",
+      retryable: true,
+      retryAfterMs: 30_000,
+    });
+    await expect(get).rejects.toMatchObject({
+      code: "busy",
+      retryable: true,
+      retryAfterMs: 30_000,
+      fatal: false,
+    });
+    expect(t.isClosed, "busy ends the session").toBe(true);
   });
 
   it("refuses a frame that is not JSON", async () => {
@@ -385,6 +598,73 @@ describe("errors", () => {
     socket.reply({ res: "pong" });
     await settle();
     expect(t.isClosed).toBe(true);
+  });
+
+  /**
+   * C26 in TODO.md. On shutdown the server sends every idle session
+   * `{res:"err", code:"busy"}` and then closes it. Read as a stray reply this
+   * was a protocol violation, so every plugin attached to a restarting server
+   * went to "stopped" instead of waiting for it to come back.
+   */
+  describe("an error frame nobody asked for (C26)", () => {
+    async function idle() {
+      const socket = new FakeSocket();
+      let cause: Error | undefined;
+      const t = new Transport("ws://test", {
+        onBatch: () => {},
+        onClosed: (c) => {
+          cause = c;
+        },
+        socketFactory: () => socket,
+        timeoutMs: 1000,
+      });
+      const connecting = t.connect();
+      socket.open();
+      await connecting;
+      const hello = t.hello({ vault: "v", token: "tok", device: "d", cursor: 0 });
+      socket.reply(ready({ cursor: 0 }));
+      await hello;
+      return { t, socket, cause: () => cause };
+    }
+
+    it("takes busy as the connection ending, which a loop retries after the hint", async () => {
+      const { t, socket, cause } = await idle();
+      socket.raw({
+        res: "err",
+        code: "busy",
+        msg: "this server is shutting down",
+        retryable: true,
+        retryAfterMs: 5000,
+      });
+      await settle();
+      expect(t.isClosed).toBe(true);
+      expect(cause()).toBeInstanceOf(ProtocolError);
+      expect((cause() as ProtocolError).fatal, "a shutdown notice must not stop the loop").toBe(
+        false,
+      );
+      expect((cause() as ProtocolError).retryAfterMs).toBe(5000);
+      expect(cause()!.message).toMatch(/shutting down/);
+    });
+
+    it("takes a refusal that would repeat as fatal, as it would be in reply", async () => {
+      for (const code of ["proto", "auth", "cursor", "protostate"]) {
+        const { t, socket, cause } = await idle();
+        socket.raw({ res: "err", code, msg: "no", retryable: false });
+        await settle();
+        expect(t.isClosed, code).toBe(true);
+        expect(cause(), code).toBeInstanceOf(ProtocolError);
+        expect((cause() as ProtocolError).code).toBe(code);
+        expect((cause() as ProtocolError).fatal, code).toBe(true);
+      }
+    });
+
+    it("reads a shutdown notice with no retryable field by its code, which is how one arrives before ready", async () => {
+      const { t, socket, cause } = await idle();
+      socket.raw({ res: "err", code: "busy", msg: "shutting down" });
+      await settle();
+      expect(t.isClosed).toBe(true);
+      expect((cause() as ProtocolError).fatal).toBe(false);
+    });
   });
 
   it("fails everything waiting when the connection goes away", async () => {
@@ -404,12 +684,74 @@ describe("errors", () => {
     await expect(t.get(1)).rejects.toBeInstanceOf(ConnectionError);
   });
 
-  it("refuses two requests at once rather than crossing their replies", async () => {
-    // Two in flight would resolve into each other's slot, and the caller
-    // would receive the wrong answer with nothing reporting it.
-    const { t } = await helloed(0);
-    void t.get(1).catch(() => {});
-    await expect(t.get(2)).rejects.toThrow(/already in flight/);
+  /**
+   * I1 in TODO.md. Two requests in flight used to be refused, because a
+   * reply was matched to the one request in flight by position. Every reply
+   * now echoes the id it answers, so the answers can arrive in any order and
+   * each caller gets its own.
+   */
+  it("matches two replies in flight to their requests by id, whatever order they come in", async () => {
+    const { t, socket } = await helloed(0);
+    const first = t.get(1);
+    const second = t.get(2);
+    await settle();
+    const [askOne, askTwo] = socket.sentText.slice(-2) as Record<string, unknown>[];
+    expect(askOne!["id"]).not.toBe(askTwo!["id"]);
+    socket.reply({ res: "chunks", id: askTwo!["id"], uid: 2, size: 0, chunks: [] });
+    socket.reply({ res: "chunks", id: askOne!["id"], uid: 1, size: 0, chunks: [] });
+    expect((await first).uid).toBe(1);
+    expect((await second).uid).toBe(2);
+    expect(t.isClosed).toBe(false);
+  });
+
+  it("gives every request a fresh id", async () => {
+    const { t, socket } = await helloed(0);
+    for (let i = 0; i < 5; i++) {
+      const get = t.get(i + 1);
+      await settle();
+      socket.reply({ res: "chunks", uid: i + 1, size: 0, chunks: [] });
+      await get;
+    }
+    const ids = socket.sentText.map((m) => m["id"]).filter((id) => id !== undefined);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toHaveLength(6); // the hello and five gets
+  });
+
+  it("ends the session on a reply to a request it does not have in flight", async () => {
+    // The server never sends an id it was not given, so an unknown one means
+    // the two ends disagree about state, and the protocol says to stop.
+    const { t, socket } = await helloed(0);
+    const get = t.get(1);
+    await settle();
+    socket.reply({ res: "chunks", id: 999, uid: 1, size: 0, chunks: [] });
+    await expect(get).rejects.toMatchObject({ code: "protostate" });
+    expect(t.isClosed).toBe(true);
+  });
+
+  it("carries a put's id on its want and its ack", async () => {
+    const { t, socket } = await helloed(0);
+    const name = "a".repeat(64);
+    const put = t.put(
+      "p",
+      { size: 1, ctime: 0, mtime: 0 },
+      [name],
+      async () => new Uint8Array([1]),
+    );
+    await settle();
+    const id = socket.sentText.at(-1)!["id"];
+    socket.reply({ res: "want", id, chunks: [name] });
+    await settle();
+    socket.reply({ res: "ack", id, uid: 4 });
+    expect(await put).toMatchObject({ uid: 4 });
+  });
+
+  it("sends pings with no id, and takes the pong without one", async () => {
+    const { t, socket } = await helloed(0);
+    const ping = t.ping();
+    await settle();
+    expect("id" in socket.sentText.at(-1)!).toBe(false);
+    socket.raw({ res: "pong" });
+    await expect(ping).resolves.toBeUndefined();
   });
 
   it("closes the connection when a request goes unanswered", async () => {
@@ -429,6 +771,35 @@ describe("errors", () => {
   });
 });
 
+/**
+ * C31 in TODO.md. `connect` waited for the socket to open with no deadline, so
+ * a server that accepted the TCP connection and never completed the handshake,
+ * or a firewall that swallowed it, left the client hanging for as long as the
+ * platform cared to wait, and the CLI held the vault's lock for the whole of it.
+ */
+describe("a connection that never opens (C31)", () => {
+  it("gives up within the timeout and closes the socket", async () => {
+    vi.useFakeTimers();
+    try {
+      const socket = new FakeSocket();
+      const t = new Transport("ws://test", {
+        onBatch: () => {},
+        socketFactory: () => socket,
+        timeoutMs: 50,
+      });
+      const connecting = t.connect();
+      const rejected = expect(connecting).rejects.toThrow(
+        /no connection to ws:\/\/test within 50ms/,
+      );
+      await vi.advanceTimersByTimeAsync(60);
+      await rejected;
+      expect(socket.closed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("bodies", () => {
   it("keeps bodies that arrive before anything asks for them", async () => {
     // The server streams a fetch as binary frames with no reply in front, so
@@ -438,8 +809,8 @@ describe("bodies", () => {
     const one = await named(new Uint8Array([7]));
     const two = await named(new Uint8Array([8]));
     const fetching = t.fetch([one.name, two.name]);
-    socket.body(one.body);
-    socket.body(two.body);
+    await settle();
+    socket.bodies(one.body, two.body);
     const bodies = await fetching;
     expect(bodies.map((b) => b[0])).toEqual([7, 8]);
   });
@@ -448,8 +819,28 @@ describe("bodies", () => {
     const { t, socket } = await helloed(0);
     const parts = await Promise.all([1, 2, 3].map((n) => named(new Uint8Array([n]))));
     const fetching = t.fetch(parts.map((p) => p.name));
-    for (const p of parts) socket.body(p.body);
+    await settle();
+    socket.bodies(...parts.map((p) => p.body));
     expect(await fetching).toHaveLength(3);
+  });
+
+  it("expects the bodies header to announce exactly the number asked for", async () => {
+    const { t, socket } = await helloed(0);
+    const fetching = t.fetch(["a".repeat(64), "b".repeat(64)]);
+    await settle();
+    socket.reply({ res: "bodies", count: 1 });
+    await expect(fetching).rejects.toMatchObject({ code: "protostate" });
+    expect(t.isClosed).toBe(true);
+  });
+
+  it("refuses a body that arrives with no header in front of it", async () => {
+    const { t, socket } = await helloed(0);
+    const one = await named(new Uint8Array([7]));
+    const fetching = t.fetch([one.name]);
+    await settle();
+    socket.body(one.body);
+    await expect(fetching).rejects.toBeInstanceOf(Error);
+    expect(t.isClosed).toBe(true);
   });
 
   /**
@@ -464,7 +855,8 @@ describe("bodies", () => {
     const wanted = await named(new Uint8Array([1, 2, 3]));
     const other = await named(new Uint8Array([9, 9, 9]));
     const fetching = t.fetch([wanted.name]);
-    socket.body(other.body);
+    await settle();
+    socket.bodies(other.body);
     await expect(fetching).rejects.toMatchObject({ code: "badchunk" });
     // The stream no longer says what it is answering, so there is nothing to
     // carry on to.
@@ -481,31 +873,44 @@ describe("bodies", () => {
     expect(t.isClosed).toBe(true);
   });
 
+  /**
+   * C34 in TODO.md. Under protocol 2 a fetch was answered in bare bodies, so
+   * a body left over from a refused one was consumed as the answer to the
+   * next. The `bodies` header removes the class: a fetch is answered by the
+   * header and exactly that many frames, or by an error and none, so there
+   * is never a leftover, and a body with no header is a protocol fault.
+   */
   it("does not let one fetch inherit the bodies of another", async () => {
     const { t, socket } = await helloed(0);
     const wanted = await named(new Uint8Array([4, 5, 6]));
     const stale = await named(new Uint8Array([7, 8, 9]));
 
-    // A fetch is abandoned with a body still to come.
+    // A fetch is refused. No bodies follow a refusal.
     const abandoned = t.fetch([stale.name, wanted.name]);
-    socket.body(stale.body);
-    socket.reply({ res: "err", code: "nochunk", msg: "gone" });
+    await settle();
+    socket.reply({ res: "err", code: "nochunk", msg: "gone", retryable: false });
     await expect(abandoned).rejects.toMatchObject({ code: "nochunk" });
+    expect(t.isClosed).toBe(false);
 
-    // Whatever happens next, it is not that the leftover is served as the
-    // answer to a different question.
-    const next = t.fetch([wanted.name]).catch((e: Error) => e);
-    socket.body(wanted.body);
-    const result = await next;
-    if (result instanceof Error) return; // refused outright, which is fine
-    expect(result[0], "a fetch was answered with another fetch's body").toEqual(wanted.body);
+    // The next fetch is answered on its own terms.
+    const next = t.fetch([wanted.name]);
+    await settle();
+    socket.bodies(wanted.body);
+    expect((await next)[0]).toEqual(wanted.body);
+
+    // And a body arriving outside any fetch, which a misbehaving server
+    // could still send, ends the session rather than being kept for the
+    // next question.
+    socket.body(stale.body);
+    await settle();
+    expect(t.isClosed).toBe(true);
   });
 
   it("raises a refusal that arrives instead of the bodies", async () => {
     const { t, socket } = await helloed(0);
     const fetching = t.fetch(["a".repeat(64)]);
     await settle();
-    socket.reply({ res: "err", code: "nochunk", msg: "not held" });
+    socket.reply({ res: "err", code: "nochunk", msg: "not held", retryable: false });
     await expect(fetching).rejects.toMatchObject({ code: "nochunk" });
   });
 
@@ -513,6 +918,144 @@ describe("bodies", () => {
     const { t, socket } = await helloed(0);
     expect(await t.fetch([])).toEqual([]);
     expect(socket.sentText).toHaveLength(1); // the hello, and nothing more
+  });
+});
+
+/**
+ * C24 in TODO.md. Success replies were read leniently: a missing or non-numeric
+ * uid became zero and was committed to the index as a version, and a `want`
+ * with a malformed member dropped it and carried on. Every field a reply is
+ * acted on has one shape, and anything else ends the session.
+ */
+describe("a success reply that is not the shape it should be", () => {
+  const name = "a".repeat(64);
+  const bad = [undefined, 0, -1, "5", 1.5, null, Number.MAX_SAFE_INTEGER + 1];
+
+  it("refuses a have whose uid is not a version number", async () => {
+    for (const uid of bad) {
+      const { t, socket } = await helloed(0);
+      const put = t.put(
+        "p",
+        { size: 1, ctime: 0, mtime: 0 },
+        [name],
+        async () => new Uint8Array(1),
+      );
+      await settle();
+      socket.reply({ res: "have", ...(uid === undefined ? {} : { uid }) });
+      await expect(put, `uid ${String(uid)}`).rejects.toMatchObject({ code: "protostate" });
+      expect(t.isClosed, `uid ${String(uid)}`).toBe(true);
+    }
+  });
+
+  it("refuses an ack whose uid is not a version number", async () => {
+    for (const uid of bad) {
+      const { t, socket } = await helloed(0);
+      const put = t.put(
+        "p",
+        { size: 1, ctime: 0, mtime: 0 },
+        [name],
+        async () => new Uint8Array(1),
+      );
+      await settle();
+      socket.reply({ res: "want", chunks: [name] });
+      await settle();
+      socket.reply({ res: "ack", ...(uid === undefined ? {} : { uid }) });
+      await expect(put, `uid ${String(uid)}`).rejects.toMatchObject({ code: "protostate" });
+      expect(t.isClosed).toBe(true);
+    }
+  });
+
+  it("refuses a want that names a chunk twice, or names something that is not a chunk", async () => {
+    for (const chunks of [[name, name], [name, 7], [name, "not-hex"], "nope", undefined]) {
+      const { t, socket } = await helloed(0);
+      const put = t.put(
+        "p",
+        { size: 1, ctime: 0, mtime: 0 },
+        [name],
+        async () => new Uint8Array(1),
+      );
+      await settle();
+      socket.reply({ res: "want", ...(chunks === undefined ? {} : { chunks }) });
+      await expect(put, JSON.stringify(chunks)).rejects.toBeInstanceOf(ProtocolError);
+      expect(t.isClosed).toBe(true);
+      expect(socket.sentBinary, "sent bodies for a want it refused").toHaveLength(0);
+    }
+  });
+
+  it("refuses acks whose results carry no version number", async () => {
+    const entry = {
+      path: "p",
+      meta: { size: 0, ctime: 0, mtime: 0 },
+      names: [],
+      mac: "m",
+      parent: "",
+    };
+    for (const results of [[{ uid: 0 }], [{}], [{ uid: "3" }], [null], [{ code: 7 }]]) {
+      const { t, socket } = await helloed(0);
+      const putting = t.putMany([entry], async () => new Uint8Array(0));
+      await settle();
+      socket.reply({ res: "acks", results });
+      await expect(putting, JSON.stringify(results)).rejects.toMatchObject({ code: "protostate" });
+      expect(t.isClosed).toBe(true);
+    }
+  });
+
+  it("refuses a chunks answer with a bad uid, size or chunk list", async () => {
+    for (const reply of [
+      { res: "chunks", uid: 0, size: 1, chunks: [name] },
+      { res: "chunks", uid: 3, size: -1, chunks: [name] },
+      { res: "chunks", uid: 3, size: 1.5, chunks: [name] },
+      { res: "chunks", uid: 3, size: 1, chunks: [name, 4] },
+      { res: "chunks", uid: 3, size: 1 },
+    ]) {
+      const { t, socket } = await helloed(0);
+      const get = t.get(3);
+      await settle();
+      socket.reply(reply);
+      await expect(get, JSON.stringify(reply)).rejects.toMatchObject({ code: "protostate" });
+      expect(t.isClosed).toBe(true);
+    }
+  });
+
+  it("refuses a ready whose limits are not counts", async () => {
+    for (const field of [
+      "cursor",
+      "perFileMax",
+      "chunkMax",
+      "maxChunks",
+      "maxBatchBytes",
+      "maxFetchBytes",
+      "minProto",
+    ]) {
+      const { t, socket } = await connected();
+      const hello = t.hello({ vault: "v", token: "tok", device: "d", cursor: 0 });
+      socket.reply(ready({ [field]: "lots" }));
+      await expect(hello, field).rejects.toMatchObject({ code: "protostate" });
+      expect(t.isClosed).toBe(true);
+    }
+  });
+
+  it("refuses a history or deleted list holding a version nobody could act on", async () => {
+    for (const entry of [
+      { path: "p", chunks: [] },
+      { uid: 0, path: "p", chunks: [] },
+      { uid: 2, chunks: [] },
+      { uid: 2, path: "p" },
+    ]) {
+      const { t, socket } = await helloed(0);
+      const asking = t.history("sealed");
+      await settle();
+      socket.reply({ res: "history", entries: [entry] });
+      await expect(asking, JSON.stringify(entry)).rejects.toMatchObject({ code: "protostate" });
+    }
+  });
+
+  it("still takes every well-formed answer", async () => {
+    const { t, socket } = await helloed(0);
+    const get = t.get(3);
+    await settle();
+    socket.reply({ res: "chunks", uid: 3, size: 0, chunks: [] });
+    expect(await get).toEqual({ uid: 3, size: 0, chunks: [] });
   });
 });
 
@@ -602,7 +1145,14 @@ describe("recovery answers from a server that answers badly", () => {
       limit: 5,
     });
 
-    socket.reply({ res: "history", path: "SEALED-PATH", entries: [{ uid: 3 }, { uid: 2 }] });
+    socket.reply({
+      res: "history",
+      path: "SEALED-PATH",
+      entries: [
+        { uid: 3, path: "SEALED-PATH", chunks: [] },
+        { uid: 2, path: "SEALED-PATH", chunks: [] },
+      ],
+    });
     expect((await asked).map((e) => e.uid)).toEqual([3, 2]);
   });
 
@@ -631,7 +1181,14 @@ describe("recovery answers from a server that answers badly", () => {
     const asked = t.deleted(2);
     await settle();
     expect(socket.sentText.at(-1)).toMatchObject({ op: "deleted", limit: 2 });
-    socket.reply({ res: "deleted", entries: [{ uid: 9 }, { uid: 8 }], more: true });
+    socket.reply({
+      res: "deleted",
+      entries: [
+        { uid: 9, path: "p", chunks: [] },
+        { uid: 8, path: "q", chunks: [] },
+      ],
+      more: true,
+    });
     expect((await asked).more).toBe(true);
   });
 
@@ -711,57 +1268,12 @@ describe("a download against what the server said it would store", () => {
     await settle();
     socket.reply({ res: "chunks", uid: 1, size: 3, chunks: [name] });
     await settle();
-    socket.body(body);
+    socket.bodies(body);
     // It gets as far as decrypting, which is where a body that is not a
     // sealed chunk fails. That is past the bound, which is the point.
     await expect(asked).rejects.not.toThrow(/stores at most/);
   });
 });
-
-/** An engine wired to a fake socket, connected, with limits of the test's choosing. */
-async function engineOnFakeSocket(limits: {
-  maxChunks?: number;
-  perFileMax?: number;
-  chunkMax?: number;
-}) {
-  const { Engine } = await import("./engine.ts");
-  const { deriveKeys } = await import("./crypto.ts");
-  const { MemoryIndexStore, MemoryVault } = await import("./vault.ts");
-  const socket = new FakeSocket();
-  const t = new Transport("ws://test", {
-    onBatch: () => {},
-    socketFactory: () => socket,
-    timeoutMs: 2000,
-  });
-  const connecting = t.connect();
-  socket.open();
-  await connecting;
-
-  const vault = new MemoryVault();
-  const engine = new Engine({
-    vault,
-    store: new MemoryIndexStore(),
-    keys: await deriveKeys(new Uint8Array(20).fill(1)),
-    transport: t,
-    device: "d",
-    vaultId: "v",
-    token: "t",
-  });
-  const started = engine.start();
-  await settle();
-  socket.reply({
-    res: "ready",
-    proto: 2,
-    cursor: 0,
-    perFileMax: limits.perFileMax ?? 1 << 28,
-    chunkMax: limits.chunkMax ?? 1 << 20,
-    maxChunks: limits.maxChunks ?? 100,
-  });
-  await settle();
-  socket.reply({ op: "caught-up", cursor: 0 });
-  await started;
-  return { engine, socket, t, vault };
-}
 
 /**
  * A server may advertise a smaller chunk ceiling than this client's own idea of
@@ -828,7 +1340,7 @@ describe("the timeout a fetch leaves behind", () => {
 
     const fetching = t.fetch([name]);
     await settle();
-    socket.body(body);
+    socket.bodies(body);
     expect(await fetching).toHaveLength(1);
 
     // Well past the timeout that was armed for the reply.
@@ -846,7 +1358,7 @@ describe("the timeout a fetch leaves behind", () => {
     const { t, socket } = await helloed(0, { timeoutMs: 120 });
     const fetching = t.fetch(["a".repeat(64)]);
     await settle();
-    socket.reply({ res: "err", code: "nochunk", msg: "not held" });
+    socket.reply({ res: "err", code: "nochunk", msg: "not held", retryable: false });
     await expect(fetching).rejects.toMatchObject({ code: "nochunk" });
 
     await new Promise((r) => setTimeout(r, 300));
@@ -917,5 +1429,204 @@ describe("a batch frame that cannot be trusted", () => {
     await settle();
     expect(batches).toHaveLength(2);
     expect(socket.closed).toBe(false);
+  });
+});
+
+/**
+ * I3 in TODO.md. `ready` carries two caps on a batched write, the encoded
+ * frame and the summed ciphertext budget, and one on a fetch. The engine used
+ * a constant of its own, so a server advertising something smaller was ignored
+ * and the batch refused with `toolarge`, which the engine reads as permanent
+ * and wrote every note in the batch off for good.
+ */
+describe("keeping to the caps the server advertised", () => {
+  /** A server that takes whatever is put and acknowledges it, one uid per entry. */
+  function acceptEverything(socket: FakeSocket): void {
+    let uid = 0;
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "putmany") {
+        const entries = frame["entries"] as unknown[];
+        s.reply({ res: "acks", id: frame["id"], results: entries.map(() => ({ uid: ++uid })) });
+      } else if (frame["op"] === "put") {
+        s.reply({ res: "have", id: frame["id"], uid: ++uid });
+      } else if (frame["op"] === "ping") {
+        s.raw({ res: "pong" });
+      }
+    };
+  }
+
+  /** Every putmany frame this socket saw, with its encoded size and summed budget. */
+  function batches(socket: FakeSocket) {
+    const { entryBudget } = require_transport();
+    return socket.sentText
+      .filter((m) => m["op"] === "putmany")
+      .map((m) => {
+        const entries = m["entries"] as { meta: { size: number }; chunks: string[] }[];
+        return {
+          count: entries.length,
+          encoded: JSON.stringify(m).length,
+          budget: entries.reduce((n, e) => n + entryBudget(e.meta.size, e.chunks.length), 0),
+        };
+      });
+  }
+  function require_transport(): { entryBudget: (size: number, chunks: number) => number } {
+    return { entryBudget: (size, chunks) => size + 256 * chunks };
+  }
+
+  it("splits a batched write by the summed budget cap", async () => {
+    const cap = 6000;
+    const { engine, socket, vault } = await engineOnFakeSocket({ maxBatchBytes: cap });
+    acceptEverything(socket);
+    // Each note is one chunk of about 400 bytes: a budget of about 656, so
+    // nine fit under the cap and thirty need four batches.
+    for (let i = 0; i < 30; i++) {
+      await vault.edit(`note-${String(i).padStart(2, "0")}.md`, `note ${i}\n${"x".repeat(390)}\n`);
+    }
+    const report = await engine.sync();
+    expect(report.uploaded).toBe(30);
+    expect(report.skipped).toBe(0);
+    const sent = batches(socket);
+    expect(sent.length, JSON.stringify(sent)).toBeGreaterThan(1);
+    for (const b of sent) {
+      expect(b.budget, `a batch of ${b.count} carried a budget of ${b.budget}`).toBeLessThanOrEqual(
+        cap,
+      );
+    }
+    expect(sent.reduce((n, b) => n + b.count, 0)).toBe(30);
+  });
+
+  it("splits a batched write by the encoded frame cap", async () => {
+    // Empty notes cost no budget at all, so only the frame size can fill a
+    // batch: each entry encodes to a few hundred bytes of sealed path, mac
+    // and parent.
+    const cap = 4096;
+    const { engine, socket, vault } = await engineOnFakeSocket({ maxBatchBytes: cap });
+    acceptEverything(socket);
+    for (let i = 0; i < 40; i++) await vault.edit(`empty-${String(i).padStart(2, "0")}.md`, "");
+    const report = await engine.sync();
+    expect(report.uploaded).toBe(40);
+    const sent = batches(socket);
+    expect(sent.length).toBeGreaterThan(1);
+    for (const b of sent) {
+      expect(b.encoded, `a batch of ${b.count} encoded to ${b.encoded}`).toBeLessThanOrEqual(cap);
+    }
+    expect(sent.reduce((n, b) => n + b.count, 0)).toBe(40);
+  });
+
+  it("sends a file whose own budget is over the cap with put, and the notes beside it as a batch", async () => {
+    const cap = 6000;
+    const { engine, socket, vault } = await engineOnFakeSocket({ maxBatchBytes: cap });
+    acceptEverything(socket);
+    for (let i = 0; i < 3; i++) await vault.edit(`note-${i}.md`, `note ${i}\n`);
+    const big = new Uint8Array(cap + 1000);
+    crypto.getRandomValues(big);
+    await vault.write("photo.bin", big, { mtime: 1000, ctime: 1000 });
+    const report = await engine.sync();
+    expect(report.uploaded, JSON.stringify(report)).toBe(4);
+    expect(report.skipped).toBe(0);
+    const puts = socket.sentText.filter((m) => m["op"] === "put");
+    expect(puts, "the large file did not go alone").toHaveLength(1);
+    expect(batches(socket).reduce((n, b) => n + b.count, 0)).toBe(3);
+  });
+
+  /**
+   * A fetch is bounded by the summed budget of what it asks for and by a
+   * count of names. The client cannot see a stored chunk's size, so it costs
+   * each at its share of the file's declared size plus the allowance the
+   * server's own rule grants, which is never under what the server will
+   * count.
+   */
+  it("splits a fetch by the byte cap and asks for every chunk once", async () => {
+    const { Engine, planFetches } = await import("./engine.ts");
+    void Engine;
+    const budget = (name: string) => Number(name.split(":")[1]);
+    const names = ["a:1000", "b:1000", "c:1000", "d:2500", "e:100", "f:100", "g:5000"];
+    const asks = planFetches(names, budget, 2500, 65536);
+    for (const ask of asks) {
+      const total = ask.reduce((n, name) => n + budget(name), 0);
+      expect(total <= 2500 || ask.length === 1, `${ask.join(",")} costs ${total}`).toBe(true);
+    }
+    expect(asks.flat()).toEqual(names);
+    expect(asks.length).toBeGreaterThan(2);
+  });
+
+  it("splits a fetch by the count of names", async () => {
+    const { planFetches } = await import("./engine.ts");
+    const names = Array.from({ length: 10 }, (_, i) => `n${i}`);
+    const asks = planFetches(names, () => 1, 1 << 30, 4);
+    expect(asks.map((a) => a.length)).toEqual([4, 4, 2]);
+    expect(asks.flat()).toEqual(names);
+  });
+
+  it("downloads a batch of files in fetches that each keep under the server's cap", async () => {
+    const { macEntry, sealChunks, sealPath } = await import("./crypto.ts");
+    const cap = 3000;
+    const { engine, socket, vault, keys, logs } = await engineOnFakeSocket({ maxFetchBytes: cap });
+
+    // Ten files of a kilobyte, one chunk each, so each costs 1000 + 256 and
+    // two fit under the cap.
+    const files: {
+      path: string;
+      sealedPath: string;
+      body: Uint8Array;
+      name: string;
+      text: Uint8Array;
+    }[] = [];
+    for (let i = 0; i < 10; i++) {
+      const text = new TextEncoder().encode(`file ${i}\n${"y".repeat(990)}`);
+      const [chunk] = await sealChunks(keys, [text]);
+      files.push({
+        path: `f${i}.md`,
+        sealedPath: await sealPath(keys, `f${i}.md`),
+        body: chunk!.bytes,
+        name: chunk!.name,
+        text,
+      });
+    }
+    const byName = new Map(files.map((f) => [f.name, f.body]));
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "fetch") {
+        const asked = frame["chunks"] as string[];
+        s.bodies(...asked.map((n) => byName.get(n)!));
+      }
+    };
+    const entries = await Promise.all(
+      files.map(async (f, i) => {
+        const facts = {
+          path: f.sealedPath,
+          size: f.text.length,
+          ctime: 1000,
+          mtime: 1000,
+          folder: false,
+          deleted: false,
+          chunks: [f.name],
+          parent: "",
+        };
+        return {
+          uid: i + 1,
+          ...facts,
+          device: "other",
+          mac: await macEntry(keys, facts),
+        };
+      }),
+    );
+    socket.raw({ op: "batch", from: 1, to: 10, entries });
+    // Accepting a batch verifies every authenticator, which is WebCrypto and
+    // takes more than one turn of the event loop.
+    for (let i = 0; i < 200 && engine.status().pending < 10; i++) await settle();
+    expect(engine.status().pending, logs.join("\n")).toBe(10);
+    const report = await engine.sync();
+    expect(report.downloaded, JSON.stringify(report)).toBe(10);
+
+    const fetches = socket.sentText.filter((m) => m["op"] === "fetch");
+    expect(fetches.length, "one fetch carried everything").toBeGreaterThan(1);
+    for (const f of fetches) {
+      const asked = f["chunks"] as string[];
+      expect(asked.length * (1000 + 256), `a fetch of ${asked.length}`).toBeLessThanOrEqual(cap);
+    }
+    expect(fetches.flatMap((f) => f["chunks"] as string[]).sort()).toEqual(
+      files.map((f) => f.name).sort(),
+    );
+    for (const f of files) expect(vault.text(f.path)).toBe(new TextDecoder().decode(f.text));
   });
 });

@@ -15,6 +15,7 @@ import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts"
 import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 import { App, notices } from "./stub.ts";
+import type { Version } from "../core/client.ts";
 import { HistoryModal, PAGE, diffLines, type HistorySource } from "./history.ts";
 
 const SECRET = new Uint8Array(20).fill(91);
@@ -279,4 +280,116 @@ it("names the note whose history it is showing", async () => {
   // In the body, not just in titleEl, because titleEl is the part that does
   // not render.
   expect(rendered(modal)).toContain("Projects/note.md");
+});
+
+/**
+ * P6 in TODO.md. `diffLines` was a set difference of the two line lists, so
+ * anything a set cannot see, a duplicate removed or two paragraphs swapped,
+ * came out as "No difference", and somebody deciding whether to restore was
+ * told two versions were the same when they were not.
+ */
+describe("the line diff (P6)", () => {
+  it("shows a removed duplicate paragraph", () => {
+    const diff = diffLines("a\nb\na\n", "a\nb\n");
+    expect(diff).not.toMatch(/No difference/);
+    expect(diff).toBe("- a");
+  });
+
+  it("shows two paragraphs that swapped places", () => {
+    const diff = diffLines("one\ntwo\n", "two\none\n");
+    expect(diff).not.toMatch(/No difference/);
+    expect(diff).toContain("- one");
+    expect(diff).toContain("+ one");
+    expect(diff).not.toContain("two");
+  });
+
+  it("still shows an appended line as the one addition", () => {
+    expect(diffLines("alpha\nbravo\n", "alpha\nbravo\ncharlie\n")).toBe("+ charlie");
+    expect(diffLines("same\n", "same\n")).toMatch(/No difference/);
+  });
+});
+
+/**
+ * P19 in TODO.md. Reading a version is a round trip and two clicks start two.
+ * The one that finished last used to win the pane, so the list said B, Restore
+ * restored B, and the text on screen was A.
+ */
+describe("selections that finish out of order (P19)", () => {
+  const version = (uid: number): Version => ({
+    uid,
+    path: "note.md",
+    contentId: `content-${uid}`,
+    size: 1,
+    ctime: 0,
+    mtime: 1_700_000_000_000 + uid,
+    folder: false,
+    deleted: false,
+    device: "d",
+    chunks: 1,
+  });
+
+  /** A source whose reads finish when the test says. */
+  function controlled(pages: Version[][]) {
+    const pending = new Map<number, (text: string) => void>();
+    let historyCalls = 0;
+    const source: HistorySource = {
+      history: async () => {
+        historyCalls++;
+        await new Promise((r) => setTimeout(r, 30));
+        return pages.shift() ?? [];
+      },
+      contentAt: (v) =>
+        new Promise<string>((resolve) => {
+          pending.set(v.uid, resolve);
+        }),
+      restoreVersion: async (v) => `restored ${v.uid}`,
+      currentText: async () => "",
+    };
+    return {
+      source,
+      finish: (uid: number) => pending.get(uid)!(`text of ${uid}`),
+      calls: () => historyCalls,
+    };
+  }
+
+  it("shows the version chosen last, whichever read finished last", async () => {
+    const a = version(2);
+    const b = version(1);
+    const { source, finish } = controlled([[a, b]]);
+    const modal = new HistoryModal(new App() as never, source, "note.md");
+    modal.open();
+    await settle();
+    // The modal opened on A and is waiting for its text. Pick B.
+    rows(modal)[1]!.click();
+    await settle();
+    // B answers first, then A, deliberately reversed.
+    finish(1);
+    await settle();
+    expect(rendered(modal)).toContain("text of 1");
+    finish(2);
+    await settle();
+    const text = rendered(modal);
+    expect(text, "the slower read for A overwrote B's pane").toContain("text of 1");
+    expect(text).not.toContain("text of 2");
+  });
+
+  it("asks for a page once however many times Load more is pressed", async () => {
+    const first = Array.from({ length: PAGE }, (_, i) => version(100 - i));
+    const second = [version(5)];
+    const { source, finish, calls } = controlled([first, second]);
+    const modal = new HistoryModal(new App() as never, source, "note.md");
+    modal.open();
+    await settle();
+    finish(100);
+    await settle();
+    expect(calls()).toBe(1);
+
+    const more = () => buttons(modal).find((b) => b.text.includes("Load more"));
+    expect(more(), "no Load more button for a full first page").toBeDefined();
+    more()!.click();
+    more()!.click();
+    await settle();
+    expect(calls(), "two presses became two requests for the same page").toBe(2);
+    expect(rows(modal).length).toBe(PAGE + 1);
+  });
 });

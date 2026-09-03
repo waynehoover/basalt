@@ -23,10 +23,11 @@
  * Restoring never overwrites. If the path is occupied the version lands beside
  * it as `Note (restored 42).md` and the notice says where it went. Sync writes
  * over the file. The whole project's position on this is in
- * docs/philosophy.md: a sync you did not ask for should never rewrite the file
+ * docs/design.md: a sync you did not ask for should never rewrite the file
  * you have open, and restoring is a sync you asked for pointed at the past.
  */
 
+import { diff_match_patch } from "diff-match-patch";
 import { Modal, Notice, type App } from "obsidian";
 
 import type { Version } from "../core/client.ts";
@@ -52,6 +53,18 @@ export class HistoryModal extends Modal {
   private text = "";
   private showDiff = false;
   private exhausted = false;
+  /**
+   * Which selection the pane is loading for.
+   *
+   * Reading a version is a round trip, and somebody pressing the down arrow
+   * twice starts two. The one that finishes last used to win the pane, so
+   * with A slow and B fast the list said B, the Restore button restored B,
+   * and the text on screen was A. Every load takes a number and only the
+   * newest number may draw.
+   */
+  private loading = 0;
+  /** The page load in flight, so a second press of Load more joins it rather than asking again. */
+  private paging: Promise<void> | undefined;
   private listEl!: HTMLElement;
   private paneEl!: HTMLElement;
 
@@ -77,7 +90,17 @@ export class HistoryModal extends Modal {
   }
 
   /** Fetches a page and redraws. `before` continues from the oldest held. */
-  private async load(): Promise<void> {
+  private load(): Promise<void> {
+    // One page at a time. Two presses of Load more used to send two requests
+    // for the same `before`, and the second page arrived twice.
+    if (this.paging) return this.paging;
+    this.paging = this.loadPage().finally(() => {
+      this.paging = undefined;
+    });
+    return this.paging;
+  }
+
+  private async loadPage(): Promise<void> {
     const before = this.versions.length ? this.versions[this.versions.length - 1]!.uid : undefined;
     try {
       const page = await this.source.history(this.path, {
@@ -199,20 +222,27 @@ export class HistoryModal extends Modal {
   }
 
   private async choose(version: Version): Promise<void> {
+    const mine = ++this.loading;
     this.chosen = version;
     this.text = "Loading…";
     this.render();
+    let text: string;
     try {
       const older = await this.source.contentAt(version);
       if (this.showDiff) {
         const now = (await this.source.currentText(this.path)) ?? "";
-        this.text = diffLines(older, now);
+        text = diffLines(older, now);
       } else {
-        this.text = older;
+        text = older;
       }
     } catch (err) {
-      this.text = `Could not read this version: ${(err as Error).message}`;
+      text = `Could not read this version: ${(err as Error).message}`;
     }
+    // A newer selection has been made while this one was loading. Its text
+    // belongs to a version the list no longer says is chosen, and drawing it
+    // would label one version's text with another's name.
+    if (mine !== this.loading) return;
+    this.text = text;
     // Only the pane, so a slow read does not rebuild the list under the
     // pointer of somebody about to click the next version.
     this.renderPane();
@@ -276,15 +306,32 @@ function describe(version: Version, newest: boolean): string {
  * Line-wise rather than character-wise, because this is for reading rather than
  * for merging: the merge in core/merge.ts is character-granular precisely
  * because a paragraph is one line, and that is the wrong granularity to look at.
+ *
+ * A real diff, from the library the merge already uses in its line mode. The
+ * first version of this was a set difference of the two line lists, which is
+ * not a diff: a paragraph that appeared twice and now appears once, or two
+ * paragraphs that swapped places, came out as "No difference from the note on
+ * disk", and a person deciding whether to restore was told the versions were
+ * the same when they were not.
  */
 export function diffLines(older: string, current: string): string {
-  const a = older.split("\n");
-  const b = current.split("\n");
-  const inB = new Set(b);
-  const inA = new Set(a);
+  const dmp = new diff_match_patch();
+  const { chars1, chars2, lineArray } = dmp.diff_linesToChars_(older, current);
+  const diffs = dmp.diff_main(chars1, chars2, false);
+  dmp.diff_charsToLines_(diffs, lineArray);
 
   const out: string[] = [];
-  for (const line of a) if (!inB.has(line)) out.push(`- ${line}`);
-  for (const line of b) if (!inA.has(line)) out.push(`+ ${line}`);
+  for (const [op, text] of diffs) {
+    if (op === 0) continue;
+    const mark = op === -1 ? "-" : "+";
+    for (const line of splitLines(text)) out.push(`${mark} ${line}`);
+  }
   return out.length ? out.join("\n") : "No difference from the note on disk.";
+}
+
+/** The lines of a run of text, without the empty tail a trailing newline leaves. */
+function splitLines(text: string): string[] {
+  const lines = text.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines;
 }

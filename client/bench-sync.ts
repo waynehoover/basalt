@@ -16,7 +16,7 @@
  *
  * Timings here are localhost. They say what the software costs, not what a
  * network costs, and they are not comparable to a number measured over a link
- * with latency in it. docs/benchmark.md says what that means for comparisons.
+ * with latency in it. docs/compared.md says what that means for comparisons.
  */
 
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";

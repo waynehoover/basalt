@@ -36,25 +36,27 @@ export interface Vault {
   list(): Promise<FileStat[]>;
   read(path: string): Promise<Uint8Array>;
   /**
+   * Makes durable whatever the writes so far have left un-durable.
+   *
+   * Optional, because a vault whose writes are already durable when they return
+   * has nothing to do here. Called once at the end of a pass, before the index
+   * is saved, so that the index is never durable ahead of the notes it names.
+   * Obsidian's `DataAdapter` has no way to ask for this, so the plugin's vault
+   * cannot offer it; see the note on `ObsidianVault` about what that costs.
+   */
+  flush?(): Promise<void>;
+  /**
    * The same bytes, in blocks, for a caller that does not need them at once.
    *
    * Optional, and the reason the engine has two paths for a large file. A
    * vault that can stream lets one be chunked, named and sent in bounded
    * memory; a vault that cannot has to hand over the whole thing.
    *
-   * Obsidian's `DataAdapter` is the second kind: `readBinary` returns the
-   * whole ArrayBuffer and there is no ranged or streaming read beside it, so
-   * the plugin takes the buffered path and the headless client does not.
+   * Both vaults offer it. The headless client streams from the file; the
+   * plugin fetches the URL Obsidian's webview already uses for a file, which
+   * carries a body stream and honours a Range header on desktop. Where that
+   * fetch fails, as it may on a phone, the engine falls back to `read`.
    */
-  /**
-   * Makes durable whatever the writes so far have left un-durable.
-   *
-   * Optional, because a vault whose writes are already durable when they return
-   * has nothing to do here. Called once at the end of a pass, before the index
-   * is saved, so that the index is never durable ahead of the notes it names.
-   */
-  flush?(): Promise<void>;
-
   readBlocks?(path: string, blockSize?: number): AsyncIterable<Uint8Array>;
   /**
    * One byte range. Needed with `readBlocks` and for the same reason.
@@ -90,6 +92,34 @@ export interface Vault {
    * errs towards keeping a file rather than removing one.
    */
   sameFile?(a: string, b: string): Promise<boolean>;
+  /**
+   * The identity the filesystem gives a path, so two paths that would be one
+   * file here can be told apart from two files.
+   *
+   * Two distinct paths on the server can alias one local file: `Note.md` and
+   * `note.md` on a filesystem that folds case, or one name in NFC and NFD.
+   * Written one after the other, the second replaced the first and both were
+   * recorded as synced, and the next scan reported the first one deleted.
+   *
+   * Optional. Without it the engine folds case and Unicode normalisation
+   * everywhere, which refuses two files that a case-sensitive disk could have
+   * held apart, and that is the safe side to err on.
+   */
+  canonical?(path: string): string;
+  /**
+   * Writes a file only if nothing is at the path, and says whether it did.
+   *
+   * `exists` followed by `write` is a gap, and a conflict copy or a restore
+   * landing in it replaces whatever another process put there first. That is
+   * the one file the copy exists to keep. Optional, because a platform whose
+   * API has no exclusive create cannot offer it; the engine then falls back
+   * to the gap it always had.
+   */
+  create?(
+    path: string,
+    bytes: Uint8Array,
+    times: { mtime: number; ctime: number },
+  ): Promise<boolean>;
   /**
    * Watches for changes, returning a function that stops watching.
    *
@@ -223,6 +253,16 @@ export class MemoryVault implements Vault {
 
   async exists(path: string): Promise<boolean> {
     return this.files.has(path) || this.folders.has(path);
+  }
+
+  async create(
+    path: string,
+    bytes: Uint8Array,
+    times: { mtime: number; ctime: number },
+  ): Promise<boolean> {
+    if (this.files.has(path) || this.folders.has(path)) return false;
+    await this.write(path, bytes, times);
+    return true;
   }
 
   watch(onChange: (path: string) => void): () => void {
