@@ -65,6 +65,24 @@
  * output would produce a conflict copy a day. A misplaced hunk changes which
  * lines exist, not their order, so the weaker comparison still catches it.
  *
+ * ## The three the fuzzer found, and what a fuzzer is for here
+ *
+ * The four above each came from a note going wrong. Three more came from
+ * merge.fuzz.test.ts, which generates the shapes nobody thought of and holds
+ * the outcome to two properties: that a merge of edits on different lines is
+ * the merge of those edits, and that every word in the result is a word
+ * somebody wrote. All three are the same failure as the overlap check exists
+ * for, a line or a word neither device wrote, reached by routes the overlap
+ * check cannot see, because it compares spans and spans can miss each other by
+ * one character.
+ *
+ * `fusedLine` is an added line whose only separator the other device deleted.
+ * `splicedAdditions` is two devices rewriting one line with a space left
+ * between their spans, so the two rewrites run together. `inventedWord` is the
+ * outcome check under all of it: a word in the result that none of the three
+ * versions holds. Each is documented where it is defined, with the case that
+ * produced it and the cases that must go on merging.
+ *
  * ## Which check catches what, measured
  *
  * Each of these was disabled in turn to find out, rather than reasoned about:
@@ -80,10 +98,20 @@
  *     non-overlapping regions, `patch_apply` placed every hunk in every case
  *     tried, including with all four lines of context either side destroyed.
  *   - **Insertion survival** likewise. It is a check on the library's own report.
+ *   - **fusedLine** catches a splice both directions agree on. Disabling it
+ *     leaves two tests failing and, with `inventedWord` still in place, one
+ *     generated case in a hundred thousand: a run-on of two real lines, where
+ *     no single word is wrong.
+ *   - **splicedAdditions** catches two rewrites of one line whose spans miss
+ *     each other. Disabling it leaves two tests failing, and nothing else sees
+ *     those: every word in the result is somebody's.
+ *   - **inventedWord** catches a splice inside a word, which no span check
+ *     sees because both spans are innocent. Disabling it leaves three tests
+ *     failing.
  *
- * The last two stay for the cost of a comparison over data already at hand, and
- * because the flags are the precise defect this module exists to invert. What is
- * not done is pretending they are tested.
+ * The applied flags and insertion survival stay for the cost of a comparison
+ * over data already at hand, and because the flags are the precise defect this
+ * module exists to invert. What is not done is pretending they are tested.
  *
  * ## Why not node-diff3, which is the algorithm git uses
  *
@@ -132,11 +160,13 @@ const INSERT = 1;
  * A region of the base that one side changed, in base coordinates.
  *
  * `start === end` is an insertion point: nothing was removed, text was added
- * there. A wider span is text that was deleted or replaced.
+ * there, and `text` is what was added. A wider span is text that was deleted
+ * or replaced, and `text` is what was removed.
  */
 interface Span {
   readonly start: number;
   readonly end: number;
+  readonly text: string;
 }
 
 /**
@@ -153,7 +183,7 @@ function changedSpans(diff: Diff[]): Span[] {
     if (op === EQUAL) {
       at += text.length;
     } else if (op === DELETE) {
-      spans.push({ start: at, end: at + text.length });
+      spans.push({ start: at, end: at + text.length, text });
       // Deleted text still occupied space in the base, so the cursor has
       // to move past it or every later span is recorded too early. No test
       // reaches this on its own any more: the two-directions check catches
@@ -161,7 +191,7 @@ function changedSpans(diff: Diff[]): Span[] {
       // merges catch a wrong offset that invents a collision.
       at += text.length;
     } else {
-      spans.push({ start: at, end: at });
+      spans.push({ start: at, end: at, text });
     }
   }
   return spans;
@@ -195,6 +225,9 @@ function changedSpans(diff: Diff[]): Span[] {
  * one mangled sentence. An earlier version tried to make that call here by
  * asking whether the offset was at a line boundary; it gave the same answers and
  * needed a concept of its own to do it.
+ *
+ * An addition at the *edge* of text the other side removed is not a collision
+ * here either, and one shape of it is refused: see `fusedLine`.
  */
 function conflictingSpans(mine: Span[], theirs: Span[]): Span | undefined {
   for (const l of mine) {
@@ -218,6 +251,195 @@ function conflictingSpans(mine: Span[], theirs: Span[]): Span | undefined {
         continue;
       }
       if (l.start < r.end && r.start < l.end) return l;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The first added run that would no longer be a line of its own once the other
+ * side's changes are applied around it, or undefined if every one keeps its
+ * boundaries.
+ *
+ * Touching is not overlapping, and an addition next to a deletion is usually
+ * fine: one device appends to a list while the other removes the last item, or
+ * adds a first item while the other removes the old first one. Those merge, and
+ * must go on merging. The exception is a blank line. It has no inside, so
+ * writing into it is, in character terms, an addition at the edge of the one
+ * newline that gave it its width, and if the other device deleted that blank
+ * line the new line has lost the only separator it had:
+ *
+ * ```
+ * base    line text here.\n\nhere again.\n
+ * mine    line text here.\nmine0\nhere again.\n
+ * theirs  line text here.\nhere again.\n
+ * merged  line text here.\nmine0here again.\n
+ * ```
+ *
+ * Found by the token property of merge.fuzz.test.ts, not constructed. Every
+ * hunk applied, every addition is present, and both directions agree on the
+ * run-on, so this is the one place the two-directions check does not decide
+ * whether two edits concatenate cleanly, and the line-boundary concept it was
+ * spared has to be asked here after all. Rule 10: a line neither device wrote
+ * is a lost edit, whatever the flags say.
+ *
+ * The question asked is the general one, because the first version asked a
+ * narrower one and the fuzzer went straight past it (case 1588232853): what
+ * follows an addition after the merge need not be a character of the ancestor,
+ * it can be the other side's own addition at the far end of what it deleted.
+ * So, for each run one side added: if in that side's own version it began a
+ * line without bringing the newline itself, then after the merge whatever can
+ * precede it must still be a line end, and likewise at the back. What can
+ * precede it is found by walking back over every deletion of either side that
+ * ends there, and includes the other side's additions at that point, because
+ * the order of two additions at one point is the one thing this module leaves
+ * open. A run that sat mid-line, or brings its own newline, asks nothing, so
+ * two devices editing one sentence at different words still merge.
+ *
+ * Pinned in merge.test.ts under "an addition whose separator the other side
+ * deleted", alongside the adjacent shapes that must keep merging.
+ */
+function fusedLine(base: string, own: Span[], other: Span[]): Span | undefined {
+  const boundary = (i: number) => i < 0 || i >= base.length || base[i] === "\n";
+  const ownDeletions = own.filter((s) => s.start < s.end);
+  const allDeletions = [...ownDeletions, ...other.filter((s) => s.start < s.end)];
+  const otherAdditions = other.filter((s) => s.start === s.end);
+
+  // Where a walk from `at` over deleted text comes to rest, in each direction.
+  const after = (at: number, deletions: Span[]): number => {
+    const d = deletions.find((s) => s.start === at);
+    return d === undefined ? at : after(d.end, deletions);
+  };
+  const before = (at: number, deletions: Span[]): number => {
+    const d = deletions.find((s) => s.end === at);
+    return d === undefined ? at : before(d.start, deletions);
+  };
+
+  for (const p of own) {
+    if (p.start !== p.end) continue;
+    if (!p.text.startsWith("\n") && boundary(before(p.start, ownDeletions) - 1)) {
+      // It began a line in its own version. Whatever can come before it
+      // after the merge has to end one.
+      const at = before(p.start, allDeletions);
+      if (!boundary(at - 1)) return p;
+      for (const q of otherAdditions) {
+        if (at <= q.start && q.start <= p.start && !q.text.endsWith("\n")) return p;
+      }
+    }
+    if (!p.text.endsWith("\n") && boundary(after(p.start, ownDeletions))) {
+      // It ended a line in its own version. Whatever can come after it
+      // after the merge has to begin one.
+      const at = after(p.start, allDeletions);
+      if (!boundary(at)) return p;
+      for (const q of otherAdditions) {
+        if (p.start <= q.start && q.start <= at && !q.text.startsWith("\n")) return p;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The first addition that the merge would join to the other device's addition,
+ * making one line neither device wrote, or undefined if none would.
+ *
+ * `conflictingSpans` asks about characters, and two devices rewriting the same
+ * line can leave spans that miss each other. Found by the fuzzer's placed
+ * property (case 1588304879), on a three-item list where each device rewrote a
+ * different bullet and the bullets were next to each other:
+ *
+ * ```
+ * base    - here\n- line sync\n- line
+ * mine    - here\n- mine line here 1\n- line sync\nmine0 line
+ * theirs  theirs added 0\ntheirs1 line sync\n- line
+ * merged  theirs added 0\ntheirs1 mine line here 1\n- line sync\nmine0 line
+ * ```
+ *
+ * `theirs1 mine line here 1` is a line neither device wrote, and `- line sync`,
+ * the line theirs meant to rewrite, is left exactly as the ancestor had it. The
+ * spans miss each other by the single space after a bullet: theirs deleted
+ * `- here\n-` and mine deleted `line sync\n-`, so nothing overlaps, both
+ * directions agree, every hunk lands and every insertion is present. This is
+ * the failure the module's second paragraph promises to catch, escaping through
+ * a one-character gap.
+ *
+ * So: two additions, one from each device, that end up on one line with only
+ * spaces of the ancestor left between them are refused, but only when a
+ * deletion across that gap took a newline with it. Both halves are needed and
+ * both were measured:
+ *
+ *   - Without the gap test, two devices changing different words of one
+ *     paragraph would be refused, which is the thing diff3 was rejected for.
+ *   - Without the newline test, two devices changing *adjacent* words would be
+ *     refused: `The cat sat.` against `The dog sat.` and `The cat ran.` leaves
+ *     one space between the two edits and merges to `The dog ran.`, which is
+ *     what both people meant. What makes the case above different is that the
+ *     deletions took line ends with them, so the text each addition was written
+ *     against is not merely edited, it is somewhere else.
+ *
+ * Two additions at one point are the other half of the same question. That is
+ * the daily note when both are whole lines, so it stays a merge, and it is two
+ * devices rewriting one word when either of them also took text away there
+ * (case 3869976870, `- the the` against `- mine1 the` and `- theirs0 the`,
+ * where theirs shares the opening letters and so deletes nothing, arriving at
+ * exactly the point mine's replacement arrives at). Both orders have to keep
+ * the two apart, because which comes first is the one thing this module leaves
+ * open.
+ *
+ * What this does not close is written down rather than guessed at. The same
+ * shape with ancestor text left standing between the two edits, where that
+ * text is then absorbed into a word of the other side's insertion, still
+ * merges wrongly at about two cases in a hundred thousand. It is described
+ * with a reproduction in the header of merge.fuzz.test.ts, along with the rule
+ * that would refuse it and what that rule was measured to cost.
+ *
+ * Pinned in merge.test.ts under "two rewrites of one line that miss each
+ * other", with the adjacent-words merge and the daily note next to it.
+ */
+function splicedAdditions(base: string, mine: Span[], theirs: Span[]): Span | undefined {
+  const points = (spans: Span[]) => spans.filter((s) => s.start === s.end);
+  const mineAdds = points(mine);
+  const theirAdds = points(theirs);
+  if (mineAdds.length === 0 || theirAdds.length === 0) return undefined;
+  const deletions = [...mine, ...theirs].filter((s) => s.start < s.end);
+  if (deletions.length === 0) return undefined;
+
+  // What of the ancestor is left between two points, counted from the start so
+  // that asking is a subtraction rather than a scan. Spaces and tabs do not
+  // count: they are what two texts joined on one line are separated by.
+  const gone = new Uint8Array(base.length);
+  for (const d of deletions) gone.fill(1, d.start, d.end);
+  const kept = new Int32Array(base.length + 1);
+  for (let i = 0; i < base.length; i++) {
+    const c = base[i]!;
+    kept[i + 1] = kept[i]! + (gone[i] === 1 || c === " " || c === "\t" ? 0 : 1);
+  }
+
+  // Whether `x` followed by `y` puts a line end between them.
+  const apart = (x: Span, y: Span) => x.text.endsWith("\n") || y.text.startsWith("\n");
+
+  for (const l of mineAdds) {
+    for (const r of theirAdds) {
+      const [first, second] = l.start <= r.start ? [l, r] : [r, l];
+      if (first.start === second.start) {
+        // Two additions at one point, which is the daily note when both are
+        // whole lines, and is two devices rewriting one word when one of them
+        // also took text away there. The order is arbitrary, so both orders
+        // have to keep them apart.
+        if (apart(first, second) && apart(second, first)) continue;
+        if (deletions.some((d) => d.start <= first.start && d.end >= first.start)) return first;
+        continue;
+      }
+      // Both orders, not just the one their offsets suggest. With nothing of
+      // the ancestor left between them the merge can put either first, and
+      // does: case 16087566 has theirs' whole line, newline and all, arriving
+      // after mine's word rather than before it.
+      if (apart(first, second) && apart(second, first)) continue;
+      if (kept[second.start]! - kept[first.start]! > 0) continue;
+      const structural = deletions.some(
+        (d) => d.start <= second.start && d.end >= first.start && d.text.includes("\n"),
+      );
+      if (structural) return first;
     }
   }
   return undefined;
@@ -291,13 +513,42 @@ export function mergeText(
     dmp.diff_cleanupSemantic(theirDiff);
     dmp.diff_cleanupEfficiency(theirDiff);
   }
-  const collision = conflictingSpans(changedSpans(diff), changedSpans(theirDiff));
+  const mineSpans = changedSpans(diff);
+  const theirSpans = changedSpans(theirDiff);
+  const collision = conflictingSpans(mineSpans, theirSpans);
   if (collision !== undefined) {
     return {
       kind: "conflict",
       why:
         `both devices changed the same text, at characters ` +
         `${collision.start} to ${collision.end} of the last synced version`,
+    };
+  }
+
+  // Also before applying anything: an added line whose separator the other
+  // side removed would be spliced onto its neighbour, and both directions
+  // agree on the splice, so nothing later would notice. See fusedLine.
+  const fused = fusedLine(base, mineSpans, theirSpans) ?? fusedLine(base, theirSpans, mineSpans);
+  if (fused !== undefined) {
+    return {
+      kind: "conflict",
+      why:
+        `a line added on one device would run into text changed on the other, ` +
+        `at character ${fused.start} of the last synced version`,
+    };
+  }
+
+  // And still before applying anything: two additions that would land on one
+  // line with only a space of the ancestor between them. See splicedAdditions.
+  // One call, not two: unlike fusedLine this asks about a pair, so swapping
+  // the sides asks the same question.
+  const spliced = splicedAdditions(base, mineSpans, theirSpans);
+  if (spliced !== undefined) {
+    return {
+      kind: "conflict",
+      why:
+        `each device rewrote the same line differently, and the two rewrites ` +
+        `would run together at character ${spliced.start} of the last synced version`,
     };
   }
 
@@ -331,7 +582,7 @@ export function mergeText(
     };
   }
 
-  if (!sameLines(forward.text, reverse.text)) {
+  if (!samePlacement(base, forward.text, reverse.text)) {
     return {
       kind: "conflict",
       why: "merging the two versions in either order gives different content, so at least one change was placed wrongly",
@@ -345,6 +596,18 @@ export function mergeText(
     return {
       kind: "conflict",
       why: `the merge reported success but ${describe(missing)} is not in the result`,
+    };
+  }
+
+  // And the same question the fuzzer asks of a whole note, asked of this one:
+  // is every word in the result a word somebody wrote. See inventedWord.
+  const invented = inventedWord(base, mine, theirs, forward.text);
+  if (invented !== undefined) {
+    return {
+      kind: "conflict",
+      why:
+        `the merge produced ${JSON.stringify(invented.slice(0, 40))}, ` +
+        `which is not a word in the last synced version or in either device's`,
     };
   }
 
@@ -363,28 +626,76 @@ export function mergeText(
 }
 
 /**
- * Whether two merges produced the same content, allowing for ordering.
+ * Whether two merges made the same changes to the ancestor, in the same places.
  *
- * The sort is the whole point and it is not a shortcut. Two devices appending
+ * Not string equality, and the reason is not a shortcut. Two devices appending
  * to the same daily note is the commonest concurrent edit there is, and it is
  * order-ambiguous: merging their change into mine puts theirs last, merging
  * mine into theirs puts mine last, and both are right. Comparing the strings
  * exactly turns that into a conflict, which was measured rather than guessed:
  * five tests fail, the daily note among them.
  *
- * What it gives up is narrow and worth naming. Two merges that produce the same
- * lines in a different order look identical here, so a line moved to different
- * places by the two directions would pass. A hunk placed wrongly does not, and
- * that is the failure this exists for: a misplaced edit changes the text of a
- * line, so the two multisets differ and the check fires.
+ * The first version of this compared the two results as multisets of lines,
+ * and documented what that gave up: a line moved to different places by the two
+ * directions compares equal. That was written down as a narrow hole and it was
+ * not one. The fuzzer in merge.fuzz.test.ts reached it within its first few
+ * hundred cases, and a hand-built case followed: a line added under Item 3
+ * lands under Item 6 when the other device has removed the first three
+ * sections, the same misplacement the two-directions check exists to catch,
+ * with the text of every line unchanged. The same happens to a deletion when
+ * every section holds a copy of the deleted line. Both are in merge.test.ts
+ * under "with every line still present".
+ *
+ * So each result is described by where it changed the ancestor: every line it
+ * added, tagged with the ancestor line it was added before, and every ancestor
+ * line it removed, by index. Two results agree when those descriptions agree.
+ * Two additions at one point by the two sides carry the same tag whichever
+ * comes first, so the daily note still merges; a line added under the wrong
+ * section carries a different tag and does not.
+ *
+ * Which lines are added and removed is decided by a line-wise diff of the
+ * ancestor against each result, run to completion with no time limit. It is
+ * one character per line, so it is small, and a time limit would make the
+ * answer depend on the clock. The alignment it picks is a choice, and when a
+ * result repeats a line that was already there, the choice could in principle
+ * differ between the two results and refuse a good merge. The pinned case of
+ * appending a line identical to the last one is there to notice if it ever
+ * does; refusing is the safe direction, and it has not.
  */
-function sameLines(a: string, b: string): boolean {
+function samePlacement(base: string, a: string, b: string): boolean {
   if (a === b) return true;
-  const x = a.split("\n").sort();
-  const y = b.split("\n").sort();
+  const x = placements(base, a);
+  const y = placements(base, b);
   if (x.length !== y.length) return false;
   for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
   return true;
+}
+
+/**
+ * Every line `result` adds to or removes from `base`, each tagged with the
+ * ancestor line it happened at, sorted so that two lists compare as multisets.
+ */
+function placements(base: string, result: string): string[] {
+  const dmp = new diff_match_patch();
+  dmp.Diff_Timeout = 0;
+  const { chars1, chars2, lineArray } = dmp.diff_linesToChars_(base, result);
+  const diff = dmp.diff_main(chars1, chars2, false);
+  dmp.diff_charsToLines_(diff, lineArray);
+
+  const out: string[] = [];
+  let at = 0;
+  for (const [op, text] of diff) {
+    // Each line keeps its newline, so a final line without one stays distinct.
+    const lines = text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+    if (op === EQUAL) {
+      at += lines.length;
+    } else if (op === DELETE) {
+      for (const line of lines) out.push(`-${at++} ${line}`);
+    } else {
+      for (const line of lines) out.push(`+${at} ${line}`);
+    }
+  }
+  return out.sort();
 }
 
 /** Applies one side's changes to the other, reporting how many hunks landed. */
@@ -413,6 +724,56 @@ function missingInsertions(diff: Diff[], result: string): string | undefined {
     if (op !== INSERT) continue;
     if (!result.includes(text)) return text;
   }
+  return undefined;
+}
+
+/**
+ * The first word in the result that none of the three versions contains, or
+ * undefined if every word came from somewhere.
+ *
+ * Every check above asks about spans before anything is applied, and a span is
+ * innocent when the damage is inside a word. diff-match-patch works in
+ * characters, so a device rewriting a word into one that shares its opening
+ * letters deletes nothing at all: `- the` becoming `- theirs0` is the four
+ * characters `irs0` inserted after `- the`. If the other device then removes
+ * the line those letters were leaning on, they land on whatever line is left:
+ *
+ * ```
+ * base    - line here\n- note line\n- the
+ * mine    - mine line line 0\n- line here
+ * theirs  - line here\n- note line\n- theirs0
+ * merged  - mine line line 0\n- line hereirs0
+ * ```
+ *
+ * `hereirs0` is not a word anybody typed, and every span involved is somewhere
+ * it is entitled to be. Found by the token property of merge.fuzz.test.ts
+ * (cases 3869907292 and 3869956296), which is the same question asked of a whole
+ * note, so asking it here holds every real merge to what the fuzzer holds a
+ * generated one to. Rule 4 once more: the checks above are an account of the
+ * work, and this is the outcome.
+ *
+ * The cost is measured rather than assumed. Two devices rewriting different
+ * halves of one word can no longer merge, which changed one test: `abcdefghij`
+ * against `ABCDEfghij` and `abcdeFGHIJ` used to give `ABCDEFGHIJ`. Prose does
+ * not edit half a word, and over 400,000 generated merges this refused one
+ * that the oracle called clean. What it buys is every splice that mangles a
+ * word, which no span check can see.
+ *
+ * Not a replacement for `fusedLine`, which was tested against it: a run-on
+ * whose two halves are each somebody's real words, `mine added 1 the theirs0`
+ * from case 1588285323, has nothing wrong with any word in it.
+ *
+ * Pinned in merge.test.ts under "a word neither device wrote".
+ */
+function inventedWord(
+  base: string,
+  mine: string,
+  theirs: string,
+  merged: string,
+): string | undefined {
+  const known = new Set<string>();
+  for (const text of [base, mine, theirs]) for (const word of text.split(/\s+/)) known.add(word);
+  for (const word of merged.split(/\s+/)) if (word !== "" && !known.has(word)) return word;
   return undefined;
 }
 

@@ -384,18 +384,22 @@ describe("the guards behind the overlap check", () => {
   });
 
   it("merges spans that abut exactly", () => {
-    // Overlap has to mean crossing, not touching. Local changes the first
-    // half and the other device changes the second, so the changed regions
-    // share a boundary and nothing else. Testing `<=` instead of `<` would
-    // turn ordinary editing into conflicts.
-    const base = "abcdefghij";
-    const mine = "ABCDEfghij";
-    const theirs = "abcdeFGHIJ";
+    // Overlap has to mean crossing, not touching. Local rewrites a word and
+    // the other device breaks the line straight after it, so the changed
+    // regions share a boundary and nothing else. Testing `<=` instead of `<`
+    // would turn ordinary editing into conflicts.
+    //
+    // This case used to be `abcdefghij` against `ABCDEfghij` and
+    // `abcdeFGHIJ`, two devices rewriting different halves of one word. That
+    // is a conflict now, and deliberately: see inventedWord in merge.ts.
+    const base = "- buy milk today";
+    const mine = "- buy oats today";
+    const theirs = "- buy milk\ntoday";
 
     const r = mergeText(base, mine, theirs);
     expect(r.kind).toBe("merged");
     if (r.kind !== "merged") return;
-    expect(r.text).toBe("ABCDEFGHIJ");
+    expect(r.text).toBe("- buy oats\ntoday");
   });
 
   it("locates changed regions by their real offsets", () => {
@@ -707,5 +711,330 @@ describe("a merge that stops the file being what it was", () => {
     if (out.kind !== "merged") throw new Error(`refused a good merge: ${out.why}`);
     expect(out.text).toContain("edited here");
     expect(out.text).toContain("edited there");
+  });
+});
+
+/**
+ * The hole the two-directions check was documented to have, and then found by
+ * the fuzzer in merge.fuzz.test.ts before it was constructed by hand.
+ *
+ * `sameLines` compared the two directions as multisets of lines, so a change
+ * that lands in the wrong place without changing which lines exist passed. Two
+ * shapes do that in repetitive content: a line *inserted* into the wrong
+ * section, and a line *deleted* from the wrong section when every section has
+ * one. The observed misplacement (Item 3's edit landing on Item 6) was a
+ * replacement, which changes the line text and so was caught; these two are
+ * the same misplacement with the text unchanged.
+ */
+describe("a hunk placed in the wrong place, with every line still present", () => {
+  const block = (i: number) => `## Section\n\nSome shared boilerplate text here.\n\nItem ${i}\n`;
+  const blocks = Array.from({ length: 12 }, (_, i) => block(i));
+  const base = blocks.join("\n");
+  // Sections 0 to 2 removed on the other device, so every offset shifts by
+  // three sections and the matcher's target lands on text that looks right.
+  const theirs = blocks.slice(3).join("\n");
+
+  it("refuses a new line that landed in another section", () => {
+    const mine = base.replace("Item 3\n", "Item 3\nNEW LINE ADDED LOCALLY\n");
+
+    // The library, unaided, puts the new line under Item 6.
+    const spliced = unguardedMerge(base, mine, theirs);
+    expect(spliced).toContain("Item 6\nNEW LINE ADDED LOCALLY");
+    expect(spliced).not.toContain("Item 3\nNEW LINE ADDED LOCALLY");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      // Merging is acceptable only if the line is where it was written.
+      expect(r.text).toContain("Item 3\nNEW LINE ADDED LOCALLY");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("refuses a deletion that removed the same line from another section", () => {
+    const parts = [...blocks];
+    parts[3] = "## Section\n\n\nItem 3\n";
+    const mine = parts.join("\n");
+
+    // Unaided, the library strips the boilerplate from the section holding
+    // Item 6 and leaves the one holding Item 3 intact.
+    const spliced = unguardedMerge(base, mine, theirs);
+    expect(spliced).toContain("## Section\n\n\nItem 6\n");
+    expect(spliced).toContain("Some shared boilerplate text here.\n\nItem 3\n");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text).toContain("## Section\n\n\nItem 3\n");
+      expect(r.text).not.toContain("## Section\n\n\nItem 6\n");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("still lets two devices append to one daily note", () => {
+    // The reason the comparison is not string equality, restated next to the
+    // thing that tightened it. The order of two additions at one point is
+    // arbitrary and must not become a conflict.
+    const day = "# 2026-09-02\n\n- first thing\n";
+    const r = mergeText(day, day + "- mine\n", day + "- theirs\n");
+    expect(r.kind).toBe("merged");
+  });
+
+  it("still lets a device append a line identical to the last one", () => {
+    // An added line that happens to repeat an existing one is the case where
+    // a line-level alignment can wander, so it is pinned as a merge.
+    const base = "- p\n- p\n";
+    const r = mergeText(base, base + "- p\n", base + "- q\n");
+    expect(r.kind).toBe("merged");
+    if (r.kind !== "merged") return;
+    expect(r.text.split("\n").filter((l) => l === "- p")).toHaveLength(3);
+    expect(r.text).toContain("- q");
+  });
+});
+
+/**
+ * A splice both directions agree on, found by the token property of the fuzzer.
+ *
+ * One device writes into a blank line; the other deletes that blank line. At
+ * the character level the write is an insertion at a point and the deletion is
+ * the one newline that gave the blank line its width, and the point sits on the
+ * span's edge rather than inside it, because an empty line has no inside. So
+ * the overlap check let it through, and applying either way round removed the
+ * only separator the new line had:
+ *
+ * ```
+ * base    line text here.\n\nhere again.\n
+ * mine    line text here.\nmine0\nhere again.\n
+ * theirs  line text here.\nhere again.\n
+ * merged  line text here.\nmine0here again.\n
+ * ```
+ *
+ * A line neither device wrote, from two edits that both applied, in both
+ * directions. Rule 10: the property is that no edit was lost, and "mine0" as
+ * a line was.
+ */
+describe("an addition whose separator the other side deleted", () => {
+  it("refuses writing into a blank line the other side removed", () => {
+    const base = "line text here.\n\nhere again.\n";
+    const mine = "line text here.\nmine0\nhere again.\n";
+    const theirs = "line text here.\nhere again.\n";
+
+    expect(unguardedMerge(base, mine, theirs)).toBe("line text here.\nmine0here again.\n");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text.split("\n")).toContain("mine0");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("refuses a new line that would run into the other side's new line", () => {
+    // Fuzz case 1588232853, and the reason the check asks the general
+    // question. Theirs added lines in front of the blank line; mine removed
+    // the blank line and everything after it, and added a line of its own
+    // at the end. What follows theirs' last line after the merge is not a
+    // character of the ancestor at all, it is mine's addition.
+    const base = "# 2026-09-02\n\n- note text\n- text here\n";
+    const mine = "# 2026-09-02\nMINE LINE\n";
+    const theirs = "# 2026-09-02\nTHEIRS TWO\n\nTHEIRS ONE\n- note text\n- text here\n";
+
+    expect(unguardedMerge(base, mine, theirs)).toContain("THEIRS ONEMINE LINE");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      const lines = r.text.split("\n");
+      expect(lines).toContain("THEIRS ONE");
+      expect(lines).toContain("MINE LINE");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("refuses a new line that would run into a line the other side rewrote", () => {
+    // Case 1588285323, and the one shape in this file that only this check
+    // sees. Mine cut most of the note and left `mine added 1` as a line of
+    // its own, whose closing newline was the newline of the line after it.
+    // Theirs rewrote that line. Neither addition is spliced into a word, so
+    // every word in the result is somebody's, and both directions agree, so
+    // the only thing wrong is that `mine added 1` is no longer a line.
+    const base =
+      "# 2026-09-02\n\n- here\n- text the\n- here line\n- text note same\n" +
+      "- note note note\n- text here\n- the\n- the the text\n- line note here again\n";
+    const mine =
+      "# 2026-09-02\n\n- mine2\n- the\nmine added 1\n- the the text\n- line note here again\n";
+    const theirs =
+      "# 2026-09-02\n- theirs text sync 1\n\n- here\n- text the\n- here line\n" +
+      "- text note same\n- note note note\n- text here\n- the the theirs0\n- line note here again\n";
+
+    expect(unguardedMerge(base, mine, theirs)).toContain("mine added 1 the theirs0");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text.split("\n")).toContain("mine added 1");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("still merges an appended line against a deleted last line", () => {
+    // The mirror image, which is fine: the deleted line took its own newline
+    // with it and the appended line brought its own.
+    const base = "# day\n\n- first\n- last\n";
+    const r = mergeText(base, base + "- new\n", "# day\n\n- first\n");
+    expect(r.kind).toBe("merged");
+    expect(r.kind === "merged" && r.text).toBe("# day\n\n- first\n- new\n");
+  });
+
+  it("still merges a new first item against a deleted first item", () => {
+    const base = "# day\n\n- a\n- b\n";
+    const r = mergeText(base, "# day\n\n- new\n- a\n- b\n", "# day\n\n- b\n");
+    expect(r.kind).toBe("merged");
+    expect(r.kind === "merged" && r.text).toBe("# day\n\n- new\n- b\n");
+  });
+});
+
+/**
+ * Two devices rewriting one line, with their character spans missing each
+ * other, which is the overlap check's own failure reached by a route it cannot
+ * see. Both found by the placed property of merge.fuzz.test.ts.
+ */
+describe("two rewrites of one line that miss each other", () => {
+  it("refuses two edits whose spans are a space apart across a line end", () => {
+    // Case 1588304879. Each device rewrote a different bullet of a short
+    // list and the bullets are next to each other, so diff-match-patch reads
+    // theirs as deleting "- here\n-" and mine as deleting "line sync\n-".
+    // The two deletions are separated by the single space after a bullet, so
+    // nothing overlaps, and the two additions land side by side.
+    const base = "# 2026-09-02\n\n- here\n- line sync\n- line";
+    const mine = "# 2026-09-02\n\n- here\n- mine line here 1\n- line sync\nmine0 line";
+    const theirs = "# 2026-09-02\n\ntheirs added 0\ntheirs1 line sync\n- line";
+
+    // Unaided, the library makes a line neither device wrote and leaves the
+    // line theirs meant to rewrite exactly as the ancestor had it.
+    const spliced = unguardedMerge(base, mine, theirs);
+    expect(spliced).toContain("theirs1 mine line here 1");
+    expect(spliced).toContain("- line sync");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text).not.toContain("theirs1 mine line here 1");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("refuses a word replacement that meets the other side's new line", () => {
+    // Case 1588275183, the same shape from the other direction: mine
+    // rewrote the marker of a line theirs replaced the text of, so mine's
+    // word ends up on theirs' new line and the line mine edited survives
+    // untouched.
+    const base = "# 2026-09-02\n\n- here the same the\n- line line\n- here note\n";
+    const mine = "# 2026-09-02\nmine0 here the same the\n- line line\n";
+    const theirs =
+      "# 2026-09-02\n\n- theirs line again 0\n- here the same the\nTHEIRS LINE 2\n- here note\n";
+
+    expect(unguardedMerge(base, mine, theirs)).toContain("mine0 theirs line again 0");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text).not.toContain("mine0 theirs line again 0");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("refuses two rewrites of one word that arrive at the same point", () => {
+    // Case 3869976870. `theirs0` begins with `the`, so theirs' edit is four
+    // characters inserted after `- the` and nothing deleted, at exactly the
+    // point where mine's own replacement of that word is inserted. Two
+    // additions at one point are the daily note and are allowed, except when
+    // a device also took text away there, which is what this is.
+    const base = "# 2026-09-02\n\n- again\n- text note\n- the the\n";
+    const mine = "\n- again\n# 2026-09-02\n- text note\n- mine1 the\n";
+    const theirs = "# 2026-09-02\n\n- again\n- text note\n- theirs0 the\n";
+
+    expect(unguardedMerge(base, mine, theirs)).toContain("- mine1irs0 the");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text).not.toContain("mine1irs0");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("refuses a line whose first word the other device took away", () => {
+    // Case 7028336. Theirs wrote `- theirs text note 1` over `- the`, which
+    // reads as everything from the fourth letter being inserted after
+    // `- the`, and mine deleted `- the` and put a line of its own in its
+    // place. The two additions arrive one after the other with nothing of the
+    // ancestor between them, and what is left of theirs' line is
+    // `irs text note 1`. Found by the token property, refused by this check:
+    // both are true of it and either alone would do.
+    const base = "# 2026-09-02\n\n- the\n- the again";
+    const mine = "- mine note sync 0\n\n- the again";
+    const theirs = "# 2026-09-02\n\n- theirs text note 1\n- the\nTHEIRS LINE 0\n- the theirs2";
+
+    expect(unguardedMerge(base, mine, theirs)).toContain("\nirs text note 1");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text).not.toContain("\nirs text note 1");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("still merges two devices changing adjacent words of one sentence", () => {
+    // The cost this check must not have. Only a space separates the two
+    // edits here too, and neither deletion took a line end with it, so the
+    // result is the sentence both people meant.
+    const r = mergeText("The cat sat.", "The dog sat.", "The cat ran.");
+    expect(r.kind).toBe("merged");
+    expect(r.kind === "merged" && r.text).toBe("The dog ran.");
+  });
+
+  it("still lets two devices append to one daily note", () => {
+    // Two additions at one point stay the daily note. They are only refused
+    // when a device also took text away at that point.
+    const day = "# 2026-09-02\n\n- first thing\n";
+    const r = mergeText(day, day + "- mine\n", day + "- theirs\n");
+    expect(r.kind).toBe("merged");
+  });
+});
+
+/**
+ * A splice inside a word, which every check that compares spans lets through
+ * because both spans are innocent. Found by the token property of
+ * merge.fuzz.test.ts.
+ */
+describe("a word neither device wrote", () => {
+  it("refuses a fragment of a word the other device deleted the front of", () => {
+    // Case 3869907292, trimmed. Theirs rewrote `- the` as `- theirs0`, which
+    // begins with the same three letters, so diff-match-patch reads it as
+    // `irs0` inserted after `- the` and nothing deleted. Mine deleted the
+    // lines that `- the` was one of. Nothing overlaps, and `irs0` lands on
+    // the end of whatever line is left.
+    const base = "- line here\n- note line\n- the\n";
+    const mine = "- mine line line 0\n- line here\n";
+    const theirs = "- line here\n- note line\n- theirs0\n";
+
+    expect(unguardedMerge(base, mine, theirs)).toContain("- line hereirs0");
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind === "merged") {
+      expect(r.text).not.toContain("hereirs0");
+    } else {
+      expect(r.kind).toBe("conflict");
+    }
+  });
+
+  it("still merges two edits to different words of one line", () => {
+    // The check asks about words, not about lines, so a line neither device
+    // wrote is still the right answer when every word in it is somebody's.
+    const r = mergeText("a b c\n", "a B c\n", "a b C\n");
+    expect(r.kind).toBe("merged");
+    expect(r.kind === "merged" && r.text).toBe("a B C\n");
   });
 });
