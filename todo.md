@@ -198,6 +198,25 @@ refused-but-confusing > operational footguns > leaks/hardening.
   compare the two without opening SQLite, and the runbook now has an
   explicit verify-before-deleting step.
 
+## Found by the canvas corpus, not yet acted on
+
+- [ ] **Only `.canvas` and `.json` get a validity gate.** `.svg`, `.xml`,
+  `.yml`, `.yaml`, `.csv` and the source extensions are all in
+  `TEXT_EXTENSIONS`, so they are merged as text with no `stillValid` at all. A
+  malformed merge of an SVG or an XML file is the same failure the canvas case
+  turned out to be, and nothing would catch it. Real validators mean real
+  parsers, which is a dependency shipped to a phone, so this wants a cheap
+  well-formedness check or a decision to refuse merging those types.
+- [ ] **An Excalidraw drawing is `name.excalidraw.md`**, so its extension is
+  `md` and it merges as markdown with no gate, although its body is a JSON
+  block. Worth checking what a bad merge does to one.
+- [ ] **A node deleted on one device against an edge drawn to it on the other**
+  merges to valid JSON holding an orphaned edge, which Obsidian silently drops
+  on the next save. Not a merge the code invented, since there is no third
+  answer, but it is a silent edit loss. Telling it from an edge the ancestor
+  already had needs `stillValid` to see the ancestor and both sides, which is a
+  signature change. Pinned as a test with the reasoning.
+
 ## Known divergence between the two shells
 
 - [ ] **The plugin still throws on a name clash; the CLI blocks the pair.**
@@ -213,9 +232,29 @@ refused-but-confusing > operational footguns > leaks/hardening.
 
 - [x] Merge fuzz harness. Done, see above.
 
-- [ ] Recorded-Obsidian-event fidelity suite for `plugin/vault.ts`
-  (rename storms, rapid saves, trash vs `.trash`, dotfile gaps).
-- [ ] Canvas/JSON structured-file merge corpus for `stillValid`.
+- [x] Recorded-Obsidian-event fidelity suite for `plugin/vault.ts`. Done, and
+  the fake it runs against was not faithful, which is the thing that would have
+  made it worthless. Six divergences found by reading the shipped Obsidian
+  binary: the index reported dot-prefixed paths it actually hides, there was no
+  case-folding model at all and the one in the test file had the refusal rule
+  missing, `trashLocal` kept the full path instead of moving to a basename that
+  can collide, `list` on a missing directory answered empty rather than
+  throwing, the index omitted the vault root, and a comment claimed a folder
+  rename is one event when it is one per descendant. It then found a real
+  ordering bug: a write landing during a flush could be crossed off as durable
+  without being fsynced, with the index then naming it durable. Not reachable
+  today, because the engine awaits a whole pass before flushing, so it is the
+  file's own documented claim made true rather than a live loss.
+- [x] Canvas/JSON structured-file merge corpus for `stillValid`. Done, and the
+  check turned out to be load-bearing rather than speculative as the comments
+  claimed. The ordinary case: a board with two cards and no arrows, each device
+  draws one. `"edges":[]` is one line in the ancestor and three on each side, so
+  both changed the same line and the character merge concatenated two edge
+  objects with no comma between them. Every other check passed. Measured over
+  the corpus, 193 of 4,420 merges produce a file Obsidian will not open, and
+  nothing but `stillValid` sees any of them. Verified against the shipped
+  Obsidian binary rather than inferred: the canvas writer puts each node and
+  edge on its own line, and the reader has no catch above `JSON.parse`.
 - [x] Index rewrite cost measured at 1k/10k/50k notes; the SQLite question
   is answered no, and the numbers are in `docs/compared.md` under measured
   and deliberately not done. Four milliseconds at ten thousand notes.
