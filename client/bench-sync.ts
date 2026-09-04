@@ -284,8 +284,8 @@ async function run(wire: Wire) {
     );
     // What latency multiplies. A design that asks once per file behaves
     // very differently on a slow wire from one that asks once per pass.
-    console.log(`  round trips, upload   ${a.c.requestsSent} for ${files} files`);
-    console.log(`  round trips, download ${b.c.requestsSent}`);
+    console.log(`  round trips, upload   ${a.c.transport.requestsSent} for ${files} files`);
+    console.log(`  round trips, download ${b.c.transport.requestsSent}`);
     console.log("");
     console.log(
       wrong === 0 && extra === 0 && before.size === after.size ? "  correct" : "  NOT CORRECT",

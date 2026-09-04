@@ -30,9 +30,31 @@ export interface FileStat {
   readonly size: number;
 }
 
+/**
+ * The timestamps a write carries.
+ *
+ * Its own name because both vaults, the engine and every test double spelled
+ * it out separately, and the two fields have to travel together: a downloaded
+ * file stamped with the moment it landed looks locally edited on the next
+ * pass.
+ */
+export interface Times {
+  readonly mtime: number;
+  readonly ctime: number;
+}
+
 /** What the engine needs from a place files live. */
 export interface Vault {
-  /** Every file and folder, excluding anything the client should not sync. */
+  /**
+   * Every file and folder, excluding anything the client should not sync.
+   *
+   * Paths are reported in NFC. A Mac spells names on disk in NFD and every
+   * other platform in NFC, and the two are one name, so a vault that handed
+   * out the disk's bytes had two devices each refusing the other's spelling
+   * of one note for ever. Both real vaults normalise here and map back on
+   * the way in; the engine's own folding is the fallback for one that does
+   * not, and it errs towards refusing rather than overwriting.
+   */
   list(): Promise<FileStat[]>;
   read(path: string): Promise<Uint8Array>;
   /**
@@ -74,7 +96,7 @@ export interface Vault {
    * table compares timestamps, and a downloaded file stamped with the moment
    * it landed looks locally edited on the next pass.
    */
-  write(path: string, bytes: Uint8Array, times: { mtime: number; ctime: number }): Promise<void>;
+  write(path: string, bytes: Uint8Array, times: Times): Promise<void>;
   remove(path: string): Promise<void>;
   mkdir(path: string): Promise<void>;
   exists(path: string): Promise<boolean>;
@@ -115,11 +137,7 @@ export interface Vault {
    * API has no exclusive create cannot offer it; the engine then falls back
    * to the gap it always had.
    */
-  create?(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<boolean>;
+  create?(path: string, bytes: Uint8Array, times: Times): Promise<boolean>;
   /**
    * Watches for changes, returning a function that stops watching.
    *
@@ -140,6 +158,81 @@ export interface Vault {
 export interface IndexStore {
   load(): Promise<StoredState | undefined>;
   save(state: StoredState): Promise<void>;
+}
+
+/** What a stat says about the index file, and all this needs of one. */
+export interface IndexStamp {
+  readonly size: number;
+  readonly mtime: number;
+}
+
+/**
+ * The last index this session wrote, so an unchanged index is not written again.
+ *
+ * A pass ends by saving whether or not anything happened, and a settled vault
+ * passes on every watch tick and every keepalive. At 2000 files that was a
+ * 9 MiB serialisation and two fsyncs every thirty seconds, for ever, to record
+ * that nothing had changed; at 10k it measured 21 ms of which 11 ms was the
+ * flushes. Two separate audits found this independently, which is the best
+ * evidence a thing is real.
+ *
+ * Comparing the string is not free either, but stringify is 2.1 ms against
+ * 10.7 ms of fsync, so it pays for itself the first time it matches. And a
+ * write skipped because the bytes on disk are already those bytes cannot lose
+ * anything: the failure it would cause is the failure it prevents.
+ *
+ * That last sentence holds only while the bytes are still there, which is why
+ * the file is asked about as well. An index removed from outside during a
+ * session used to be skipped by every later unchanged pass, and the restart
+ * after it started cold over a vault this device had already synced.
+ *
+ * Asking whether it exists was not enough either (R3). Something overwriting
+ * the index in place leaves a file that is there and is not what was written,
+ * and every later unchanged pass would skip over it and preserve it for the
+ * rest of the session. So what is remembered is its size and modification
+ * time, and the skip needs both to match. Not the content: reading nine
+ * megabytes back on every settled pass is the cost this skip exists to avoid,
+ * while a stat is one call whatever the index weighs.
+ *
+ * The residual, stated rather than hidden: an overwrite of exactly the same
+ * length inside one modification-time tick is invisible here and still skips.
+ * That is a corruption-only window, narrow where the clock is fine grained
+ * (APFS and ext4 record nanoseconds) and real where it is not (HFS+ ticks once
+ * a second, FAT once every two). Closing it means reading the file back on
+ * every settled pass, which is the whole cost this skip exists to avoid.
+ *
+ * Here in core because it was not: the plugin's store grew the stamp and the
+ * headless client's kept an existence check, so one client carried a fix the
+ * other did not. Two copies of a rule is how they come to disagree.
+ */
+export class LastIndexWrite {
+  private text: string | undefined;
+  private stamp: IndexStamp | undefined;
+
+  /** Whether `text` is on disk already, untouched since this session put it there. */
+  matches(text: string, onDisk: IndexStamp | undefined): boolean {
+    const was = this.stamp;
+    if (text !== this.text || was === undefined || onDisk === undefined) return false;
+    return onDisk.size === was.size && onDisk.mtime === was.mtime;
+  }
+
+  /**
+   * Records what was just written and how it looks on disk.
+   *
+   * Only ever after the write is durable. Recording it first would skip the
+   * write that a failed one still owes. A stamp that could not be taken is
+   * remembered as none, which makes the next save write rather than skip.
+   */
+  wrote(text: string, onDisk: IndexStamp | undefined): void {
+    this.text = text;
+    this.stamp = onDisk;
+  }
+
+  /** Forgets it, for an index that has been removed on purpose. */
+  forget(): void {
+    this.text = undefined;
+    this.stamp = undefined;
+  }
 }
 
 /**
@@ -212,11 +305,7 @@ export class MemoryVault implements Vault {
     return f.bytes;
   }
 
-  async write(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<void> {
+  async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
     this.files.set(path, { bytes: bytes.slice(), mtime: times.mtime, ctime: times.ctime });
     for (const parent of parents(path)) this.folders.add(parent);
     this.notify(path);
@@ -252,11 +341,7 @@ export class MemoryVault implements Vault {
     return this.files.has(path) || this.folders.has(path);
   }
 
-  async create(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<boolean> {
+  async create(path: string, bytes: Uint8Array, times: Times): Promise<boolean> {
     if (this.files.has(path) || this.folders.has(path)) return false;
     await this.write(path, bytes, times);
     return true;

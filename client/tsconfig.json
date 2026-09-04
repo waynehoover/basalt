@@ -16,5 +16,11 @@
     "noEmit": true,
     "types": ["node", "vitest/globals"]
   },
-  "include": ["src"]
+  // The benchmarks are in here on purpose. They import the same public API the
+  // client does, and while they sat outside it a change to that API broke them
+  // with every gate still green: `Client.requestsSent` went, and nothing said
+  // so. The vitest configs are still out, because they fail today on
+  // `minWorkers`, which the installed vitest types do not declare and its
+  // runtime accepts; that is a separate decision about working config.
+  "include": ["src", "bench.ts", "bench-sync.ts"]
 }

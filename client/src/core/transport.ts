@@ -457,9 +457,15 @@ export class Transport {
    * The fetch collecting bodies, if one is. The `bodies` header says exactly
    * how many binary frames follow and this is what reads them; a body with no
    * fetch collecting is a body nobody asked for.
+   *
+   * `waiter` is the reader of that same fetch, waiting on a body that has not
+   * arrived. It used to be a field of its own, which described one in-progress
+   * fetch in two places; there is only ever one fetch, so there is only ever
+   * one waiter, and the two can no more disagree now than they were allowed to
+   * before.
    */
-  private collecting: { pending: Pending; want: number; got: Uint8Array[] } | undefined;
-  private bodyWaiter: ((bytes: Uint8Array) => void) | undefined;
+  private collecting:
+    { pending: Pending; want: number; got: Uint8Array[]; waiter?: () => void } | undefined;
 
   /**
    * How many requests this connection has sent.
@@ -567,8 +573,7 @@ export class Transport {
     this.pending.clear();
     const ping = this.pinging;
     this.pinging = undefined;
-    const body = this.bodyWaiter;
-    this.bodyWaiter = undefined;
+    const body = this.collecting?.waiter;
     this.collecting = undefined;
     for (const p of waiting) {
       this.disarm(p);
@@ -579,7 +584,7 @@ export class Transport {
       ping.reject(cause);
     }
     // A body reader is woken with nothing, and finds the transport closed.
-    body?.(new Uint8Array(0));
+    body?.();
     try {
       this.socket?.close();
     } catch {
@@ -664,10 +669,10 @@ export class Transport {
     // Progress on the fetch, so its clock restarts.
     this.arm(fetch.pending);
     fetch.got.push(bytes);
-    const waiter = this.bodyWaiter;
+    const waiter = fetch.waiter;
     if (waiter) {
-      this.bodyWaiter = undefined;
-      waiter(bytes);
+      delete fetch.waiter;
+      waiter();
     }
   }
 
@@ -1537,7 +1542,7 @@ export class Transport {
     if (!fetch || this.closed) throw this.closeReason ?? new ConnectionError("not connected");
     if (fetch.got.length <= i) {
       await new Promise<void>((resolve) => {
-        this.bodyWaiter = () => resolve();
+        fetch.waiter = resolve;
       });
       if (this.closed) throw this.closeReason ?? new ConnectionError("not connected");
     }
@@ -1767,7 +1772,6 @@ function idOf(reply: Reply): number {
  */
 export class Backoff {
   private count = 0;
-  private nextAt = 0;
 
   constructor(
     private readonly min = 0,
@@ -1778,14 +1782,12 @@ export class Backoff {
   ) {}
 
   /** Records a success: the next attempt waits only the floor. */
-  success(now: number): void {
+  success(): void {
     this.count = 0;
-    this.nextAt = now + this.delay();
   }
 
-  fail(now: number): void {
+  fail(): void {
     this.count++;
-    this.nextAt = now + this.delay();
   }
 
   /** How long the next attempt waits, given the failures so far. */
@@ -1794,14 +1796,6 @@ export class Backoff {
     let t = this.base * Math.pow(2, this.count - 1);
     if (this.jitter) t *= 0.5 + 0.5 * this.random();
     return Math.floor(Math.min(this.max, this.min + t));
-  }
-
-  isReady(now: number): boolean {
-    return now >= this.nextAt;
-  }
-
-  get failures(): number {
-    return this.count;
   }
 }
 
@@ -1815,22 +1809,6 @@ function defaultSocketFactory(url: string): SocketLike {
     throw new Error("no WebSocket available in this environment");
   }
   return new ctor(url) as SocketLike;
-}
-
-/**
- * Chooses the scheme for a host from the pairing string.
- *
- * Plain WebSocket only for loopback, where there is no network to protect and no
- * certificate to have. Everything else is `wss`, because TLS is terminated in
- * front of the server by `tailscale serve` or a tunnel and the server itself
- * holds no key material. Obsidian's engine makes the same call at
- * `obsidian-sync-engine.js:937`.
- */
-export function urlForHost(hostAndPort: string): string {
-  const host = hostAndPort.replace(/^wss?:\/\//, "");
-  const local =
-    host.startsWith("127.0.0.1") || host.startsWith("localhost") || host.startsWith("[::1]");
-  return `${local ? "ws" : "wss"}://${host}`;
 }
 
 /**

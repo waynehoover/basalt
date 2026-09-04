@@ -14,7 +14,7 @@ import { authToken, type VaultKeys } from "./crypto.ts";
 import { testKeys, testWrapped } from "./test-keys.ts";
 import type { SyncReport } from "./engine.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
-import { MemoryIndexStore, MemoryVault } from "./vault.ts";
+import { MemoryIndexStore, MemoryVault, type Times } from "./vault.ts";
 
 const SECRET = new Uint8Array(32).fill(21);
 let keys: VaultKeys;
@@ -69,11 +69,7 @@ class SlowWriteVault extends MemoryVault {
   gate: Promise<void> = Promise.resolve();
   writesStarted = 0;
   writesFinished = 0;
-  override async write(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<void> {
+  override async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
     this.writesStarted++;
     await this.gate;
     await super.write(path, bytes, times);

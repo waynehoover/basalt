@@ -9,7 +9,7 @@
 import { describe, expect, it } from "vitest";
 
 import { combinePasses, type SyncReport } from "./engine.ts";
-import { didSomething } from "./client.ts";
+import { didSomething, summarise } from "./client.ts";
 
 function report(over: Partial<SyncReport>): SyncReport {
   return {
@@ -25,6 +25,7 @@ function report(over: Partial<SyncReport>): SyncReport {
     waiting: 0,
     retrying: 0,
     skipped: 0,
+    skippedPaths: [],
     ignored: 0,
     blocked: 0,
     inTheWay: [],
@@ -102,5 +103,28 @@ describe("what counts as work worth another pass (C-D6)", () => {
     ] as const) {
       expect(didSomething(report({ [key]: 1 })), key).toBe(true);
     }
+  });
+});
+
+/**
+ * The one line the plugin has. It is painted straight into the synced state,
+ * so a counter missing here is a counter the panel and the status bar cannot
+ * show at all.
+ */
+describe("the one-line summary (N1)", () => {
+  it("does not say a vault is up to date while a save is still owed", () => {
+    // Tens of seconds of write debounce, during which the pass is honest and
+    // the summary was not. Rule 7.
+    expect(summarise(report({ waiting: 1 }))).toBe("1 waiting");
+    expect(summarise(report({ unchanged: 100, waiting: 2 }))).toBe("2 waiting");
+  });
+
+  it("mentions folders it made", () => {
+    expect(summarise(report({ foldersCreated: 1 }))).toBe("1 folder");
+    expect(summarise(report({ uploaded: 2, foldersCreated: 3 }))).toBe("2 sent, 3 folders");
+  });
+
+  it("still says up to date when a pass really had nothing to report", () => {
+    expect(summarise(report({ unchanged: 40 }))).toBe("up to date");
   });
 });

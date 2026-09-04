@@ -17,14 +17,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { chunkName } from "./crypto.ts";
 import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
-import {
-  Backoff,
-  ConnectionError,
-  ProtocolError,
-  Transport,
-  urlForHost,
-  type Batch,
-} from "./transport.ts";
+import { Backoff, ConnectionError, ProtocolError, Transport, type Batch } from "./transport.ts";
 
 /** A connected transport and the socket behind it. */
 async function connected(
@@ -223,7 +216,7 @@ describe("the handshake", () => {
     socket.raw({
       res: "err",
       code: "proto",
-      msg: "protocol 3 not supported, this server (version 0.2.2) speaks 2 to 2",
+      msg: "protocol 3 not supported, this server speaks 2 to 2",
     });
     await expect(hello).rejects.toMatchObject({ code: "proto", retryable: false });
     await expect(hello).rejects.toThrow(/speaks 2 to 2/);
@@ -1218,38 +1211,16 @@ describe("a success reply that is not the shape it should be", () => {
   });
 });
 
-describe("the scheme for a host", () => {
-  it("uses plain websocket only for loopback", () => {
-    expect(urlForHost("127.0.0.1:3003")).toBe("ws://127.0.0.1:3003");
-    expect(urlForHost("localhost:3003")).toBe("ws://localhost:3003");
-    expect(urlForHost("[::1]:3003")).toBe("ws://[::1]:3003");
-  });
-
-  it("uses TLS for everything else", () => {
-    // TLS is terminated in front of the server, which holds no key material,
-    // so anything not on this machine has to be wss.
-    expect(urlForHost("homelab.example.ts.net:3003")).toBe("wss://homelab.example.ts.net:3003");
-    expect(urlForHost("192.168.1.10:3003")).toBe("wss://192.168.1.10:3003");
-  });
-
-  it("tolerates a scheme already being there", () => {
-    expect(urlForHost("wss://host:1")).toBe("wss://host:1");
-    expect(urlForHost("ws://127.0.0.1:1")).toBe("ws://127.0.0.1:1");
-  });
-});
-
 describe("reconnect pacing", () => {
   it("does not wait at all before the first attempt", () => {
-    const b = new Backoff(0, 300_000, 5_000, false);
-    expect(b.delay()).toBe(0);
-    expect(b.isReady(0)).toBe(true);
+    expect(new Backoff(0, 300_000, 5_000, false).delay()).toBe(0);
   });
 
   it("doubles, and stops at the ceiling", () => {
     const b = new Backoff(0, 300_000, 5_000, false);
     const seen: number[] = [];
     for (let i = 0; i < 10; i++) {
-      b.fail(0);
+      b.fail();
       seen.push(b.delay());
     }
     expect(seen.slice(0, 4)).toEqual([5_000, 10_000, 20_000, 40_000]);
@@ -1263,27 +1234,28 @@ describe("reconnect pacing", () => {
     // and come back together.
     const lowest = new Backoff(0, 300_000, 5_000, true, () => 0);
     const highest = new Backoff(0, 300_000, 5_000, true, () => 1);
-    lowest.fail(0);
-    highest.fail(0);
+    lowest.fail();
+    highest.fail();
     expect(lowest.delay()).toBe(2_500);
     expect(highest.delay()).toBe(5_000);
   });
 
   it("forgets its failures on success", () => {
     const b = new Backoff(0, 300_000, 5_000, false);
-    b.fail(0);
-    b.fail(0);
-    expect(b.failures).toBe(2);
-    b.success(0);
-    expect(b.failures).toBe(0);
+    b.fail();
+    b.fail();
+    expect(b.delay()).toBe(10_000);
+    b.success();
     expect(b.delay()).toBe(0);
   });
 
-  it("respects a floor between attempts", () => {
+  it("waits at least the floor, however the last attempt went", () => {
     const b = new Backoff(1_000, 300_000, 5_000, false);
-    b.success(0);
-    expect(b.isReady(500)).toBe(false);
-    expect(b.isReady(1_000)).toBe(true);
+    expect(b.delay()).toBe(1_000);
+    b.success();
+    expect(b.delay()).toBe(1_000);
+    b.fail();
+    expect(b.delay()).toBe(6_000);
   });
 });
 
