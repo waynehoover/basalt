@@ -50,7 +50,7 @@ func TestS16ShutdownClosesIdleSessionsWithAReasonAndRefusesNewOnes(t *testing.T)
 	}
 
 	late := r.dial("late")
-	late.sendJSON(helloMsg(testVault, testToken, "late", 0))
+	late.sendJSON(late.deviceHello(0))
 	late.expectErr(wire.CodeBusy)
 	if !late.closed() {
 		t.Fatal("a connection made during shutdown was admitted")

@@ -271,6 +271,14 @@ type Server struct {
 	// be a test that passes when the machine is busy.
 	beforeJoin func()
 
+	// beforeRegister runs inside a register, just before the store is asked to
+	// insert the row, and is nil in every non-test build. It is the register's
+	// beforeRotate: how a test lands a rotation inside the window between a
+	// registrar authenticating and its registration committing, which is the
+	// window in which a retired root would otherwise buy itself a permanent
+	// device.
+	beforeRegister func()
+
 	// beforeRotate runs inside a rotate, just before the store is asked to swap
 	// the credential, and is nil in every non-test build. It is how a test
 	// parks one device's rotation inside the store call while another device's
@@ -394,6 +402,28 @@ func (s *Server) forget(sess *Session) {
 		sess.counted = false
 		s.preAuth--
 	}
+}
+
+// registrarsOn is every session on this vault that authenticated with the
+// vault's own credential, except one, for a rotation to close.
+//
+// The hub cannot answer this: a registrar joins no vault's fan-out, because
+// there is nothing it may be sent. The session list can, and it is the same
+// list Shutdown fans its notices out over.
+//
+// Reading registrar and vaultID from another session's goroutine is safe
+// because both are written before that session calls authenticated, which
+// takes this mutex, so this acquisition happens after those writes.
+func (s *Server) registrarsOn(vaultID string, except *Session) []*Session {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+	var out []*Session
+	for sess := range s.sessions {
+		if sess != except && sess.registrar && sess.vaultID == vaultID {
+			out = append(out, sess)
+		}
+	}
+	return out
 }
 
 // Sessions is how many connections are being handled, joined or not.

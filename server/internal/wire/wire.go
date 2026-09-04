@@ -19,19 +19,21 @@ import "github.com/waynehoover/basalt-sync/server/internal/store"
 // negotiated: interoperating with a version we have not seen is how a silent
 // incompatibility gets shipped.
 //
-// Both are 3, and 3 is the only protocol there has ever been in the wild.
-// Protocols 1 and 2 were removed before anything was deployed, so there is no
-// vault and no device that speaks them, and a session either speaks 3 or was
-// refused at hello.
+// Both are 4, and 4 is not compatible with 3. Hello gained a `deviceId`, the
+// credential it carries is a device's rather than the vault's, and the vault's
+// own auth key stopped being a sync credential at all: there is nothing in a
+// protocol 3 hello that a protocol 4 server could serve, and a shim that
+// guessed would be handing a device the sync rights per-device credentials
+// exist to take away. Protocol 3 was in use by one person for a day.
 //
-// The two constants, the range check at hello and the refusal that names the
-// client's number, the server's range and `serverVersion` are kept anyway.
-// They are about ten lines, and they are how the next protocol bump is done:
-// when protocol 4 arrives its compatibility shim gets written then, against a
-// protocol 3 that has actually run. Do not delete them as dead weight.
+// A protocol 3 client is therefore refused at hello, naming its number and the
+// server's range, which is what the range check has been kept for since
+// protocols 1 and 2 were withdrawn. That refusal is the whole of the
+// compatibility story and it is deliberate: the alternative is a device that
+// connects and silently syncs under a credential nobody can revoke.
 const (
-	Proto    = 3
-	MinProto = 3
+	Proto    = 4
+	MinProto = 4
 )
 
 // MaxRequestID bounds a client-chosen request id: an integer from 1 to 2^32-1.
@@ -79,6 +81,12 @@ const (
 	// CodeNoChunk is a fetch for a chunk the server does not hold. Loud, so a
 	// client is never left waiting for a body that is not coming.
 	CodeNoChunk = "nochunk"
+	// CodeNoDevice names a device this vault does not have: a revoke for an id
+	// that is already gone. Its own code, beside nouid and nochunk, because
+	// the protocol says what is missing rather than making a caller read the
+	// sentence: a list read a moment ago is stale and wants refreshing, which
+	// is a different act from every other refusal a revoke can get.
+	CodeNoDevice = "nodevice"
 	// CodeProtoState is a message that does not belong in the current state:
 	// a put before hello, a stray binary frame. The session closes.
 	CodeProtoState = "protostate"
@@ -96,6 +104,17 @@ const (
 	// with both sides reporting success. It is refused instead, because a
 	// refusal is reversible and silent divergence is not.
 	CodeCursor = "cursor"
+	// CodeFull is a registration refused because the vault already holds as
+	// many devices as it may.
+	//
+	// Not `busy`, although both are limits. `busy` means come back later and
+	// carries a hint saying how much later, and this never becomes true by
+	// waiting: somebody has to revoke a device. A client that treated it as
+	// `busy` would retry a registration that can only ever be refused, which
+	// is the hot loop `retryable` exists to prevent. The session continues,
+	// because nothing was written and a registrar with a second device to
+	// register may still register it.
+	CodeFull = "full"
 	// CodeRotated is a rotate that lost the race: the vault's credential is no
 	// longer the one this session authenticated under, because another device
 	// rotated first.
@@ -135,6 +154,17 @@ type In struct {
 	Device string `json:"device"`
 	Crypto string `json:"crypto"`
 	Cursor int64  `json:"cursor"`
+	// DeviceID names the row in the vault's device list that this connection
+	// claims to be, and Token is then that device's auth key rather than the
+	// vault's. Present is what makes a hello a device connecting: absent, the
+	// credential is the vault's, and the session that results may register a
+	// device and nothing else.
+	//
+	// It is deliberately not the same field as Device. Device is a label a
+	// person reads beside a version and two laptops may share it; this is the
+	// identity, and the difference is the whole of what makes revoking one
+	// device rather than "everything called laptop" possible.
+	DeviceID string `json:"deviceId,omitempty"`
 	// Claim is the auth key this device wants the vault bound to, sent only
 	// while pairing the first device to an unclaimed vault. Ignored once a
 	// vault has been claimed, so a device sending it every time costs nothing
@@ -149,7 +179,24 @@ type In struct {
 	Wrapped string `json:"wrapped,omitempty"`
 
 	// rotate: the new auth key, whose hash replaces the stored one.
+	//
+	// register: the new device's auth key, whose hash becomes its row's. The
+	// key and not the hash, for the same reason `claim` is the key: the server
+	// stores only the digest either way, and a hash is a credential nobody can
+	// judge, so a device offering the hash of "password" would be registered
+	// with a straight face. MinClaimLength is the floor for both.
 	Auth string `json:"auth,omitempty"`
+
+	// register: Name is the label for the new device's row, defaulting to the
+	// session's own `device` name when it is empty, and bounded exactly as
+	// that name is. It is never an identifier: two devices may share one.
+	Name string `json:"name,omitempty"`
+
+	// revoke: AllowLast is the caller saying out loud that it means to leave
+	// the vault with no devices at all, reachable only by the recovery key.
+	// Refused without it, because that is a thing to want after a house fire
+	// and not a thing to discover you did by clicking the wrong row.
+	AllowLast bool `json:"allowLast,omitempty"`
 
 	// invite: Invite is the random identifier and Sealed the root secret sealed
 	// under the invite key, which never reaches the server. TTLMs is how long
@@ -325,6 +372,70 @@ type Ready struct {
 	// omitted only for a vault nothing has claimed, which no device can reach
 	// past the handshake.
 	Wrapped string `json:"wrapped,omitempty"`
+}
+
+// Registrar answers a hello that offered the vault's credential rather than a
+// device's. It is the other outcome of a handshake, and it says so in one word
+// rather than leaving a client to work out what it got.
+//
+// A registrar session may register a device and rewrap the data key, which are
+// the two powers the root secret has, and may do nothing else: no entries, no
+// history, no chunk, no device list, no catch-up and no place in the vault's
+// fan-out. So no `ready`, because `ready` promises the ceilings for a put and
+// a backlog behind it, and a reply that promised a catch-up nobody would send
+// is how a client comes to wait for a frame that is not coming.
+//
+// MaxDevices is here for the same reason every ceiling is in `ready`: a client
+// that knows the cap before it registers can say "revoke one first" instead of
+// discovering the cap by being refused.
+type Registrar struct {
+	Res           string `json:"res"` // "registrar"
+	ID            int64  `json:"id,omitempty"`
+	Proto         int    `json:"proto"`
+	MinProto      int    `json:"minProto"`
+	ServerVersion string `json:"serverVersion"`
+	MaxDevices    int    `json:"maxDevices"`
+}
+
+// Registered answers a register: the device now has a row and may connect with
+// its own credential.
+//
+// Wrapped is the vault's wrapped data key, which is what the registering
+// session came for. It holds the root, so it can unwrap it and hand the new
+// device the data key itself; the new device never holds the root and so never
+// needs the wrapping again.
+type Registered struct {
+	Res      string `json:"res"` // "registered"
+	ID       int64  `json:"id,omitempty"`
+	DeviceID string `json:"deviceId"`
+	Wrapped  string `json:"wrapped,omitempty"`
+}
+
+// DeviceList answers a devices request with every device that may reach this
+// vault.
+//
+// Devices is never null, for the same reason Batch.Entries is not: a client
+// that iterates it would crash on exactly the vault it is meant to handle. It
+// carries no credential, and store.Device has no field that could; see its
+// comment there.
+type DeviceList struct {
+	Res        string         `json:"res"` // "devices"
+	ID         int64          `json:"id,omitempty"`
+	Devices    []store.Device `json:"devices"`
+	MaxDevices int            `json:"maxDevices"`
+}
+
+// Revoked answers a revoke: the row is gone and every session that device had
+// open has been closed, in that order, so the reply means both.
+type Revoked struct {
+	Res      string `json:"res"` // "revoked"
+	ID       int64  `json:"id,omitempty"`
+	DeviceID string `json:"deviceId"`
+	// Self is true when the device revoked was this session's own, in which
+	// case this reply is the last frame on the connection. A client that
+	// unlinked itself is owed the difference between "you are gone" and a
+	// server that hung up for its own reasons.
+	Self bool `json:"self,omitempty"`
 }
 
 // Batch delivers entries, and is the only message that ever does.

@@ -21,14 +21,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coder/websocket"
-
 	"github.com/waynehoover/basalt-sync/server/internal/dirlock"
 
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 	"github.com/waynehoover/basalt-sync/server/internal/server"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
-	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
 // A mac of the right shape, standing in for a real writer's. The server holds no
@@ -1145,22 +1142,10 @@ func TestI25TheCapFlagsReachReady(t *testing.T) {
 		go func() { _ = run(ctx, append([]string{"serve", "-data", dir, "-addr", addr}, flags...), out) }()
 		waitForServer(t, addr, out)
 
-		wsCtx, wsCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer wsCancel()
-		conn, _, err := websocket.Dial(wsCtx, "ws://"+addr, nil)
-		if err != nil {
-			t.Fatalf("dial: %v", err)
-		}
-		defer conn.CloseNow()
-		cl := &wsClient{t: t, conn: conn, ctx: wsCtx}
-		cl.write(wire.In{Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
-			Token: bootstrapToken(t, out.String()), Claim: strings.Repeat("k", 43),
-			Wrapped: testWrapped, Device: "probe"})
-		ready := cl.readJSON()
-		if ready["res"] != "ready" {
-			t.Fatalf("wanted ready, got %v", ready)
-		}
-		return ready
+		// The ceilings are in `ready`, which since protocol 4 only a
+		// registered device is given, so the probe has to be one: claim,
+		// register, then connect.
+		return dialFirstDevice(t, "ws://"+addr, bootstrapToken(t, out.String())).ready
 	}
 
 	lowered := readyWith(t, "-max-batch-bytes", "2097152", "-max-fetch-bytes", "3145728")

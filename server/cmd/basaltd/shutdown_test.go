@@ -155,11 +155,23 @@ type wsClient struct {
 	t    *testing.T
 	conn *websocket.Conn
 	ctx  context.Context
+	// ready is the handshake reply this client was given, kept because the
+	// caps a flag sets are advertised there and one test is entirely about
+	// what it says.
+	ready map[string]any
 }
 
-// dialFirstDevice connects and claims the vault the way the first device does,
-// and drains the empty catch-up.
-func dialFirstDevice(t *testing.T, url, token string) *wsClient {
+// The vault's own credential, and the device credential the first device ends
+// up syncing under. Protocol 4 separates the two: the first is what claims the
+// vault and registers a device, the second is what the device connects with
+// afterwards, and the second never leaves the device it was made on.
+const (
+	vaultKey    = "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk"
+	firstDevID  = "first-device"
+	firstDevKey = "a-device-auth-key-for-the-first-device-0001"
+)
+
+func dialWS(t *testing.T, url string) *wsClient {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
@@ -168,13 +180,41 @@ func dialFirstDevice(t *testing.T, url, token string) *wsClient {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { conn.CloseNow() })
-	cl := &wsClient{t: t, conn: conn, ctx: ctx}
+	return &wsClient{t: t, conn: conn, ctx: ctx}
+}
+
+// dialFirstDevice runs the whole of what a first device does against the real
+// binary: claim the vault with the first-run token, register a device row on
+// the registrar session that produces, then connect as that device and drain
+// the empty catch-up.
+//
+// Three steps because there are three credentials in play, and doing it here
+// rather than in a helper each test skips is what keeps the command-line
+// tests speaking the protocol the shipped server actually implements.
+func dialFirstDevice(t *testing.T, url, token string) *wsClient {
+	t.Helper()
+	reg := dialWS(t, url)
+	reg.write(wire.In{
+		Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
+		Token: token, Claim: vaultKey, Wrapped: testWrapped, Device: "test-device",
+	})
+	if res := reg.readJSON(); res["res"] != "registrar" {
+		t.Fatalf("wanted registrar, got %v", res)
+	}
+	reg.write(wire.In{Op: "register", ID: 2, DeviceID: firstDevID, Auth: firstDevKey, Name: "test-device"})
+	if res := reg.readJSON(); res["res"] != "registered" {
+		t.Fatalf("wanted registered, got %v", res)
+	}
+	reg.conn.CloseNow()
+
+	cl := dialWS(t, url)
 	cl.write(wire.In{
 		Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
-		Token: token, Claim: strings.Repeat("k", 43), Wrapped: testWrapped, Device: "test-device",
+		Token: firstDevKey, DeviceID: firstDevID, Device: "test-device",
 	})
-	if res := cl.readJSON(); res["res"] != "ready" {
-		t.Fatalf("wanted ready, got %v", res)
+	cl.ready = cl.readJSON()
+	if cl.ready["res"] != "ready" {
+		t.Fatalf("wanted ready, got %v", cl.ready)
 	}
 	if res := cl.readJSON(); res["op"] != "caught-up" {
 		t.Fatalf("wanted caught-up, got %v", res)

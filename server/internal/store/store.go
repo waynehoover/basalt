@@ -95,6 +95,31 @@ const (
 	// refusing the second registration, not the length.
 	MaxDeviceIDLen = 64
 
+	// MaxDevices caps how many devices one vault may have registered at once.
+	//
+	// The same eight as server.DefaultMaxPeers, deliberately, and a test pins
+	// the two together: a vault that may register eight devices must be able
+	// to have all eight connected, or the eighth would be refused with `busy`
+	// for ever and nothing would say why. They are separate constants because
+	// they bound different things, a stored list and a live fan-out, and the
+	// connection limit is an operator's to lower.
+	//
+	// The ninth registration is refused with ErrDeviceLimit. That is the whole
+	// of what "a managed list rather than a connection-count cliff" means: the
+	// refusal names a person's decision, revoke a device you no longer use,
+	// instead of arriving as a connection that mysteriously will not open.
+	//
+	// A vault that somehow already holds more than this keeps every row and
+	// every one of those devices goes on connecting and syncing. Nothing here
+	// deletes a row to get back under the cap. The cap bounds growth; it is
+	// not an invariant the store enforces retroactively, because the only way
+	// to enforce it retroactively is for the server to choose which of
+	// somebody's devices stops working, silently, and a device that cannot
+	// connect looks from the outside exactly like a vault that has lost notes.
+	// Refusing the next registration is visible and reversible; a delete is
+	// neither (rule 3, and the first rule).
+	MaxDevices = 8
+
 	// MaxVaultLen bounds a vault id, for the same reason as MaxDeviceLen and
 	// one more: it lands in log lines on every refusal, and it was unbounded
 	// (S24). It is hashed before it touches the filesystem, so the bound is
@@ -195,6 +220,13 @@ var (
 	// from "the database is broken", and stop rather than retry.
 	ErrUnknownDevice = errors.New("no such device on this vault")
 
+	// ErrDeviceLimit is a registration refused because the vault already holds
+	// MaxDevices devices. Distinct from ErrDeviceExists because the answer is
+	// different: that one means "you already did this", this one means "revoke
+	// something first". Never retryable, and never resolved by waiting, which
+	// is why it does not become `busy` on the wire.
+	ErrDeviceLimit = errors.New("this vault already has as many devices as it may have")
+
 	// ErrLastDevice is a revocation that would leave a vault with no devices
 	// at all. Reachable only by the recovery key after that, which is a real
 	// thing to want and not a thing to do by accident, so RevokeDevice refuses
@@ -273,21 +305,22 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- write to the vault it is meant only to keep, and a stolen disk already
   -- yields every byte of ciphertext without also handing over the credential.
   --
-  -- Its meaning is narrowing. Through protocol 3 this is the sync credential:
-  -- every device holds the root, derives the same auth key, and matching this
-  -- hash is what a hello proves. Per-device credentials make it the
-  -- registration credential and nothing else: may register a device, may not
-  -- sync. That is what lets the recovery key put the first device back after
-  -- every device is lost, and it is why revoking a device can mean something,
-  -- which under one shared credential it never could.
+  -- Through protocol 3 this was the sync credential: every device held the
+  -- root, derived the same auth key, and matching this hash was what a hello
+  -- proved. Protocol 4 narrowed it to the registration credential and nothing
+  -- else: may register a device, may not sync. That is what lets the recovery
+  -- key put the first device back after every device is lost, and it is why
+  -- revoking a device means something, which under one shared credential it
+  -- never could.
   --
-  -- Step 1 (this change) adds the devices table and leaves the session alone,
-  -- so today this is still both. Step 2 takes the sync half away. The thing
-  -- step 2 must not do is keep accepting this hash as a sync credential while
-  -- devices exist: a vault whose devices can all be bypassed by the one
-  -- credential they were meant to replace has a device list and no
-  -- revocation, which is worse than not having the list, because it looks
-  -- like it works. The sync credential is devices.auth_hash, via DeviceByID.
+  -- The narrowing is structural rather than remembered. A session that offers
+  -- this credential is a registrar and the code that serves entries is not
+  -- reachable from it; the sync credential is devices.auth_hash, via
+  -- DeviceByID. Keeping this hash as a sync credential once device rows exist
+  -- would be a vault whose devices can all be bypassed by the one credential
+  -- they were meant to replace: a device list with no revocation, which is
+  -- worse than no list, because it looks like it works.
+  -- TestTheVaultCredentialCannotSync is what stops that coming back.
   auth_hash  TEXT    NOT NULL DEFAULT '',
   -- The vault's data key, wrapped by the first device under a key derived
   -- from the root secret, and empty only before a device has claimed the
@@ -300,14 +333,19 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- rotation transaction, so it moves at exactly the moment the credential
   -- and the blob do.
   --
-  -- It exists because authenticating, reading the blob, joining the fan-out
-  -- and rotating are four steps, not one. A device that passed auth under the
-  -- old root and paused before joining would join after the rotation's
-  -- eviction had already swept the hub, and go on reading and writing under a
-  -- credential the vault no longer knows. A session captures this number with
-  -- the hash it authenticated under and checks it again after joining; if it
-  -- moved, the session is refused. Reading hash and blob in one query does not
-  -- close that, because the window is after the read.
+  -- It existed because authenticating, reading the blob, joining the fan-out
+  -- and rotating were four steps under protocol 3, where the vault's hash was
+  -- the credential every device connected with: a device that passed auth
+  -- under the old root and paused before joining would join after the
+  -- rotation had swept the hub, and go on writing under a credential the
+  -- vault no longer knew.
+  --
+  -- Protocol 4 removed that window rather than watching it. A rotation does
+  -- not touch a device row, so a device session is not affected by one at
+  -- all, and the only session that can be is a registrar's, whose two powers
+  -- are each conditional on this row's auth_hash inside the statement that
+  -- exercises them. What the number is still for is the record: it is the
+  -- only evidence a vault's secret has ever been replaced.
   rotations  INTEGER NOT NULL DEFAULT 0,
   -- How many purges have dropped history from this vault. Bumped inside the
   -- purge transaction, and only when the purge removed something, so it moves
@@ -1725,6 +1763,12 @@ func ValidSealed(s string) bool { return validBase64URL(s, MaxSealedLen) }
 // ValidInvite is the same check for an invite identifier.
 func ValidInvite(s string) bool { return validBase64URL(s, MaxInviteLen) }
 
+// ValidDeviceID is the same check for a device identifier, so the session can
+// refuse a malformed one at hello with the same rule RegisterDevice applies,
+// rather than reporting the shape of an id as a failure to authenticate. There
+// is no minimum length; see MaxDeviceIDLen.
+func ValidDeviceID(s string) bool { return validBase64URL(s, MaxDeviceIDLen) }
+
 func validBase64URL(s string, max int) bool {
 	if s == "" || len(s) > max {
 		return false
@@ -1885,10 +1929,11 @@ func (s *Store) Wrapped(vaultID string) (string, error) {
 // so the row is read once on each side of authentication rather than once
 // before it. Reading earlier would send that device an empty wrapped in ready.
 //
-// One query is also not on its own enough to keep a rotation from cutting
-// across a handshake. The window that matters is between this read and the
-// join, so the caller re-reads Rotations after joining; see the column's
-// comment in the schema.
+// A rotation cutting across a handshake is not this read's problem any more.
+// Protocol 4 gave devices their own credentials, so a rotation does not touch
+// a device session at all, and the only session it can cut across is a
+// registrar's, whose two powers are each conditional on the vault hash inside
+// the statement that exercises them; see Rotate and RegisterDevice.
 func (s *Store) VaultKeys(vaultID string) (hash, wrapped string, rotations int64, err error) {
 	err = s.db.QueryRow(
 		`SELECT auth_hash, wrapped, rotations FROM vaults WHERE vault_id = ?`,
@@ -1899,10 +1944,16 @@ func (s *Store) VaultKeys(vaultID string) (hash, wrapped string, rotations int64
 	return hash, wrapped, rotations, err
 }
 
-// Rotations is the vault's rotation generation on its own, for the re-read a
-// session does after joining the fan-out. Zero for a vault with no row, which
-// is also where a vault starts, so a vault that disappeared mid-handshake
-// reads as unrotated and is caught by the hash check instead.
+// Rotations is the vault's rotation generation on its own: how many times the
+// secret has been replaced. Zero for a vault with no row, which is also where a
+// vault starts.
+//
+// It was a session's re-read after joining the fan-out, under protocol 3, where
+// a rotation retired the credential every device was connected with. Nothing
+// reads it that way now, because a rotation leaves device sessions alone; it is
+// kept because it is the only record that a vault's secret has ever been
+// replaced, and a rotation that left no trace is one nobody can confirm
+// happened.
 func (s *Store) Rotations(vaultID string) (int64, error) {
 	var n int64
 	err := s.db.QueryRow(`SELECT rotations FROM vaults WHERE vault_id = ?`, vaultID).Scan(&n)
@@ -2068,29 +2119,46 @@ type Device struct {
 // milliseconds, and last_seen starts at zero, which reads as "has not connected
 // yet" rather than as "was here at the epoch".
 //
-// authHash is the hex SHA-256 of that device's own auth key, never the key: the
-// same rule as vaults.auth_hash and for the same reason, that a server holding
-// a key could be a device rather than merely recognise one.
+// deviceHash is the hex SHA-256 of that device's own auth key, never the key:
+// the same rule as vaults.auth_hash and for the same reason, that a server
+// holding a key could be a device rather than merely recognise one.
 //
-// The vault must be claimed. Registration is the one power vaults.auth_hash
-// keeps once its meaning narrows (see the column's comment), so an unclaimed
-// vault has no credential that could have authorised this and the answer is
-// ErrUnknownVault. The check is inside the transaction with the insert, because
-// a claim read outside it is a claim that could have been rotated away before
-// the row landed.
+// vaultHash is the vault credential the caller authenticated under, and the
+// insert happens only while it is still the vault's. Registration is the one
+// power vaults.auth_hash keeps (see the column's comment), so the caller has
+// to be holding the credential that still has it. An unclaimed vault has none
+// and the answer is ErrUnknownVault; a vault whose hash has moved on is
+// ErrRotated, the same word a rotation that lost its race gets.
+//
+// That guard is not decoration. Rotation exists because a root secret leaked,
+// and rotate is a registrar's op, so the leak-holder and the person rotating
+// are two registrar sessions racing. Without it, the session holding the
+// retired root registers a device a millisecond after the rotation and keeps
+// permanent access to the vault the rotation was meant to take away from it:
+// the ErrRotated incident again, in the one place where the prize is a
+// credential that survives the rotation.
+//
+// max is what the vault may hold, MaxDevices when it is not positive. Over it
+// is ErrDeviceLimit; see MaxDevices for what happens to a vault already over.
 //
 // A device id this vault already holds is ErrDeviceExists, not a constraint
 // error. AddInvite's story is the precedent: a bare insert surfaced as
 // `internal`, which is retryable, so a device that retried after a lost reply
-// retried for ever. The insert is conditional in SQL rather than a read
-// followed by a write, so two devices offering one id cannot both be told they
-// registered it, whichever process they arrive through.
+// retried for ever.
+//
+// Every one of those conditions is in the one statement rather than read first
+// and acted on second, because the store is opened by more than one process
+// and a count read outside the insert is a count that was true a moment ago:
+// eight goroutines each seeing seven rows would each insert an eighth.
+// TestConcurrentRegistrationsCannotExceedTheCap is the one that fails against
+// a read-then-write version.
 //
 // Rule 4: the row count is checked rather than the absence of an error, because
-// ON CONFLICT DO NOTHING is a successful statement that wrote nothing.
-// TestRegisteringADeviceRefusesADuplicateID and
-// TestConcurrentRegistrationsOfOneIDProduceOneRow pin both halves.
-func (s *Store) RegisterDevice(vaultID, deviceID, name, authHash string, now int64) error {
+// an insert whose WHERE is false is a successful statement that wrote nothing.
+// Which of the four refusals it was is then read inside the same transaction,
+// so the answer describes the rows the insert was actually refused against,
+// the way RevokeDevice's does.
+func (s *Store) RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash string, max int, now int64) error {
 	if !validBase64URL(deviceID, MaxDeviceIDLen) {
 		return fmt.Errorf("%w: device id is %d bytes and must be base64url of at most %d",
 			ErrBadEntry, len(deviceID), MaxDeviceIDLen)
@@ -2098,27 +2166,30 @@ func (s *Store) RegisterDevice(vaultID, deviceID, name, authHash string, now int
 	if err := CheckName("device", name, MaxDeviceLen); err != nil {
 		return fmt.Errorf("%w: %s", ErrBadEntry, err)
 	}
-	if !isHex64(authHash) {
+	if !isHex64(deviceHash) {
 		return fmt.Errorf("%w: a device's auth hash is a 64 character hex digest", ErrBadEntry)
+	}
+	if !isHex64(vaultHash) {
+		// Not ErrUnknownVault: the caller offered no credential at all, which
+		// is a caller bug rather than a fact about the vault.
+		return fmt.Errorf("%w: registering a device names the vault credential it is authorised by, "+
+			"which is a 64 character hex digest", ErrBadEntry)
+	}
+	if max <= 0 {
+		max = MaxDevices
 	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
 	return s.inTx(func(tx *sql.Tx) error {
-		var hash string
-		err := tx.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash)
-		if errors.Is(err, sql.ErrNoRows) || (err == nil && hash == "") {
-			return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
-		}
-		if err != nil {
-			return err
-		}
 		res, err := tx.Exec(
 			`INSERT INTO devices (vault_id, device_id, name, auth_hash, created_at, last_seen)
-			 VALUES (?, ?, ?, ?, ?, 0)
+			 SELECT ?, ?, ?, ?, ?, 0
+			  WHERE EXISTS (SELECT 1 FROM vaults WHERE vault_id = ? AND auth_hash = ?)
+			    AND (SELECT COUNT(*) FROM devices WHERE vault_id = ?) < ?
 			 ON CONFLICT(vault_id, device_id) DO NOTHING`,
-			vaultID, deviceID, name, authHash, now)
+			vaultID, deviceID, name, deviceHash, now, vaultID, vaultHash, vaultID, max)
 		if err != nil {
 			return err
 		}
@@ -2126,10 +2197,40 @@ func (s *Store) RegisterDevice(vaultID, deviceID, name, authHash string, now int
 		if err != nil {
 			return err
 		}
-		if n != 1 {
-			return fmt.Errorf("%w: %q", ErrDeviceExists, deviceID)
+		if n == 1 {
+			return nil
 		}
-		return nil
+
+		var hash string
+		switch err := tx.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash); {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
+		case err != nil:
+			return err
+		}
+		if hash == "" {
+			return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
+		}
+		if hash != vaultHash {
+			return fmt.Errorf("%w: vault %q was rotated, so the credential this registration "+
+				"was authorised by no longer opens it", ErrRotated, vaultID)
+		}
+		var exists int
+		switch err := tx.QueryRow(
+			`SELECT 1 FROM devices WHERE vault_id = ? AND device_id = ?`,
+			vaultID, deviceID).Scan(&exists); {
+		case err == nil:
+			return fmt.Errorf("%w: %q", ErrDeviceExists, deviceID)
+		case !errors.Is(err, sql.ErrNoRows):
+			return err
+		}
+		var count int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM devices WHERE vault_id = ?`, vaultID).Scan(&count); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: vault %q has %d of at most %d devices; revoke one you no longer use",
+			ErrDeviceLimit, vaultID, count, max)
 	})
 }
 

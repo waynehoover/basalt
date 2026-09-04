@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -56,6 +57,34 @@ type Session struct {
 	remote  string
 	joined  bool
 
+	// deviceID is the row in the vault's device list this session
+	// authenticated as, and is empty on a registrar session, which is not a
+	// device. It is written before the session joins the fan-out and read
+	// afterwards by whoever is revoking that device, so the hub's lock is what
+	// publishes it; see Hub.sessionsOf.
+	deviceID string
+
+	// registrar is true when this session authenticated with the *vault's*
+	// credential rather than a device's. Such a session may register a device
+	// and rewrap the data key, which are the two powers the root secret has,
+	// and may do nothing else: it holds no place in the fan-out, receives no
+	// entries and reads none.
+	//
+	// It is a property of how the session was opened, decided once in
+	// handleHello and read by dispatch, rather than a check each handler
+	// remembers to make. That is the narrowing enforced: the vault's auth hash
+	// stopped being a sync credential in protocol 4, and a vault whose devices
+	// could all be bypassed by the credential they replace would be a device
+	// list with no revocation that looks like it works.
+	registrar bool
+
+	// wrapped is the vault's wrapped data key as this session last saw it. A
+	// registrar hands it to each device it registers, which is what lets a
+	// device hold the data key without ever holding the root; a rotate on this
+	// session replaces it, so a register after a rotate hands out the new
+	// wrapping rather than the retired one.
+	wrapped string
+
 	// reqID is the id of the request being served, echoed on its reply and on
 	// any error refusing it, and zero between requests so that an error sent
 	// then, the shutdown notice, is recognisably unsolicited. Only the session
@@ -68,16 +97,14 @@ type Session struct {
 	bootstrap bool
 
 	// authHash is the vault's stored auth hash that this session's credential
-	// matched, and rotations the vault's rotation generation when it did. Both
-	// are captured before the session joins the fan-out.
+	// matched, on a registrar session, and empty on a device's, which
+	// authenticated against its own row and never against the vault.
 	//
-	// authHash is what a rotation compare-and-swaps against, so this session
-	// can only replace the credential it proved it holds. rotations is checked
-	// again after joining, because the eviction a rotation performs is a
-	// snapshot of the hub and a session that joins just after it is not in it.
-	// Only the session goroutine touches either.
-	authHash  string
-	rotations int64
+	// It is what both of a registrar's powers compare-and-swap against: a
+	// rotation may only replace the credential it proved it holds, and a
+	// registration only lands while that credential is still the vault's. Only
+	// the session goroutine touches it.
+	authHash string
 
 	// counted is true while this session is in the server's pre-auth count,
 	// guarded by Server.sessMu (S19).
@@ -499,20 +526,22 @@ func (s *Session) shutdown() {
 	s.kill(nil)
 }
 
-// evict closes this session from another goroutine because the vault's secret
-// was rotated on a different one. The notice is unsolicited `auth`: the
-// credential this session connected with no longer opens the vault, and the
-// device pairs again with the new string.
-func (s *Session) evict() {
+// evict closes this session from another goroutine because the credential it
+// is holding stopped opening what it opened: a rotation retired a registrar's
+// root, or a revoke deleted a device's row.
+//
+// The notice is unsolicited `auth` in both cases, with a message that says
+// which. `auth` is the code a client already stops on, and the two causes want
+// the same thing from it: stop, and do not reconnect with what you have.
+func (s *Session) evict(msg string, cause error) {
 	if s.srv.beforeEvict != nil {
 		s.srv.beforeEvict()
 	}
-	if b, err := json.Marshal(s.errFrame(0, wire.CodeAuth,
-		"the vault's secret was rotated by another device; pair again with the new string", 0)); err == nil {
+	if b, err := json.Marshal(s.errFrame(0, wire.CodeAuth, msg, 0)); err == nil {
 		s.trySend(websocket.MessageText, b)
 	}
 	s.drain(time.Second)
-	s.kill(errors.New("vault secret rotated"))
+	s.kill(cause)
 }
 
 /* ---------------------------------------------------------------- *
@@ -601,9 +630,50 @@ func (s *Session) run() error {
 	}
 }
 
+// deviceOps is every op a session must hold a device credential to send. It
+// exists so that a registrar asking for one is told which credential it needs,
+// while a genuinely unknown op is still an unknown op: a client waiting on a
+// reply that will never come looks the same either way, and the two are fixed
+// differently.
+var deviceOps = map[string]bool{
+	"put": true, "putmany": true, "get": true, "fetch": true,
+	"history": true, "deleted": true, "invite": true,
+	"devices": true, "revoke": true,
+}
+
 // dispatch routes one request. frameLen is the encoded size of the frame it
 // arrived in, which is what maxBatchBytes bounds.
+//
+// What a session may do is decided here, once, from the credential that opened
+// it, rather than by each handler remembering to ask. Per-handler checks are
+// how the next op added becomes the one that forgot, and the op that forgot
+// here would be the vault credential syncing again.
 func (s *Session) dispatch(m wire.In, frameLen int) error {
+	if m.Op == "hello" {
+		return s.fatal(wire.CodeProtoState, errors.New("hello sent twice"))
+	}
+	if s.registrar {
+		switch m.Op {
+		case "register":
+			return s.handleRegister(m)
+		case "rotate":
+			return s.handleRotate(m)
+		case "ping":
+			// Allowed, and the one exception to "nothing else". A pong reads
+			// nothing, writes nothing and says nothing about the vault; it is
+			// how a connection behind NAT stays open, and a registrar that
+			// could not answer for itself would be a registration that fails
+			// on the slow walk to the other device.
+			return s.writeJSON(wire.Pong{Res: "pong"})
+		}
+		if deviceOps[m.Op] {
+			return s.reject(wire.CodeAuth, fmt.Errorf(
+				"this session authenticated with the vault's credential, which may register a device "+
+					"and rotate the vault's secret and may not sync; %q needs a device's own credential", m.Op))
+		}
+		return s.reject(wire.CodeProtoState, fmt.Errorf("unknown op %q", m.Op))
+	}
+
 	switch m.Op {
 	case "ping":
 		return s.writeJSON(wire.Pong{Res: "pong"})
@@ -619,12 +689,31 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		return s.handleHistory(m)
 	case "deleted":
 		return s.handleDeleted(m)
-	case "rotate":
-		return s.handleRotate(m)
 	case "invite":
 		return s.handleInvite(m)
-	case "hello":
-		return s.fatal(wire.CodeProtoState, errors.New("hello sent twice"))
+	case "devices":
+		return s.handleDevices(m)
+	case "revoke":
+		return s.handleRevoke(m)
+	case "register":
+		// A device may not mint a credential. That is the whole point of a
+		// device not holding the root: a stolen laptop can read what it
+		// already had and cannot add a ninth device to the vault behind you.
+		//
+		// A device session also has no vault credential to register under, so
+		// handleRegister would refuse it a second time if this were removed.
+		// This refusal exists to be the one that says what to do instead.
+		return s.reject(wire.CodeAuth, errors.New(
+			"a device may not register another device, because it does not hold the vault's credential; "+
+				"add a device with an invite, or with the recovery key"))
+	case "rotate":
+		// Rotation retires the root secret and rewraps the data key, and a
+		// device holds neither. Letting one through would also mean a stolen
+		// device could write a credential nobody holds into the vault and
+		// leave the recovery key opening nothing.
+		return s.reject(wire.CodeAuth, errors.New(
+			"rotating the vault's secret needs the vault's credential, which a device does not hold; "+
+				"connect with the recovery key"))
 	}
 	// Named, not ignored. A client blocked waiting on a reply it will never
 	// get looks exactly like a hung server.
@@ -702,62 +791,108 @@ func (s *Session) handleHello(m wire.In) error {
 		return s.fatal(wire.CodeBadEntry, errors.New(
 			"this hello carries both a token and an invite, and an invite stands in for a token; send one"))
 	}
-	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped, Invite: m.Invite}
-	grant, err := s.srv.auth(creds)
-	if err != nil {
-		// Logged in full, reported as one word. Telling a caller whether the
-		// vault or the token was wrong tells them which half to keep guessing.
-		s.srv.log.Warn("auth failed", "remote", s.remote, "vault", m.Vault, "err", err)
-		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
-	}
-	// The vault's key material, one read for both columns, used by both paths
-	// below. After auth and never before it: a first device's claim writes both
-	// columns while it authenticates, so reading any earlier would send that
-	// device an empty wrapped in ready.
+
+	// The fork protocol 4 is about, and the whole of how the narrowing is
+	// enforced rather than remembered.
 	//
-	// A vault with a hash and no wrapped key cannot be produced by this build,
-	// because a claim without one is refused above. A data directory written by
-	// an older build can hold one, and there is no key schedule left to serve
-	// it under: every content key derives from the data key now. Serving it
-	// would mean handing a device a vault it can neither read nor safely add
-	// to, so the session is refused with something an operator can act on.
-	hash, wrapped, rotations, err := s.srv.st.VaultKeys(m.Vault)
+	// A hello carrying a deviceId is a device connecting, and its token is
+	// that device's own auth key, checked against that device's row. A hello
+	// carrying none offers the vault's credential, which since protocol 4 may
+	// register a device and rewrap the data key and may not sync.
+	//
+	// There is exactly one place a syncing session is built, helloAsDevice,
+	// and the only way into it is a device row whose hash matched. The
+	// pluggable Authenticator, which answers "does this token open this
+	// vault", is not consulted on that branch at all, so no authenticator and
+	// no later handler can hand the vault's credential the sync rights it lost.
+	// TestTheVaultCredentialCannotSync.
+	if m.DeviceID != "" {
+		// Shape first, and as `badname` rather than `auth`, because it is a
+		// fact about the request rather than about the vault: refusing a
+		// malformed id as an authentication failure would make the shape of an
+		// id look like the answer to whether that device exists.
+		if !store.ValidDeviceID(m.DeviceID) {
+			return s.fatal(wire.CodeBadName, fmt.Errorf(
+				"device id is %d bytes and must be base64url of at most %d",
+				len(m.DeviceID), store.MaxDeviceIDLen))
+		}
+		// A device connecting is not a vault being claimed and is not an
+		// invite being redeemed, and a server that picked one for the client
+		// would be choosing which credential it meant. The same rule, and the
+		// same code, as the token-and-invite refusal above.
+		if m.Claim != "" || m.Invite != "" {
+			return s.fatal(wire.CodeBadEntry, errors.New(
+				"this hello carries a deviceId, which is a registered device connecting, "+
+					"as well as a claim or an invite, which are how a vault is bound and how a device is added; send one"))
+		}
+		return s.helloAsDevice(m)
+	}
+	return s.helloAsRegistrar(m)
+}
+
+// helloAsDevice finishes a hello that named a device: the sync path, and the
+// only one there is.
+//
+// No Authenticator on this branch. It answers whether a token opens a *vault*,
+// which since protocol 4 is a different question from whether a connection is
+// a device of that vault, and asking it here is exactly how the vault's
+// credential would find its way back to syncing.
+func (s *Session) helloAsDevice(m wire.In) error {
+	_, stored, ok, err := s.srv.st.DeviceByID(m.Vault, m.DeviceID)
 	if err != nil {
 		return s.fatal(wire.CodeInternal, err)
 	}
-	// The vault must still be the one that was just authenticated against. A
-	// rotation committed between the authenticator's read and this one would
-	// otherwise hand this device the new blob, which the root it holds cannot
-	// unwrap, under a credential the vault no longer knows.
-	if grant.AuthHash != "" && hash != grant.AuthHash {
-		return s.fatal(wire.CodeAuth, errors.New(
-			"the vault's secret was rotated while this session was authenticating; pair again with the new string"))
+	// A device with no row and a device whose key is wrong are one refusal,
+	// saying neither which, exactly as a wrong vault and a wrong token are.
+	// Telling them apart would tell a caller which half to keep guessing, and
+	// after a revoke it would also confirm that this id was a device here
+	// yesterday.
+	//
+	// Constant time and over the digests, so the comparison is a fixed 32
+	// bytes whatever was offered. A device with no row is compared against a
+	// digest that cannot match rather than skipped, so an unregistered id and
+	// a wrong key take the same time as each other.
+	offered := sha256.Sum256([]byte(m.Token))
+	want, decodeErr := hex.DecodeString(stored)
+	if !ok || decodeErr != nil || len(want) != len(offered) {
+		want = make([]byte, len(offered))
+	}
+	if subtle.ConstantTimeCompare(offered[:], want) != 1 || !ok {
+		s.srv.log.Warn("device auth failed", "remote", s.remote, "vault", m.Vault,
+			"deviceId", m.DeviceID, "registered", ok)
+		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+	}
+
+	// The vault's key material. A device that has converted holds the data key
+	// itself and ignores the wrapping, but the blob is what a device still
+	// carrying the root uses, and it is what says the vault is serveable at
+	// all: a vault with a hash and no wrapped key was written by a build whose
+	// key schedule no longer exists, and serving it would hand a device a
+	// vault it can neither read nor safely add to.
+	hash, wrapped, _, err := s.srv.st.VaultKeys(m.Vault)
+	if err != nil {
+		return s.fatal(wire.CodeInternal, err)
 	}
 	if hash != "" && wrapped == "" {
 		return s.fatal(wire.CodeProto, fmt.Errorf(
 			"vault %q was claimed by an older build and has no data key, which this server (version %s) "+
 				"cannot serve: start a fresh data directory and pair the first device again", m.Vault, s.srv.version))
 	}
-
-	if grant.Redeemed {
-		// The invite is already marked used. Hand over the sealed secret and
-		// the wrapped key, then close: this connection proved nothing about
-		// holding the root and is not a device yet. It connects again with
-		// the derived key like any other.
-		s.srv.log.Info("invite redeemed", "remote", s.remote, "vault", m.Vault, "device", m.Device)
-		if err := s.writeJSON(wire.Redeemed{Res: "redeemed", ID: s.reqID, Sealed: grant.Sealed, Wrapped: wrapped}); err != nil {
-			return err
-		}
-		return errRedeemed
-	}
-	s.bootstrap = grant.Bootstrap
-	s.authHash = grant.AuthHash
-	s.rotations = rotations
+	// No rotation check on this path, and that is the point of the feature. A
+	// rotation replaces the root and rewraps the same data key; it touches no
+	// device row, so every device goes on syncing across one. Under protocol 3
+	// the vault's hash *was* the device's credential, so a rotation had to
+	// evict everybody; a device refused here for somebody else's rotation
+	// would be the weekend of re-pairing this exists to abolish.
+	// TestRotationLeavesEveryDeviceRowAndEverySessionAlone.
 
 	s.vaultID = m.Vault
 	s.device = m.Device
+	s.deviceID = m.DeviceID
+	s.wrapped = wrapped
 	// Authenticated: out of the pre-auth count, and allowed the full read
-	// limit from here on.
+	// limit from here on. Taking sessMu here is also what publishes the fields
+	// just written to any goroutine that later takes it.
 	s.srv.authenticated(s)
 	s.conn.SetReadLimit(ReadLimit)
 
@@ -799,22 +934,23 @@ func (s *Session) handleHello(m wire.In) error {
 	}
 	s.joined = true
 
-	// Joined, so the generation is read again.
+	// Still registered, and stamped as seen, in one statement.
 	//
-	// A rotation evicts the sessions that are in the hub when it commits, which
-	// is a snapshot. A device that passed auth under the old root and paused
-	// anywhere before this join was in no snapshot, and went on reading and
-	// writing valid entries afterwards, because the data key did not change and
-	// nothing else ever re-checked the credential. Now the rotation moves a
-	// number, and a session whose number moved is refused with `auth` instead
-	// of being served. Joining first is still right, because it is what closes
-	// the window in which a commit is in neither the backlog nor the fan-out;
-	// this check is what makes joining first safe.
-	if now, err := s.srv.st.Rotations(m.Vault); err != nil {
+	// After the join and not before, which is what makes a revoke racing a
+	// connect come out right whichever order they land in. A revoke deletes
+	// the row and only then collects the sessions to close. If the delete
+	// lands before this update, SawDevice moves no rows, because it is an
+	// UPDATE and never an upsert, and this session is refused. If it lands
+	// after, this session was already in the hub when the revoke looked, so
+	// the revoke closes it. There is no interleaving that leaves a revoked
+	// device connected. TestARevokeRacingAConnectAlwaysWins.
+	if err := s.srv.st.SawDevice(m.Vault, m.DeviceID, s.srv.now().UnixMilli()); err != nil {
+		if errors.Is(err, store.ErrUnknownDevice) {
+			s.srv.log.Warn("device revoked mid-handshake", "remote", s.remote,
+				"vault", m.Vault, "deviceId", m.DeviceID)
+			return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+		}
 		return s.fatal(wire.CodeInternal, err)
-	} else if now != s.rotations {
-		return s.fatal(wire.CodeAuth, errors.New(
-			"the vault's secret was rotated while this session was joining; pair again with the new string"))
 	}
 
 	// Limits first, so a client knows every ceiling before its first put rather
@@ -823,7 +959,7 @@ func (s *Session) handleHello(m wire.In) error {
 		return err
 	}
 	s.srv.log.Info("session ready", "remote", s.remote, "vault", m.Vault,
-		"device", m.Device, "cursor", m.Cursor, "latest", latest, "peers", peers)
+		"device", m.Device, "deviceId", m.DeviceID, "cursor", m.Cursor, "latest", latest, "peers", peers)
 
 	cursor, sent, err := s.replay(m.Vault, m.Cursor)
 	if err != nil {
@@ -844,9 +980,100 @@ func (s *Session) handleHello(m wire.In) error {
 	return nil
 }
 
+// helloAsRegistrar finishes a hello that offered the vault's credential.
+//
+// What comes back is a session that may register a device and rotate the
+// vault's secret, and nothing else. It joins no vault's fan-out, so it is sent
+// no entry and occupies no device slot, and it is given no `ready`, because
+// `ready` promises the ceilings for a put and a backlog behind it and this
+// session will never get either.
+func (s *Session) helloAsRegistrar(m wire.In) error {
+	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped, Invite: m.Invite}
+	grant, err := s.srv.auth(creds)
+	if err != nil {
+		// Logged in full, reported as one word. Telling a caller whether the
+		// vault or the token was wrong tells them which half to keep guessing.
+		s.srv.log.Warn("auth failed", "remote", s.remote, "vault", m.Vault, "err", err)
+		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+	}
+	// The vault's key material, one read for both columns, used by both paths
+	// below. After auth and never before it: a first device's claim writes both
+	// columns while it authenticates, so reading any earlier would send that
+	// device an empty wrapped in ready.
+	//
+	// A vault with a hash and no wrapped key cannot be produced by this build,
+	// because a claim without one is refused above. A data directory written by
+	// an older build can hold one, and there is no key schedule left to serve
+	// it under: every content key derives from the data key now. Serving it
+	// would mean handing a device a vault it can neither read nor safely add
+	// to, so the session is refused with something an operator can act on.
+	hash, wrapped, _, err := s.srv.st.VaultKeys(m.Vault)
+	if err != nil {
+		return s.fatal(wire.CodeInternal, err)
+	}
+	// The vault must still be the one that was just authenticated against. A
+	// rotation committed between the authenticator's read and this one would
+	// otherwise hand this device the new blob, which the root it holds cannot
+	// unwrap, under a credential the vault no longer knows.
+	if grant.AuthHash != "" && hash != grant.AuthHash {
+		return s.fatal(wire.CodeAuth, errors.New(
+			"the vault's secret was rotated while this session was authenticating; pair again with the new string"))
+	}
+	if hash != "" && wrapped == "" {
+		return s.fatal(wire.CodeProto, fmt.Errorf(
+			"vault %q was claimed by an older build and has no data key, which this server (version %s) "+
+				"cannot serve: start a fresh data directory and pair the first device again", m.Vault, s.srv.version))
+	}
+
+	if grant.Redeemed {
+		// The invite is already marked used. Hand over the sealed secret and
+		// the wrapped key, then close: this connection proved nothing about
+		// holding the root and is not a device yet. It connects again with
+		// the derived key like any other.
+		s.srv.log.Info("invite redeemed", "remote", s.remote, "vault", m.Vault, "device", m.Device)
+		if err := s.writeJSON(wire.Redeemed{Res: "redeemed", ID: s.reqID, Sealed: grant.Sealed, Wrapped: wrapped}); err != nil {
+			return err
+		}
+		return errRedeemed
+	}
+	s.bootstrap = grant.Bootstrap
+	s.authHash = grant.AuthHash
+	s.wrapped = wrapped
+
+	s.vaultID = m.Vault
+	s.device = m.Device
+	s.registrar = true
+	// Authenticated: out of the pre-auth count, and allowed the full read
+	// limit from here on. Taking sessMu here is also what publishes the fields
+	// just written, registrar and vaultID among them, to the goroutine of
+	// whoever later rotates this vault; see Server.registrarsOn.
+	s.srv.authenticated(s)
+	s.conn.SetReadLimit(ReadLimit)
+
+	if err := s.srv.st.EnsureVault(m.Vault, s.srv.now().UnixMilli()); err != nil {
+		return s.fatal(wire.CodeInternal, err)
+	}
+	// No join, no cursor check and no catch-up: there is nothing this session
+	// may be sent. It is not counted against the vault's connected-device
+	// limit either, because it is not a device and holding a slot open would
+	// mean adding a device could cost you one.
+	s.srv.log.Info("registrar ready", "remote", s.remote, "vault", m.Vault,
+		"device", m.Device, "bootstrap", grant.Bootstrap)
+	return s.writeJSON(wire.Registrar{
+		Res: "registrar", ID: s.reqID,
+		Proto: wire.Proto, MinProto: wire.MinProto,
+		ServerVersion: s.srv.version, MaxDevices: store.MaxDevices,
+	})
+}
+
 // errRedeemed ends a session that connected only to redeem an invite. It is not
 // a fault, so no error frame follows the reply; Handle drains and closes.
 var errRedeemed = errors.New("invite redeemed, closing")
+
+// errRevokedSelf ends a session that revoked its own device, which is what
+// unlinking is. Like errRedeemed it is not a fault: the reply saying so has
+// already gone, and Handle drains and closes behind it.
+var errRevokedSelf = errors.New("this device revoked itself, closing")
 
 // checkName bounds a vault or device name and refuses control characters in it.
 //
@@ -1630,15 +1857,20 @@ func (s *Session) quarantineIfCorrupt(name string, err error) {
 // happen, which is that the second rotation overwrote the first and the device
 // the first was revoking owned the vault.
 //
-// Refused with `auth` on a session that authenticated with the bootstrap token,
-// which proved nothing about holding the old root, and with `badentry` on a
-// malformed request. Either refusal leaves the session usable, because neither
-// changed anything. Every claimed vault has a data key, so there is no such
-// thing here as a vault with nothing to re-wrap.
+// Registrar sessions only, which dispatch enforces: rotation retires the root
+// secret and rewraps the data key, and since protocol 4 a device holds
+// neither. It touches no device row, so every device keeps syncing across one,
+// which is the expensive half of what per-device credentials removed.
+//
+// Refused with `auth` on a session that authenticated with the bootstrap
+// token, which proved nothing about holding the old root, and with `badentry`
+// on a malformed request. Either refusal leaves the session usable, because
+// neither changed anything. Every claimed vault has a data key, so there is no
+// such thing here as a vault with nothing to re-wrap.
 func (s *Session) handleRotate(m wire.In) error {
 	if s.bootstrap {
 		return s.reject(wire.CodeAuth, errors.New(
-			"this session authenticated with the bootstrap token, and only a device holding the vault's secret may rotate it"))
+			"this session authenticated with the bootstrap token, and only a session holding the vault's secret may rotate it"))
 	}
 	if len(m.Auth) < MinClaimLength {
 		return s.reject(wire.CodeBadEntry, fmt.Errorf(
@@ -1674,30 +1906,217 @@ func (s *Session) handleRotate(m wire.In) error {
 		return s.reject(wire.CodeInternal, errors.New("the vault's secret could not be replaced: "+err.Error()))
 	}
 	// This session's credential is the new one now, so a second rotate from it
-	// swaps against the hash it just wrote rather than the one it arrived with.
+	// swaps against the hash it just wrote rather than the one it arrived with,
+	// and a register after it hands out the new wrapping rather than the
+	// retired one.
 	s.authHash = next
-	s.rotations++
-	// Committed. Every other device on the vault is holding a credential that
-	// no longer opens it; told so and closed, from this goroutine, before this
-	// device is told it succeeded, so "rotated" also means "and nobody else is
-	// still writing under the old string".
+	s.wrapped = m.Wrapped
+	// Committed. Every device row is untouched and every device goes on
+	// syncing, which is what per-device credentials bought: rotation replaces
+	// the root and rewraps the same data key, and no device holds either.
+	// Under protocol 3 this evicted the whole vault and told every device to
+	// pair again, because the vault's hash *was* their credential.
+	//
+	// What is still closed is any *other* registrar session on this vault.
+	// Those are holding the root that was just retired, and the one thing a
+	// retired root must not do is register a device, which would be permanent
+	// access surviving the rotation that was meant to end it. The conditional
+	// insert in store.RegisterDevice is what actually guarantees that; closing
+	// them is so the holder is told rather than left to discover it.
 	//
 	// In parallel, because each peer is given up to a second to read its
 	// notice before it is closed, and in series seven other devices spent
 	// seven seconds of that before this one was told anything. Shutdown fans
 	// its notices out the same way, for the same reason.
-	others := s.srv.hub.others(s.vaultID, s)
+	others := s.srv.registrarsOn(s.vaultID, s)
 	var wg sync.WaitGroup
 	for _, peer := range others {
 		wg.Add(1)
 		go func(peer *Session) {
 			defer wg.Done()
-			peer.evict()
+			peer.evict("the vault's secret was rotated by another device; "+
+				"the recovery key you are holding no longer opens it", errors.New("vault secret rotated"))
 		}(peer)
 	}
 	wg.Wait()
 	s.srv.log.Info("vault secret rotated", "vault", s.vaultID, "device", s.device, "evicted", len(others))
 	return s.writeJSON(wire.Rotated{Res: "rotated", ID: s.reqID})
+}
+
+/* ---------------------------------------------------------------- *
+ * The device list
+ * ---------------------------------------------------------------- */
+
+// handleRegister adds a device to the vault's list. Registrar sessions only,
+// which is enforced in dispatch: this is the one power vaults.auth_hash kept
+// when protocol 4 took the sync half away.
+//
+// The auth key and not its hash, matching `claim`. Either way the server keeps
+// only the digest, so nothing is revealed by sending the key that the digest
+// would have hidden; what the key buys is that MinClaimLength can be enforced,
+// and a credential nobody can judge is one a client bug binds a device to for
+// ever. See docs/design.md on why the digest is a bare unsalted SHA-256.
+//
+// Registering the same device twice, with the same key, succeeds. That is the
+// half-finished registration: the row committed and the reply was lost, and
+// the caller is a conversion that has to be able to run again after a crash.
+// Answering ErrDeviceExists there would leave a device retrying for ever, so
+// the row is read back and a row that is already exactly what was asked for is
+// the registration having happened (rule 4: the outcome is verified, not the
+// call). A different key under an id the vault already holds is refused, and
+// nothing is overwritten: that is somebody else's device.
+func (s *Session) handleRegister(m wire.In) error {
+	if !store.ValidDeviceID(m.DeviceID) {
+		return s.reject(wire.CodeBadName, fmt.Errorf(
+			"device id is %d bytes and must be base64url of at most %d",
+			len(m.DeviceID), store.MaxDeviceIDLen))
+	}
+	if len(m.Auth) < MinClaimLength {
+		return s.reject(wire.CodeBadEntry, fmt.Errorf(
+			"the device's auth key is %d characters, which is too few", len(m.Auth)))
+	}
+	// The name defaults to the one this hello already carries, which is what
+	// the client sends as --device today, so a device that says nothing about
+	// its name still arrives in the list as something a person recognises.
+	name := m.Name
+	if name == "" {
+		name = s.device
+	}
+	if err := checkName("device", name, store.MaxDeviceLen); err != nil {
+		return s.reject(wire.CodeBadName, err)
+	}
+	if s.authHash == "" {
+		// No authenticator this build ships leaves it empty for a session that
+		// got this far. A registration authorised by no credential at all is
+		// the hole this whole path exists to close, so it is refused rather
+		// than guessed, exactly as rotate does.
+		return s.reject(wire.CodeAuth, errors.New(
+			"this session has no vault credential to register a device under"))
+	}
+	sum := sha256.Sum256([]byte(m.Auth))
+	deviceHash := hex.EncodeToString(sum[:])
+	if s.srv.beforeRegister != nil {
+		s.srv.beforeRegister()
+	}
+	err := s.srv.st.RegisterDevice(s.vaultID, m.DeviceID, name, deviceHash,
+		s.authHash, store.MaxDevices, s.srv.now().UnixMilli())
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrDeviceExists):
+		_, existing, ok, readErr := s.srv.st.DeviceByID(s.vaultID, m.DeviceID)
+		if readErr != nil {
+			return s.reject(wire.CodeInternal, readErr)
+		}
+		if !ok || subtle.ConstantTimeCompare([]byte(existing), []byte(deviceHash)) != 1 {
+			return s.reject(wire.CodeBadEntry, fmt.Errorf(
+				"this vault already has a different device registered under id %q", m.DeviceID))
+		}
+		s.srv.log.Info("device already registered", "vault", s.vaultID, "deviceId", m.DeviceID)
+	case errors.Is(err, store.ErrDeviceLimit):
+		return s.reject(wire.CodeFull, err)
+	case errors.Is(err, store.ErrRotated):
+		// The vault was rotated between this session's hello and this
+		// registration. Fatal, for the same reason a losing rotate is: the
+		// credential this session is holding no longer opens the vault, and
+		// retrying the same request cannot succeed.
+		return s.fatal(wire.CodeRotated, errors.New(
+			"the vault was rotated by another device, so this registration was refused; "+
+				"reconnect with the new recovery key and try again"))
+	case errors.Is(err, store.ErrUnknownVault), errors.Is(err, store.ErrBadEntry):
+		return s.reject(wire.CodeBadEntry, err)
+	default:
+		s.srv.log.Error("register failed", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the device could not be registered: "+err.Error()))
+	}
+	s.srv.log.Info("device registered", "vault", s.vaultID, "deviceId", m.DeviceID, "name", name)
+	return s.writeJSON(wire.Registered{
+		Res: "registered", ID: s.reqID, DeviceID: m.DeviceID, Wrapped: s.wrapped,
+	})
+}
+
+// handleDevices answers with every device that may reach this vault: the only
+// way to answer "what is still connected to my notes". Device sessions only,
+// because the list is the vault's content in the sense that matters and a
+// registrar reads nothing.
+func (s *Session) handleDevices(m wire.In) error {
+	ds, err := s.srv.st.Devices(s.vaultID)
+	if err != nil {
+		s.srv.log.Error("listing devices failed", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the device list could not be read: "+err.Error()))
+	}
+	return s.writeJSON(wire.DeviceList{
+		Res: "devices", ID: s.reqID, Devices: ds, MaxDevices: store.MaxDevices,
+	})
+}
+
+// handleRevoke deletes a device's row and closes every session that device has
+// open, in that order, so the reply means both. A device may revoke another and
+// may revoke itself, which is what unlinking is.
+//
+// Deleting the row alone would be a revocation the revoked device does not
+// notice until it happens to reconnect: it holds an authenticated connection,
+// and nothing on it is re-checked, so it would go on reading every note pushed
+// to the vault for as long as it stayed up. "Revoked" has to mean "and it
+// stopped", or the panel is telling somebody their stolen laptop is off the
+// vault while it is still receiving.
+//
+// The order is the guarantee, not luck. The delete lands first, so a connect
+// racing this either does its SawDevice after the delete and is refused, or was
+// already in the hub when the list below is taken and is closed here. See
+// helloAsDevice for the other half.
+func (s *Session) handleRevoke(m wire.In) error {
+	if !store.ValidDeviceID(m.DeviceID) {
+		return s.reject(wire.CodeBadName, fmt.Errorf(
+			"device id is %d bytes and must be base64url of at most %d",
+			len(m.DeviceID), store.MaxDeviceIDLen))
+	}
+	if err := s.srv.st.RevokeDevice(s.vaultID, m.DeviceID, m.AllowLast); err != nil {
+		switch {
+		case errors.Is(err, store.ErrUnknownDevice):
+			return s.reject(wire.CodeNoDevice, err)
+		case errors.Is(err, store.ErrLastDevice):
+			// badentry, the same code and the same shape as a hello carrying
+			// two credentials: a well-formed frame the server will not act on,
+			// which the caller fixes by sending a different one. The message
+			// says which field.
+			return s.reject(wire.CodeBadEntry, fmt.Errorf(
+				"%s; resend with allowLast to do it anyway", err))
+		}
+		s.srv.log.Error("revoke failed", "vault", s.vaultID, "deviceId", m.DeviceID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the device could not be revoked: "+err.Error()))
+	}
+
+	// Every session that device has open except this one. This one is left
+	// out because it is about to be told what happened, and evicting it here
+	// would close the socket before the reply reached it.
+	victims := s.srv.hub.sessionsOf(s.vaultID, m.DeviceID, s)
+	var wg sync.WaitGroup
+	for _, peer := range victims {
+		wg.Add(1)
+		go func(peer *Session) {
+			defer wg.Done()
+			peer.evict("this device was revoked and may no longer sync this vault; "+
+				"add it again with an invite from a device that still has the vault",
+				errors.New("device revoked"))
+		}(peer)
+	}
+	wg.Wait()
+
+	self := m.DeviceID == s.deviceID
+	s.srv.log.Info("device revoked", "vault", s.vaultID, "deviceId", m.DeviceID,
+		"by", s.device, "closed", len(victims), "self", self)
+	if err := s.writeJSON(wire.Revoked{
+		Res: "revoked", ID: s.reqID, DeviceID: m.DeviceID, Self: self,
+	}); err != nil {
+		return err
+	}
+	if self {
+		// A device that revoked itself is revoked, and a revoked device does
+		// not stay connected. The reply has already gone; Handle drains and
+		// closes behind this.
+		return errRevokedSelf
+	}
+	return nil
 }
 
 /* ---------------------------------------------------------------- *
@@ -1710,16 +2129,17 @@ func (s *Session) handleRotate(m wire.In) error {
 // name it cannot guess, for a few minutes. docs/protocol.md, "Adding a device
 // with a single-use invite".
 //
-// Refused with `auth` on a bootstrap session, which never proved it held the
-// root it would be sealing, and with `badentry` on a malformed request. The ttl
-// defaults to DefaultInviteTTL and is capped at MaxInviteTTL rather than
-// refused above it, because the reply says when the invite actually expires
-// and a client asking for longer has nothing to do differently.
+// Device sessions only, which dispatch enforces. An invite is issued by a
+// device that already has the vault, and that is also what retired the
+// explicit bootstrap check this used to carry: a bootstrap session is a
+// registrar, and a registrar never reaches this function, so the check could
+// only ever have been dead code pretending to be a guard.
+//
+// Refused with `badentry` on a malformed request. The ttl defaults to
+// DefaultInviteTTL and is capped at MaxInviteTTL rather than refused above it,
+// because the reply says when the invite actually expires and a client asking
+// for longer has nothing to do differently.
 func (s *Session) handleInvite(m wire.In) error {
-	if s.bootstrap {
-		return s.reject(wire.CodeAuth, errors.New(
-			"this session authenticated with the bootstrap token, and only a device holding the vault's secret may issue invites"))
-	}
 	if !store.ValidInvite(m.Invite) {
 		return s.reject(wire.CodeBadEntry, fmt.Errorf(
 			"the invite identifier is %d bytes and must be base64url of at most %d", len(m.Invite), store.MaxInviteLen))

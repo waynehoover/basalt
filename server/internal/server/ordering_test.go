@@ -417,7 +417,7 @@ func TestCaughtUpIsQueuedBeforeAChangeThatLandsInTheHandoverWindow(t *testing.T)
 	}
 
 	cl := r.dial("a")
-	cl.sendJSON(helloMsg(testVault, testToken, "a", 0))
+	cl.sendJSON(cl.deviceHello(0))
 
 	var ready wire.Ready
 	cl.recvInto("ready", &ready)

@@ -77,10 +77,10 @@ func TestHandshakeRefusals(t *testing.T) {
 		{"unsupported crypto", wire.In{
 			Op: "hello", Crypto: "rot13/1",
 			Vault: testVault, Token: testToken}, wire.CodeProto},
-		{"wrong token", helloMsg(testVault, "guess", "a", 0), wire.CodeAuth},
-		{"unknown vault", helloMsg("someone-elses", testToken, "a", 0), wire.CodeAuth},
-		{"missing vault", helloMsg("", testToken, "a", 0), wire.CodeAuth},
-		{"negative cursor", helloMsg(testVault, testToken, "a", -1), wire.CodeProtoState},
+		{"wrong token", vaultHello(testVault, "guess", "a", 0), wire.CodeAuth},
+		{"unknown vault", vaultHello("someone-elses", testToken, "a", 0), wire.CodeAuth},
+		{"missing vault", vaultHello("", testToken, "a", 0), wire.CodeAuth},
+		{"negative cursor", vaultHello(testVault, testToken, "a", -1), wire.CodeProtoState},
 		{"not hello at all", wire.In{Op: "put", Path: "a.md"}, wire.CodeProtoState},
 	}
 	for _, c := range cases {
@@ -102,11 +102,11 @@ func TestAuthFailuresDoNotSayWhichHalfWasWrong(t *testing.T) {
 	r := newRig(t)
 
 	badToken := r.dial("a")
-	badToken.sendJSON(helloMsg(testVault, "guess", "a", 0))
+	badToken.sendJSON(vaultHello(testVault, "guess", "a", 0))
 	one := badToken.expectErr(wire.CodeAuth)
 
 	badVault := r.dial("b")
-	badVault.sendJSON(helloMsg("someone-elses", testToken, "b", 0))
+	badVault.sendJSON(vaultHello("someone-elses", testToken, "b", 0))
 	two := badVault.expectErr(wire.CodeAuth)
 
 	if one != two {
@@ -118,7 +118,7 @@ func TestSecondHelloIsRefused(t *testing.T) {
 	r := newRig(t)
 	cl := r.dial("a")
 	cl.hello(0)
-	cl.sendJSON(helloMsg(testVault, testToken, "a", 0))
+	cl.sendJSON(cl.deviceHello(0))
 	cl.expectErr(wire.CodeProtoState)
 }
 
@@ -130,7 +130,7 @@ func TestAClientAheadOfTheServerIsRefused(t *testing.T) {
 	r.seed("a.md", "one") // server is at uid 1
 
 	cl := r.dial("restored-from-an-old-backup")
-	cl.sendJSON(helloMsg(testVault, testToken, "a", 99))
+	cl.sendJSON(cl.deviceHello(99))
 	msg := cl.expectErr(wire.CodeCursor)
 	if !cl.closed() {
 		t.Fatal("session continued past a diverged cursor")
@@ -144,7 +144,7 @@ func TestVaultDeviceLimitIsRefusedNotDegraded(t *testing.T) {
 	r.dial("b").hello(0)
 
 	third := r.dial("c")
-	third.sendJSON(helloMsg(testVault, testToken, "c", 0))
+	third.sendJSON(third.deviceHello(0))
 	third.expectErr(wire.CodeBusy)
 
 	if got := r.srv.Peers(testVault); got != 2 {
@@ -836,7 +836,7 @@ func TestEveryEntryOnTheWireCarriesAChunkArray(t *testing.T) {
 	}
 
 	cl := r.dial("a")
-	cl.sendJSON(helloMsg(testVault, testToken, "a", 0))
+	cl.sendJSON(cl.deviceHello(0))
 	cl.recvInto("ready", nil)
 
 	// Read the raw frame, because decoding into a struct is exactly what hides

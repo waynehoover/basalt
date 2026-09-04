@@ -228,7 +228,7 @@ func TestTheProtoAndCryptoRefusalsStillNameWhatThisServerSpeaks(t *testing.T) {
 	cl.sendRaw(wire.In{Op: "hello", ID: 1, Proto: wire.MinProto - 1, Crypto: wire.Crypto,
 		Vault: testVault, Device: "prober"})
 	msg := cl.expectErr(wire.CodeProto)
-	for _, want := range []string{"protocol 2", "3 to 3"} {
+	for _, want := range []string{"protocol 3", "4 to 4"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("the proto refusal does not name %q: %q", want, msg)
 		}

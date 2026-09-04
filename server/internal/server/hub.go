@@ -74,15 +74,24 @@ func (h *Hub) broadcast(vaultID string, e store.Entry, origin *Session) {
 	}
 }
 
-// others returns every session on the vault except origin, for a rotation to
-// close: their credential was just retired, and a device left connected under
-// it would go on writing until it happened to reconnect and be refused.
-func (h *Hub) others(vaultID string, origin *Session) []*Session {
+// sessionsOf returns every session on the vault belonging to one device,
+// except origin, for a revoke to close.
+//
+// Deleting the row is not enough on its own. A revoked device holding an open
+// connection has already authenticated, and nothing on a live session is
+// re-checked, so it would go on receiving every note pushed to the vault for
+// as long as it stayed up: a revocation the revoked device never notices.
+//
+// A device may have more than one session, so this is a list rather than a
+// lookup, and origin is left out because the caller is about to answer it.
+// Reading deviceID here is safe without any lock of its own: it is written
+// before the session joins, and joining takes the same mutex this holds.
+func (h *Hub) sessionsOf(vaultID, deviceID string, origin *Session) []*Session {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	out := make([]*Session, 0, len(h.byVault[vaultID]))
+	var out []*Session
 	for s := range h.byVault[vaultID] {
-		if s != origin {
+		if s != origin && s.deviceID == deviceID {
 			out = append(out, s)
 		}
 	}

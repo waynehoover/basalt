@@ -13,3 +13,8 @@ func (s *Server) PreAuth() int {
 
 // Peers is the number of devices currently connected to a vault.
 func (s *Server) Peers(vaultID string) int { return s.hub.peerCount(vaultID) }
+
+// Registrars is how many sessions on a vault authenticated with the vault's
+// own credential. They join no fan-out, so Peers cannot see them, and a test
+// that waits for one to go otherwise has nothing to wait on.
+func (s *Server) Registrars(vaultID string) int { return len(s.registrarsOn(vaultID, nil)) }

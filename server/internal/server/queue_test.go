@@ -201,7 +201,7 @@ func TestS2AHandoverIntoAFullQueueWaitsForRoomInsteadOfDroppingThePeer(t *testin
 	}
 
 	cl := r.dial("slow")
-	cl.sendJSON(helloMsg(testVault, testToken, "slow", 0))
+	cl.sendJSON(cl.deviceHello(0))
 
 	// Read everything: filler, batches and caught-up. The filler is skipped,
 	// the batches are checked for continuity, and caught-up must name the late
@@ -333,7 +333,7 @@ func TestS8TheCatchUpBufferIsBoundedInBytesAsWellAsEntries(t *testing.T) {
 	}()
 
 	cl := r.dial("a")
-	cl.sendJSON(helloMsg(testVault, testToken, "a", 0))
+	cl.sendJSON(cl.deviceHello(0))
 	<-entered
 	peer := r.onlyPeer()
 

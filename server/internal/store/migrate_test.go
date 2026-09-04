@@ -304,7 +304,8 @@ func TestADatabaseFromAnOlderBuildGainsTheDevicesTable(t *testing.T) {
 		t.Fatalf("claiming a migrated vault: %v", err)
 	}
 	if err := s.RegisterDevice("v1", "device-one", "laptop",
-		"1111111111111111111111111111111111111111111111111111111111111111", 3000); err != nil {
+		"1111111111111111111111111111111111111111111111111111111111111111",
+		"0000000000000000000000000000000000000000000000000000000000000001", MaxDevices, 3000); err != nil {
 		t.Fatalf("registering a device on a migrated vault: %v", err)
 	}
 	if got, err := s.Devices("v1"); err != nil || len(got) != 1 || got[0].ID != "device-one" {

@@ -106,13 +106,17 @@ func TestI23TheTTLDefaultsAndIsCapped(t *testing.T) {
 }
 
 func TestI23InviteRefusals(t *testing.T) {
-	t.Run("a bootstrap session may not issue invites", func(t *testing.T) {
+	t.Run("a session holding the vault credential may not issue invites", func(t *testing.T) {
+		// An invite is issued by a device that already has the vault. A
+		// bootstrap hello never proved it held the root it would be sealing,
+		// and since protocol 4 it does not even produce a session that could:
+		// the vault credential opens a registrar, and a registrar syncs
+		// nothing and issues nothing.
 		r := newRigDerived(t)
 		cl := r.dial("first")
 		cl.sendJSON(wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault,
 			Token: testToken, Claim: longKey, Wrapped: testWrapped, Device: "first"})
-		cl.recvInto("ready", &wire.Ready{})
-		cl.recvInto("caught-up", &wire.CaughtUp{})
+		cl.recvInto("registrar", &wire.Registrar{})
 		cl.sendJSON(wire.In{Op: "invite", Invite: testInvite, Sealed: testSealed})
 		cl.expectErr(wire.CodeAuth)
 		if n, _ := r.st.OutstandingInvites(testVault, 0); n != 0 {
@@ -150,8 +154,12 @@ func TestI23RotateDeletesOutstandingInvites(t *testing.T) {
 	if n, _ := r.st.OutstandingInvites(testVault, r.srv.now().UnixMilli()); n != 1 {
 		t.Fatalf("%d invites before the rotate", n)
 	}
-	a.sendJSON(wire.In{Op: "rotate", Auth: newKey, Wrapped: newWrapped})
-	a.recvInto("rotated", &wire.Rotated{})
+	// From a registrar session, which is the only kind that may rotate: the
+	// invite the device issued seals the root, and the root is what is being
+	// retired.
+	reg := registrarWith(t, r, "recovery-key", longKey)
+	reg.sendJSON(wire.In{Op: "rotate", Auth: newKey, Wrapped: newWrapped})
+	reg.recvInto("rotated", &wire.Rotated{})
 	if n, _ := r.st.InviteRows(testVault); n != 0 {
 		t.Fatalf("%d invite rows survived the rotate", n)
 	}
