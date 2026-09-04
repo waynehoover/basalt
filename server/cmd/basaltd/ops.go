@@ -60,8 +60,8 @@ func cmdHealth(args []string, out io.Writer) error {
 //
 // Read-only, and it takes the shared lock, so it runs against a live server.
 // Rule 5 in a different clothes: the numbers are separate rather than summed,
-// because "1.2 GB" tells you nothing about whether a purge would help and
-// versions against files tells you exactly that.
+// because "1.2 GB" tells you nothing about whether a purge would help and the
+// reclaim line tells you exactly that.
 //
 // -json prints the same numbers as one object, for a script that alerts on
 // them (I17). Same fields, same source, so the two cannot disagree.
@@ -125,16 +125,66 @@ func cmdStats(args []string, out io.Writer) error {
 			fmt.Fprintf(out, "  %d deleted and still recoverable\n", s.Deleted)
 		}
 		fmt.Fprintf(out, "  %d versions in all, %d chunks referenced\n", s.Versions, s.ChunkRefs)
-		// The one number that says whether a purge is worth running: history is
-		// every version beyond the newest of each path.
-		if history := s.Versions - (s.Files + s.Folders + s.Deleted); history > 0 {
-			fmt.Fprintf(out, "  %d of those versions are history, which purge would drop\n", history)
+		rec, err := st.Reclaimable(v, chunks.DefaultGrace)
+		if err != nil {
+			return err
 		}
+		writeReclaimable(out, rec, chunks.DefaultGrace)
 		fmt.Fprintf(out, "  newest uid %d\n", s.LatestUID)
 	}
 	fmt.Fprintf(out, "%d chunk bodies on disk\n", bodies)
 	fmt.Fprintf(out, "purge spares bodies newer than %s unless -grace says otherwise\n", chunks.DefaultGrace)
 	return nil
+}
+
+// writeReclaimable prints what says whether a purge is worth the ceremony: the
+// history it would drop, and the bytes it would give back.
+//
+// The bytes are the point. History as a count was already here and it does not
+// answer the question anybody asks, because "431 versions" is four kilobytes
+// or four gigabytes, and the ceremony is stop, back up, purge, start. Nothing
+// said when it was worth doing, so the answer used to arrive as a `nospace`
+// refusal on somebody's phone.
+//
+// Zero gets a line of its own rather than silence. "Not worth running" is an
+// answer, and an absent line is indistinguishable from a figure nobody printed
+// (rule 7). TestStatsSaysWhetherAPurgeIsWorthRunning.
+func writeReclaimable(out io.Writer, rec store.Reclaimable, grace time.Duration) {
+	if rec.Versions > 0 {
+		fmt.Fprintf(out, "  %d of those versions are history, which purge would drop\n", rec.Versions)
+	}
+	// An incomplete walk describes how far it got, not what the vault holds,
+	// so it prints no figure at all. Same rule, and the same incident, as the
+	// purge report: one stray file in the first shard used to produce a full
+	// report with every collectible orphan in the tree unexamined.
+	if !rec.Complete {
+		fmt.Fprintln(out, "  the chunk walk stopped before the end of the store, so there is no reclaimable")
+		fmt.Fprintln(out, "  figure here; basaltd verify says what is in the way")
+		return
+	}
+	// Four distinct answers, because "nothing would come back" has three
+	// different reasons and only one of them means a purge is pointless. The
+	// window case is the one an operator purging for space actually lands in,
+	// since they stop the server and every collectible body was written within
+	// the hour, and it is never folded into the figure above (rule 8): the
+	// number that says what would not happen is a number too.
+	switch {
+	case rec.Bodies > 0:
+		fmt.Fprintf(out, "  purge would reclaim %s in %d chunk bodies nothing still references\n",
+			humanBytes(rec.Bytes), rec.Bodies)
+		if rec.RecentBodies > 0 {
+			fmt.Fprintf(out, "  another %s in %d bodies is collectible but inside the %s grace window, which purge spares\n",
+				humanBytes(rec.RecentBytes), rec.RecentBodies, grace)
+		}
+	case rec.RecentBodies > 0:
+		fmt.Fprintf(out, "  purge would reclaim nothing yet: %s in %d bodies is collectible but was written\n"+
+			"  within the last %s, which purge spares in case a push was interrupted mid-upload\n",
+			humanBytes(rec.RecentBytes), rec.RecentBodies, grace)
+	case rec.Versions > 0:
+		fmt.Fprintln(out, "  purge would reclaim no disk: every body those versions use is shared with a version that stays")
+	default:
+		fmt.Fprintln(out, "  nothing for purge to reclaim: no history, and every body is still referenced")
+	}
 }
 
 // statsJSON is what `stats -json` prints. Field names are the prose line's
@@ -170,6 +220,22 @@ type vaultStats struct {
 	Purges int64 `json:"purges"`
 	// Invites is single-use invites that could still be redeemed.
 	Invites int `json:"invites"`
+	// ReclaimBytes and ReclaimBodies are what a purge at the default grace
+	// would give back, and RecentBytes and RecentBodies what the window would
+	// hold back from it. Separate here for the same reason the prose keeps
+	// them apart: on a server stopped a moment ago the first pair is zero and
+	// the second is the whole figure.
+	//
+	// ReclaimComplete is false when the chunk walk stopped early, in which
+	// case the four figures above describe how far it got and a script must
+	// not alert on them (rule 7). The prose prints nothing at all in that
+	// case; JSON says so in a field, because a missing field and a zero read
+	// the same to a script.
+	ReclaimBytes    int64 `json:"reclaimBytes"`
+	ReclaimBodies   int   `json:"reclaimBodies"`
+	RecentBytes     int64 `json:"recentBytes"`
+	RecentBodies    int   `json:"recentBodies"`
+	ReclaimComplete bool  `json:"reclaimComplete"`
 }
 
 func writeStatsJSON(out io.Writer, st *store.Store, vaults []string, bodies int) error {
@@ -193,16 +259,23 @@ func writeStatsJSON(out io.Writer, st *store.Store, vaults []string, bodies int)
 		if err != nil {
 			return err
 		}
-		history := s.Versions - (s.Files + s.Folders + s.Deleted)
-		if history < 0 {
-			history = 0
+		// The same call the prose uses, so the history count and the bytes
+		// come from one place and the two surfaces cannot disagree. History
+		// used to be arithmetic on Stats here and arithmetic on Stats again in
+		// the prose, which is two ways to compute one number.
+		rec, err := st.Reclaimable(v, chunks.DefaultGrace)
+		if err != nil {
+			return err
 		}
 		rep.Vaults = append(rep.Vaults, vaultStats{
 			Vault: v, Claimed: hash != "",
 			Files: s.Files, Folders: s.Folders, Bytes: s.Bytes,
 			Deleted: s.Deleted, Recoverable: s.Recoverable, Purged: s.Deleted - s.Recoverable,
-			Versions: s.Versions, History: history, ChunkRefs: s.ChunkRefs,
+			Versions: s.Versions, History: rec.Versions, ChunkRefs: s.ChunkRefs,
 			LatestUID: s.LatestUID, AllocatedTo: s.AllocatedTo, Purges: s.Purges, Invites: invites,
+			ReclaimBytes: rec.Bytes, ReclaimBodies: rec.Bodies,
+			RecentBytes: rec.RecentBytes, RecentBodies: rec.RecentBodies,
+			ReclaimComplete: rec.Complete,
 		})
 	}
 	enc := json.NewEncoder(out)

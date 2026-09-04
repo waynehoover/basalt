@@ -18,7 +18,7 @@ point of the project.
 ## The first rule
 
 **Do not lose a note.** When simplicity and correctness conflict, correctness
-wins and the feature gets cut instead. `docs/design.md` lists ten durability
+wins and the feature gets cut instead. `docs/design.md` lists eleven durability
 rules, each with the incident that produced it; they are not aspirational.
 
 ## Scope, and what is refused

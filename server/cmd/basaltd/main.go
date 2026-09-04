@@ -532,15 +532,38 @@ func logStartup(log *slog.Logger, st *store.Store, served, version string) error
 	if err != nil {
 		return err
 	}
+	// What a purge would give back, on the one line an operator already reads.
+	//
+	// An unpurged server grows until `nospace` refuses uploads, and the answer
+	// is the heaviest ceremony there is: stop, back up, purge, start. Nothing
+	// said when it was worth doing, so it was learned from a refused upload on
+	// somebody's phone. Now the restart says it, which is the moment an
+	// operator is looking. Only the served vault: the figure needs a walk of
+	// that vault's chunk tree, measured at 56 ms over ten thousand bodies
+	// against 11,307 for the real-vault corpus in compared.md, and doing it
+	// per vault would multiply that for vaults nobody is serving.
+	//
+	// A walk that stopped early prints no figure at all, only that it stopped
+	// (rule 7), for the same reason the purge report does.
+	reclaimable := "unknown"
+	if rec, err := st.Reclaimable(served, chunks.DefaultGrace); err != nil {
+		log.Warn("could not tell how much a purge would reclaim", "vault", served, "err", err)
+	} else if !rec.Complete {
+		reclaimable = "the chunk walk stopped early; run basaltd verify"
+	} else {
+		reclaimable = humanBytes(rec.Bytes)
+	}
 	found := false
 	for _, v := range vaults {
 		if v.Name == served {
 			found = true
-			log.Info("starting", "version", version, "vault", v.Name, "latest", v.Latest, "claimed", v.Claimed)
+			log.Info("starting", "version", version, "vault", v.Name, "latest", v.Latest,
+				"claimed", v.Claimed, "reclaimable", reclaimable)
 		}
 	}
 	if !found {
-		log.Info("starting", "version", version, "vault", served, "latest", 0, "claimed", false)
+		log.Info("starting", "version", version, "vault", served, "latest", 0, "claimed", false,
+			"reclaimable", reclaimable)
 	}
 	for _, v := range vaults {
 		if v.Name != served {

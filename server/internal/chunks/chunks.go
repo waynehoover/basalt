@@ -657,6 +657,36 @@ const DefaultGrace = time.Hour
 // which aborts at the same file. TestSweepReportsNothingItDidNotFinishLookingAt
 // and TestPurgeDoesNotPrintAReportTheSweepDidNotFinish.
 func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time) (SweepReport, error) {
+	return s.walk(vaultID, live, cutoff, true)
+}
+
+// Reclaimable is Sweep with the deleting taken out: the same walk under the
+// same rules, reporting what a sweep would take and touching nothing.
+//
+// It exists so `stats` and the startup line can say how many bytes a purge
+// would give back. An unpurged server grows until `nospace` refuses uploads,
+// and the documented answer is the heaviest ceremony there is: stop, back up,
+// purge, start. That should happen because somebody was told, not because the
+// disk filled.
+//
+// One walk and not two. A second copy of this loop would be a second set of
+// rules about what counts as a body, and on the day they disagreed the preview
+// would promise space a purge does not free. So Deleted and DeletedBytes here
+// mean "would delete", every other field means what it means after a real
+// sweep, and the two cannot drift because there is only one of them.
+// TestReclaimablePredictsExactlyWhatAPurgeThenFrees.
+//
+// Nothing is deleted here, so this does not need the lock a sweep needs. What
+// that costs is that a body committed between the caller reading its live set
+// and this walk reaching it is counted as reclaimable when it is not: a
+// snapshot rather than a promise, which is what a report is.
+func (s *Store) Reclaimable(vaultID string, live map[string]struct{}, cutoff time.Time) (SweepReport, error) {
+	return s.walk(vaultID, live, cutoff, false)
+}
+
+// walk is the body of both Sweep and Reclaimable. remove says which: false
+// counts a collectible body and leaves it where it is.
+func (s *Store) walk(vaultID string, live map[string]struct{}, cutoff time.Time, remove bool) (SweepReport, error) {
 	var rep SweepReport
 	root := s.VaultDir(vaultID)
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
@@ -740,8 +770,10 @@ func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time
 			rep.SparedBytes += info.Size()
 			return nil
 		}
-		if rmErr := os.Remove(p); rmErr != nil {
-			return rmErr
+		if remove {
+			if rmErr := os.Remove(p); rmErr != nil {
+				return rmErr
+			}
 		}
 		rep.Deleted++
 		rep.DeletedBytes += info.Size()

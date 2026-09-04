@@ -59,6 +59,13 @@ them by number.
     asserted that two devices agreed. It passed while one side's edit had
     vanished. Agreement is not the property. Not losing an edit is.
 
+11. **A recovery path tested only in docs is a rumour.** The restore runbook
+    read correctly the whole time nothing had run it. It runs on every push
+    now, against the built binary: back up, lose the original, copy, verify
+    deeply, serve, and read every version and every body back. The last step
+    is the one that earns the rule, because a restore that verifies, starts
+    and serves a vault with a hole in it passes every check before it.
+
 ## Conflicts: keep both
 
 Obsidian Sync and LiveSync both merge with diff-match-patch. Obsidian discards
@@ -177,6 +184,21 @@ list or a `get` returns is checked against its authenticator before anything is
 assembled, and a restore fetches exactly the chunk list the writer signed, so a
 server cannot point a restore at another file's content.
 
+That rule is why the server does not stamp its own arrival time on an entry.
+`ctime` and `mtime` come from the writing device, are covered by the entry's
+authenticator, and are never checked against anything, so a device with a wrong
+clock writes times that read oddly in a history list. The fix that suggests
+itself is a timestamp the server writes and the panel prefers, and it was
+declined: nothing would cover it, the server would choose what it said, and a
+person deciding which version to restore would be reading it. What it would buy
+is nothing, because the ordering is already right. History comes back in `uid`
+order, which is arrival order by construction and involves no clock, so the
+worst a skewed device does is put a wrong label beside a correctly placed
+version. What the server does instead is say so: a device declaring times more
+than a day ahead of the server's own clock is named once per session in the
+log, with the offset and with the note that the ordering is unaffected. Neither
+device changes its behaviour, because neither should.
+
 **What it can still do is withhold.** A server can advance a client past
 versions it never shows it, because an empty batch over a covered range is also
 how a device sees its own write. Nothing detects that. It is a liveness attack
@@ -207,6 +229,36 @@ What a stranger can still learn is that a Basalt server is here and which
 protocol it speaks, because the refusal has to name the numbers for an old
 client to know which end to upgrade, and that the port is up, because a
 healthcheck has to say so.
+
+### Why the other pre-auth codes stay distinct
+
+`auth` deliberately never says which of the token, the vault, the device row or
+the invite was wrong, so the codes beside it look like the same disclosure
+wearing a different name: `badname` says the vault id parses, `proto` says how
+old this client is, `full` says the server is out of room. Each was checked,
+and none of them is.
+
+`proto`, `badname`, `protostate` and `badentry` are decided by comparing the
+frame against constants that are in this repository and in
+[protocol.md](protocol.md), before any credential is looked at and without
+reading the vault. A prober learns the length of a name it may send, which it
+could have read here. Collapsing them into `auth` would cost the thing they
+exist for: a client that cannot tell `proto` from `auth` cannot tell somebody
+which end to upgrade, and one that cannot tell `badname` from `auth` sends
+somebody hunting a credential bug over a 65-character device name.
+
+`full` is not reachable without a credential at all. It comes from the device
+limit, which is counted inside the transaction that writes the row, after the
+invite has been spent, so a redeem carrying an invite nobody issued is refused
+by the spend and never reaches the count. A vault at its limit answers a bogus
+invite exactly as an empty one does.
+
+The property behind all of that is one sentence: a pre-auth refusal is a
+function of the request, and never of the vault. It is tested as one, the way
+the version property above is. The same probe goes to a vault this server
+serves, furnished with devices, entries and an outstanding invite, and to a
+vault it has never heard of, and the two frames must match byte for byte,
+whatever code either of them chooses.
 
 ## The keys
 

@@ -1446,6 +1446,95 @@ func (s *Store) inTx(fn func(*sql.Tx) error) error {
 	return tx.Commit()
 }
 
+// Reclaimable is what a purge of this vault would give back, worked out
+// without deleting anything.
+//
+// It exists because the ceremony is heavy and the trigger was wrong. An
+// unpurged server grows until `nospace` refuses uploads, and the documented
+// remedy is stop, back up, purge, start; under Docker, a multi-container
+// dance. Nothing said when it was worth doing, so the answer arrived as a
+// refused upload. These numbers are what `stats` and the startup line print,
+// so a purge happens because somebody was told.
+//
+// Deliberately only the visibility half. Nothing here deletes, nothing here
+// runs on a timer, and there is still no online purge: purge is the one
+// command that destroys something no device holds, and it stays a deliberate
+// ceremony on a stopped server.
+type Reclaimable struct {
+	// Versions is the history a purge would drop: every entry beyond the
+	// newest of each path. Exact, and free, because it is two counts.
+	Versions int64
+	// Bodies and Bytes are the chunk bodies that no surviving version
+	// references and that are older than the grace window, which is what a
+	// purge at that grace would actually collect.
+	Bodies int
+	Bytes  int64
+	// RecentBodies and RecentBytes are unreferenced too, but inside the
+	// window, so a purge at this grace would spare them. Separate rather than
+	// summed, for the reason SweepReport keeps them separate: on a server
+	// stopped a moment ago they are the whole figure, and folding them in
+	// would promise space that purge then reports as spared. Rule 8.
+	RecentBodies int
+	RecentBytes  int64
+	// Complete says the walk reached the end of the chunk tree. False means
+	// every figure above describes how far it got rather than what the vault
+	// holds, and a caller must not print them as a status (rule 7), exactly as
+	// for a sweep that stopped.
+	Complete bool
+}
+
+// Reclaimable reports what a purge at this grace would free. It deletes
+// nothing and takes no lock, so it runs against a live server, and its numbers
+// are a snapshot that the next commit can move.
+//
+// The survivor query below is the exact inverse of Purge's DELETE predicate,
+// written with the same subquery so the mirroring is visible rather than
+// remembered. If the two ever disagree this preview promises space a purge
+// does not free, which is the failure this whole feature exists to avoid, so
+// it is pinned by a test that predicts, purges, and compares:
+// TestReclaimablePredictsExactlyWhatAPurgeThenFrees.
+func (s *Store) Reclaimable(vaultID string, grace time.Duration) (Reclaimable, error) {
+	var r Reclaimable
+	var total, paths int64
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM entries WHERE vault_id = ?`, vaultID).Scan(&total); err != nil {
+		return r, err
+	}
+	if err := s.db.QueryRow(
+		`SELECT COUNT(DISTINCT path) FROM entries WHERE vault_id = ?`, vaultID).Scan(&paths); err != nil {
+		return r, err
+	}
+	r.Versions = total - paths
+
+	rows, err := s.db.Query(
+		`SELECT DISTINCT name FROM entry_chunks
+		  WHERE vault_id = ?
+		    AND uid IN (SELECT MAX(uid) FROM entries WHERE vault_id = ? GROUP BY path)`,
+		vaultID, vaultID)
+	if err != nil {
+		return r, err
+	}
+	survivors := map[string]struct{}{}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return r, err
+		}
+		survivors[n] = struct{}{}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return r, err
+	}
+
+	rep, err := s.chunks.Reclaimable(vaultID, survivors, time.Now().Add(-grace))
+	r.Bodies, r.Bytes = rep.Deleted, rep.DeletedBytes
+	r.RecentBodies, r.RecentBytes = rep.Spared, rep.SparedBytes
+	r.Complete = rep.Complete
+	return r, err
+}
+
 // liveChunks is every chunk name referenced by a committed entry of this vault,
 // read within the caller's transaction so it matches the rest of that snapshot.
 func liveChunks(tx *sql.Tx, vaultID string) (map[string]struct{}, error) {

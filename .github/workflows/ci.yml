@@ -84,6 +84,34 @@ jobs:
       - name: the pinned image is not behind the newest server release
         run: scripts/pin-check.sh
 
+  # docs/server.md has carried the restore rehearsal as prose since the backup
+  # was written, and a recovery path tested only in docs is a rumour. Not
+  # because the steps are wrong: because nobody has run them since the backup
+  # format, the schema or the startup checks last moved, and the one command
+  # nothing else exercises is the one you reach for on the worst day.
+  #
+  # Its own job so that "the restore rehearsal failed" is a sentence CI can
+  # say, and behind a build tag so that a -run filter over the unit tests
+  # cannot skip it in silence. `go test` compiles and vets the tagged file, so
+  # it is not outside the checks above by being outside `go vet ./...`.
+  restore:
+    name: the restore rehearsal
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      # The runbook, executed against the built binary: back up, lose the
+      # original, copy the backup somewhere fresh, verify it deeply, check what
+      # it holds against what it claims, start a server on it, and read every
+      # version and every body back over a real socket.
+      - name: the backup restores, verifies and serves what it held
+        working-directory: server
+        run: go test -tags rehearsal -run TestRestoreRehearsal -count=1 ./cmd/basaltd/
+
   client:
     name: client
     runs-on: ubuntu-latest

@@ -58,6 +58,16 @@ run "the systemd unit verifies" server go test -race -run 'TestService' ./cmd/ba
 run "the pinned image is not behind the newest server release" "" \
   bash "$root/scripts/pin-check.sh"
 
+# ---- the restore rehearsal -------------------------------------------------
+#
+# Behind a build tag, so it is not one of the six hundred tests above that a
+# -run filter can skip without saying so, and run here for the same reason the
+# stress suite is: a recovery path tested only in docs is a rumour, and the
+# runbook it executes is the one nobody finds out is wrong until the day the
+# live directory is gone.
+run "the backup restores, verifies and serves what it held" server \
+  go test -tags rehearsal -run TestRestoreRehearsal -count=1 ./cmd/basaltd/
+
 # ---- client ----------------------------------------------------------------
 run "install" client bun install --frozen-lockfile
 run "format" client bun run format:check

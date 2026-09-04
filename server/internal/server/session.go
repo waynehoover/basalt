@@ -99,6 +99,12 @@ type Session struct {
 	// the vault; see Grant.
 	bootstrap bool
 
+	// saidSkewed is set once this session has reported a device writing
+	// timestamps its own clock says are impossible. Once, because a first sync
+	// commits thousands of entries and a per-entry warning is a log nobody
+	// reads. Only the session goroutine touches it; see noteFutureMTime.
+	saidSkewed bool
+
 	// authHash is the vault's stored auth hash that this session's credential
 	// matched, on a registrar session, and empty on a device's, which
 	// authenticated against its own row and never against the vault.
@@ -1753,6 +1759,8 @@ func putErrorCode(err error) string {
 // it here used to cost a reconnect and a replayed handshake for a fault the
 // next put might not even see.
 func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
+	s.noteFutureMTime(e)
+
 	s.srv.commitMu.Lock()
 	defer s.srv.commitMu.Unlock()
 
@@ -1785,6 +1793,59 @@ func (s *Session) commit(e store.Entry) (int64, *wire.Err) {
 
 	s.srv.hub.broadcast(s.vaultID, e, s)
 	return uid, nil
+}
+
+// clockSkewTolerance is how far ahead of the server a device's timestamps may
+// be before it is reported as having a wrong clock.
+//
+// Wide on purpose, and one-sided. A past mtime is ordinary: every note written
+// before the vault was paired has one, and a vault full of 2015 files is not a
+// fault. A *future* mtime cannot be produced by a correct clock, so that is the
+// only direction worth reporting.
+//
+// A day rather than an hour because both clocks are suspects here. A device an
+// hour out is more likely to be a server that has not synced its own time than
+// a device with the wrong date, and naming somebody's phone as broken when it
+// is not is worse than saying nothing. A device with a genuinely wrong clock is
+// out by days.
+const clockSkewTolerance = 24 * time.Hour
+
+// noteFutureMTime says so, once, when a device declares a modification time
+// this server's clock says has not happened yet.
+//
+// `ctime` and `mtime` are the client's, covered by the entry's authenticator
+// and never checked against anything: the server holds no key and has no
+// business overruling what a device says about its own files. A device with a
+// wrong clock therefore writes entries whose timestamps are wrong, and both
+// shells print those timestamps beside every version in a history list.
+//
+// Nothing is at risk. Merging is by hash, the cursor is by uid, and history is
+// ordered `uid DESC`, which is arrival order and involves no clock at all, so
+// what a skewed device costs is a label that reads oddly next to a list that is
+// correctly ordered. TestHistoryIsOrderedByArrivalAndNotByAnyClock.
+//
+// What was proposed instead was a server-stamped arrival time that the UI would
+// prefer over the client's. Declined: the server writes it, no key covers it,
+// and a person choosing which version to restore would be reading it. "It
+// cannot write anything either" is the property docs/design.md rests the whole
+// threat model on, and trading a piece of it for a nicer label is the wrong way
+// round. Saying the clock is wrong costs nothing and fixes the cause.
+//
+// Once per session, because a first sync commits thousands of entries.
+// TestASkewedDeviceIsReportedOncePerSession.
+func (s *Session) noteFutureMTime(e store.Entry) {
+	if s.saidSkewed || e.MTime <= 0 {
+		return
+	}
+	ahead := time.Duration(e.MTime-s.srv.now().UnixMilli()) * time.Millisecond
+	if ahead <= clockSkewTolerance {
+		return
+	}
+	s.saidSkewed = true
+	s.srv.log.Warn("a device is writing timestamps from the future, so its clock or this server's is wrong",
+		"vault", s.vaultID, "device", s.device, "deviceId", s.deviceID,
+		"ahead", ahead.Round(time.Minute),
+		"hint", "history is ordered by arrival and is unaffected; the times shown beside each version are not")
 }
 
 /* ---------------------------------------------------------------- *

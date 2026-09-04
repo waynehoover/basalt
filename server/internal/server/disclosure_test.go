@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -266,5 +267,167 @@ func TestHealthSaysOkAndNothingElse(t *testing.T) {
 	}
 	if string(body) != "ok\n" {
 		t.Fatalf("/health body = %q, want exactly \"ok\\n\"", body)
+	}
+}
+
+/* ---------------------------------------------------------------- *
+ * What a stranger on the port learns: nothing about the vault either
+ * ---------------------------------------------------------------- */
+
+// Every pre-auth refusal is a function of the request, never of the vault.
+//
+// The suspicion this pins was that `auth` correctly says nothing while the
+// codes around it still oracle: "this vault id parses", "this proto is old",
+// "the server is full". Two of those turn out to be facts a caller already
+// holds. `proto`, `badname`, `protostate` and `badentry` are decided by
+// checking the frame against constants that are in this repository and in
+// docs/protocol.md, so a prober learns nothing it could not have computed
+// offline, and collapsing them into `auth` would cost a real client the one
+// thing it is for: telling a person which end to fix. A client that cannot
+// tell `proto` from `auth` cannot say whether to upgrade the server or the
+// plugin, and one that cannot tell `badname` from `auth` sends somebody
+// hunting a credential bug over a 65-character device name.
+//
+// The third, `full`, is not reachable here at all: it comes from the device
+// limit, which is checked inside the transaction that registers a row, after
+// the invite has been spent, so anybody without a live invite gets `auth` from
+// the spend and never reaches the count. That ordering is the property, and it
+// is asserted below rather than read.
+//
+// So the test is the boundary rather than a list of codes: the same probe
+// against a vault this server serves, and against one it has never heard of,
+// must produce the same frame, byte for byte. Anything that later starts
+// answering differently for a vault that exists shows up here, whatever code
+// it chooses.
+func TestNoPreAuthRefusalDependsOnWhetherTheVaultExists(t *testing.T) {
+	// One vault that is real in every way a vault can be: claimed, with
+	// devices on it, entries in it and an outstanding invite. If any of those
+	// can be sensed from outside, this is the rig that would show it.
+	furnished := func(t *testing.T) *rig {
+		t.Helper()
+		r := newRig(t)
+		r.device("laptop")
+		r.device("phone")
+		r.seed("note.md", "hello")
+		if err := r.st.AddInvite(testVault, "iiiiiiiiiiiiiiiiiiiiii", "sealed-blob",
+			r.srv.now().Add(time.Hour).UnixMilli(), r.srv.now().UnixMilli()); err != nil {
+			t.Fatalf("adding an invite: %v", err)
+		}
+		return r
+	}
+
+	long := strings.Repeat("x", store.MaxDeviceLen+1)
+	for _, tc := range []struct {
+		what string
+		// code is what this probe is aiming at. Asserted as well as the two
+		// frames matching, because two frames match beautifully when every
+		// probe in the table is being refused by the same early check: this
+		// table passed in full, and vacuously, when a missing `proto` field
+		// meant every row got the protocol refusal (rule 10).
+		code string
+		// probe takes the vault name to aim at, so the same frame goes to a
+		// vault that exists and to one that does not.
+		probe func(vault string) wire.In
+	}{
+		{"no credential", wire.CodeAuth, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober"}
+		}},
+		{"a wrong token", wire.CodeAuth, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober", Token: "not the token"}
+		}},
+		{"a malformed device id", wire.CodeBadName, func(v string) wire.In {
+			// Shape before credential, and as `badname` rather than `auth`, so
+			// the shape of an id never becomes the answer to whether that
+			// device exists. See the comment on this check in handleHello.
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober",
+				DeviceID: strings.Repeat("d", store.MaxDeviceIDLen+1), Token: "anything"}
+		}},
+		{"a device id that is not registered", wire.CodeAuth, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober",
+				DeviceID: deviceID("laptop"), Token: "not this device's key"}
+		}},
+		{"an invite that was never issued", wire.CodeAuth, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober",
+				Invite: "jjjjjjjjjjjjjjjjjjjjjj", DeviceID: deviceID("newcomer"),
+				Auth: strings.Repeat("k", MinClaimLength)}
+		}},
+		{"an over-long device name", wire.CodeBadName, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: long}
+		}},
+		{"a negative cursor", wire.CodeProtoState, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober", Cursor: -1}
+		}},
+		{"a protocol this server does not speak", wire.CodeProto, func(v string) wire.In {
+			return wire.In{Op: "hello", ID: 1, Proto: wire.MinProto - 1, Crypto: wire.Crypto,
+				Vault: v, Device: "prober"}
+		}},
+		{"a crypto suite this server does not speak", wire.CodeProto, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: "basalt/something-else/1", Vault: v, Device: "prober"}
+		}},
+		{"a token and an invite together", wire.CodeBadEntry, func(v string) wire.In {
+			return wire.In{Op: "hello", Crypto: wire.Crypto, Vault: v, Device: "prober",
+				Token: testToken, Invite: "jjjjjjjjjjjjjjjjjjjjjj"}
+		}},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			real := furnished(t)
+			cl := real.dial("prober")
+			cl.sendJSON(tc.probe(testVault))
+			present := cl.recvFrame()
+
+			absent := furnished(t)
+			cl = absent.dial("prober")
+			cl.sendJSON(tc.probe("no-such-vault"))
+			missing := cl.recvFrame()
+
+			if string(present) != string(missing) {
+				t.Fatalf("the refusal differs by whether the vault exists:\n  served: %s\n  unknown: %s",
+					present, missing)
+			}
+			if !strings.Contains(string(present), `"code":"`+tc.code+`"`) {
+				t.Fatalf("this probe never reached the check it is about: wanted %s, got %s",
+					tc.code, present)
+			}
+		})
+	}
+}
+
+// `full` needs a live invite to reach, which is what keeps the device limit
+// from being something a stranger can measure.
+//
+// The invite is spent inside the transaction that registers the row, and the
+// spend comes first, so a redeem carrying an invite nobody issued is refused
+// as `auth` before the count is looked at. A vault at its limit therefore
+// answers a bogus invite exactly as an empty vault does. Reversing those two
+// steps would turn the device limit into a probe: send junk, and the code tells
+// you how many devices this vault has.
+func TestAFullVaultDoesNotAnnounceItselfToAnInviteNobodyIssued(t *testing.T) {
+	full := newRig(t)
+	for i := 0; i < store.MaxDevices; i++ {
+		full.device(fmt.Sprintf("device-%d", i))
+	}
+	empty := newRig(t)
+
+	// Both clients are fresh, so sendJSON gives each the same request id and
+	// fills in the current protocol number; a probe left at protocol zero is
+	// refused before it reaches the invite at all.
+	probe := wire.In{Op: "hello", Crypto: wire.Crypto, Vault: testVault, Device: "prober",
+		Invite: "jjjjjjjjjjjjjjjjjjjjjj", DeviceID: deviceID("newcomer"),
+		Auth: strings.Repeat("k", MinClaimLength)}
+
+	cl := full.dial("prober")
+	cl.sendJSON(probe)
+	atLimit := cl.recvFrame()
+
+	cl = empty.dial("prober")
+	cl.sendJSON(probe)
+	withRoom := cl.recvFrame()
+
+	if string(atLimit) != string(withRoom) {
+		t.Fatalf("a full vault answers a bogus invite differently:\n  full:  %s\n  empty: %s",
+			atLimit, withRoom)
+	}
+	if !strings.Contains(string(atLimit), `"code":"auth"`) {
+		t.Fatalf("a bogus invite is not refused as auth: %s", atLimit)
 	}
 }

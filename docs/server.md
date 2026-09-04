@@ -348,8 +348,17 @@ not point it at the live data directory: the database there is mid-write.
 
 ### Restore rehearsal
 
-A backup nobody has restored is a rumour. Once, and then once a year, on a
-machine or directory that is not the live one:
+A backup nobody has restored is a rumour. CI runs these steps on every push,
+against the built binary and a vault generated for the run: back up, lose the
+original, copy the backup somewhere fresh, `verify -deep` it, check what it
+holds against what `backup.json` claims, start a server on it, and read every
+version and every chunk body back over a real socket. It is its own job, `the
+restore rehearsal`, so a failure says which thing failed, and `scripts/check.sh`
+runs it too.
+
+What CI cannot rehearse is your copy: your offsite directory, your disk, the
+rsync you actually run. So the steps below are still worth doing by hand, once,
+and then once a year, on a machine or directory that is not the live one:
 
 1. Copy the offsite backup to a fresh directory:
    `rsync -a offsite:/backups/basalt/ /tmp/restore/`.
@@ -365,6 +374,13 @@ machine or directory that is not the live one:
    and check the history of a file. Then unlink that device from the rehearsal
    server, so it does not carry a cursor that is ahead of the live one.
 6. Stop it and delete `/tmp/restore`.
+
+Step 2 is the one that pays for itself. A body that rotted in the offsite copy
+is still there, still the right length, and a shallow verify walks straight
+past it; `-deep` re-reads every body and checks it against its name, which for
+a content-addressed store is complete for the bytes. Step 5 is the other one:
+a restore that starts and serves a vault with a hole in it passes every check
+before it, and the only thing that catches it is reading a note back.
 
 For the real thing, the steps are the same with the live directory as the
 destination:
@@ -512,6 +528,7 @@ vault "default"
   17 deleted and still recoverable
   9120 versions in all, 22384 chunks referenced
   7057 of those versions are history, which purge would drop
+  purge would reclaim 14.8 MiB in 8931 chunk bodies nothing still references
   newest uid 9120
 21117 chunk bodies on disk
 purge spares bodies newer than 1h0m0s unless -grace says otherwise
@@ -519,6 +536,18 @@ purge spares bodies newer than 1h0m0s unless -grace says otherwise
 
 The numbers are separate rather than totalled, because a total does not say
 whether a purge would help.
+
+The reclaim line is the one that answers whether the ceremony below is worth
+starting. A version count does not: seven thousand versions is four kilobytes
+or four gigabytes. The same figure is on the startup line, so a restart says
+it whether or not anybody runs `stats`, and it is the only figure here that
+needs a walk of the chunk tree, measured at 56 ms over ten thousand bodies.
+
+It is a preview and nothing else. Nothing purges on a timer, nothing purges
+while the server is up, and the number is a snapshot a later push can move.
+On a server that has just stopped, every collectible body was written within
+the grace window, so this line says so and names the bytes the window is
+holding back rather than promising space the purge then spares.
 
 `stats -json` prints the same numbers as one object, for scripts. The vaults
 are an array, so the shape is worth having in front of you:
@@ -529,7 +558,10 @@ are an array, so the shape is worth having in front of you:
                 "folders": 212, "bytes": 64193000, "deleted": 17,
                 "recoverable": 17, "purged": 0, "versions": 9120,
                 "history": 7057, "chunkRefs": 22384, "latestUid": 9120,
-                "allocatedTo": 9120, "invites": 0 } ] }
+                "allocatedTo": 9120, "invites": 0,
+                "reclaimBytes": 15518000, "reclaimBodies": 8931,
+                "recentBytes": 0, "recentBodies": 0,
+                "reclaimComplete": true } ] }
 ```
 
 The numbers above are an example, not a measurement of anything. Two of the
@@ -538,9 +570,16 @@ the vault still holds, and `allocatedTo` is the highest uid ever handed out,
 including ones a purge has since removed, so the two are equal until you
 purge and `allocatedTo` is the one that never goes backwards.
 
+`reclaimBytes` is the alertable form of the reclaim line, and `recentBytes`
+what the grace window is holding back from it; the two are never summed for
+you, because on a stopped server the first is zero and the second is the whole
+figure. `reclaimComplete` is false when the chunk walk stopped early, and then
+all four describe how far it got rather than what the vault holds: alert on
+that field before the others, and run `basaltd verify` when it is false.
+
 ## What to alert on
 
-There is no dashboard, on purpose. Four things are worth a check from a cron
+There is no dashboard, on purpose. Six things are worth a check from a cron
 job or whatever watches your machines, all readable without a key.
 
 | Signal | How to read it | What it means |
@@ -549,18 +588,25 @@ job or whatever watches your machines, all readable without a key.
 | Cursor stuck | `latestUid` from `stats -json` unchanged for days while you have been writing | Devices are not reaching the server, or one device's `basalt status` shows a server cursor ahead of its own and nothing arriving. Check the device before the server. |
 | Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, which is the expected state after restoring an older backup. `basalt rebase --backup-taken` on the headless client, or *Rejoin this server* in the plugin panel, rejoins without losing what only that device holds. The refusal each device shows names both. The log names the device. |
 | `nospace` | `journalctl -u basalt | grep nospace` | The disk is full. Nothing is lost, uploads are refused until it is not. Purge after a backup, or give it a bigger disk. |
+| A device with a wrong clock | `journalctl -u basalt \| grep 'timestamps from the future'` | That device is stamping notes with a date that has not happened, so every version it writes carries a time that reads wrong. Nothing is at risk: history is ordered by arrival, merging is by content hash. Fix the clock on the device the line names. Reported once per connection. |
+| A purge is worth running | `reclaimBytes` from `stats -json`, against how much disk you have | Old versions are holding space nothing needs. This is the row that exists so the one above never fires: the remedy for a full disk is a ceremony, and it should start because this said so rather than because uploads stopped. Check `reclaimComplete` first. |
 
 The startup line is the other thing to grep for after a restart, with the same
 made-up numbers as the example above:
 
 ```
-msg=starting version=0.3.1 vault=default latest=9120 claimed=true
+msg=starting version=0.3.1 vault=default latest=9120 claimed=true reclaimable="14.8 MiB"
 ```
 
 `latest` is the uid every device compares itself against. If a device says it
 is behind that number and nothing arrives, that is the withholding
 [design.md](design.md#what-the-server-can-and-cannot-do) says cannot be
 detected by the protocol; it is detected by you, here.
+
+`reclaimable` is what a purge would give back, and it is on this line because a
+restart is when somebody is looking. It reads `the chunk walk stopped early;
+run basaltd verify` when the walk could not finish, rather than a figure that
+would describe how far it got.
 
 ## Rotating the vault secret
 
