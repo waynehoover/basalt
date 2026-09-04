@@ -26,6 +26,7 @@ import (
 
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 	"github.com/waynehoover/basalt-sync/server/internal/dirlock"
+	"github.com/waynehoover/basalt-sync/server/internal/fsync"
 	"github.com/waynehoover/basalt-sync/server/internal/server"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
 	"github.com/waynehoover/basalt-sync/server/internal/wire"
@@ -330,6 +331,11 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 		log.Warn("the fetch cap was clamped to between one chunk and the file ceiling",
 			"asked", *maxFetch, "using", srv.MaxFetchBytes())
 	}
+	// The ceiling that will be advertised, checked against what the served
+	// vault already holds, before the port opens.
+	if err := refuseCeilingBelowContent(st, *vault, srv.PerFileMax()); err != nil {
+		return err
+	}
 
 	hs := &http.Server{
 		Addr: *addr,
@@ -399,6 +405,74 @@ func cmdServe(ctx context.Context, args []string, out io.Writer) error {
 // its ordinary requests, then the sessions. The systemd unit allows 30 s, so
 // two of these fit inside it with room for the store to close.
 const shutdownTimeout = 5 * time.Second
+
+// refuseCeilingBelowContent refuses to serve a vault holding a live file
+// larger than the ceiling this server is about to advertise.
+//
+// `ready` tells every device the largest file the server stores, and the client
+// believes it: a version over that size is refused on download, recorded as a
+// failure, and the sync moves on. So a vault that took a 100 MiB attachment
+// under `-max-file 134217728` and was restarted without the flag served every
+// device that already had the file and quietly starved every device paired
+// after. The docs said so, under Reference, and documented is not fixed.
+//
+// Refuse, rather than warn in the startup line, on the first rule. A warning is
+// read by whoever reads the journal, some time after a phone has reported the
+// vault synced with an attachment missing and nothing else has said a word,
+// which is the silent kind of failure this project is arranged against. A
+// refusal is read by whoever typed the flag, at the moment they typed it, and
+// costs nothing that can be lost: raising the flag again is always available
+// and loses nothing, because the file is already here.
+//
+// Nobody need have typed a flag to arrive here, which is why the message says
+// so. Upload a file above the ceiling, back up, delete it on a device so its
+// newest version is a deletion and it stops counting, lower the flag, and the
+// server starts. Restore that backup the documented way and the file is live
+// again under a ceiling below it, with no flag changed and no way for a device
+// to help: a device deletes by pushing an entry, and there is no server to push
+// to. purge cannot help either, because it keeps MAX(uid) per path by
+// construction. So the only remedy the message may offer as a standalone fix is
+// the one that works from a stopped server, which is the flag; the order that
+// brings the ceiling back down is spelled out rather than implied.
+// TestTheRefusalOffersOnlyRemediesAStoppedServerHas.
+//
+// Only the newest version of each live path counts; see store.FilesOver for why
+// history and deletions over the ceiling do not. Paths are sealed, so what can
+// be named is the uid and the size. TestServeRefusesACeilingBelowAFileTheVaultHolds.
+func refuseCeilingBelowContent(st *store.Store, vault string, ceiling int64) error {
+	over, err := st.FilesOver(vault, ceiling)
+	if err != nil {
+		return fmt.Errorf("checking the file ceiling against vault %q: %w", vault, err)
+	}
+	if len(over) == 0 {
+		return nil
+	}
+	const listed = 10
+	var b strings.Builder
+	noun, pronoun, isare, waswere := "files", "them", "are", "were"
+	if len(over) == 1 {
+		noun, pronoun, isare, waswere = "file", "it", "is", "was"
+	}
+	fmt.Fprintf(&b, "-max-file %d is below %d %s vault %q already holds:", ceiling, len(over), noun, vault)
+	for i, f := range over {
+		if i == listed {
+			fmt.Fprintf(&b, "\n  and %d more", len(over)-listed)
+			break
+		}
+		fmt.Fprintf(&b, "\n  uid %d is %d bytes", f.UID, f.Size)
+	}
+	fmt.Fprintf(&b, "\nA device paired from now on could never download %s, and would report the vault synced without %s.\n"+
+		"Start with -max-file %d or more and this server runs as it did. Nothing is lost by doing that: the %s\n"+
+		"%s already here. `basaltd service -max-file %d` writes the systemd unit with the flag in it, and under\n"+
+		"Docker it goes in the command.\n"+
+		"Deleting on a device is not a way out from here, because a device deletes by pushing an entry and there\n"+
+		"is no server to push to. To bring the ceiling down: raise, start, delete or shrink %s on a device, wait\n"+
+		"for that to reach this server, stop, lower.\n"+
+		"This can happen with no flag changed, by restoring a backup taken before the %s %s deleted.\n"+
+		"Paths are sealed here, so the uid and the size are all this server can say about %s.",
+		pronoun, pronoun, over[0].Size, noun, isare, over[0].Size, pronoun, noun, waswere, pronoun)
+	return errors.New(b.String())
+}
 
 // gracefulStop stops the listener and then the sessions, each with its own
 // fresh deadline (S28).
@@ -675,7 +749,7 @@ func writeTokenFile(path, content string) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		return err
 	}
-	if err := syncDir(dir); err != nil {
+	if err := fsync.Dir(dir); err != nil {
 		return err
 	}
 
@@ -695,18 +769,6 @@ func writeTokenFile(path, content string) error {
 		return fmt.Errorf("%s does not contain what was just written", path)
 	}
 	return nil
-}
-
-// syncDir flushes a directory entry so a rename into it is durable. The chunks
-// and store packages each have their own; this binary needs one that is not in
-// either of their public surfaces.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }
 
 // newToken is 160 bits in Crockford-ish base32: no padding, and the alphabet
@@ -855,19 +917,76 @@ func cmdPurge(args []string, out io.Writer) error {
 	}
 
 	rep, err := st.Purge(*vault, *grace)
-	// Print the report before returning any error. The versions were deleted
-	// before the sweep ran, so a sweep that fails still leaves work done, and
-	// swallowing the numbers would hide both what went and what a quarantined
-	// body cost. rule 8: trust the numbers. A failure inside the transaction is
-	// the other case, and Purge zeroes the report there, so what is printed is
-	// what committed rather than rows that were rolled back.
+	// Print the versions before returning any error. They were deleted before
+	// the sweep ran, in a transaction that either committed or rolled back
+	// whole, so a sweep that fails still leaves work done and swallowing the
+	// numbers would hide what went. Rule 8: trust the numbers. A failure inside
+	// the transaction is the other case, and Purge zeroes the report there, so
+	// what is printed is what committed rather than rows that were rolled back.
 	fmt.Fprintf(out, "versions %d -> %d (removed %d)\n",
 		rep.VersionsBefore, rep.VersionsAfter, rep.VersionsRemoved)
-	fmt.Fprintf(out, "chunks %d live, %d deleted, %d spared as too recent to collect\n",
-		rep.ChunksLive, rep.ChunksDeleted, rep.ChunksSpared)
+
+	// The chunk figures are a different kind of number and get a different
+	// rule. The sweep is a walk, and a walk that stopped counted what it
+	// reached rather than what the vault holds. One stray file in the first
+	// shard used to print the whole report in full, "0 spared as too recent to
+	// collect (0 B)" and all, with every collectible orphan in the tree
+	// unexamined, and then advised re-running with -grace 0, which aborts at
+	// the same file. Rule 7: a status describes the vault, not how far the
+	// filter got. So an unfinished sweep prints no figures at all, only that it
+	// stopped, and the error underneath says where.
+	// TestPurgeDoesNotPrintAReportTheSweepDidNotFinish.
+	if !rep.SweepComplete {
+		fmt.Fprintln(out, "the chunk sweep stopped before it reached the end of the store, so there are no")
+		fmt.Fprintln(out, "chunk figures here: what it had counted describes how far the walk got, not what")
+		fmt.Fprintln(out, "this vault holds. The error below says where it stopped.")
+		return err
+	}
+	fmt.Fprintf(out, "chunks %d live, %d deleted (%s reclaimed), %d spared as too recent to collect (%s)\n",
+		rep.ChunksLive, rep.ChunksDeleted, humanBytes(rep.BytesDeleted), rep.ChunksSpared, humanBytes(rep.BytesSpared))
+	if rep.ChunksSpared > 0 {
+		// What the purge did not do, as its own lines with its own numbers.
+		// The default window is right: it is what keeps a purge from starving
+		// a push mid-upload. It is also why the whole ceremony, stop, back up,
+		// purge, on a server stopped a moment ago reclaims nothing, because
+		// every body it would take was written within the hour. That used to
+		// be one figure in the middle of the line above, and an operator who
+		// came for disk space got none back and no hint why. Rule 8: the
+		// number that says what did not happen is a number too, so it gets the
+		// bytes, and the line that carries it says how to get them.
+		//
+		// The advice is safe because of where purge runs: it holds the data
+		// directory exclusively, so no server is up and nothing is in flight.
+		// A body left by a push that was cut off has no entry and its device
+		// was never acked, so it sends the body again. See chunks.DefaultGrace
+		// for the livelock the window prevents on a *running* server, and
+		// TestPurgeSaysWhatTheGraceWindowSparedAndHowToReclaimIt.
+		lead := "spared"
+		if rep.ChunksDeleted == 0 {
+			lead = "reclaimed nothing: spared"
+		}
+		fmt.Fprintf(out, "%s %d bodies (%s) written within the last %s, in case a push was interrupted mid-upload.\n"+
+			"Nothing is in flight on a stopped server, and purge only runs on one, so re-run with -grace 0 to reclaim them.\n",
+			lead, rep.ChunksSpared, humanBytes(rep.BytesSpared), *grace)
+	}
+	// The two other kinds of file a sweep walks past, both with their bytes.
+	// Both are space this purge did not reclaim, which is the figure somebody
+	// purging for space came for, and a count with no bytes beside it does not
+	// answer that (rule 8).
 	if rep.ChunksQuarantined > 0 {
-		fmt.Fprintf(out, "%d quarantined bodies left in place, waiting for a device to resend them\n",
-			rep.ChunksQuarantined)
+		fmt.Fprintf(out, "%d quarantined bodies (%s) left in place, waiting for a device to resend them\n",
+			rep.ChunksQuarantined, humanBytes(rep.BytesQuarantined))
+	}
+	if rep.ChunksTemp > 0 {
+		// Nothing collects these, at any grace. They are the debris of a push
+		// that was killed between uploading a body and renaming it into place,
+		// and deleting them is not this command's job: a body under a temporary
+		// name has no name to check it against, so removing one is deleting a
+		// file on the strength of where it sits. Named, with its bytes, so it
+		// is somebody's decision rather than a slow leak nothing mentions.
+		fmt.Fprintf(out, "%d unfinished uploads (%s) left in place; no grace collects these, and they are\n"+
+			"the debris of a push that was killed mid-upload. Nothing on a device is waiting for them.\n",
+			rep.ChunksTemp, humanBytes(rep.BytesTemp))
 	}
 	if err != nil {
 		return err
@@ -1023,6 +1142,17 @@ func cmdBackup(args []string, out io.Writer) error {
 
 	if tokenCopied {
 		fmt.Fprintln(out, "  the device auth token is in the backup, so a restore needs no re-pairing")
+	}
+
+	// What the backup covers, read back from the file just written rather than
+	// from the report (rule 4), so what is printed is what a script will find.
+	meta, err := store.ReadBackupMeta(*to)
+	if err != nil {
+		return fmt.Errorf("reading back %s: %w", store.BackupMetaFile, err)
+	}
+	for _, v := range meta.Vaults {
+		fmt.Fprintf(out, "  %s: vault %q holds uids %d to %d (%d versions), purge generation %d\n",
+			store.BackupMetaFile, v.Vault, v.OldestUID, v.LatestUID, v.Versions, v.Purges)
 	}
 
 	// The copy is ciphertext. Saying so every time is the point: a backup

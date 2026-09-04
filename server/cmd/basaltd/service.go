@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,6 +10,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/waynehoover/basalt-sync/server/internal/dirlock"
+	"github.com/waynehoover/basalt-sync/server/internal/server"
+	"github.com/waynehoover/basalt-sync/server/internal/store"
 )
 
 // cmdService prints a systemd unit for running this server.
@@ -28,7 +33,49 @@ func cmdService(args []string, out io.Writer) error {
 	vault := fs.String("vault", "default", "the one vault this server serves")
 	runAs := fs.String("user", "", "user to run as (default: whoever is running this)")
 	binary := fs.String("binary", "", "path to the basalt binary (default: this one)")
+	// The ceiling goes in the unit, because a unit that cannot carry it is how
+	// somebody who ran by hand with -max-file makes that permanent and silently
+	// drops it. serve then refuses to start on a vault holding a larger file,
+	// which is right, and the refusal arrives at three in the morning under
+	// Restart=always instead of here. See the check below and
+	// TestTheUnitCarriesTheFileCeiling.
+	maxFile := fs.Int64("max-file", store.DefaultPerFileMax,
+		"largest file to accept, in bytes; written into the unit, because a unit that drops it will not start on a vault holding a larger file")
 	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// The unit this is about to print has to be one that starts. serve refuses
+	// a ceiling below a live file the vault already holds, so a unit generated
+	// without the flag that the vault needs is a unit that fails on first
+	// start, five seconds later, and every five seconds after that. Checked
+	// here, against the same store and the same rule, so the refusal reaches
+	// whoever is typing rather than whoever reads journals (rule 7: say what
+	// the vault holds, not what this command was told).
+	//
+	// Only when there is a data directory to read. `basaltd service` is
+	// normally run before the first serve, on a directory that does not exist
+	// yet, and refusing to print a unit because there is nothing to check
+	// would be refusing the ordinary case. Shared, like verify: this reads and
+	// can run beside a live server.
+	dbPath, _ := store.DataDir(*dataDir)
+	if _, err := os.Stat(dbPath); err == nil {
+		lock, err := dirlock.Shared(*dataDir, dirlock.Data)
+		if err != nil {
+			return locked(err, *dataDir, "service", stopFirst)
+		}
+		defer lock.Release()
+		st, err := openStore(*dataDir)
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		if err := refuseCeilingBelowContent(st, *vault, server.ClampPerFileMax(*maxFile)); err != nil {
+			return fmt.Errorf("this unit would not start:\n%w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		// Rule 2: a failed read is not an empty result. A data directory that
+		// cannot be described is not one with nothing in it.
 		return err
 	}
 
@@ -85,7 +132,8 @@ func cmdService(args []string, out io.Writer) error {
 		}
 	}
 
-	fmt.Fprint(out, unit(unitArgs{Binary: exe, Data: data, Addr: *addr, Vault: *vault, User: who, Home: home}))
+	fmt.Fprint(out, unit(unitArgs{Binary: exe, Data: data, Addr: *addr, Vault: *vault, User: who,
+		Home: home, MaxFile: server.ClampPerFileMax(*maxFile)}))
 	// The examples are shell, not systemd, so their paths are shell-quoted. A
 	// path with a space, pasted unquoted, would run `backup -data /my` against a
 	// directory that is not the one meant.
@@ -151,6 +199,8 @@ type unitArgs struct {
 	Binary, Data, Addr, Vault, User string
 	// Home is the run-as user's home directory, or "" when unknown.
 	Home string
+	// MaxFile is the file ceiling the unit will run with, in bytes.
+	MaxFile int64
 }
 
 // unit is the systemd unit itself.
@@ -171,11 +221,27 @@ func unit(a unitArgs) string {
 		"After=network-online.target",
 		"Wants=network-online.target",
 		"",
+		"# Restart=always below comes back from anything, and this is where that",
+		"# stops. serve refuses to start on a vault holding a file above",
+		"# -max-file, and a refusal is not a crash: with no limit it reprints",
+		"# every five seconds for ever while the unit never reaches failed and",
+		"# nothing watching unit state says a word. Five failures inside five",
+		"# minutes and systemd gives up, so `systemctl status basalt` says failed",
+		"# and the reason is the last thing in the journal. Once it is fixed,",
+		"# `systemctl reset-failed basalt` before starting again. A server that",
+		"# crashes now and then is well inside this and still comes back.",
+		"StartLimitIntervalSec=5min",
+		"StartLimitBurst=5",
+		"",
 		"[Service]",
 		"Type=simple",
 		"User=" + a.User,
-		fmt.Sprintf("ExecStart=%s serve -data %s -addr %s -vault %s",
-			systemdArg(a.Binary), systemdArg(a.Data), systemdArg(a.Addr), systemdArg(a.Vault)),
+		// -max-file is spelled out rather than left to the default. The default
+		// is a number in this binary, and a unit whose ceiling moves when the
+		// binary is upgraded is a unit that stops starting on a vault holding a
+		// file the old default allowed.
+		fmt.Sprintf("ExecStart=%s serve -data %s -addr %s -vault %s -max-file %d",
+			systemdArg(a.Binary), systemdArg(a.Data), systemdArg(a.Addr), systemdArg(a.Vault), a.MaxFile),
 		"",
 		"# SIGTERM is what serve already listens for, and it finishes what it is",
 		"# doing: an ack means stored, and a shutdown must not turn one into a lie.",
@@ -187,6 +253,7 @@ func unit(a unitArgs) string {
 		"# syncing.",
 		"Restart=always",
 		"RestartSec=5",
+		"# ...but not for ever: see the start limit in [Unit] above.",
 		"",
 		"# One directory, one socket, nothing else.",
 		"NoNewPrivileges=true",

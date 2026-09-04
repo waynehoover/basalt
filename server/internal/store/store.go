@@ -259,7 +259,17 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- the hash it authenticated under and checks it again after joining; if it
   -- moved, the session is refused. Reading hash and blob in one query does not
   -- close that, because the window is after the read.
-  rotations  INTEGER NOT NULL DEFAULT 0
+  rotations  INTEGER NOT NULL DEFAULT 0,
+  -- How many purges have dropped history from this vault. Bumped inside the
+  -- purge transaction, and only when the purge removed something, so it moves
+  -- exactly when versions leave the store for good.
+  --
+  -- It exists for backups. A backup directory never deletes a body, so after a
+  -- purge it holds history the source no longer has, and the runbook is to
+  -- start a fresh directory and keep the old one. Deciding which directory is
+  -- the one with the history in it needs a number that says which side of a
+  -- purge each was taken on, and this is that number; backup.json records it.
+  purges     INTEGER NOT NULL DEFAULT 0
 );
 
 -- Single-use invites for adding a device without showing the root secret
@@ -350,6 +360,13 @@ type Store struct {
 	// that tried to commit inside it by timing would be a test that passes when
 	// the machine is busy.
 	duringBackup func()
+
+	// afterPublish runs inside Backup, after the snapshot has been renamed over
+	// the previous one and before backup.json is written, and is nil in every
+	// non-test build. Returning an error from it stands in for a crash in that
+	// window, which is the window the coverage file's whole ordering argument
+	// is about.
+	afterPublish func() error
 
 	// afterPurgeDelete runs inside Purge's transaction, after the DELETE and
 	// before the checks, and is nil in every non-test build. Returning an error
@@ -986,7 +1003,14 @@ type Stats struct {
 	Versions    int64 // entry rows, including superseded ones
 	ChunkRefs   int64 // distinct chunk names referenced by any entry
 	LatestUID   int64
+	// OldestUID is the smallest uid still present, or 0 for an empty vault.
+	// With LatestUID it is the range a backup of this vault covers; a purge
+	// moves it up as the oldest versions go.
+	OldestUID   int64
 	AllocatedTo int64 // next_uid - 1: uids handed out, including purged ones
+	// Purges is how many purges have dropped history from this vault; see the
+	// column's comment in the schema.
+	Purges int64
 }
 
 func (s *Store) Stats(vaultID string) (Stats, error) {
@@ -1021,17 +1045,65 @@ func (s *Store) Stats(vaultID string) (Stats, error) {
 		vaultID).Scan(&st.ChunkRefs); err != nil {
 		return st, err
 	}
-	var next sql.NullInt64
+	var next, purges sql.NullInt64
 	if err := s.db.QueryRow(
-		`SELECT next_uid FROM vaults WHERE vault_id = ?`, vaultID).Scan(&next); err != nil {
+		`SELECT next_uid, purges FROM vaults WHERE vault_id = ?`, vaultID).Scan(&next, &purges); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return st, err
 		}
 	}
 	st.AllocatedTo = next.Int64 - 1
+	st.Purges = purges.Int64
+	var oldest sql.NullInt64
+	if err := s.db.QueryRow(
+		`SELECT MIN(uid) FROM entries WHERE vault_id = ?`, vaultID).Scan(&oldest); err != nil {
+		return st, err
+	}
+	st.OldestUID = oldest.Int64
 	var err error
 	st.LatestUID, err = s.LatestUID(vaultID)
 	return st, err
+}
+
+// Oversize is a live file whose declared size is above some ceiling: the uid
+// of its newest version and that size. Paths are sealed, so these two are all
+// the server can say about it.
+type Oversize struct {
+	UID  int64
+	Size int64
+}
+
+// FilesOver lists the files a device syncing this vault today would download
+// and could not, if the server advertised limit as its file ceiling: the
+// newest version of each path that is neither deleted nor a folder, where the
+// declared size is over limit. Largest first.
+//
+// Only the newest version per path counts. A superseded version over the
+// ceiling is history nobody is sent on a first sync, and a deleted file's
+// newest version is its deletion record, which has no size. Counting either
+// would mean a ceiling could never be lowered after one large upload without
+// a purge, which is a stricter rule than "do not strand a file" needs.
+func (s *Store) FilesOver(vaultID string, limit int64) ([]Oversize, error) {
+	rows, err := s.db.Query(
+		`SELECT e.uid, e.size
+		   FROM entries e
+		   JOIN (SELECT path, MAX(uid) AS uid FROM entries WHERE vault_id = ? GROUP BY path) latest
+		     ON e.path = latest.path AND e.uid = latest.uid
+		  WHERE e.vault_id = ? AND e.deleted = 0 AND e.folder = 0 AND e.size > ?
+		  ORDER BY e.size DESC, e.uid ASC`, vaultID, vaultID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Oversize
+	for rows.Next() {
+		var o Oversize
+		if err := rows.Scan(&o.UID, &o.Size); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }
 
 // Vaults lists every vault id, oldest first.
@@ -1070,11 +1142,32 @@ type PurgeReport struct {
 	// rather than folded into the deleted count so the numbers add up and a
 	// grace window that is doing nothing is visible.
 	ChunksSpared int
+	// BytesDeleted is what the sweep reclaimed and BytesSpared what the grace
+	// window kept from it. Counts alone hid the one figure an operator purging
+	// for space came for: "2 spared" is two kilobytes or two gigabytes, and a
+	// purge on a just-stopped server spares everything it would otherwise take.
+	BytesDeleted int64
+	BytesSpared  int64
 	// ChunksQuarantined were set aside because they failed their own hash. They
 	// are kept until a client resends the real chunk, so a purge counts them
 	// rather than collecting them, and reports the count so a body that has gone
 	// bad is visible rather than silently sitting in the tree.
+	//
+	// ChunksTemp is `.tmp-` debris, which nothing removes at any grace. Both
+	// carry their bytes, because both are space the purge did not reclaim and
+	// a count without bytes is the figure an operator purging for space cannot
+	// use.
 	ChunksQuarantined int
+	ChunksTemp        int
+	BytesQuarantined  int64
+	BytesTemp         int64
+
+	// SweepComplete says the chunk sweep reached the end of the tree. When it
+	// is false every chunk figure above describes how far the walk got rather
+	// than what the vault holds, and a caller must not print them as a status
+	// (rule 7). The version figures are unaffected: they come from a committed
+	// transaction that ran before the sweep.
+	SweepComplete bool
 }
 
 // Purge drops version history, keeping only the newest entry per path, then
@@ -1158,6 +1251,18 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 				rep.VersionsBefore, rep.VersionsRemoved, rep.VersionsAfter)
 		}
 
+		// The generation moves with the history, in the same transaction, and
+		// only when history actually left: a purge that found nothing to drop
+		// changes what a backup taken before it is the last copy of not at
+		// all. See the column's comment in the schema, and
+		// TestAPurgeThatDropsNothingDoesNotMoveTheGeneration.
+		if rep.VersionsRemoved > 0 {
+			if _, err := tx.Exec(
+				`UPDATE vaults SET purges = purges + 1 WHERE vault_id = ?`, vaultID); err != nil {
+				return err
+			}
+		}
+
 		// The live set is read here, after the delete and inside the same
 		// transaction, so it is exactly what the committed result references.
 		live, err = liveChunks(tx, vaultID)
@@ -1174,7 +1279,12 @@ func (s *Store) Purge(vaultID string, grace time.Duration) (PurgeReport, error) 
 	}
 
 	rep.ChunksLive = len(live)
-	rep.ChunksDeleted, rep.ChunksSpared, rep.ChunksQuarantined, err = s.chunks.Sweep(vaultID, live, time.Now().Add(-grace))
+	swept, err := s.chunks.Sweep(vaultID, live, time.Now().Add(-grace))
+	rep.ChunksDeleted, rep.ChunksSpared = swept.Deleted, swept.Spared
+	rep.ChunksQuarantined, rep.ChunksTemp = swept.Quarantined, swept.Temp
+	rep.BytesDeleted, rep.BytesSpared = swept.DeletedBytes, swept.SparedBytes
+	rep.BytesQuarantined, rep.BytesTemp = swept.QuarantinedBytes, swept.TempBytes
+	rep.SweepComplete = swept.Complete
 	return rep, err
 }
 
@@ -1424,9 +1534,26 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
-	// The index behind Deleted()'s rename suppression. CREATE INDEX IF NOT
-	// EXISTS in the schema covers a new database; this covers one that already
-	// existed.
+	// The purge generation. A database written before it starts at zero, which
+	// is right for the same reason rotations is: a backup taken from it says
+	// generation zero, the first purge afterwards makes it one, and the only
+	// comparison anyone makes is between two of these numbers.
+	if has, err := hasColumn(db, "vaults", "purges"); err != nil {
+		return err
+	} else if !has {
+		if _, err := db.Exec(
+			`ALTER TABLE vaults ADD COLUMN purges INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+
+	// The index behind Deleted()'s rename suppression. Belt and braces: unlike
+	// CREATE TABLE IF NOT EXISTS, the CREATE INDEX IF NOT EXISTS in the schema
+	// does reach a table that already exists, so this is a second statement
+	// saying the same thing rather than the only one that says it. It stays so
+	// the migration reads as the complete list of what an older database is
+	// missing. TestOpeningADatabaseFromAnOlderBuildAddsTheColumnsAndLosesNothing
+	// asserts the index is there, not which statement made it.
 	if _, err := db.Exec(
 		`CREATE INDEX IF NOT EXISTS entries_by_prev ON entries(vault_id, prev_path, uid)`); err != nil {
 		return err

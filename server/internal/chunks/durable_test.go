@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/waynehoover/basalt-sync/server/internal/fsync"
 )
 
 // S17 and S25: the two ways a body could be on disk and not be durable, or be
@@ -21,7 +23,7 @@ func recordingSyncs(s *Store) *[]string {
 	var flushed []string
 	s.sync = func(dir string) error {
 		flushed = append(flushed, dir)
-		return syncDir(dir)
+		return fsync.Dir(dir)
 	}
 	return &flushed
 }
@@ -163,16 +165,16 @@ func TestS17AConcurrentFirstChunkWaitsForTheDirectoryToBeDurable(t *testing.T) {
 			// The store root is flushed first, which is after both directories
 			// have been created: the moment the loser can see them.
 			once.Do(func() { close(rootFlushed) })
-			return syncDir(dir)
+			return fsync.Dir(dir)
 		}
 		if dir == vaultDir {
 			// A slow fsync, which is what an fsync is.
 			<-release
-			err := syncDir(dir)
+			err := fsync.Dir(dir)
 			vaultFlushed.Store(true)
 			return err
 		}
-		return syncDir(dir)
+		return fsync.Dir(dir)
 	}
 
 	winner := make(chan error, 1)

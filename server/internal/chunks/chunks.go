@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/waynehoover/basalt-sync/server/internal/fsync"
 )
 
 // NameLen is the length of a chunk name in characters.
@@ -90,7 +92,7 @@ type Store struct {
 	// mkdirAll for the race it closes.
 	mkdirMu sync.Mutex
 
-	// sync flushes one directory and is syncDir in every non-test build. A
+	// sync flushes one directory and is fsync.Dir in every non-test build. A
 	// test replaces it to see which directories were flushed, because the one
 	// fault this package guards against, a name that is not durable, leaves
 	// no trace on a disk that did not lose power.
@@ -113,7 +115,7 @@ func New(dir string, max int64) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir, max: max, sync: syncDir, write: writeAll}, nil
+	return &Store{dir: dir, max: max, sync: fsync.Dir, write: writeAll}, nil
 }
 
 // writeAll writes the whole body or reports why it could not.
@@ -641,16 +643,28 @@ const DefaultGrace = time.Hour
 // Sweep never reports success it has not verified: a body it fails to remove is
 // an error, not a silent omission from the count.
 //
-// quarantined counts bodies Quarantine set aside because they failed their own
+// Quarantined counts bodies Quarantine set aside because they failed their own
 // hash. They are left in place on purpose, so the sweep reports them rather than
 // aborting on them: aborting is how one quarantined body turned every later
 // purge into a failure that deleted history and reclaimed nothing.
-func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time) (deleted, spared, quarantined int, err error) {
+//
+// Complete says whether the walk reached the end of the tree. WalkDir stops at
+// the first error, so anything that aborts it leaves counts that describe how
+// far it got and not what the vault holds, and a caller must not print them
+// (rule 7). One stray file in the first shard used to produce a full report
+// reading "0 spared as too recent to collect (0 B)" with every collectible
+// orphan in the tree unexamined, followed by advice to re-run with -grace 0,
+// which aborts at the same file. TestSweepReportsNothingItDidNotFinishLookingAt
+// and TestPurgeDoesNotPrintAReportTheSweepDidNotFinish.
+func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time) (SweepReport, error) {
+	var rep SweepReport
 	root := s.VaultDir(vaultID)
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		return 0, 0, 0, nil
+		// Nothing here to describe, which the walk below would have said too.
+		rep.Complete = true
+		return rep, nil
 	}
-	err = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			// An unreadable directory is not an empty one. Aborting leaves the
 			// chunks in place; continuing would report a clean sweep of a tree
@@ -664,7 +678,26 @@ func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time
 		if strings.HasPrefix(name, tmpPrefix) {
 			// An in-progress Put, or the debris of a crashed one. Leaving it
 			// costs a little disk; deleting it can pull the file out from under
-			// a live upload.
+			// a live upload. Counted rather than skipped in silence: nothing
+			// removes these at any grace, so they are space the purge did not
+			// reclaim, and saying what was not reclaimed is what this report
+			// is for.
+			info, statErr := d.Info()
+			if statErr != nil {
+				// Gone between the readdir and the stat, which for a temporary
+				// name is a Put finishing its rename underneath the walk: it
+				// is the expected outcome, not a fault, and it is what
+				// TestPushesCompleteWhileAPurgeIsRunning produces. Nothing here
+				// is about to be deleted on the strength of this stat, so the
+				// rule-2 answer below does not apply; only a failure that is
+				// not "it is not there" is a failure.
+				if os.IsNotExist(statErr) {
+					return nil
+				}
+				return statErr
+			}
+			rep.Temp++
+			rep.TempBytes += info.Size()
 			return nil
 		}
 		if strings.HasSuffix(name, corruptSuffix) {
@@ -672,7 +705,19 @@ func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time
 			// It is meant to stay until a client resends the real chunk, so it
 			// is counted and skipped, not deleted and not treated as an
 			// unexpected file. See Quarantine.
-			quarantined++
+			info, statErr := d.Info()
+			if statErr != nil {
+				// Same as the temporary names above: this one is counted, not
+				// deleted, so a body that has gone between the readdir and the
+				// stat is one less thing to report rather than a reason to
+				// abandon the sweep.
+				if os.IsNotExist(statErr) {
+					return nil
+				}
+				return statErr
+			}
+			rep.Quarantined++
+			rep.QuarantinedBytes += info.Size()
 			return nil
 		}
 		if !ValidName(name) {
@@ -691,16 +736,49 @@ func (s *Store) Sweep(vaultID string, live map[string]struct{}, cutoff time.Time
 			return statErr
 		}
 		if !info.ModTime().Before(cutoff) {
-			spared++
+			rep.Spared++
+			rep.SparedBytes += info.Size()
 			return nil
 		}
 		if rmErr := os.Remove(p); rmErr != nil {
 			return rmErr
 		}
-		deleted++
+		rep.Deleted++
+		rep.DeletedBytes += info.Size()
 		return nil
 	})
-	return deleted, spared, quarantined, err
+	rep.Complete = err == nil
+	return rep, err
+}
+
+// SweepReport is what a sweep did and did not do, in bodies and in bytes.
+//
+// The bytes are there because the counts alone hid the figure an operator
+// purging for space came for. A purge on a server stopped a moment ago spares
+// every body it would otherwise take, and "2 spared" reads the same whether the
+// window kept back two kilobytes or two gigabytes. Rule 8: the number that says
+// what did not happen is as much a number as the one that says what did.
+type SweepReport struct {
+	Deleted     int
+	Spared      int
+	Quarantined int
+	// Temp is `.tmp-` debris: an in-progress Put, or what a crashed one left.
+	// Nothing removes these at any grace, so they are counted here rather than
+	// skipped in silence, for the same reason the spared bytes are.
+	Temp int
+
+	DeletedBytes int64
+	SparedBytes  int64
+	// QuarantinedBytes and TempBytes are the same figure for the two kinds of
+	// file a sweep walks past. A count with no bytes beside it is the thing
+	// this type's own doc comment says is not enough.
+	QuarantinedBytes int64
+	TempBytes        int64
+
+	// Complete says the walk reached the end of the tree. False means every
+	// number above describes how far it got, not what the vault holds, and
+	// none of them may be reported as a status (rule 7). See Sweep.
+	Complete bool
 }
 
 // CountBodies counts the chunk files this store holds, across every vault.
@@ -729,13 +807,4 @@ func (s *Store) CountBodies() (int, error) {
 		return 0, nil
 	}
 	return n, err
-}
-
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }

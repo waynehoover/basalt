@@ -79,13 +79,14 @@ not ask for should never rewrite the file you are editing.
 Notes are chunked on a rolling hash and only the chunks the server lacks are
 sent. One line inserted into a 2 MiB note costs about 22 KB, most of it the
 entry naming the new version's chunks. Chunks are compressed after chunking and
-before encryption, which takes a vault's text from 108% of plaintext on the
-wire to about 60%, or nearer 69% for a real vault that also holds attachments,
-because a photograph does not compress. That order is forced: compressing first would move every boundary on
-any edit, and ciphertext does not compress.
+before encryption, which takes a vault's text to well under what the plaintext
+would have cost. That order is forced: compressing first would move every
+boundary on any edit, and ciphertext does not compress.
 
-Every size and threshold came from a measurement on a real vault.
-[compared.md](compared.md) has the numbers.
+Every size and threshold came from a measurement on a real vault, and the
+figures live in [compared.md](compared.md) with the corpus each was taken on,
+rather than being restated here, so there is one place to correct when they are
+measured again.
 
 ## Simplicity
 
@@ -183,6 +184,29 @@ rather than a corruption: no note is altered, and a person notices when two
 devices disagree. Detecting it needs a hash chain over the whole log, which was
 measured and rejected because a global chain forces concurrent writers to
 serialise, one round trip per collision.
+
+### What a stranger on the port learns
+
+Behind `tailscale serve` the port is private. Behind Caddy it is on the
+internet, and an unauthenticated request can reach exactly three things: `GET
+/health`, one hello frame before the server decides whether to keep talking,
+and the `426` that every other path and method gets, which says `basalt speaks
+websocket only`. None of them says which release is running. `/health` answers
+`ok` and nothing else, the `426` names no version and sends no `Server` header,
+and a hello refused for its protocol or crypto names the range the server
+speaks and not its version. The version is in `ready`, which only a device
+holding the vault's auth key receives, and in `basaltd version` on the machine
+itself. A version string is where targeted probing starts, and the operator has
+better ways to learn it than the network does.
+
+That is a property rather than three careful strings, and it is tested as one:
+a sentinel version is stamped on the server and every pre-auth response,
+headers included, is checked for it.
+
+What a stranger can still learn is that a Basalt server is here and which
+protocol it speaks, because the refusal has to name the numbers for an old
+client to know which end to upgrade, and that the port is up, because a
+healthcheck has to say so.
 
 ## The keys
 

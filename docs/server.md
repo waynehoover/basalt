@@ -27,8 +27,10 @@ once produced a successful backup of nothing.
 
 ### Docker
 
-The image is the binary on an empty filesystem: about 5 MB to pull, 12 MB on
-disk, no shell, nothing to update. `latest` is for trying it out; pin the tag
+The image is the binary on an empty filesystem: no shell, no package manager,
+nothing to update. For 0.3.1 on linux/amd64 it is 5.2 MB of compressed layers
+to pull and a 12.0 MB binary on disk, which you can check for any release with
+`docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:<tag> --raw`. `latest` is for trying it out; pin the tag
 and its digest for a server you keep, the way `compose.yaml` does, so a pull
 cannot move you to an image nobody tested against your devices.
 
@@ -80,6 +82,14 @@ filter, and address families limited to sockets. `ProtectHome` is added only
 when the data directory is outside a home directory, since otherwise it would
 stop the server starting.
 
+It restarts from anything, but not for ever: five failures inside five minutes
+and systemd stops, so a server that is *refusing* rather than crashing shows up
+as `failed` instead of reprinting the same refusal every five seconds while
+nothing watching unit state says a word. Once the reason is fixed,
+`systemctl reset-failed basalt` before starting it again. Every flag the unit runs with is
+written out, `-max-file` included, so upgrading the binary cannot move a
+running server's ceiling underneath it.
+
 The server's own releases are tagged `server/vX.Y.Z`. The plugin is released
 separately, on bare version tags, because the two move on different clocks. A
 client and server that disagree on the protocol version refuse each other by
@@ -89,8 +99,9 @@ name, so a mismatch never half-works.
 
 The server first, then each client. The handshake carries the range of
 protocol versions a server speaks, and a device outside it is refused at hello
-with both numbers and the server's version, which is the message to read as
-"upgrade the server".
+with both numbers, which is the message to read as "upgrade the server". The
+refusal does not say which release the server is, because nothing has
+authenticated when it is sent; `basaltd version` on the server does.
 
 Today that range is one version wide. Protocol 3 is the only protocol: the two
 before it were removed rather than carried, because nothing had been deployed
@@ -220,6 +231,47 @@ place, and read back to confirm both its contents and its `0600` mode, so a
 crash cannot leave it half written and a restore cannot inherit a world-readable
 credential.
 
+Beside the database the backup writes `backup.json`: when the snapshot was
+taken, which database it describes, and, per vault, the uid range it covers and
+the purge generation the source was at. It is what lets a script answer "which
+backup covers uid 4021" or "which directory still has the history I purged"
+without opening SQLite:
+
+```json
+{
+  "format": 2,
+  "takenAt": "2026-09-03T03:30:12Z",
+  "database": {"bytes": 5292032, "modifiedAt": "2026-09-03T03:30:12.418Z"},
+  "vaults": [
+    {"vault": "default", "oldestUid": 1, "latestUid": 4188,
+     "allocatedTo": 4188, "versions": 4188, "purges": 0}
+  ]
+}
+```
+
+The file is either a summary of the `basalt.db` beside it or it is not there.
+The previous run's copy is removed before the new database is published and the
+new copy written after, so a crash in between leaves no `backup.json` rather
+than one describing a snapshot that has gone: after a purge the previous run's
+coverage is the *larger*, older range, and the query below would then pick this
+directory for a uid it no longer holds. The next run writes it again. `database`
+is the other half of the same promise, for the case no ordering here can
+prevent: a build that does not write this file republishing into the same
+directory. If `bytes` does not match `basalt.db` beside it, the file describes a
+snapshot that is gone, and every command that reads it refuses rather than
+answering from it. `modifiedAt` is the stronger check for a directory nobody has
+copied, since copying moves it.
+
+```bash
+jq '.vaults[] | select(.vault == "default" and .oldestUid <= 4021 and 4021 <= .latestUid)' \
+  /srv/basalt-backup*/backup.json
+```
+
+`versions` against the span says whether the snapshot has holes, which a purge
+leaves; `purges` is the generation, and `basaltd stats -json` reports the live
+store's as `purges` too. The database is the authority and this is a summary of
+it; `verify` still reads the database.
+
 **The backup is ciphertext.** Restoring it needs the vault's root secret, which
 lives on your devices and in the pairing string. Keep the pairing string
 somewhere other than the backup. The command reminds you every time because no
@@ -326,12 +378,18 @@ A device that has already seen versions newer than the backup is refused with
 `code:"cursor"`. That is deliberate. Continuing would reissue version numbers
 for different content and the two would silently diverge.
 
-On the headless client the way back is `basalt rebase --backup-taken`, which
-prints both cursors, rejoins from the server's, and re-uploads what only that
-device holds as new versions, deleting nothing. See
-[the client README](../client/README.md#commands). The plugin has no rebase,
-so a plugin device is unlinked and paired again; its notes are on the device
-and come back as new versions either way.
+Both clients have the way back, and it is the same operation. On the headless
+client it is `basalt rebase --backup-taken`, which prints both cursors, rejoins
+from the server's, and re-uploads what only that device holds as new versions,
+deleting nothing. See [the client README](../client/README.md#commands). In the
+plugin it is *Rejoin this server*, which appears in the panel only while that
+device is the one being refused: the first press shows both versions and asks
+again, the second does it.
+
+Unlinking and pairing again also gets a device back on, and costs more than it
+looks: re-pairing resets the merge base, so every note returns as a version with
+no ancestor and the next edit made on two devices at once cannot merge. Prefer
+the rebase, on either client.
 
 ### After a purge: the bodies the backup keeps
 
@@ -345,6 +403,19 @@ after a purge, and keep the old one for as long as you might want the history
 it holds, then delete it whole. There is no command that removes bodies from a
 backup, on purpose, because a tool that deletes from the one copy of what was
 purged is the tool that gets run with the wrong path.
+
+`backup.json` is what tells the two directories apart. The old one says a
+lower `purges` than the live store (`basaltd stats -json`) and a lower
+`oldestUid` than the new one: it is the one with the history in it. Before the
+old directory goes, in this order:
+
+1. Take a backup into the fresh directory and read its `backup.json`. Its
+   `purges` must equal the live store's and its `latestUid` must be at least
+   the live store's newest uid.
+2. `basaltd verify -deep -data /srv/basalt-backup-new`, and it must say
+   `0 faults` over a non-zero number of references.
+3. Only then delete the old directory whole. A script deciding this compares
+   the two `backup.json` files and never has to open a database.
 
 ### Your notes are also plain files
 
@@ -373,9 +444,9 @@ while a server holds it. Run it as its own container against the same volume.
 
 ```bash
 docker compose stop basalt
-docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.0 \
+docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.1 \
   backup -data /data -to /data/backup
-docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.0 \
+docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.1 \
   purge -data /data -confirm default -backup /data/backup -grace 0
 docker compose start basalt
 ```
@@ -390,7 +461,27 @@ purge deletes nothing.
 It refuses to run while the server is up. By default it spares unreferenced
 bodies written in the last hour, in case they belong to an upload that was
 interrupted. On a server you just stopped nothing was in flight, so `-grace 0`
-is what actually reclaims the space.
+is what actually reclaims the space. A purge that spared anything says so on
+its own line, with the count and the bytes it left behind and the flag that
+would take them, so the default ceremony cannot reclaim nothing quietly:
+
+```
+chunks 5 live, 0 deleted (0 B reclaimed), 2 spared as too recent to collect (22 B)
+reclaimed nothing: spared 2 bodies (22 B) written within the last 1h0m0s, in case a push was interrupted mid-upload.
+Nothing is in flight on a stopped server, and purge only runs on one, so re-run with -grace 0 to reclaim them.
+```
+
+Two other kinds of file the sweep walks past get their own line when there are
+any, with their bytes, because both are space the purge did not reclaim:
+quarantined bodies, which stay until a device resends the real chunk, and
+unfinished uploads, which no grace collects at all.
+
+If the sweep cannot finish, no chunk figures are printed. It walks the tree and
+stops at the first thing it does not recognise, so its counts would describe how
+far it got rather than what the vault holds: one stray file in the first shard
+read as "0 spared as too recent to collect" with every collectible orphan
+unexamined. The versions line stays, because that ran in a transaction that
+committed, and the error names the file to remove.
 
 A deleted note's newest version is its deletion record, so purge removes its
 content while the path stays listed as deleted. `basalt deleted` marks those
@@ -451,9 +542,9 @@ job or whatever watches your machines, all readable without a key.
 
 | Signal | How to read it | What it means |
 |---|---|---|
-| Health failing | `basaltd health` exits non-zero | The server is down or not answering. systemd restarts it; if it keeps failing, `journalctl -u basalt` has the reason. |
+| Health failing | `basaltd health` exits non-zero | The server is down or not answering. systemd restarts it, and after five failures in five minutes gives up and marks the unit `failed`; `journalctl -u basalt` has the reason. |
 | Cursor stuck | `latestUid` from `stats -json` unchanged for days while you have been writing | Devices are not reaching the server, or one device's `basalt status` shows a server cursor ahead of its own and nothing arriving. Check the device before the server. |
-| Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, which is the expected state after restoring an older backup. On the headless client, `basalt rebase --backup-taken` rejoins without losing what only that device holds. The plugin has no rebase, so those devices are unlinked and paired again. The log names the device. |
+| Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, which is the expected state after restoring an older backup. `basalt rebase --backup-taken` on the headless client, or *Rejoin this server* in the plugin panel, rejoins without losing what only that device holds. The refusal each device shows names both. The log names the device. |
 | `nospace` | `journalctl -u basalt | grep nospace` | The disk is full. Nothing is lost, uploads are refused until it is not. Purge after a backup, or give it a bigger disk. |
 
 The startup line is the other thing to grep for after a restart, with the same
@@ -475,13 +566,16 @@ credential. There is no per-device revocation. If a pairing string has been
 somewhere it should not have been, give the vault a new secret.
 
 Every vault has a data key wrapped under the root, so the root can change
-without the history changing. Rotation is a headless-client command; the
-plugin has no rotate, so run it from a machine with the CLI paired to the
-vault:
+without the history changing. Either client can do it, from any device that
+still has the vault. On a machine with the headless client:
 
 ```bash
 basalt rotate
 ```
+
+In Obsidian it is *Replace the vault's secret* in the panel, behind a warning
+and two presses. It matters that the plugin has this: the device somebody loses
+is usually a phone, and so, often, is the only other one they have with them.
 
 The server replaces the auth hash and the wrapped key in one transaction,
 deletes every outstanding invite, closes every other device's session with
@@ -494,7 +588,8 @@ what was already read. [design.md](design.md#a-lost-or-stolen-device) says more.
 The new secret is written into the device's config before the request goes out,
 so a reply lost on the way cannot leave a vault whose new root nobody holds.
 `basalt rotate` prints the key and exits non-zero if that happens, saying it may
-have committed; the next `basalt sync` here tries the new secret first and
+have committed; the plugin puts the same key in the panel and says the same
+thing. The next connection from that device tries the new secret first and
 settles which one the vault has. Keep both keys until it has. If two devices
 rotate at once, one is refused with `rotated` and pairs again with the string
 the other printed.
@@ -549,8 +644,33 @@ Each vault accepts eight simultaneous devices. More are refused with
 server pays. The headless client streams large files and stays under 300 MB at
 256 MiB. The plugin cannot stream on every platform and costs roughly 210 MB
 plus 2.7 MB per MiB. The default is set for a phone. Raise it if your large
-files only ever move through the headless client. Lowering it below a file
-already in the vault leaves that file unreachable to a new device.
+files only ever move through the headless client. It is in bytes, with no
+suffixes: 128 MiB is `-max-file 134217728`.
+
+Lowering it below a file already in the vault would leave that file unreachable
+to a device paired afterwards, which would report the vault synced without it,
+so `serve` refuses to start with a ceiling below a live file it holds and names
+the uid and size of each. Superseded versions and deleted files over the
+ceiling do not count, because no device asks for them on a first sync.
+
+You can reach that refusal without touching a flag: restore a backup taken
+before the large file was deleted and it is live again under a ceiling below
+it. From there the only remedy is the flag, because a device deletes by pushing
+an entry and there is nothing running to push to, and purge keeps the newest
+version of every path by construction. Raising it loses nothing, since the file
+is already there. To bring the ceiling back down afterwards: raise, start,
+delete or shrink the file on a device, wait for that to reach the server, stop,
+lower.
+
+So the flag has to be reachable wherever the server actually runs.
+`basaltd service -max-file N` writes it into the unit, and refuses to print a
+unit whose ceiling is below a file the data directory already holds, so you
+find out here rather than from the journal. Under Docker it goes in the
+command:
+
+```yaml
+command: ["serve", "-addr", "0.0.0.0:3003", "-max-file", "134217728"]
+```
 
 On a wildcard bind such as `:3003`, the printed address names this machine's
 interfaces rather than `0.0.0.0`, which a device cannot connect to.
@@ -599,6 +719,7 @@ next to their reasoning in the source; these are the numbers.
 | flag | on | |
 |---|---|---|
 | `-addr`, `-vault` | service | what the unit should run with |
+| `-max-file` | service | the file ceiling to write into the unit, in bytes |
 | `-user` | service | user to run as (default: you) |
 | `-binary` | service | path to the binary (default: this one) |
 | `-addr` | health | server to ask (default `127.0.0.1:3003`) |
@@ -612,4 +733,7 @@ without a shell or curl in the image.
 `basaltd version` prints the version, platform and Go toolchain. The server
 logs the version on startup, on the same line as the served vault's latest uid
 and whether it is claimed, and advertises it to every device in `ready` as
-`serverVersion`.
+`serverVersion`. Nothing that has not authenticated learns it: `/health`
+answers `ok` and no more, and a hello refused for its protocol or crypto names
+the range the server speaks and not the release. See
+[design.md](design.md#what-a-stranger-on-the-port-learns).

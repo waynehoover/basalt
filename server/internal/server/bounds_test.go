@@ -315,3 +315,70 @@ func TestS27ACommitFaultRefusesThePutAndKeepsTheSession(t *testing.T) {
 	c2.sendJSON(wire.In{Op: "ping"})
 	c2.recvInto("pong", &wire.Pong{})
 }
+
+/* ---------------------------------------------------------------- *
+ * The advertised limits, and the clamp that keeps them servable
+ * ---------------------------------------------------------------- */
+
+// Every limit a flag can set is pulled into a range the rest of the code can
+// actually serve, because ready advertises whatever comes out and a client
+// believes it: advertised has to equal enforced or a client retries a put that
+// can never succeed.
+//
+// TestI25TheCapFlagsReachReady pins the two caps end to end through the real
+// binary. This pins every edge of all three setters, including the file limit,
+// which no flag test reaches, and the unset case, which has to land on the
+// shipped default rather than on the floor.
+func TestTheAdvertisedLimitsAreClampedToWhatIsServable(t *testing.T) {
+	limits := []struct {
+		name        string
+		set         func(*Server, int64)
+		get         func(*Server) int64
+		lo, hi, def int64
+	}{
+		{"per-file max", (*Server).SetPerFileMax, (*Server).PerFileMax,
+			1, store.PerFileMax, store.DefaultPerFileMax},
+		{"batch cap", (*Server).SetMaxBatchBytes, (*Server).MaxBatchBytes,
+			store.ChunkMax, ReadLimit / 2, wire.MaxBatchBytes},
+		{"fetch cap", (*Server).SetMaxFetchBytes, (*Server).MaxFetchBytes,
+			store.ChunkMax, store.PerFileMax, wire.MaxFetchBytes},
+	}
+
+	for _, l := range limits {
+		t.Run(l.name, func(t *testing.T) {
+			// A default outside its own range is served as the clamped value,
+			// so the flag nobody set would advertise a number nobody chose.
+			if l.def < l.lo || l.def > l.hi {
+				t.Fatalf("the shipped default %d is outside the range %d..%d it is clamped to", l.def, l.lo, l.hi)
+			}
+
+			cases := []struct {
+				what     string
+				in, want int64
+			}{
+				{"unset", 0, l.def},
+				{"negative", -1, l.def},
+				{"at the floor", l.lo, l.lo},
+				{"at the ceiling", l.hi, l.hi},
+				{"above the ceiling", l.hi + 1, l.hi},
+				{"in range", (l.lo + l.hi) / 2, (l.lo + l.hi) / 2},
+			}
+			// A floor of one byte has nothing under it but zero, which is the
+			// unset case above and means the default, not the floor.
+			if l.lo > 1 {
+				cases = append(cases, struct {
+					what     string
+					in, want int64
+				}{"below the floor", l.lo - 1, l.lo})
+			}
+
+			for _, c := range cases {
+				s := &Server{}
+				l.set(s, c.in)
+				if got := l.get(s); got != c.want {
+					t.Errorf("%s: set %d, advertising %d, want %d", c.what, c.in, got, c.want)
+				}
+			}
+		})
+	}
+}

@@ -164,6 +164,10 @@ type vaultStats struct {
 	ChunkRefs   int64  `json:"chunkRefs"`
 	LatestUID   int64  `json:"latestUid"`
 	AllocatedTo int64  `json:"allocatedTo"`
+	// Purges is the vault's purge generation, the same number a backup's
+	// backup.json records, so a script can tell which backups predate the
+	// history the live store has since dropped.
+	Purges int64 `json:"purges"`
 	// Invites is single-use invites that could still be redeemed.
 	Invites int `json:"invites"`
 }
@@ -198,7 +202,7 @@ func writeStatsJSON(out io.Writer, st *store.Store, vaults []string, bodies int)
 			Files: s.Files, Folders: s.Folders, Bytes: s.Bytes,
 			Deleted: s.Deleted, Recoverable: s.Recoverable, Purged: s.Deleted - s.Recoverable,
 			Versions: s.Versions, History: history, ChunkRefs: s.ChunkRefs,
-			LatestUID: s.LatestUID, AllocatedTo: s.AllocatedTo, Invites: invites,
+			LatestUID: s.LatestUID, AllocatedTo: s.AllocatedTo, Purges: s.Purges, Invites: invites,
 		})
 	}
 	enc := json.NewEncoder(out)

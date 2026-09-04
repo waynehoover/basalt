@@ -202,8 +202,9 @@ type Server struct {
 	maxPeers int
 
 	// version is what `ready.serverVersion` says and what the startup line
-	// logs: the stamped release, or "dev". A client refused on `proto` names it
-	// so the operator knows which end to upgrade.
+	// logs: the stamped release, or "dev". It is sent only after a hello has
+	// authenticated; a refusal before that names the protocol range and nothing
+	// about the build, see handleHello.
 	version string
 
 	// maxPreAuth and helloTimeout are MaxPreAuth and HelloTimeout unless a test
@@ -509,19 +510,43 @@ func (s *Server) SetVersion(v string) {
 // Version is what this server calls itself.
 func (s *Server) Version() string { return s.version }
 
+// clamp holds a limit inside the range the code below it can actually serve.
+//
+// Zero or negative means the flag was not set, and an unset flag is the shipped
+// default rather than the floor: silently serving the smallest legal value
+// because nobody asked for one would be a limit nobody chose. Everything else
+// is pulled to the nearest end of the range, and the caller advertises what
+// came back, because advertised has to equal enforced.
+func clamp(n, lo, hi, def int64) int64 {
+	if n <= 0 {
+		n = def
+	}
+	if n < lo {
+		return lo
+	}
+	if n > hi {
+		return hi
+	}
+	return n
+}
+
 // SetPerFileMax changes the largest file this server accepts and advertises.
+func (s *Server) SetPerFileMax(max int64) {
+	s.perFileMax = ClampPerFileMax(max)
+}
+
+// ClampPerFileMax is what a -max-file value actually becomes.
 //
 // Clamped to what the store can hold, because a limit above that would be
 // advertised, attempted, and then refused by Validate: the client would have
-// read and sealed the file to find out.
-func (s *Server) SetPerFileMax(max int64) {
-	if max <= 0 {
-		max = store.DefaultPerFileMax
-	}
-	if max > store.PerFileMax {
-		max = store.PerFileMax
-	}
-	s.perFileMax = max
+// read and sealed the file to find out. There is no floor beyond one byte: a
+// ceiling set low only refuses files, and refusing is the safe direction.
+//
+// Exported because `basaltd service` writes the flag into a unit and has to
+// check it against the vault first, and two copies of this arithmetic would be
+// two answers to "what will this unit actually run with".
+func ClampPerFileMax(max int64) int64 {
+	return clamp(max, 1, store.PerFileMax, store.DefaultPerFileMax)
 }
 
 // PerFileMax is what this server advertises and enforces.
@@ -534,16 +559,7 @@ func (s *Server) PerFileMax() int64 { return s.perFileMax }
 // a code rather than dying at the socket (S22). The flag exists to lower the
 // cap, for a client test against the real binary; it cannot raise it.
 func (s *Server) SetMaxBatchBytes(n int64) {
-	if n <= 0 {
-		n = wire.MaxBatchBytes
-	}
-	if n < store.ChunkMax {
-		n = store.ChunkMax
-	}
-	if n > ReadLimit/2 {
-		n = ReadLimit / 2
-	}
-	s.maxBatchBytes = n
+	s.maxBatchBytes = clamp(n, store.ChunkMax, ReadLimit/2, wire.MaxBatchBytes)
 }
 
 // MaxBatchBytes is what this server advertises and enforces.
@@ -554,16 +570,7 @@ func (s *Server) MaxBatchBytes() int64 { return s.maxBatchBytes }
 // clamp is one chunk at the bottom and the largest file the store can hold at
 // the top, so one fetch can always carry one file and never has to.
 func (s *Server) SetMaxFetchBytes(n int64) {
-	if n <= 0 {
-		n = wire.MaxFetchBytes
-	}
-	if n < store.ChunkMax {
-		n = store.ChunkMax
-	}
-	if n > store.PerFileMax {
-		n = store.PerFileMax
-	}
-	s.maxFetchBytes = n
+	s.maxFetchBytes = clamp(n, store.ChunkMax, store.PerFileMax, wire.MaxFetchBytes)
 }
 
 // MaxFetchBytes is what this server advertises and enforces.

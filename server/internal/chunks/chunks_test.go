@@ -272,10 +272,11 @@ func TestSweepDeletesUnreferencedAndKeepsLive(t *testing.T) {
 		}
 	}
 
-	deleted, spared, _, err := s.Sweep("v1", map[string]struct{}{nk: {}}, time.Now())
+	rep, err := s.Sweep("v1", map[string]struct{}{nk: {}}, time.Now())
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
+	deleted, spared := rep.Deleted, rep.Spared
 	if deleted != 1 || spared != 0 {
 		t.Fatalf("deleted %d, spared %d; want 1 and 0", deleted, spared)
 	}
@@ -301,7 +302,7 @@ func TestSweepLeavesInProgressWritesAlone(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if _, _, _, err := s.Sweep("v1", nil, time.Now()); err != nil {
+	if _, err := s.Sweep("v1", nil, time.Now()); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 	if _, err := os.Stat(tmp); err != nil {
@@ -322,7 +323,7 @@ func TestSweepRefusesToDeleteAFileItDidNotWrite(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	if _, _, _, err := s.Sweep("v1", nil, time.Now()); err == nil {
+	if _, err := s.Sweep("v1", nil, time.Now()); err == nil {
 		t.Fatal("sweep reported success over a file it did not recognise")
 	}
 	if _, err := os.Stat(stray); err != nil {
@@ -332,10 +333,11 @@ func TestSweepRefusesToDeleteAFileItDidNotWrite(t *testing.T) {
 
 func TestSweepOfAnUntouchedVaultIsNotAnError(t *testing.T) {
 	s := newTestStore(t)
-	deleted, _, _, err := s.Sweep("never-used", map[string]struct{}{}, time.Now())
+	rep, err := s.Sweep("never-used", map[string]struct{}{}, time.Now())
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
+	deleted := rep.Deleted
 	if deleted != 0 {
 		t.Fatalf("deleted %d from an empty vault", deleted)
 	}
@@ -380,10 +382,11 @@ func TestSweepSparesRecentlyWrittenChunks(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	deleted, spared, _, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
+	rep, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
+	deleted, spared := rep.Deleted, rep.Spared
 	if deleted != 0 || spared != 1 {
 		t.Fatalf("deleted %d, spared %d; want 0 and 1", deleted, spared)
 	}
@@ -410,10 +413,11 @@ func TestSweepCollectsChunksOlderThanTheGraceWindow(t *testing.T) {
 		t.Fatalf("backdate: %v", err)
 	}
 
-	deleted, spared, _, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
+	rep, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
+	deleted, spared := rep.Deleted, rep.Spared
 	if deleted != 1 || spared != 0 {
 		t.Fatalf("deleted %d, spared %d; want 1 and 0", deleted, spared)
 	}
@@ -434,10 +438,11 @@ func TestSweepKeepsAnOldChunkThatIsStillReferenced(t *testing.T) {
 		t.Fatalf("backdate: %v", err)
 	}
 
-	deleted, spared, _, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now())
+	rep, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now())
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
+	deleted, spared := rep.Deleted, rep.Spared
 	if deleted != 0 || spared != 0 {
 		t.Fatalf("deleted %d, spared %d; want 0 and 0 (kept as live, not as spared)", deleted, spared)
 	}
@@ -459,10 +464,11 @@ func TestSweepCountsALiveRecentChunkAsLiveNotSpared(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	deleted, spared, _, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now().Add(-DefaultGrace))
+	rep, err := s.Sweep("v1", map[string]struct{}{name: {}}, time.Now().Add(-DefaultGrace))
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
+	deleted, spared := rep.Deleted, rep.Spared
 	if deleted != 0 || spared != 0 {
 		t.Fatalf("deleted %d, spared %d; want 0 and 0", deleted, spared)
 	}
@@ -526,10 +532,11 @@ func TestSweepReportsQuarantinedBodiesInsteadOfAborting(t *testing.T) {
 	}
 
 	// Nothing live, no grace: a sweep that should simply tidy up and report.
-	deleted, spared, quarantined, err := s.Sweep("v1", map[string]struct{}{}, time.Now())
+	rep, err := s.Sweep("v1", map[string]struct{}{}, time.Now())
 	if err != nil {
 		t.Fatalf("sweep aborted on a quarantined body: %v", err)
 	}
+	deleted, spared, quarantined := rep.Deleted, rep.Spared, rep.Quarantined
 	if quarantined != 1 {
 		t.Fatalf("quarantined = %d, want 1", quarantined)
 	}
@@ -550,5 +557,182 @@ func TestSweepReportsQuarantinedBodiesInsteadOfAborting(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("CountBodies = %d, want 0: a quarantined body is not a body", n)
+	}
+}
+
+// The bytes are the figure an operator purging for space came for, and they
+// were reachable by counting. Both test bodies elsewhere are 11 bytes, so
+// replacing either accumulator with the constant 11 left the whole suite
+// green: the total said "2 bodies worth" rather than "what these two bodies
+// weigh". Rule 10, the assertion has to check the property. Two bodies of
+// different sizes, so no multiple of a body count reaches the answer: 7 and 19
+// total 26, which is neither 2*7 nor 2*19 nor 2*11.
+func TestSweepAddsUpTheSizesItSparedRatherThanCountingBodies(t *testing.T) {
+	s := newTestStore(t)
+	small, large := []byte("1234567"), []byte("1234567890123456789")
+	if len(small) != 7 || len(large) != 19 {
+		t.Fatalf("the bodies are %d and %d bytes, the arithmetic below assumes 7 and 19", len(small), len(large))
+	}
+	for _, body := range [][]byte{small, large} {
+		if err := s.Put("v1", Name(body), body); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+
+	rep, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if rep.Spared != 2 || rep.Deleted != 0 {
+		t.Fatalf("spared %d, deleted %d; want 2 and 0", rep.Spared, rep.Deleted)
+	}
+	if rep.SparedBytes != 26 {
+		t.Fatalf("SparedBytes = %d, want 26 (7 + 19)", rep.SparedBytes)
+	}
+	if rep.DeletedBytes != 0 {
+		t.Fatalf("DeletedBytes = %d with nothing deleted", rep.DeletedBytes)
+	}
+}
+
+// The same property for what the sweep did take. Same two sizes, both
+// backdated past the window, so the sweep collects them and has to report what
+// they weighed rather than how many there were.
+func TestSweepAddsUpTheSizesItReclaimedRatherThanCountingBodies(t *testing.T) {
+	s := newTestStore(t)
+	small, large := []byte("1234567"), []byte("1234567890123456789")
+	old := time.Now().Add(-2 * DefaultGrace)
+	for _, body := range [][]byte{small, large} {
+		if err := s.Put("v1", Name(body), body); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+		p, err := s.Path("v1", Name(body))
+		if err != nil {
+			t.Fatalf("path: %v", err)
+		}
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatalf("backdate: %v", err)
+		}
+	}
+
+	rep, err := s.Sweep("v1", nil, time.Now().Add(-DefaultGrace))
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if rep.Deleted != 2 || rep.Spared != 0 {
+		t.Fatalf("deleted %d, spared %d; want 2 and 0", rep.Deleted, rep.Spared)
+	}
+	if rep.DeletedBytes != 26 {
+		t.Fatalf("DeletedBytes = %d, want 26 (7 + 19)", rep.DeletedBytes)
+	}
+	if rep.SparedBytes != 0 {
+		t.Fatalf("SparedBytes = %d with nothing spared", rep.SparedBytes)
+	}
+}
+
+// WalkDir stops at the first error, so a sweep that aborts has counted what it
+// reached and nothing else. The counts were returned anyway and the caller
+// printed them: one stray file in the first shard produced "0 spared as too
+// recent to collect (0 B)" while every collectible orphan in the tree sat
+// unexamined. Rule 7, a status describes the vault and not how far the walk
+// got, so the report says whether the walk finished and the caller prints
+// nothing when it did not.
+func TestSweepReportsNothingItDidNotFinishLookingAt(t *testing.T) {
+	s := newTestStore(t)
+	// Two orphans a finished sweep would take, and a stray in a shard that
+	// sorts before either. WalkDir walks in lexical order, so the stray is
+	// reached first and the orphans are never examined.
+	for _, body := range []string{"orphan one", "orphan two"} {
+		if err := s.Put("v1", Name([]byte(body)), []byte(body)); err != nil {
+			t.Fatalf("put: %v", err)
+		}
+	}
+	dir := filepath.Join(s.VaultDir("v1"), "00")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes-backup.md"), []byte("stray"), 0o600); err != nil {
+		t.Fatalf("write stray: %v", err)
+	}
+
+	rep, err := s.Sweep("v1", nil, time.Now())
+	if err == nil {
+		t.Fatal("sweep reported success over a file it did not recognise")
+	}
+	if rep.Complete {
+		t.Fatalf("a sweep that stopped at %v calls itself complete: %+v", err, rep)
+	}
+	// The orphans are still there, which is what makes the numbers a lie
+	// rather than merely incomplete.
+	for _, body := range []string{"orphan one", "orphan two"} {
+		if !s.Has("v1", Name([]byte(body))) {
+			t.Fatalf("the sweep collected %q after aborting", body)
+		}
+	}
+}
+
+// A sweep that reached the end says so, or the flag above would be satisfied
+// by never setting it.
+func TestAFinishedSweepSaysItFinished(t *testing.T) {
+	s := newTestStore(t)
+	body := []byte("orphaned")
+	if err := s.Put("v1", Name(body), body); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	rep, err := s.Sweep("v1", nil, time.Now())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if !rep.Complete {
+		t.Fatalf("a sweep that walked the whole tree does not say so: %+v", rep)
+	}
+	// And an untouched vault, where there is no tree to walk.
+	empty, err := s.Sweep("never-used", nil, time.Now())
+	if err != nil {
+		t.Fatalf("sweep of an untouched vault: %v", err)
+	}
+	if !empty.Complete {
+		t.Fatalf("a vault with no chunk directory is not described: %+v", empty)
+	}
+}
+
+// `.tmp-` debris is skipped, and was skipped in silence. Nothing removes it at
+// any grace, so it is space the purge did not reclaim, and this report exists
+// to say what was not reclaimed. Same for a quarantined body, which had a
+// count and no bytes.
+func TestSweepCountsTheSpaceItWalkedPastAndCannotReclaim(t *testing.T) {
+	s := newTestStore(t)
+	dir := filepath.Join(s.VaultDir("v1"), "ab")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Different sizes, so no count times a constant reaches either total.
+	if err := os.WriteFile(filepath.Join(dir, tmpPrefix+"inflight"), []byte("1234567"), 0o600); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, tmpPrefix+"another"), []byte("123456789012345"), 0o600); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	body := []byte("this body went bad")
+	name := Name(body)
+	if err := s.Put("v1", name, body); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := s.Quarantine("v1", name); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+
+	rep, err := s.Sweep("v1", nil, time.Now())
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if rep.Temp != 2 || rep.TempBytes != 22 {
+		t.Fatalf("temp debris reported as %d files (%d B), want 2 (22 B)", rep.Temp, rep.TempBytes)
+	}
+	if rep.Quarantined != 1 || rep.QuarantinedBytes != int64(len(body)) {
+		t.Fatalf("quarantined reported as %d bodies (%d B), want 1 (%d B)",
+			rep.Quarantined, rep.QuarantinedBytes, len(body))
+	}
+	if rep.Deleted != 0 {
+		t.Fatalf("the sweep deleted %d files it was meant to walk past", rep.Deleted)
 	}
 }

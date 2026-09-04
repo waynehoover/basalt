@@ -681,9 +681,11 @@ func TestS24VaultAndDeviceAreBoundedAndFreeOfControlCharacters(t *testing.T) {
  * ---------------------------------------------------------------- */
 
 // Protocol 3 is the only protocol. A client asking for 2 is refused at hello
-// with both numbers and the server's version in the message, which is the
-// whole of what the negotiation machinery is kept for: when protocol 4 lands,
-// this is how an old client learns which end to upgrade.
+// with both numbers in the message, which is the whole of what the negotiation
+// machinery is kept for: when protocol 4 lands, this is how an old client
+// learns which end to upgrade. The server's version used to be in this message
+// too and is not any more, because nothing has authenticated when it is sent;
+// see disclosure_test.go.
 func TestI9AProto2HelloIsRefusedNamingBothNumbers(t *testing.T) {
 	r := newRig(t)
 	r.srv.SetVersion("4.5.6")
@@ -691,7 +693,7 @@ func TestI9AProto2HelloIsRefusedNamingBothNumbers(t *testing.T) {
 	cl.sendRaw(wire.In{Op: "hello", ID: 1, Proto: 2, Crypto: wire.Crypto,
 		Vault: testVault, Token: testToken, Device: "old-phone"})
 	msg := cl.expectErr(wire.CodeProto)
-	for _, want := range []string{"protocol 2", "4.5.6", "3 to 3"} {
+	for _, want := range []string{"protocol 2", "3 to 3"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("the refusal does not name %q: %q", want, msg)
 		}

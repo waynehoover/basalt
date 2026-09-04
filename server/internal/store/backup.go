@@ -1,10 +1,14 @@
 package store
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/waynehoover/basalt-sync/server/internal/fsync"
 )
 
 // BackupReport says what a backup copied.
@@ -44,6 +48,200 @@ type BackupReport struct {
 
 	// Verified is chunk references checked in the backup after writing it.
 	Verified int
+
+	// Meta is what was written to backup.json beside the database: the uid
+	// range each vault covers and the purge generation it was taken at.
+	Meta BackupMeta
+}
+
+// BackupMetaFile is the name of the coverage file a backup writes beside its
+// database, so a script can ask what a backup directory holds without opening
+// SQLite.
+const BackupMetaFile = "backup.json"
+
+// BackupMetaFormat is the version of backup.json this build writes and reads.
+// Format 1 carried no Database stamp, so a file at that version cannot be
+// checked against the database beside it and is not accepted.
+const BackupMetaFormat = 2
+
+// BackupMeta is what backup.json says about the snapshot beside it.
+//
+// It exists because the runbook after a purge is to start a fresh backup
+// directory, keep the old one for its history, and delete it whole later, and a
+// directory of hashes gives nothing to decide that on. A retention script, or a
+// person with jq, needs three things per vault: which uids the snapshot holds,
+// when it was taken, and which side of a purge it was taken on. The database is
+// the authority and this is a summary of it.
+//
+// It used to say it could "lag behind the database by one run but never claim
+// more than the database holds", and that was false. A crash between the
+// rename and this file left the previous run's coverage beside a new database,
+// and after a purge the previous run's coverage is the *larger*, older range:
+// backup.json saying uids 1 to 5, 5 versions, purge generation 0, beside a
+// database holding 4 to 5, 2 versions, generation 1. The retention query in
+// docs/server.md then picks a directory that does not cover the uid it was
+// asked for. Two things fix it, and both are needed because they cover
+// different failures: the old file is removed before the database is
+// published, so a crash leaves no coverage rather than the wrong coverage
+// (rule 2, absent and unreadable are not the same state, and neither is
+// absent and wrong); and Database stamps the file against the database it
+// describes, so a republish by any build that does not write this file, a
+// rollback for instance, is detectable rather than silently stale for ever.
+// TestBackupLeavesNoCoverageRatherThanStaleCoverage and
+// TestCoverageIsStampedAgainstTheDatabaseBesideIt.
+type BackupMeta struct {
+	// Format is 2. A script checks it before trusting the field names.
+	// Format 1 had no Database stamp.
+	Format int `json:"format"`
+	// TakenAt is when the snapshot was taken, RFC 3339 in UTC.
+	TakenAt string `json:"takenAt"`
+	// Database ties this file to the basalt.db published beside it.
+	Database Snapshot        `json:"database"`
+	Vaults   []VaultCoverage `json:"vaults"`
+}
+
+// Snapshot is how backup.json names the database it describes: the size and
+// modification time of basalt.db at the moment the file was written.
+//
+// Size is what ReadBackupMeta checks, because it survives a plain `cp -r` of
+// the whole directory and a copy is a thing people legitimately do to a backup.
+// ModifiedAt is recorded beside it for a script looking at a directory nobody
+// has copied, where it is the stronger of the two, and is not checked here
+// because a copy moves it and a moved mtime is not a stale file.
+type Snapshot struct {
+	Bytes      int64  `json:"bytes"`
+	ModifiedAt string `json:"modifiedAt"`
+}
+
+// DatabaseStamp describes the database in a backup directory, for writing into
+// backup.json and for checking one that was written earlier.
+func DatabaseStamp(dir string) (Snapshot, error) {
+	dbPath, _ := DataDir(dir)
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return Snapshot{
+		Bytes:      info.Size(),
+		ModifiedAt: info.ModTime().UTC().Format(time.RFC3339Nano),
+	}, nil
+}
+
+// VaultCoverage is the uid range one vault's snapshot covers.
+//
+// OldestUID to LatestUID is the span; Versions against that span says whether
+// there are holes in it, which a purge leaves. AllocatedTo is the uid counter,
+// which purge never rewinds, and Purges is the generation: a snapshot at a
+// lower generation than the live store holds history the live store has since
+// dropped, and is the one to keep.
+type VaultCoverage struct {
+	Vault       string `json:"vault"`
+	OldestUID   int64  `json:"oldestUid"`
+	LatestUID   int64  `json:"latestUid"`
+	AllocatedTo int64  `json:"allocatedTo"`
+	Versions    int64  `json:"versions"`
+	Purges      int64  `json:"purges"`
+}
+
+// coverage describes the vaults this store holds, in the shape backup.json
+// records. Called on the snapshot, never on the live store, so the numbers are
+// the file's own.
+func (s *Store) coverage(vaults []string, now time.Time) (BackupMeta, error) {
+	meta := BackupMeta{Format: BackupMetaFormat, TakenAt: now.UTC().Format(time.RFC3339), Vaults: []VaultCoverage{}}
+	for _, v := range vaults {
+		st, err := s.Stats(v)
+		if err != nil {
+			return meta, err
+		}
+		meta.Vaults = append(meta.Vaults, VaultCoverage{
+			Vault: v, OldestUID: st.OldestUID, LatestUID: st.LatestUID,
+			AllocatedTo: st.AllocatedTo, Versions: st.Versions, Purges: st.Purges,
+		})
+	}
+	return meta, nil
+}
+
+// writeBackupMeta publishes meta as backup.json in destDir, the same careful
+// way as everything else in a backup: a temporary file, flushed, renamed into
+// place, and the directory flushed, so a crash leaves the old file or the new
+// one and never half of either.
+func writeBackupMeta(destDir string, meta BackupMeta) error {
+	b, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	final := filepath.Join(destDir, BackupMetaFile)
+	tmp, err := os.CreateTemp(destDir, "."+BackupMetaFile+".*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // a no-op once the rename has consumed it
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, final); err != nil {
+		return err
+	}
+	return fsync.Dir(destDir)
+}
+
+// removeBackupMeta unpublishes the coverage file, durably, so that the moment
+// between here and writeBackupMeta has no coverage in it rather than the
+// previous run's. Absent is a state a reader handles; wrong is not.
+func removeBackupMeta(destDir string) error {
+	if err := os.Remove(filepath.Join(destDir, BackupMetaFile)); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return fsync.Dir(destDir)
+}
+
+// ReadBackupMeta reads a backup directory's backup.json. A directory written
+// by a build before the file existed has none, and that is reported as an
+// error rather than an empty summary: rule 2, absent and unreadable are
+// different states, and an empty coverage would read as a backup of nothing.
+func ReadBackupMeta(dir string) (BackupMeta, error) {
+	var meta BackupMeta
+	b, err := os.ReadFile(filepath.Join(dir, BackupMetaFile))
+	if err != nil {
+		return meta, err
+	}
+	if err := json.Unmarshal(b, &meta); err != nil {
+		return meta, fmt.Errorf("%s: %w", BackupMetaFile, err)
+	}
+	if meta.Format != BackupMetaFormat {
+		return meta, fmt.Errorf("%s: format %d, this build reads %d", BackupMetaFile, meta.Format, BackupMetaFormat)
+	}
+	// The file has to describe the database beside it. It can stop doing so
+	// without anything here running: a build that does not write this file can
+	// republish the database into the same directory, and the coverage left
+	// behind then describes a snapshot that is gone, for ever, because nothing
+	// corrects it. Checked on every read, so the mismatch is an error at the
+	// moment someone relies on it rather than a wrong answer.
+	stamp, err := DatabaseStamp(dir)
+	if err != nil {
+		return meta, fmt.Errorf("%s: describing the database beside it: %w", BackupMetaFile, err)
+	}
+	if stamp.Bytes != meta.Database.Bytes {
+		return meta, fmt.Errorf(
+			"%s describes a %d byte database and the one beside it is %d bytes, so it is not a summary of "+
+				"this snapshot: something republished the database without rewriting the coverage. "+
+				"Run `basaltd backup` into this directory again, or read the database itself",
+			BackupMetaFile, meta.Database.Bytes, stamp.Bytes)
+	}
+	return meta, nil
 }
 
 func (r BackupReport) String() string {
@@ -254,14 +452,34 @@ func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	// unverified snapshot over the last good one would be that failure with the
 	// safety net cut.
 	faults, verified, err := dest.Verify(deep)
-	dest.Close()
 	if err != nil {
+		dest.Close()
 		return rep, err
 	}
 	rep.Verified = verified
 	if len(faults) > 0 {
+		dest.Close()
 		return rep, fmt.Errorf("the backup is missing %d of %d chunk references, first: %s",
 			len(faults), verified, faults[0])
+	}
+	// What the snapshot covers, read from the snapshot itself so backup.json
+	// describes the file beside it and not the live store, which may have
+	// moved on while the bodies were copied.
+	meta, err := dest.coverage(vaults, time.Now())
+	dest.Close()
+	if err != nil {
+		return rep, err
+	}
+
+	// The previous run's coverage goes first, before the database it describes
+	// stops being the one here. From here until the new coverage lands there
+	// is no backup.json, which is the only honest thing this directory can say
+	// in that window: the previous file describes a snapshot that is about to
+	// be replaced, and after a purge it describes a *larger*, older uid range
+	// than the database beside it, so a retention query would pick this
+	// directory for a uid it no longer holds.
+	if err := removeBackupMeta(destDir); err != nil {
+		return rep, fmt.Errorf("removing the previous %s: %w", BackupMetaFile, err)
 	}
 
 	// Everything the snapshot names is present and checked. Publish it: rename
@@ -271,9 +489,30 @@ func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	if err := os.Rename(stagedDB, dbPath); err != nil {
 		return rep, err
 	}
-	if err := syncDir(destDir); err != nil {
+	if err := fsync.Dir(destDir); err != nil {
 		return rep, fmt.Errorf("flushing the backup directory: %w", err)
 	}
+
+	// Where a crash costs a coverage file and nothing else. The database is
+	// published and verified; what is missing is the summary of it, and the
+	// next run writes that. The test uses this hook rather than a real crash.
+	if s.afterPublish != nil {
+		if err := s.afterPublish(); err != nil {
+			return rep, err
+		}
+	}
+
+	// The stamp is taken from the published database, so backup.json names the
+	// file it is actually beside.
+	stamp, err := DatabaseStamp(destDir)
+	if err != nil {
+		return rep, fmt.Errorf("describing the published snapshot: %w", err)
+	}
+	meta.Database = stamp
+	if err := writeBackupMeta(destDir, meta); err != nil {
+		return rep, fmt.Errorf("writing %s: %w", BackupMetaFile, err)
+	}
+	rep.Meta = meta
 	return rep, nil
 }
 
@@ -287,9 +526,10 @@ func (s *Store) distinctChunkCount() (int, error) {
 	return n, err
 }
 
-// syncFile flushes a file's contents to disk. Mirrors chunks.syncDir's job for
-// a file: the write layer there fsyncs body and directory, and a backup's
-// database deserves the same, because VACUUM INTO leaves it unsynced.
+// syncFile flushes a file's contents to disk. The counterpart to fsync.Dir,
+// which flushes the name: a backup's database needs both, because VACUUM INTO
+// leaves it unsynced. It stays here because this is its only caller; the
+// directory flush moved out when three packages wanted it.
 func syncFile(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -297,18 +537,6 @@ func syncFile(path string) error {
 	}
 	defer f.Close()
 	return f.Sync()
-}
-
-// syncDir flushes a directory entry, so a rename into it is durable. A mirror of
-// the one in the chunks package, which cannot be reused because it is unexported
-// and this is a different package.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
 }
 
 // refuseOverlap refuses a backup destination that would write into the store

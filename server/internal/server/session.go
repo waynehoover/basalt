@@ -636,18 +636,28 @@ func (s *Session) handleHello(m wire.In) error {
 	// and a client on the wrong version deserves to be told so plainly. The
 	// range is one version wide today and the check is written as a range on
 	// purpose; see wire.Proto.
+	//
+	// Both numbers and nothing else. Nothing has authenticated yet, so this
+	// refusal is what anyone on the internet gets for one JSON frame, and it
+	// used to name the release: "this server (version 0.3.2) speaks 3 to 3".
+	// Behind Caddy that is the port on the open internet handing a prober the
+	// string a targeted exploit starts from. The version is in `ready`, after
+	// auth, for the device that has proved it may ask; see docs/design.md, "What
+	// a stranger on the port learns", and
+	// TestAProtoRefusalDoesNotNameTheServerVersion.
 	if m.Proto < wire.MinProto || m.Proto > wire.Proto {
 		return s.fatal(wire.CodeProto, fmt.Errorf(
-			"protocol %d not supported, this server (version %s) speaks %d to %d",
-			m.Proto, s.srv.version, wire.MinProto, wire.Proto))
+			"protocol %d not supported, this server speaks %d to %d",
+			m.Proto, wire.MinProto, wire.Proto))
 	}
 	if err := s.takeID(m); err != nil {
 		return err
 	}
 	if m.Crypto != wire.Crypto {
+		// The same rule as the proto refusal above, for the same reason.
 		return s.fatal(wire.CodeProto,
-			fmt.Errorf("crypto %q not supported, this server (version %s) speaks %q",
-				m.Crypto, s.srv.version, wire.Crypto))
+			fmt.Errorf("crypto %q not supported, this server speaks %q",
+				m.Crypto, wire.Crypto))
 	}
 	if m.Vault == "" {
 		return s.fatal(wire.CodeAuth, errors.New("missing vault"))

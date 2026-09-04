@@ -25,7 +25,7 @@ func TestS26ARefusedDestinationIsNotCreated(t *testing.T) {
 		t.Fatal("the data directory itself was accepted")
 	}
 	// A sweep afterwards finds nothing it did not put there.
-	if _, _, _, err := h.Chunks().Sweep("v1", map[string]struct{}{}, time0()); err != nil {
+	if _, err := h.Chunks().Sweep("v1", map[string]struct{}{}, time0()); err != nil {
 		t.Fatalf("the chunk tree has something in it the sweep does not recognise: %v", err)
 	}
 }

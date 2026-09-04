@@ -58,6 +58,11 @@ EXPOSE 3003
 # Bound to every interface inside the container, which is the only way the
 # published port reaches it. What the container is reachable from is the
 # publish rule and whatever is in front, not this.
+# Every flag lives in CMD, so adding one means replacing this whole line, in
+# `command:` under compose or after the image name under `docker run`. The one
+# that comes up is -max-file: serve refuses to start with a ceiling below a
+# live file the vault already holds, and a vault that took a large attachment
+# under a raised ceiling needs that ceiling again. docs/server.md says more.
 ENTRYPOINT ["/basaltd"]
 CMD ["serve", "-addr", "0.0.0.0:3003"]
 
