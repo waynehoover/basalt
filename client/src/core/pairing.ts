@@ -33,6 +33,7 @@
  * stays length-prefixed and versioned because it once carried two.
  */
 
+import { crc32Bytes } from "./crc32.ts";
 import { SECRET_LENGTH, base64urlDecode, base64urlEncode } from "./crypto.ts";
 
 /**
@@ -307,21 +308,11 @@ export function parseInvite(input: string): Invite {
  *
  * CRC-32 rather than a hash: this is not protecting against an attacker, who
  * would simply recompute it, but against a paste that lost its last line or a
- * character typed in the wrong order. CRC-32 is good at exactly those and needs
- * no crypto, which keeps this function synchronous and keeps the parser usable
- * from a constructor.
+ * character typed in the wrong order. Shared with the index journal, which
+ * needs the same question answered about a record a crash cut short; see
+ * core/crc32.ts.
  */
-function checksum(body: Uint8Array): Uint8Array {
-  let crc = 0xffffffff;
-  for (const byte of body) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit++) {
-      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
-    }
-  }
-  crc = (crc ^ 0xffffffff) >>> 0;
-  return new Uint8Array([(crc >>> 24) & 0xff, (crc >>> 16) & 0xff, (crc >>> 8) & 0xff, crc & 0xff]);
-}
+const checksum = crc32Bytes;
 
 /* ---------------------------------------------------------------- *
  * What a paired device stores
