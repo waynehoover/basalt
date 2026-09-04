@@ -218,6 +218,49 @@ does to concurrent writers, not for its arithmetic.
   5 ms, so the fsync cost is real when nothing is cached. If a phone ever
   shows the cliff these numbers do not, this decision is the one to revisit.
 
+**The index as a journal.** What replaced the whole-file rewrite instead of a
+database: a snapshot plus a log of what has changed since, appended to.
+`bun run src/stress/journal.ts` on a synthetic index of the shape a real sync
+produces, 0.5 MiB at 1,000 notes and 5.1 MiB at 10,000, on the same laptop SSD
+as the table above:
+
+| | 1,000 notes | 10,000 notes |
+|---|---|---|
+| A settled pass, which writes nothing | 0.50 ms | 4.9 ms |
+| The same, before (`JSON.stringify` and a stat) | 0.18 ms | 2.8 ms |
+| A pass that changed one note, before | 0.70 ms | 4.4 ms |
+| A pass that changed one note, now | 0.61 ms | 5.2 ms |
+| Bytes that pass writes, before | 0.5 MiB | 5.1 MiB |
+| Bytes that pass writes, now | 414 | 415 |
+| A pass that folds the log back in | 1.9 ms | 13.2 ms |
+| Replaying 1,000 records on load | 11 ms | 12 ms |
+
+Read the last two rows before the first four. On a warm SSD the journal is a
+wash on time: the whole-file write was never the expensive part, and what is
+left is the comparison that decides whether anything changed, which costs about
+two milliseconds more than the `JSON.stringify` it replaced. What it changes by
+four orders of magnitude is how much is written, which is the part that has a
+cliff. The same table's own caveat is the 50,000 note index taking 228 ms on a
+cold write, and a 415 byte append does not have that shape; nor does a phone,
+where the adapter rewrites the whole file with no way to ask for an fsync.
+
+The snapshot policy is a quarter of the snapshot's size, 1,000 records, or a
+64 KiB floor, whichever comes first, and the three bind at three different
+vault sizes. At 40 notes the floor is what stops a 20 KB index being rewritten
+every seventh pass: 22 rewrites in 200 passes without it, 2 with it. At 1,000
+notes the fraction governs and caps the log at 128 KiB, 4 ms of replay against
+the 5 ms of reading the snapshot. At 10,000 the record count governs, because a
+quarter of 5 MiB is some 3,200 passes away, and it holds the log at 380 KiB and
+replay at 12 ms whatever the vault weighs. Moving any of them is flat in this
+region, which is the answer to whether the guesses were right.
+
+Replay was measured before it was believed, and the first version was wrong: it
+copied the whole entries map for every record, so 1,000 records over 10,000
+notes was 454 ms to start a client, against about 10 ms for the whole-file read
+it replaced. Folding the records into one working copy makes it 12 ms and
+independent of the vault's size. Nothing failed; the number was implausible,
+which is rule 8.
+
 ## What was borrowed
 
 None of their code. Ideas, parameters and bug reports, each credited where used.

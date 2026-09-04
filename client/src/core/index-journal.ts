@@ -157,11 +157,21 @@ function isFailure(x: { seq: number } | DecodeFailure): x is DecodeFailure {
  * produce.
  */
 export function replay(snapshot: Snapshot, log: string): Replayed {
-  let state = snapshot.state;
+  const base = snapshot.state;
   let seq = snapshot.seq;
   let applied = 0;
   let stopped: ReplayStop = { why: "end" };
   let firstKept = true;
+
+  // Folded in place rather than copied per record, and this is not a
+  // micro-optimisation. Copying the whole entries map for every record is a
+  // thousand copies of ten thousand entries: measured at 454 ms to load a
+  // 10,000 note index with a full log, against 10 ms for the whole-file read
+  // it replaced (`bun run src/stress/journal.ts`). Rule 8 found it, not a
+  // failing assertion. The copies were never observable, because nothing sees
+  // an intermediate state, and `applyDelta` below is still pure for the
+  // caller that folds one record over one state.
+  let work: Fold | undefined;
 
   // Only whole lines. A final fragment with no newline is exactly what a crash
   // mid-append leaves, and it is the case this format exists to make obvious.
@@ -193,47 +203,114 @@ export function replay(snapshot: Snapshot, log: string): Replayed {
       break;
     }
     firstKept = false;
-    state = applyDelta(state, read.delta);
+    work ??= copyOf(base);
+    foldInto(work, read.delta);
     seq = read.seq;
     applied++;
   }
 
   if (stopped.why === "end" && trailing !== "") stopped = { why: "torn", at: complete.length };
+  // The snapshot itself when nothing was applied, so a state this function did
+  // not change is the object it was handed rather than a rebuilt copy of it.
+  const state = work === undefined ? base : (work as unknown as StoredState);
   return { state, seq, applied, stopped };
+}
+
+/** A state being built up, before it is anything the engine would accept. */
+interface Fold {
+  cursor: unknown;
+  entries: Record<string, unknown>;
+  remote: Record<string, unknown>;
+  pending: unknown;
+}
+
+/**
+ * A working copy of a state.
+ *
+ * Tolerant of a state that is not one, because a snapshot this client did not
+ * write is refused by `validateStoredState` with a message naming the field,
+ * and throwing on the way there would replace it with a stack trace.
+ */
+function copyOf(state: StoredState): Fold {
+  const from = (state ?? {}) as Partial<StoredState>;
+  return {
+    cursor: from.cursor,
+    entries: { ...from.entries },
+    remote: { ...from.remote },
+    pending: Array.isArray(from.pending) ? [...from.pending] : from.pending,
+  };
+}
+
+/** One delta into a working copy. The only place a record is interpreted. */
+function foldInto(work: Fold, delta: JournalDelta): void {
+  for (const [path, entry] of Object.entries(delta.set ?? {})) work.entries[path] = entry;
+  for (const path of delta.del ?? []) delete work.entries[path];
+  for (const [path, value] of Object.entries(delta.remote ?? {})) work.remote[path] = value;
+  for (const path of delta.unremote ?? []) delete work.remote[path];
+  if (delta.cursor !== undefined) work.cursor = delta.cursor;
+  if (delta.pending !== undefined) work.pending = [...delta.pending];
 }
 
 /** One delta over one state, giving a new state and touching neither argument. */
 export function applyDelta(state: StoredState, delta: JournalDelta): StoredState {
-  const entries = { ...state.entries };
-  for (const [path, entry] of Object.entries(delta.set ?? {})) entries[path] = entry;
-  for (const path of delta.del ?? []) delete entries[path];
-
-  const remote = { ...state.remote };
-  for (const [path, value] of Object.entries(delta.remote ?? {})) remote[path] = value;
-  for (const path of delta.unremote ?? []) delete remote[path];
-
-  return {
-    cursor: delta.cursor ?? state.cursor,
-    entries,
-    remote,
-    pending: delta.pending === undefined ? state.pending : [...delta.pending],
-    // A snapshot carries its own sequence; a replayed state does not need one.
-  } as StoredState;
+  const work = copyOf(state);
+  foldInto(work, delta);
+  return work as unknown as StoredState;
 }
 
 /**
- * What changed between two states, or undefined when nothing did.
+ * What was last written, in the form the next comparison needs.
  *
- * Undefined is the common answer and the one that matters: a settled vault
- * passes on every watch tick and must write nothing at all. Today's
- * LastIndexWrite exists for the same reason and found the same thing twice.
- *
- * Compared by serialising each entry rather than by identity, because the
- * engine mutates entries in place (see index-state.ts `observe`), so identity
- * says nothing. A later step can have the engine hand down what it touched and
- * skip this walk; the format does not change if it does.
+ * Not the state itself, and the difference is the whole cost of a settled
+ * pass. Keeping a copy of the state to compare against means a deep clone of
+ * the index on every save, and comparing two states means serialising every
+ * entry of both: at ten thousand notes that is two 5.6 MiB round trips through
+ * JSON to record that nothing happened, which is more than the whole-file
+ * write this design exists to replace. One string per entry costs about what
+ * `LastIndexWrite` already kept, and turns a pass into one serialisation of
+ * the new state and a map lookup per path.
  */
-export function deltaBetween(prev: StoredState, next: StoredState): JournalDelta | undefined {
+export interface SavedShape {
+  readonly cursor: number;
+  /** Path to the JSON of the entry as it was written. */
+  readonly entries: ReadonlyMap<string, string>;
+  readonly remote: ReadonlyMap<string, string>;
+  readonly pending: readonly string[];
+}
+
+/** The shape of a state that is already on disk. */
+export function shapeOf(state: StoredState): SavedShape {
+  return {
+    cursor: state.cursor,
+    entries: serialised(state.entries),
+    remote: serialised(state.remote),
+    pending: listOf(state.pending),
+  };
+}
+
+/**
+ * What one pass changed, and the shape to compare the next one against.
+ *
+ * Undefined for the delta is the common answer and the one that matters: a
+ * settled vault passes on every watch tick and every keepalive, and must write
+ * nothing at all. Today's `LastIndexWrite` exists for the same reason and
+ * found the same thing twice.
+ *
+ * Compared by the serialisation rather than by identity, because the engine
+ * mutates entries in place (see index-state.ts `observe`), so identity says
+ * nothing.
+ */
+export function deltaFrom(
+  saved: SavedShape,
+  next: StoredState,
+): { delta: JournalDelta | undefined; shape: SavedShape } {
+  const shape: SavedShape = {
+    cursor: next.cursor,
+    entries: serialised(next.entries),
+    remote: serialised(next.remote),
+    pending: listOf(next.pending),
+  };
+
   const delta: {
     cursor?: number;
     set?: Record<string, unknown>;
@@ -243,34 +320,57 @@ export function deltaBetween(prev: StoredState, next: StoredState): JournalDelta
     pending?: string[];
   } = {};
 
-  if (prev.cursor !== next.cursor) delta.cursor = next.cursor;
+  if (saved.cursor !== next.cursor) delta.cursor = next.cursor;
 
-  const changed = (
-    before: Record<string, unknown>,
-    after: Record<string, unknown>,
-  ): { set: Record<string, unknown>; del: string[] } => {
-    const set: Record<string, unknown> = {};
-    const del: string[] = [];
-    for (const [path, value] of Object.entries(after)) {
-      const was = Object.hasOwn(before, path) ? before[path] : undefined;
-      if (was === undefined || JSON.stringify(was) !== JSON.stringify(value)) set[path] = value;
-    }
-    for (const path of Object.keys(before)) if (!Object.hasOwn(after, path)) del.push(path);
-    return { set, del };
-  };
-
-  const e = changed(prev.entries, next.entries);
+  const e = changed(saved.entries, shape.entries, next.entries);
   if (Object.keys(e.set).length > 0) delta.set = e.set;
   if (e.del.length > 0) delta.del = e.del;
 
-  const r = changed(prev.remote, next.remote);
+  const r = changed(saved.remote, shape.remote, next.remote);
   if (Object.keys(r.set).length > 0) delta.remote = r.set;
   if (r.del.length > 0) delta.unremote = r.del;
 
   const samePending =
-    prev.pending.length === next.pending.length &&
-    prev.pending.every((p, i) => p === next.pending[i]);
-  if (!samePending) delta.pending = [...next.pending];
+    saved.pending.length === shape.pending.length &&
+    saved.pending.every((p, i) => p === shape.pending[i]);
+  if (!samePending) delta.pending = [...shape.pending];
 
-  return Object.keys(delta).length === 0 ? undefined : delta;
+  return { delta: Object.keys(delta).length === 0 ? undefined : delta, shape };
+}
+
+/** What changed between two states, or undefined when nothing did. */
+export function deltaBetween(prev: StoredState, next: StoredState): JournalDelta | undefined {
+  return deltaFrom(shapeOf(prev), next).delta;
+}
+
+/** Paths whose serialisation moved, and paths that are no longer there. */
+function changed(
+  before: ReadonlyMap<string, string>,
+  after: ReadonlyMap<string, string>,
+  values: Record<string, unknown>,
+): { set: Record<string, unknown>; del: string[] } {
+  const set: Record<string, unknown> = {};
+  const del: string[] = [];
+  for (const [path, json] of after) if (before.get(path) !== json) set[path] = values[path];
+  for (const path of before.keys()) if (!after.has(path)) del.push(path);
+  return { set, del };
+}
+
+/**
+ * One JSON string per key.
+ *
+ * Tolerant of a shape that is not an object, because a snapshot this client
+ * did not write is refused by `validateStoredState` and not here, and throwing
+ * on the way to that refusal would replace a message naming the bad field with
+ * a stack trace.
+ */
+function serialised(from: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  if (typeof from !== "object" || from === null || Array.isArray(from)) return out;
+  for (const [key, value] of Object.entries(from)) out.set(key, JSON.stringify(value));
+  return out;
+}
+
+function listOf(from: unknown): string[] {
+  return Array.isArray(from) ? [...(from as string[])] : [];
 }

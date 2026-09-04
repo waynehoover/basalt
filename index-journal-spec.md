@@ -1,11 +1,32 @@
 # The index as a journal and a snapshot
 
-A spec, not an implementation. It replaces rewriting the whole index on every
-change with appending what changed, and it exists because the index is the one
-client file whose corruption the first rule is about.
+This was a spec. It is now what both shells run, and the parts below that the
+implementation contradicts are marked where they sit; the code is the authority
+and `core/index-journal-store.ts` carries the reasoning. Four things changed on
+the way in, all of them found by building it:
 
-Nothing here is decided until the crash semantics below are agreed, because
-that is the part that cannot be fixed later by a patch.
+- **Six primitives, not five.** `logBytes` became `stamps`, which answers for
+  the size and modification time of both files. The extra one is what lets a
+  session tell that something else has written the index, which is R3's rule
+  for the whole-file store and matters more here: a record appended beside
+  somebody else's snapshot is this device's delta over their base.
+- **A log is never applied to a snapshot with no `seq`.** The claim below that
+  today's shape "needs no migration step" is right about loading and wrong
+  about what happens next: a snapshot with no sequence reads as sequence zero,
+  so a log starting at one lines up with it by coincidence rather than by
+  construction. A device carrying an old index takes one snapshot to establish
+  the sequence, and then journals.
+- **`load` hands back what it found**, rather than a validated copy of it. The
+  engine checks the index (`stored-state.ts`) and its refusal names the field;
+  a store that refused first would replace that with a message naming the file.
+  Validation is still used for the one decision it is needed for: choosing the
+  snapshot over a replayed state that does not hold together.
+- **Replay folds in place.** Copying the whole index per record measured 454 ms
+  to start a client at ten thousand notes. See docs/compared.md.
+
+The policy constants below said they were guesses and had to be measured before
+they were believed. They were, they all stayed, and the measurement is in
+docs/compared.md with which of the three governs at which vault size.
 
 ## Why, and why not a database
 
@@ -52,7 +73,10 @@ config dir.
 | `index.log` | records appended since that snapshot |
 
 `index.json` keeping today's shape is deliberate: a vault with a snapshot and
-no log loads exactly as it does now, so there is no migration step.
+no log loads exactly as it does now, so there is no migration step. What that
+does not buy, and the implementation adds: the first save after loading such a
+file writes a whole snapshot rather than a record, because a snapshot with no
+`seq` cannot say which records it already holds.
 
 ## Record format
 
@@ -110,9 +134,11 @@ Truncating rather than deleting keeps the file present, so a missing log and an
 empty log stay distinguishable.
 
 **Policy:** snapshot when the log exceeds 25% of the snapshot's size, or 1000
-records, whichever comes first. Both are guesses and both must be measured
-before they are believed; the test that pins them should assert the policy, not
-the constants.
+records, whichever comes first, and never below a 64 KiB floor. All three were
+guesses; all three were measured (`bun run src/stress/journal.ts`) and kept,
+and the useful result is that they bind at three different vault sizes: the
+floor at forty notes, the fraction at a thousand, the record count at ten
+thousand. The figures are in docs/compared.md.
 
 ## Load
 
@@ -155,7 +181,16 @@ truncating at the first bad record yields an older index either way.
   and it is not an improvement either. `improvements.md` section 6 already
   tracks it.
 - **Two writers.** A journal has the same single-writer requirement the current
-  file has. The CLI's lock still governs; the plugin is one instance.
+  file has, and one failure the current file does not: two writers number their
+  records independently, so their appends interleave into a log whose sequences
+  collide and replay stops at the collision, silently discarding everything
+  after it. The CLI's lock still governs and the plugin is one instance, and
+  that is exactly the kind of "should not happen" a journal of state goes
+  missing behind. So the implementation stamps both files after every write and
+  checks them before the next one: a file that is not what this session left is
+  said out loud and answered with a whole snapshot, which is complete on its own
+  and cannot be a delta over the wrong base. That is last-writer-wins, which is
+  what the whole-file store already did, and now it is audible.
 - **A downgrade.** An older client reads `index.json` and ignores the log,
   silently dropping up to one journal's worth of recent state. Safe by the
   invariant, bounded by the snapshot policy, but it should be stated in the
@@ -183,6 +218,12 @@ Rule 9 applies to each: write it, watch it fail, then make it pass.
 10. A vault holding today's `index.json` and no log loads unchanged.
 
 ## Order of work
+
+All four are done. The tests above live in `core/index-journal.test.ts` (the
+codec), `core/index-journal-store.test.ts` (the policy, against a fake
+filesystem), `index-journal-shells.test.ts` (every crash point, through the two
+stores the shells actually construct) and `stress/journal.stress.ts` (what it
+costs at a size where the cost shows).
 
 1. The record codec and replay, pure and in `core`, with tests 1 to 5 and 10.
    No I/O, so this is where the crash semantics get pinned cheaply.

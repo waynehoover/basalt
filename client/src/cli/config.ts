@@ -10,6 +10,7 @@
 import { mkdir, readFile, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 
+import { indexLogPath } from "../core/index-journal-store.ts";
 import { decodeConfig, encodeConfig, type DeviceConfig } from "../core/pairing.ts";
 import { syncDirectory, writeDurably } from "./vault.ts";
 
@@ -21,6 +22,8 @@ export type Config = DeviceConfig;
 
 export const configPath = (vault: string) => join(vault, STATE_DIR, "config.json");
 export const indexPath = (vault: string) => join(vault, STATE_DIR, "index.json");
+/** The journal of what has changed since that snapshot. Both are the index. */
+export const indexLog = (vault: string) => indexLogPath(indexPath(vault));
 
 /**
  * Reads the config, distinguishing "not paired" from "cannot be read".
@@ -111,6 +114,13 @@ export async function removeState(vault: string): Promise<void> {
  * taking the wrong function.
  */
 export async function removeIndex(vault: string): Promise<void> {
+  // The journal first, and this order is the only safe one. A crash between
+  // the two leaves a snapshot with no journal, which is exactly what an index
+  // looked like before the journal existed and loads without a word. The other
+  // order leaves a journal with no snapshot, which is a delta against a base
+  // that is not there, and the next load refuses to start at all.
+  await rm(indexLog(vault), { force: true });
+  await mustBeGone(indexLog(vault), "the index journal");
   await rm(indexPath(vault), { force: true });
   await mustBeGone(indexPath(vault), "the index");
   await syncDirectory(join(vault, STATE_DIR)).catch(() => undefined);
@@ -124,13 +134,18 @@ export async function removeIndex(vault: string): Promise<void> {
  * caller refuses and says how to clear it.
  */
 export async function orphanedIndex(vault: string): Promise<boolean> {
-  try {
-    await stat(indexPath(vault));
-    return true;
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+  // Either half counts. A journal left on its own is not something a fresh
+  // pairing can start from either: it is a delta against a snapshot that is
+  // gone, and the load refuses it rather than guessing at a base.
+  for (const path of [indexPath(vault), indexLog(vault)]) {
+    try {
+      await stat(path);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
   }
+  return false;
 }
 
 async function mustBeGone(path: string, what: string): Promise<void> {
