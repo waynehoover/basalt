@@ -2,6 +2,16 @@
  * Three-way text merge, and the one place Basalt deliberately behaves worse than
  * Obsidian in order to behave correctly.
  *
+ * Two merges live here, and the order they are written in is the order they
+ * were built in. `mergeTextCharacters` is the character merge, which is most of
+ * this file and every one of the seven checks below. `mergeText`, near the
+ * bottom, is what a note actually goes through: it splits the ancestor into
+ * diff3's regions and runs the character merge inside one of them at a time.
+ * Read this header for what the character merge is doing and why it needs the
+ * checks; read `mergeText` for what changed and what it was measured to be
+ * worth. The character merge is still called on a whole file when a note has no
+ * line structure to compute, so nothing here is dead.
+ *
  * ## The construction, and the defect it inherits
  *
  * Obsidian's merge is diff-match-patch used the way its own documentation shows,
@@ -117,8 +127,8 @@
  *
  * `node-diff3` (3.2.1, June 2026, pure JS) does a real three-way merge with
  * proper conflict regions, which is precisely the notion diff-match-patch lacks
- * and which the four checks above exist to reconstruct. On the face of it, it
- * should replace all of them.
+ * and which the checks above exist to reconstruct. On the face of it, it should
+ * replace all of them.
  *
  * It was tried against the cases in merge.test.ts. It conflicted on five of the
  * eight that merge cleanly here, and caught nothing that the checks above miss:
@@ -133,10 +143,15 @@
  * where that is the common case rather than the rare one, and it would mean a
  * conflict copy most days for the most ordinary thing two devices do.
  *
- * So the trade is real and it goes the other way: diff3 is safer per line and
- * far too coarse per note. It is worth revisiting if character-level three-way
- * merging appears in a maintained library; diff-match-patch has shipped nothing
- * since 2020, which is a risk this file carries knowingly.
+ * That is still true of diff3 whole, and it is why `mergeText` takes diff3's
+ * regions and not its answer: a region both devices touched goes to the
+ * character merge instead of to a conflict marker. The library is still not
+ * used, because what was wanted from it is a hundred and twenty-five lines of
+ * code and the diff it needs is already in the bundle; see merge-regions.ts.
+ *
+ * diff-match-patch has shipped nothing since 2020, which is a risk this file
+ * carries knowingly, and one that regions reduce rather than remove: the fuzzy
+ * matcher now searches a few lines instead of a note.
  *
  * ## Where this sits between the two predecessors
  *
@@ -149,6 +164,7 @@
 
 import { diff_match_patch, type Diff } from "diff-match-patch";
 
+import { regions } from "./merge-regions.ts";
 import { splitName } from "./paths.ts";
 
 /** diff-match-patch's operation codes, named so the intent is readable. */
@@ -457,14 +473,18 @@ export type MergeOutcome =
   | { readonly kind: "conflict"; readonly why: string };
 
 /**
- * Merges `mine` and `theirs` over their common ancestor `base`.
+ * The character-level merge, which is the fallback and was for a long time the
+ * whole of this module.
  *
- * `base` is the content as of the last successful sync, which the local index
- * remembers as one hash per file. That single field is the most useful idea in
- * Obsidian's engine: it turns a three-way merge into something that needs no
- * version history at all.
+ * Everything above describes it. It looks at the note as one string, and where
+ * a change goes is decided by `patch_apply`'s fuzzy search over that string,
+ * which is what the seven checks are for. `mergeText` now runs it only inside
+ * one region of a note, where the search has almost nothing to search; it is
+ * still called on a whole file when the line structure cannot be computed, and
+ * it is still tested as a merge in its own right, because it is what the note
+ * falls back to.
  */
-export function mergeText(
+export function mergeTextCharacters(
   base: string,
   mine: string,
   theirs: string,
@@ -483,6 +503,24 @@ export function mergeText(
    * failing.
    */
   stillValid: (text: string) => boolean = () => true,
+): MergeOutcome {
+  return mergeCore(base, mine, theirs, stillValid, 0);
+}
+
+/**
+ * The merge above, told where in a larger file it is happening.
+ *
+ * `at` is added to every character offset a refusal names, and is zero for a
+ * whole file. It is not zero when `mergeTextHybrid` runs this inside one region
+ * of a note, where an offset counted from the region would send somebody
+ * looking in the wrong place. Nothing else about the merge changes.
+ */
+function mergeCore(
+  base: string,
+  mine: string,
+  theirs: string,
+  stillValid: (text: string) => boolean,
+  at: number,
 ): MergeOutcome {
   if (mine === theirs) {
     return { kind: "take", text: mine, why: "both sides already agree" };
@@ -521,7 +559,7 @@ export function mergeText(
       kind: "conflict",
       why:
         `both devices changed the same text, at characters ` +
-        `${collision.start} to ${collision.end} of the last synced version`,
+        `${at + collision.start} to ${at + collision.end} of the last synced version`,
     };
   }
 
@@ -534,7 +572,7 @@ export function mergeText(
       kind: "conflict",
       why:
         `a line added on one device would run into text changed on the other, ` +
-        `at character ${fused.start} of the last synced version`,
+        `at character ${at + fused.start} of the last synced version`,
     };
   }
 
@@ -548,7 +586,7 @@ export function mergeText(
       kind: "conflict",
       why:
         `each device rewrote the same line differently, and the two rewrites ` +
-        `would run together at character ${spliced.start} of the last synced version`,
+        `would run together at character ${at + spliced.start} of the last synced version`,
     };
   }
 
@@ -623,6 +661,206 @@ export function mergeText(
   // their order, one of them has to be picked; arbitrary, and fixed, which is
   // what matters.
   return { kind: "merged", text: forward.text };
+}
+
+/**
+ * Merges `mine` and `theirs` over their common ancestor `base`.
+ *
+ * `base` is the content as of the last successful sync, which the local index
+ * remembers as one hash per file. That single field is the most useful idea in
+ * Obsidian's engine: it turns a three-way merge into something that needs no
+ * version history at all.
+ *
+ * ## Regions, and why the merge no longer searches the note for a place to put
+ * things
+ *
+ * Everything above reconstructs, from character spans, the one notion
+ * diff-match-patch does not have: which stretch of the note each device
+ * changed. Seven checks, each one a note or a fuzz case that went wrong first.
+ * They work. What they are working around is that `patch_apply` decides where a
+ * change goes by fuzzy search over the whole file, and a search over a whole
+ * file can land in the wrong section. After that, every check is asking whether
+ * a wrong answer looks wrong.
+ *
+ * diff3 does not search. It diffs both sides against the ancestor by lines and
+ * cuts the ancestor into stretches: untouched, changed by one device, changed by
+ * both. A change belongs to one stretch and cannot move to another, because
+ * nothing looks for it a second time. merge-regions.ts computes that, and this
+ * is what it is for.
+ *
+ * A stretch one device changed is **copied** from that device. No patch, no
+ * matcher, no fuzz: the only decision anybody made about those lines was which
+ * stretch they belong to, and the line diff made it. A stretch both devices
+ * changed is the case plain diff3 gives up on, and giving up on it is why
+ * node-diff3 was rejected here, because in prose it is two people editing one
+ * paragraph. So that is the one place the character merge runs, on those few
+ * lines, with all seven checks and nothing else in the file to misplace
+ * anything into.
+ *
+ * ## Why checking the seams is enough
+ *
+ * The merged pieces are concatenated, and concatenation is where a merge invents
+ * a line. So every piece but the last has to end a line. With that held, no line
+ * and no word can span two pieces, because `\n` ends both, which is why the word
+ * check inside a region is enough for the whole note and there is no second one
+ * out here: a word the merge invented would have to be inside some region, and
+ * that region already refused it against a smaller vocabulary than the note's.
+ *
+ * Without the seam check, the case that made `fusedLine` necessary walks
+ * straight back in: one device writes into a blank line the other removed, the
+ * region merges to a line with no newline left, and the next region runs into
+ * it. Pinned in merge.test.ts under "merging inside line regions".
+ *
+ * ## What it is worth, measured
+ *
+ * merge.fuzz.run.ts, a million generated cases per mode, both merges on the same
+ * seeds. Per hundred thousand cases:
+ *
+ * ```
+ *                       merged   conflicts   defects
+ *   placed   character  70,184      29,816       1.8
+ *            regions    94,519       5,481       1.6
+ *   tokens   character  57,321      42,679       0.2
+ *            regions    85,266      14,734       0.1
+ * ```
+ *
+ * A defect is a `merged` outcome whose text is not a merge of what the two
+ * devices wrote, which is the only number that decides anything; the merge rate
+ * is the number a person sees, because every conflict is a duplicate file
+ * somebody has to reconcile by hand. Both improve, which is unusual enough to
+ * be suspicious of, so the rest of this is what was done about the suspicion.
+ *
+ * The residue is not the same residue, and that matters more than the counts.
+ * Over 300,000 cases of the oracle mode, all four of the character merge's
+ * defects are a line neither device wrote, which is the failure this module
+ * exists to prevent. Neither of the region merge's two is: every line in them is
+ * some device's own line, and what is wrong is that an added line sits against
+ * the wrong paragraph, in ancestors that genuinely read two ways. The one
+ * documented in merge.fuzz.ts, where `mine1` lands on the other device's new
+ * line, is gone; it now merges, correctly.
+ *
+ * The oracle's own bias is the thing to be honest about: the placed mode judges
+ * a merge by applying two line-level edit scripts, which is close to what this
+ * merge computes, so "fewer defects there" is weaker evidence for it than the
+ * same number would be for the character merge. Three things that are not
+ * circular say the same: the token mode has no model of a merge at all and finds
+ * nothing; swapping the two devices over and merging again changes the lines in
+ * neither merge, in 200,000 cases of each mode, which is the one property here
+ * with no notion of a right answer behind it; and the four cases in
+ * merge.test.ts that used to be refusals are now exact texts, checked by hand
+ * against what the two devices meant.
+ *
+ * It is also about twice as fast on a large note, because two line diffs and a
+ * handful of tiny merges cost less than four whole-file patch applications.
+ *
+ * ## What it costs, which is not nothing
+ *
+ * A merge that refuses less is a merge that decides more. Three specific things
+ * to know:
+ *
+ *   - Where the ancestor reads two ways, the line diff picks one, and the merge
+ *     is right about that reading rather than about what somebody meant. That is
+ *     the whole of the remaining residue.
+ *   - A device that deletes a whole paragraph while the other appends to the end
+ *     now merges to the appended line, where the character merge kept both
+ *     copies. Both edits are honoured and the note is much smaller. Rule 5 says
+ *     a result smaller than its input is a bug until shown otherwise; here it is
+ *     shown, by the device that did the deleting, and it is still the shape most
+ *     worth watching.
+ *   - The order of two lines added at one point can differ from what the
+ *     character merge chose. Either is defensible, both devices compute the same
+ *     one, and the daily note is pinned in merge.test.ts so a change to it is a
+ *     deliberate act.
+ */
+export function mergeText(
+  base: string,
+  mine: string,
+  theirs: string,
+  stillValid: (text: string) => boolean = () => true,
+): MergeOutcome {
+  if (mine === theirs) {
+    return { kind: "take", text: mine, why: "both sides already agree" };
+  }
+  if (base === mine) {
+    return { kind: "take", text: theirs, why: "no local change since the last sync" };
+  }
+  if (base === theirs) {
+    return { kind: "take", text: mine, why: "no remote change since the last sync" };
+  }
+
+  const parts = regions(base, mine, theirs);
+  // The line encoding could not describe this file, which means there are no
+  // regions to work in. Rule 2: an answer that could not be computed is not an
+  // empty answer, so this falls back to the merge that needs no line structure
+  // rather than pretending the note is one region.
+  if (parts === undefined) return mergeTextCharacters(base, mine, theirs, stillValid);
+
+  const pieces: string[] = [];
+  for (const region of parts) {
+    if (region.changed === "none") pieces.push(region.base);
+    else if (region.changed === "mine") pieces.push(region.mine);
+    else if (region.changed === "theirs") pieces.push(region.theirs);
+    else if (region.base === "" && region.mine === region.theirs) {
+      // Two devices that added the same line at the same point made two
+      // additions, not one agreement, and `mergeCore` would read the two
+      // equal texts as agreement and keep one copy. That is a line a device
+      // wrote and the merge did not, which is rule 5 in one line: a result
+      // smaller than its input, with nothing to say it is right.
+      //
+      // Keeping both is also what the character merge already does whenever
+      // any other edit is near enough to stop the two sides being identical
+      // texts, so this is consistency rather than a new opinion; a duplicate
+      // line is visible and a dropped one is not. Found by the token property
+      // at five cases in a hundred thousand, all one shape, case 1588279904
+      // among them, where the line diff read mine's copy as a line that had
+      // moved. Pinned in merge.test.ts, "keeps both copies when both devices
+      // added the same line".
+      pieces.push(region.mine + region.theirs);
+    } else {
+      // The one place the character merge runs, and it sees this region and
+      // nothing else, so a hunk it misplaces can only be misplaced within a
+      // stretch both devices were editing. `stillValid` is asked of the whole
+      // file at the end, not of a fragment that is not one.
+      const inner = mergeCore(region.base, region.mine, region.theirs, () => true, region.at);
+      if (inner.kind === "conflict") return inner;
+      pieces.push(inner.text);
+    }
+  }
+
+  // Every piece but the last has to end a line, or the next one runs into it.
+  // This is the region equivalent of `fusedLine`, and it is needed for the same
+  // reason: a device writing into a blank line the other device removed leaves
+  // a region whose merge is a line with no newline left, and concatenating that
+  // with the next region makes a line neither device wrote. Pinned in
+  // merge.test.ts under "an addition whose separator the other side deleted"
+  // and again as "refuses a region whose merge would run into the next region".
+  //
+  // The offset named is the seam, which is where the ancestor's own text ends
+  // for the region that lost its newline, because that is the place a person
+  // would go and look.
+  for (let i = pieces.length - 1, seen = false; i >= 0; i--) {
+    const piece = pieces[i]!;
+    if (piece === "") continue;
+    if (seen && !piece.endsWith("\n")) {
+      const region = parts[i]!;
+      return {
+        kind: "conflict",
+        why:
+          `a change on one device would run into the next line, at character ` +
+          `${region.at + region.base.length} of the last synced version`,
+      };
+    }
+    seen = true;
+  }
+
+  const text = pieces.join("");
+  if (!stillValid(text)) {
+    return {
+      kind: "conflict",
+      why: "both sides merged cleanly and the result is no longer a valid file of its kind",
+    };
+  }
+  return { kind: "merged", text };
 }
 
 /**

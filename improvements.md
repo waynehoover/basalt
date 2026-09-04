@@ -103,15 +103,50 @@ Candidate rethinks, in increasing order of ambition:
    hand-built cases; a fuzzer with repetitive content (the observed
    failure shape: N similar sections) would attack exactly the fuzzy
    matcher. This is not a direction change, just an unfinished job.
-2. **Line-anchored hybrid.** diff3's region discipline (proper conflict
-   regions) for line structure plus diff-match-patch *within* a
-   conflicting line for prose granularity. `node-diff3` was rejected
-   because line granularity conflicts on any two edits to one
-   paragraph — but that rejection tested diff3 *alone*. A hybrid
-   (diff3 regions; character merge only inside a region both sides
-   touched, refused if it spans regions) keeps the daily-note merge
-   and gains real regions. Prototype it against `merge.test.ts`
-   before deciding; the suite is the referee.
+2. **Line-anchored hybrid. Built, measured, and shipped as the
+   default.** diff3's region discipline for line structure plus
+   diff-match-patch *within* a region both sides touched. The rejection
+   of `node-diff3` had tested diff3 *alone*, which conflicts on any two
+   edits to one paragraph; the hybrid keeps the daily-note merge and
+   gains real regions. `merge-regions.ts` computes the regions (125
+   lines of code, no new dependency: the line diff it needs is
+   diff-match-patch's own, already in the bundle), `mergeText` walks
+   them, and `mergeTextCharacters` is the old whole-file merge, kept as
+   the fallback for a note whose line structure cannot be computed and
+   still tested as a merge in its own right.
+
+   Measured by `merge.fuzz.run.ts`, a million generated cases per mode,
+   both merges on the same seeds, per hundred thousand cases:
+
+   |            |         | merged | conflicts | defects |
+   | ---------- | ------- | -----: | --------: | ------: |
+   | **placed** | classic | 70,184 |    29,816 |     1.8 |
+   |            | regions | 94,519 |     5,481 |     1.6 |
+   | **tokens** | classic | 57,321 |    42,679 |     0.2 |
+   |            | regions | 85,266 |    14,734 |     0.1 |
+
+   A defect is a `merged` outcome whose text is not a merge of what the
+   two devices wrote. Both numbers improve, which is unusual enough to
+   distrust, so: the residue also changed in kind. Over 300,000 oracle
+   cases every one of the character merge's defects is a line neither
+   device wrote, and none of the region merge's are; what is left there
+   is an added line placed against the wrong paragraph, in ancestors
+   that genuinely read two ways. The defect this file's own fuzzer
+   documented as unfixed (`mine1` landing on the other device's new
+   line) now merges, correctly. Swapping the two devices over changes
+   the lines in neither merge over 200,000 cases per mode, which is the
+   one check with no model of a right answer behind it. It is also
+   about twice as fast on a large note.
+
+   The cost, because a merge that refuses less decides more: a device
+   that deletes a paragraph while the other appends now merges to the
+   appended text where the old merge kept both copies, and the order of
+   two lines added at one point can differ from what the character
+   merge chose. Four cases in `merge.test.ts` that used to be conflicts
+   are now exact texts, each checked by hand against what the two
+   devices meant; the character merge's behaviour on all four is still
+   pinned, on the fallback entry point.
+
 3. **A CRDT for text (Automerge/Yjs).** The actual direction change.
    Kills the merge module, the `synchash` ancestor scheme, and the
    whole class of "placed wrongly" failures — at the cost of a
@@ -120,8 +155,10 @@ Candidate rethinks, in increasing order of ambition:
    devices, CRDTs are the solved answer; the reason to hesitate is
    that Basalt's merge is *already* good for the common cases and a
    CRDT is a rewrite of the sync core, not a swap of one module.
-   Recommendation: do (1) now, spike (2), keep (3) as the named
-   alternative in `design.md` so the next merge bug has somewhere to go.
+   Recommendation: (1) and (2) are done. Keep (3) as the named
+   alternative in `design.md` so the next merge bug has somewhere to go,
+   and note that (2) moved the target: what is left to a CRDT is the
+   residue of ambiguous ancestors, not mangled text.
 
 Also: `stillValid` (JSON validity for canvas files) is plumbed but the
 docs admit it came from reading others' issues, not from a failure.

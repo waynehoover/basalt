@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { diff_match_patch } from "diff-match-patch";
-import { conflictCopyPath, mergeText, sanitiseDevice } from "./merge.ts";
+import { conflictCopyPath, mergeText, mergeTextCharacters, sanitiseDevice } from "./merge.ts";
 
 /**
  * diff-match-patch used the way its own documentation shows, with none of the
@@ -138,10 +138,70 @@ describe("refusing to merge rather than losing an edit", () => {
     }
   });
 
-  it("never returns a merge that has lost a local insertion", () => {
-    // The invariant, over a spread of shapes rather than one case. Whatever
-    // the inputs, a "merged" outcome contains every local insertion of three
-    // characters or more.
+  /**
+   * The invariant, over a spread of shapes rather than one case, asked of the
+   * character merge, whose unit is a run of inserted characters.
+   *
+   * It is not asked of the merge that ships, and the reason is not that it
+   * fails: a run of characters one device inserted can legitimately arrive with
+   * the other device's insertion in the middle of it, because a region merge
+   * places each device's lines separately. `onE\nINSERTED AT THE TOP\ntwo` is
+   * the correct merge of a device that capitalised every `e` and a device that
+   * added a line, and the run `E\ntwo` is no longer a substring of it. What is
+   * asked of the shipped merge is the property under that one, which is that no
+   * word of an insertion goes missing; see the test below.
+   */
+  it("never returns a character merge that has lost a local insertion", () => {
+    const dmp = new diff_match_patch();
+    const bases = [
+      "one\ntwo\nthree\nfour\nfive\n",
+      "# Heading\n\nSome prose here.\n\n- a list item\n- another\n",
+      "same line\n".repeat(20),
+      "a\n",
+    ];
+    const edits = [
+      (s: string) => s.replace("\n", "\nINSERTED AT THE TOP\n"),
+      (s: string) => `${s}APPENDED AT THE BOTTOM\n`,
+      (s: string) => s.replace(/e/g, "E"),
+      () => "",
+      (s: string) => s.split("\n").reverse().join("\n"),
+    ];
+
+    let mergedCount = 0;
+    for (const base of bases) {
+      for (const a of edits) {
+        for (const b of edits) {
+          const mine = a(base);
+          const theirs = b(base);
+          const r = mergeTextCharacters(base, mine, theirs);
+          if (r.kind !== "merged") continue;
+          mergedCount++;
+
+          const diff = dmp.diff_main(base, mine, true, 0);
+          if (diff.length > 2) {
+            dmp.diff_cleanupSemantic(diff);
+            dmp.diff_cleanupEfficiency(diff);
+          }
+          for (const [op, text] of diff) {
+            if (op === 1 && text.length >= 3) {
+              expect(r.text, `lost ${JSON.stringify(text)}`).toContain(text);
+            }
+          }
+        }
+      }
+    }
+    // Rule 8: without a count, "every merge was clean" is also what zero
+    // merges looks like.
+    expect(mergedCount).toBeGreaterThan(10);
+  });
+
+  it("never returns a merge that has lost a word somebody typed", () => {
+    // The same grid against the merge that ships. Every word of every local
+    // insertion is in the result, and the count is here because it is also the
+    // measurement: the region merge returns text for 36 of these 100 pairs
+    // where the character merge returns text for 20, and neither loses a word.
+    // Rule 8, and the reason the count is asserted rather than mentioned: a
+    // merge that grew more cautious would still pass the word property.
     const dmp = new diff_match_patch();
     const bases = [
       "one\ntwo\nthree\nfour\nfive\n",
@@ -173,16 +233,16 @@ describe("refusing to merge rather than losing an edit", () => {
             dmp.diff_cleanupEfficiency(diff);
           }
           for (const [op, text] of diff) {
-            if (op === 1 && text.length >= 3) {
-              expect(r.text, `lost ${JSON.stringify(text)}`).toContain(text);
+            if (op !== 1) continue;
+            for (const word of text.split(/\s+/)) {
+              if (word === "") continue;
+              expect(r.text, `lost ${JSON.stringify(word)}`).toContain(word);
             }
           }
         }
       }
     }
-    // Rule 8: without a count, "every merge was clean" is also what zero
-    // merges looks like.
-    expect(mergedCount).toBeGreaterThan(10);
+    expect(mergedCount).toBe(36);
   });
 
   it("refuses when a local deletion cannot be placed", () => {
@@ -354,8 +414,14 @@ describe("the guards behind the overlap check", () => {
    * diff-match-patch places a hunk by matching four lines of context either
    * side. Destroy all eight and the hunk cannot be placed, and Obsidian's
    * version returns the result anyway with the local edit gone.
+   *
+   * And it is the clearest case for merging by regions instead, so both are
+   * here. There is nothing to place: line 15 is the only line the two devices
+   * did not both leave alone, one of them changed it, and its text is copied
+   * across. Context only matters to something that goes looking, so the
+   * character merge refuses a merge that the region merge simply has.
    */
-  it("refuses when a non-overlapping edit has nowhere left to apply", () => {
+  it("refuses a character merge whose edit has nowhere left to apply", () => {
     const lines = Array.from({ length: 30 }, (_, i) => `original line ${i}`);
     const base = lines.join("\n");
 
@@ -372,7 +438,7 @@ describe("the guards behind the overlap check", () => {
     const theirs = theirLines.join("\n");
 
     const obsidian = unguardedMerge(base, mine, theirs);
-    const ours = mergeText(base, mine, theirs);
+    const ours = mergeTextCharacters(base, mine, theirs);
 
     if (!obsidian.includes("LOCAL REWROTE LINE FIFTEEN")) {
       // The backstops are what catch this: the spans do not overlap, so
@@ -381,6 +447,14 @@ describe("the guards behind the overlap check", () => {
     } else {
       expect(ours.kind === "merged" && ours.text).toContain("LOCAL REWROTE LINE FIFTEEN");
     }
+
+    // And the merge that ships returns the answer, exactly: every line theirs
+    // rewrote, with mine's line 15 in the one place it was ever written.
+    const want = [...theirLines];
+    want[15] = "LOCAL REWROTE LINE FIFTEEN";
+    const r = mergeText(base, mine, theirs);
+    expect(r.kind).toBe("merged");
+    expect(r.kind === "merged" && r.text).toBe(want.join("\n"));
   });
 
   it("merges spans that abut exactly", () => {
@@ -451,8 +525,13 @@ describe("a hunk that did not apply", () => {
    * because it is one comparison, and because it is the exact defect this
    * module exists to invert, so removing it on the grounds that nothing
    * currently reaches it would be removing the seatbelt for never crashing.
+   *
+   * The merge that ships never asks. Mine deleted four lines and theirs rewrote
+   * the sixteen around them, and those are different lines, so each device's
+   * text is copied into its own region and no hunk is placed anywhere. The
+   * answer is below, exactly, and it is the one both people meant.
    */
-  it("refuses whenever diff-match-patch reports a hunk it could not place", () => {
+  it("refuses a character merge whose hunk diff-match-patch could not place", () => {
     const before = Array.from({ length: 8 }, (_, i) => `context above ${i}`);
     const block = Array.from({ length: 4 }, (_, i) => `doomed line ${i}`);
     const after = Array.from({ length: 8 }, (_, i) => `context below ${i}`);
@@ -477,7 +556,16 @@ describe("a hunk that did not apply", () => {
     // And this is why reading the result is not enough: it looks correct.
     expect(obsidianText).not.toContain("doomed line 0");
 
-    expect(mergeText(base, mine, theirs).kind).toBe("conflict");
+    expect(mergeTextCharacters(base, mine, theirs).kind).toBe("conflict");
+
+    const r = mergeText(base, mine, theirs);
+    expect(r.kind).toBe("merged");
+    expect(r.kind === "merged" && r.text).toBe(
+      [
+        ...before.map((_, i) => `entirely rewritten above ${i} with no words in common`),
+        ...after.map((_, i) => `entirely rewritten below ${i} with no words in common`),
+      ].join("\n"),
+    );
   });
 });
 
@@ -534,10 +622,21 @@ describe("a hunk placed in the wrong place, which reports success", () => {
     expect(spliced).toContain("Item 6 EDITED LOCALLY");
   });
 
-  it("is refused", () => {
-    const r = mergeText(base, mine, theirs);
+  it("is refused by the character merge", () => {
+    const r = mergeTextCharacters(base, mine, theirs);
     expect(r.kind).toBe("conflict");
     expect(r.kind === "conflict" && r.why).toMatch(/either order/);
+  });
+
+  it("does not happen at all when the merge is done by regions", () => {
+    // The flagship case for the region merge, and the reason it is worth
+    // having: not that it refuses this, but that it gets it right. Mine
+    // changed one line; theirs deleted three sections; those are different
+    // lines of the ancestor, so mine's line is copied into the region it
+    // belongs to and there is no search that could put it on Item 6.
+    const r = mergeText(base, mine, theirs);
+    expect(r.kind).toBe("merged");
+    expect(r.kind === "merged" && r.text).toBe(theirs.replace("Item 3", "Item 3 EDITED LOCALLY"));
   });
 
   it("does not turn ordinary merges into conflicts", () => {
@@ -594,13 +693,17 @@ describe("which check catches what", () => {
   });
 
   it("only the two-directions check catches a misplaced hunk", () => {
+    // Of the character merge's checks. The regions the shipped merge works in
+    // are what stop the hunk being misplaced in the first place, which is the
+    // line above this list in merge.ts: a check that asks whether a wrong
+    // answer looks wrong is worth less than not producing one.
     const block = (i: number) => `## Section\n\nSome shared boilerplate text here.\n\nItem ${i}\n`;
     const base = Array.from({ length: 12 }, (_, i) => block(i)).join("\n");
     const mine = base.replace("Item 3", "Item 3 EDITED LOCALLY");
     const theirs = Array.from({ length: 12 }, (_, i) => block(i))
       .slice(3)
       .join("\n");
-    const r = mergeText(base, mine, theirs);
+    const r = mergeTextCharacters(base, mine, theirs);
     expect(r.kind).toBe("conflict");
     expect(r.kind === "conflict" && r.why).toMatch(/either order/);
   });
@@ -1001,6 +1104,92 @@ describe("two rewrites of one line that miss each other", () => {
     const day = "# 2026-09-02\n\n- first thing\n";
     const r = mergeText(day, day + "- mine\n", day + "- theirs\n");
     expect(r.kind).toBe("merged");
+  });
+});
+
+/**
+ * The three things that can go wrong once a merge is done region by region,
+ * each one found by merge.fuzz.run.ts while the region merge was being built,
+ * and none of them reachable by the character merge because it has no regions.
+ *
+ * They are all the same shape underneath: a region is a piece of the answer,
+ * and a piece can be emitted twice, dropped, or joined to its neighbour.
+ */
+describe("merging inside line regions", () => {
+  it("does not repeat a line appended past the lines the other device rewrote", () => {
+    // Fuzz case 1588258344, trimmed. Mine rewrote the first item and appended a
+    // line at the end; theirs replaced every item with one line of its own. The
+    // append and the rewrite are two of mine's changes, and at the end of a file
+    // they sit at the same ancestor position: there is no line after the last
+    // one to tell them apart. Reading mine's text for the region by index took
+    // the appended line into the region as well, and the region after it emitted
+    // the line again. `MINE LINE 1` appeared twice, in a merge reported clean.
+    const base = "# 2026-09-02\n\n- the sync\n- sync\n- sync here the\n";
+    const mine = "# 2026-09-02\n\nmine0 the sync\n- sync\n- sync here the\nMINE LINE 1\n";
+    const theirs = "# 2026-09-02\n\n- theirs1\n";
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind !== "merged") throw new Error(`refused a good merge: ${r.why}`);
+    expect(r.text.split("\n").filter((l) => l === "MINE LINE 1")).toHaveLength(1);
+  });
+
+  it("keeps both copies when both devices added the same line", () => {
+    // Fuzz case 1588279904, trimmed. Both devices put the same line at the same
+    // point, so the two texts for that region are equal and the character merge
+    // reads equal texts as agreement and returns one copy. Which is a line a
+    // device wrote and the merge did not: rule 5, a result smaller than its
+    // input with nothing to say that is right.
+    //
+    // Keeping both is what the character merge itself does as soon as anything
+    // stops the two region texts being identical, so this is consistency, and a
+    // duplicate line is visible where a dropped one is not.
+    const base = "- a\n- b\n";
+    const mine = "- a\n- SAME\n- b\n- mine\n";
+    const theirs = "- a\n- SAME\n- b\n- theirs\n";
+
+    const r = mergeText(base, mine, theirs);
+    if (r.kind !== "merged") throw new Error(`refused a good merge: ${r.why}`);
+    expect(r.text.split("\n").filter((l) => l === "- SAME")).toHaveLength(2);
+    expect(r.text).toContain("- mine");
+    expect(r.text).toContain("- theirs");
+  });
+
+  it("refuses a region whose merge would run into the next region", () => {
+    // The region form of `fusedLine`, and the case that needs it: mine wrote
+    // into a blank line, theirs deleted that blank line, and the region holding
+    // it merges to `mine0` with no newline left. Concatenated with the region
+    // after it that is `mine0here again.`, a line neither device wrote, out of
+    // a merge every check inside the region was happy with. The check is on the
+    // pieces rather than on the text, because by the time it is one string the
+    // join has already happened.
+    const base = "line text here.\n\nhere again.\n";
+    const mine = "line text here.\nmine0\nhere again.\n";
+    const theirs = "line text here.\nhere again.\n";
+
+    const r = mergeText(base, mine, theirs);
+    expect(r.kind).toBe("conflict");
+    expect(r.kind === "conflict" && r.why).toMatch(/run into/);
+  });
+
+  it("still merges the ordinary shapes it would be easy to refuse with them", () => {
+    // The cost the three checks above must not have. A line appended by one
+    // device while the other rewrites earlier lines, one device adding the line
+    // the other one also added *somewhere else*, and a line appended after one
+    // the other device rewrote, which is the shape the boundary check is
+    // nearest to refusing.
+    //
+    // Not in the list, and worth saying: the same last case without a trailing
+    // newline is a conflict, and it is one in the character merge too. A device
+    // that appends to a note whose last line has no newline is editing that
+    // line, and `fusedLine` has refused that since before there were regions.
+    const cases: [string, string, string][] = [
+      ["a\nb\nc\n", "A\nb\nc\nmine\n", "a\nB\nc\n"],
+      ["- a\n- b\n", "- SAME\n- a\n- b\n", "- a\n- b\n- SAME\n"],
+      ["a\nb\n", "a\nB\n", "a\nb\nc\n"],
+    ];
+    for (const [b, m, t] of cases) {
+      expect(mergeText(b, m, t).kind, `${JSON.stringify(b)} became a conflict`).toBe("merged");
+    }
   });
 });
 
