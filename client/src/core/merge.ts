@@ -118,6 +118,13 @@
  *   - **inventedWord** catches a splice inside a word, which no span check
  *     sees because both spans are innocent. Disabling it leaves three tests
  *     failing.
+ *   - **stillValid**, which is the caller's and not one of the seven, catches
+ *     a merge that is clean text and broken structure. Only the caller knows
+ *     how to judge that, so it is asked of `.canvas` and `.json` and of
+ *     nothing else. Disabling it leaves two tests in canvas.test.ts failing,
+ *     and 193 of the 2,429 canvases that merge cleanly in that file's
+ *     generated corpus are files Obsidian will not open: one in thirteen, and
+ *     nothing else sees any of them.
  *
  * The applied flags and insertion survival stay for the cost of a comparison
  * over data already at hand, and because the flags are the precise defect this
@@ -495,12 +502,18 @@ export function mergeTextCharacters(
    * note. For a structured file there is, and a line-wise merge does not know
    * it: two edits to different parts of a canvas can each apply cleanly and
    * leave JSON that does not parse, which Obsidian then refuses to open. The
-   * four checks below all pass, because nothing was lost and nothing
-   * collided; the file is simply no longer a canvas.
+   * checks below all pass, because nothing was lost and nothing collided; the
+   * file is simply no longer a canvas.
    *
-   * Reported against Sync Engine's neighbours as an overwrite risk on canvas
-   * files, and found here by reading their issues rather than by anything
-   * failing.
+   * It arrived from reading a neighbouring project's issues rather than from
+   * anything failing here, and that was written down as a weakness. It is not
+   * one any more. canvas.test.ts holds the case: a board with two cards and no
+   * arrows, one device draws an arrow, the other draws a different arrow.
+   * `"edges":[]` is one line in the ancestor and three on each device, so the
+   * two edge objects are concatenated with no comma between them. Every other
+   * check passes and the canvas will not open. One clean merge in thirteen of
+   * that file's generated canvases is such a file, and this is the only check
+   * that sees any of them.
    */
   stillValid: (text: string) => boolean = () => true,
 ): MergeOutcome {

@@ -744,8 +744,10 @@ describe("which check catches what", () => {
  *
  * Every other check in mergeText passes for this: nothing was lost, nothing
  * collided, both directions agree. The file is simply no longer a canvas, and
- * Obsidian refuses to open it. Reported against a neighbouring project as an
- * overwrite risk on canvas files, and found here by reading their issues.
+ * Obsidian refuses to open it.
+ *
+ * The corpus is in canvas.test.ts, against canvases written the way Obsidian
+ * writes them. These are the small cases that were here first.
  */
 describe("a merge that stops the file being what it was", () => {
   const parsesAsJson = (t: string) => {
@@ -768,17 +770,16 @@ describe("a merge that stops the file being what it was", () => {
   });
 
   /**
-   * The shapes that would break a canvas are refused before the new check is
-   * reached, by the two-directions check, and that is worth knowing rather
-   * than assuming. Five attempts at a clean merge that produces broken JSON,
-   * all of them already conflicts:
+   * These particular shapes are refused before the parse check is reached, by
+   * the two-directions check, and that is worth knowing rather than assuming:
    *
-   *   appending while the other side deletes, two appends to one array, a
-   *   nested delete against an append, edits either side of a closing brace,
-   *   and adding and removing canvas nodes.
+   *   appending while the other side deletes, two appends to one array, and
+   *   adding and removing canvas nodes.
    *
-   * The parse check stays as the thing that catches a sixth shape nobody has
-   * thought of, and no test isolates it, because nothing yet gets that far.
+   * It used to say here that no test isolated the parse check because nothing
+   * got that far. That was true of these three toy arrays and false of a
+   * canvas. See "the first arrow, drawn on two devices at once" in
+   * canvas.test.ts, which is a merge nothing else refuses.
    */
   it("already refuses the shapes that would break a canvas", () => {
     const shapes: [string, string, string, string][] = [
