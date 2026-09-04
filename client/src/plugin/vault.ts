@@ -52,9 +52,13 @@
  * two leaves a note empty or short with no copy of what it held. And
  * `FileSystemAdapter.rename` throws "Destination file already exists!" when the
  * target exists, unless the two names differ only by case on a filesystem that
- * folds it; the Capacitor adapter hands `rename` to the platform plugin, whose
- * answer differs by operating system. So there is no replace-by-rename through
- * this API, and `replace` below says what is done instead.
+ * folds it. The Capacitor adapter was read again for 1.13.7 and makes the same
+ * check with the same message and the same single exception before it hands
+ * anything to the platform plugin, so the refusal is not desktop-only: what is
+ * still the platform's is what happens if the destination appears between that
+ * check and the rename, which is why `create` looks once more just before it.
+ * So there is no replace-by-rename through this API on either platform, and
+ * `replace` below says what is done instead.
  */
 
 import {
@@ -260,8 +264,15 @@ export class ObsidianVault implements Vault {
   /**
    * What this pass has written and not yet made durable: files, and the
    * directories whose entries changed under them. Cleared by `flush`.
+   *
+   * Each name carries the number of the write that owed it, counted from
+   * `owed` below, so a flush can tell the write it is syncing from a later
+   * one for the same name. Crossing a name off without that check crossed off
+   * a write it had never seen: see `forget`.
    */
-  private readonly unsynced = { files: new Set<string>(), dirs: new Set<string>() };
+  private readonly unsynced = { files: new Map<string, number>(), dirs: new Map<string, number>() };
+  /** Counts writes, so two of one file are two things owed and not one. */
+  private owed = 0;
   /** Node's fs where there is one; resolved once, on the first flush. */
   private fsync: FsyncFs | undefined | null = null;
   private readonly fsOverride: FsyncFs | undefined;
@@ -571,14 +582,34 @@ export class ObsidianVault implements Vault {
 
   /** Remembers a file whose bytes or name changed, for `flush`. */
   private wrote(normalized: string): void {
-    this.unsynced.files.add(normalized);
+    this.unsynced.files.set(normalized, ++this.owed);
     this.entryChanged(normalized);
   }
 
   /** Remembers the directory a path lives in, whose entries have changed. */
   private entryChanged(normalized: string): void {
     const cut = normalized.lastIndexOf("/");
-    this.unsynced.dirs.add(cut === -1 ? "" : normalized.slice(0, cut));
+    this.unsynced.dirs.set(cut === -1 ? "" : normalized.slice(0, cut), ++this.owed);
+  }
+
+  /**
+   * Crosses a name off, unless something owed it again while it was in hand.
+   *
+   * The flush syncs a name and then forgets it, and between those two it has
+   * awaited. A write that landed in that gap put the same name back, and the
+   * forget used to take it away again: the bytes it wrote were never fsynced
+   * and the index that followed named them as durable, which is the one
+   * ordering rule 3 forbids here. A different file was already safe, because
+   * the flush had never held its name; the same file was not, and neither was
+   * the directory a new file had just appeared in.
+   *
+   * Nothing in the engine writes during a flush today, because a pass is
+   * awaited end to end and passes are queued one at a time. This is what the
+   * file said it did, made true, so that the ordering does not rest on a
+   * property of a caller in another module.
+   */
+  private forget(owed: Map<string, number>, path: string, stamp: number): void {
+    if (owed.get(path) === stamp) owed.delete(path);
   }
 
   /**
@@ -633,25 +664,26 @@ export class ObsidianVault implements Vault {
     }
     const adapter = this.adapter;
     let failure: unknown;
-    for (const path of files) {
+    for (const [path, stamp] of files) {
       try {
         await fsyncPath(fs, adapter, path);
-        // Deleted one at a time rather than cleared, so a write that landed
-        // while this was running is still waiting for the next flush.
-        this.unsynced.files.delete(path);
+        // Dropped one at a time rather than cleared, and only the write this
+        // one synced, so a write that landed while it was running is still
+        // waiting for the next flush.
+        this.forget(this.unsynced.files, path, stamp);
       } catch (err) {
         // Gone rather than unopenable: there is nothing to make durable, so
         // the name is dropped and the pass carries on. Asked of the adapter
         // rather than read off the error, because a platform is free to
         // report a missing file however it likes.
         if (!(await this.adapter.exists(path))) {
-          this.unsynced.files.delete(path);
+          this.forget(this.unsynced.files, path, stamp);
           continue;
         }
         failure ??= err;
       }
     }
-    for (const dir of dirs) {
+    for (const [dir, stamp] of dirs) {
       try {
         await fsyncPath(fs, adapter, dir);
       } catch (err) {
@@ -664,8 +696,9 @@ export class ObsidianVault implements Vault {
         }
       }
       // Dropped either way: this failure is tolerated rather than retried,
-      // and a platform that refuses would refuse for ever.
-      this.unsynced.dirs.delete(dir);
+      // and a platform that refuses would refuse for ever. Still only the
+      // change this one synced, for the reason `forget` gives.
+      this.forget(this.unsynced.dirs, dir, stamp);
     }
     if (failure !== undefined) throw failure;
   }

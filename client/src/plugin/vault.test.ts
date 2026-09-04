@@ -81,6 +81,11 @@ describe("listing", () => {
   });
 
   it("leaves the directories that must never sync alone", async () => {
+    // Obsidian's own index leaves out every dot-prefixed path, so in a real
+    // vault these never reach the filter at all. The fake is told to hand
+    // them over anyway: the filter is the thing under test, and one that
+    // works only because its input was already clean is not tested.
+    adapter.indexHidesDotfiles = false;
     // Plugin and settings sync is refused, and one device disabling every
     // plugin on another is the incident that rule came from.
     for (const dir of [".obsidian", ".basalt", ".git", ".trash"]) {
@@ -97,6 +102,7 @@ describe("listing", () => {
    * with a custom one uploaded its own key.
    */
   it("leaves alone whatever Obsidian calls its config folder", async () => {
+    adapter.indexHidesDotfiles = false; // As above: the filter is what is under test.
     const odd = new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".my-config");
     adapter.seed(".my-config/plugins/basalt/data.json", "the root secret lives here");
     adapter.seed("real.md", "x");
@@ -120,6 +126,7 @@ describe("listing", () => {
   });
 
   it("leaves a never-sync folder alone at any depth", async () => {
+    adapter.indexHidesDotfiles = false; // As above: the filter is what is under test.
     adapter.seed("notes/.obsidian/workspace.json", "{}");
     adapter.seed("notes/real.md", "x");
     expect((await vault.list()).map((f) => f.path).sort()).toEqual(["notes", "notes/real.md"]);
@@ -590,47 +597,27 @@ describe("reading a file through its resource URL", () => {
 /**
  * A filesystem that folds case, which is what macOS and Windows are.
  *
- * `FakeAdapter` is a Map and so is case-sensitive, like Linux. Most of this
+ * `FakeAdapter` is a `Map` and so is case-sensitive, like Linux. Most of this
  * file is right to use it. This corner is not: the bug it covers only exists
  * where two spellings are one file, and on a case-sensitive fake there is
- * nothing to reproduce. So the writes and reads are folded, and `list` reports
- * the spelling the directory entry actually has, which is the whole point.
+ * nothing to reproduce.
+ *
+ * The folding lives in the fake now, under the name and the two rules the
+ * shipped adapter uses: a write lands on the spelling already on disk, and a
+ * rename onto an occupied name is refused unless the two names differ only by
+ * case. This used to be a subclass here that had the first rule and not the
+ * second, so a rename onto a name that existed in another case succeeded and
+ * left two files a folding disk could not have held.
  */
-class FoldingAdapter extends FakeAdapter {
-  private readonly spelling = new Map<string, string>();
-
-  private key(path: string): string {
-    return path.normalize("NFC").toLowerCase();
-  }
-
-  private real(path: string): string {
-    return this.spelling.get(this.key(path)) ?? path;
-  }
-
-  override async writeBinary(path: string, data: ArrayBuffer, opts?: unknown): Promise<void> {
-    const at = this.real(path);
-    this.spelling.set(this.key(path), at);
-    await super.writeBinary(at, data, opts as never);
-  }
-
-  override async exists(path: string): Promise<boolean> {
-    return super.exists(this.real(path));
-  }
-
-  override async readBinary(path: string): Promise<ArrayBuffer> {
-    return super.readBinary(this.real(path));
-  }
-
-  override async rename(from: string, to: string): Promise<void> {
-    await super.rename(this.real(from), to);
-    this.spelling.delete(this.key(from));
-    this.spelling.set(this.key(to), to);
-  }
+function foldingAdapter(): FakeAdapter {
+  const adapter = new FakeAdapter();
+  adapter.insensitive = true;
+  return adapter;
 }
 
 describe("writing a name that differs only by case", () => {
   it("renames the file rather than leaving the old spelling", async () => {
-    const folding = new FoldingAdapter();
+    const folding = foldingAdapter();
     const vault = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
     const times = { mtime: 1000, ctime: 1000 };
 
@@ -648,7 +635,7 @@ describe("writing a name that differs only by case", () => {
   });
 
   it("calls two spellings of one file the same file, and two files not", async () => {
-    const folding = new FoldingAdapter();
+    const folding = foldingAdapter();
     const vault = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
     await vault.write("Note.md", new TextEncoder().encode("first"), { mtime: 1, ctime: 1 });
 
@@ -825,7 +812,7 @@ describe("two names the plugin cannot hold apart (P20)", () => {
     expect(vault.canonical("Note.md")).not.toBe(vault.canonical("note.md"));
     expect(vault.canonical("café.md")).toBe(vault.canonical("café.md"));
 
-    const folding = new FoldingAdapter();
+    const folding = foldingAdapter();
     const foldingVault = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
     await foldingVault.write("Note.md", enc.encode("x"), { mtime: 1, ctime: 1 });
     await foldingVault.list();
@@ -848,7 +835,7 @@ describe("two names the plugin cannot hold apart (P20)", () => {
  */
 describe("a spelling check that cannot be made (P21)", () => {
   it("fails the write and leaves the note alone, then succeeds once it can", async () => {
-    const folding = new FoldingAdapter();
+    const folding = foldingAdapter();
     const v = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian");
     const times = { mtime: 1000, ctime: 1000 };
     await v.write("Note.md", enc.encode("first"), times);
@@ -1041,13 +1028,10 @@ class DesktopAdapter extends FakeAdapter {
 }
 
 /** The same, on a filesystem that folds case: macOS and Windows. */
-class FoldingDesktopAdapter extends FoldingAdapter {
-  getBasePath(): string {
-    return "/home/me/vault";
-  }
-  getFullPath(normalizedPath: string): string {
-    return normalizedPath === "" ? this.getBasePath() : `${this.getBasePath()}/${normalizedPath}`;
-  }
+function foldingDesktopAdapter(): DesktopAdapter {
+  const adapter = new DesktopAdapter();
+  adapter.insensitive = true;
+  return adapter;
 }
 
 /** A Node fs that records what was opened and synced. */
@@ -1248,7 +1232,7 @@ describe("what flush must not forget (P-D4, P-D5)", () => {
   });
 
   it("syncs the directory a case-fixing rename changed even when the write fails (P-D5)", async () => {
-    const desktop = new FoldingDesktopAdapter();
+    const desktop = foldingDesktopAdapter();
     const { fs, synced } = recordingFs();
     const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
       fs,
@@ -1276,7 +1260,7 @@ describe("what flush must not forget (P-D4, P-D5)", () => {
    * a real one does and what `recordingFs` above does not: it opens anything.
    * A path that is not there fails the way the platform fails it.
    */
-  function fsOver(adapter: DesktopAdapter | FoldingDesktopAdapter) {
+  function fsOver(adapter: DesktopAdapter) {
     const synced: string[] = [];
     const tried: string[] = [];
     const fs = {
@@ -1349,7 +1333,7 @@ describe("what flush must not forget (P-D4, P-D5)", () => {
    * it named. The pass has to finish, under the surviving spelling.
    */
   it("keeps flushing after a case-only rename moves a file mid-pass (N5)", async () => {
-    const folding = new FoldingDesktopAdapter();
+    const folding = foldingDesktopAdapter();
     const { fs, synced } = fsOver(folding);
     const v = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian", () => {}, {
       fs,

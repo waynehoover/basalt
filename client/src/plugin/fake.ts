@@ -19,12 +19,37 @@
  * was found by reading `obsidian.asar`: it does more than the name suggests, and
  * finding that out is most of why this file exists.
  *
+ * ## What was read out of 1.13.7
+ *
+ * Written down because a fake nobody can check is a mock. Each of these was
+ * found in `Obsidian.app/Contents/Resources/obsidian.asar`, and each was
+ * something this file had wrong or had not modelled at all:
+ *
+ *   - `normalizePath` is four steps, two of which rename the file.
+ *   - `rename` refuses an occupied destination, in *both* adapters, unless the
+ *     two names differ only by case on a filesystem that folds it.
+ *   - `list` is `readdir` with nothing caught around it, so a directory that
+ *     is not there is an error rather than an empty listing.
+ *   - `trashLocal` moves the path to `.trash/<basename>`, dropping the folders
+ *     it lived under and numbering a name already taken.
+ *   - The index leaves out every dot-prefixed path at any depth, and holds the
+ *     vault root as a folder called `/`.
+ *   - The desktop `trashSystem` lets Electron's refusal throw; the Capacitor
+ *     one catches it and answers false.
+ *
  * ## What it still cannot tell you
  *
  * Whether Obsidian calls these methods the way the plugin expects, whether the
  * app is in a state where the adapter is ready, and anything about the UI. Those
  * need Obsidian. What is covered here is every path through the plugin's own
  * code, which is where its bugs are.
+ *
+ * Two known simplifications, both in the safe direction. The real adapters put
+ * every call through one queue, so nothing overlaps; this one is synchronous
+ * underneath, and a test that wants an interleaving arranges it through
+ * `fault`. And a real filesystem folds case per path component against the
+ * directory it is in, where `insensitive` below folds whole paths against the
+ * entries that exist.
  */
 
 import type {
@@ -69,6 +94,16 @@ export function normalizePath(path: string): string {
   return out.replace(/\u00A0|\u202F/g, " ").normalize("NFC");
 }
 
+/**
+ * The key a case-folding filesystem files a path under.
+ *
+ * Case and Unicode composition both, because macOS folds both: APFS keeps the
+ * spelling it was given and answers to either form of it.
+ */
+function fold(path: string): string {
+  return path.normalize("NFC").toLowerCase();
+}
+
 interface FakeFile {
   binary: Uint8Array;
   ctime: number;
@@ -87,7 +122,9 @@ export type FaultOp =
   | "mkdir"
   | "remove"
   | "rename"
-  | "copy";
+  | "copy"
+  | "trashSystem"
+  | "trashLocal";
 
 /**
  * A vault held in memory, behind Obsidian's adapter interface.
@@ -115,6 +152,40 @@ export class FakeAdapter implements DataAdapter {
   now = 1_700_000_000_000;
 
   /**
+   * Whether two spellings that differ only by case are one file.
+   *
+   * False, because a `Map` is case-sensitive and so is Linux. macOS and
+   * Windows are not, and Obsidian carries the same distinction under the same
+   * name: the shipped adapter sets `this.insensitive` by writing
+   * `.OBSIDIANTEST` and asking whether `.obsidiantest` then exists.
+   *
+   * It is here rather than in a test's subclass because one of the two rules
+   * it changes cannot be modelled from outside. The other, that a write lands
+   * on the spelling already on disk, is what makes a case-only rename lose a
+   * note if nothing fixes the name.
+   */
+  insensitive = false;
+
+  /** How a path is spelled on this disk, which is the folded case's whole point. */
+  private real(path: string): string {
+    if (!this.insensitive) return path;
+    let at = "";
+    for (const part of path.split("/")) {
+      at = this.spelledAs(at === "" ? part : `${at}/${part}`);
+    }
+    return at;
+  }
+
+  /** The one existing entry this path names, or the path as it was given. */
+  private spelledAs(path: string): string {
+    if (this.files.has(path) || this.folders.has(path)) return path;
+    const key = fold(path);
+    for (const other of this.folders) if (fold(other) === key) return other;
+    for (const other of this.files.keys()) if (fold(other) === key) return other;
+    return path;
+  }
+
+  /**
    * A fault to inject, asked before every operation.
    *
    * Return nothing to let the call through, an Error to fail it before it
@@ -139,18 +210,29 @@ export class FakeAdapter implements DataAdapter {
     return "fake";
   }
 
+  /**
+   * `exists`, which the declarations give a second argument this ignores.
+   *
+   * `exists(path, sensitive)` asks the shipped adapter for an exact-spelling
+   * answer, by reading the directory and looking for the name, and only where
+   * the filesystem folds case. Nothing in the plugin passes it, so nothing
+   * here implements it; a plugin that started to would find the argument
+   * quietly dropped, which is why it is written down.
+   */
   async exists(normalizedPath: string): Promise<boolean> {
     this.check("exists", normalizedPath);
-    return this.files.has(normalizedPath) || this.folders.has(normalizedPath);
+    const at = this.real(normalizedPath);
+    return this.files.has(at) || this.folders.has(at);
   }
 
   async stat(normalizedPath: string): Promise<Stat | null> {
     this.check("stat", normalizedPath);
-    const file = this.files.get(normalizedPath);
+    const at = this.real(normalizedPath);
+    const file = this.files.get(at);
     if (file) {
       return { type: "file", ctime: file.ctime, mtime: file.mtime, size: file.binary.length };
     }
-    if (this.folders.has(normalizedPath) || normalizedPath === "/") {
+    if (this.folders.has(at) || normalizedPath === "/") {
       return { type: "folder", ctime: 0, mtime: 0, size: 0 };
     }
     return null;
@@ -164,7 +246,21 @@ export class FakeAdapter implements DataAdapter {
    */
   async list(normalizedPath: string): Promise<ListedFiles> {
     this.check("list", normalizedPath);
-    const prefix = normalizedPath === "/" || normalizedPath === "" ? "" : `${normalizedPath}/`;
+    const root = normalizedPath === "/" || normalizedPath === "";
+    normalizedPath = root ? normalizedPath : this.real(normalizedPath);
+    // `readdir` with nothing caught around it, in both shipped adapters, so a
+    // directory that is not there is an error and not an empty vault (rule
+    // 2). The plugin lists the folder a file is being written into, and a
+    // folder that went while the write was in flight is exactly the moment
+    // this has to be told apart from "the folder is empty".
+    if (!root && !this.folders.has(normalizedPath)) {
+      throw new Error(
+        this.files.has(normalizedPath)
+          ? `ENOTDIR: not a directory, scandir '${normalizedPath}'`
+          : `ENOENT: no such file or directory, scandir '${normalizedPath}'`,
+      );
+    }
+    const prefix = root ? "" : `${normalizedPath}/`;
     const files: string[] = [];
     const folders: string[] = [];
     const direct = (path: string): boolean =>
@@ -188,7 +284,7 @@ export class FakeAdapter implements DataAdapter {
   }
 
   private bytesOf(normalizedPath: string): Uint8Array {
-    const file = this.files.get(normalizedPath);
+    const file = this.files.get(this.real(normalizedPath));
     // Obsidian throws for a missing file rather than returning empty, and
     // the difference is rule 2: an unreadable file is not an empty one.
     if (!file) throw new Error(`ENOENT: no such file or directory, open '${normalizedPath}'`);
@@ -224,6 +320,11 @@ export class FakeAdapter implements DataAdapter {
   ): void {
     // Obsidian creates the parent folder. The plugin does not rely on that
     // and creates them itself, which this does not undo.
+    //
+    // Onto the spelling already on disk where the filesystem folds case:
+    // writing `NOTE.md` over an existing `Note.md` fills that file and leaves
+    // its name alone, which is the whole of the bug `matchCase` exists for.
+    normalizedPath = this.real(normalizedPath);
     const existing = this.files.get(normalizedPath);
     this.files.set(normalizedPath, {
       binary: short === undefined ? bytes.slice() : bytes.slice(0, short),
@@ -269,22 +370,92 @@ export class FakeAdapter implements DataAdapter {
 
   async mkdir(normalizedPath: string): Promise<void> {
     this.check("mkdir", normalizedPath);
-    this.folders.add(normalizedPath);
+    this.folders.add(this.real(normalizedPath));
   }
 
+  /**
+   * The platform's own trash, which can refuse and can throw.
+   *
+   * Read out of 1.13.7: the desktop adapter calls Electron's `trash` and
+   * returns what it returns, so a throw from it travels; the Capacitor
+   * adapter wraps its own call in a try and answers false instead. Both
+   * outcomes are here, because the plugin's `remove` has to survive either.
+   */
   async trashSystem(normalizedPath: string): Promise<boolean> {
+    this.check("trashSystem", normalizedPath);
     if (this.systemTrashThrows) throw new Error("the system trash refused");
     if (!this.systemTrashWorks) return false;
     this.trashedToSystem.push(normalizedPath);
-    await this.remove(normalizedPath);
+    await this.moveInto(this.real(normalizedPath), undefined);
     return true;
   }
 
+  /**
+   * The vault's own `.trash`, as the shipped adapter fills it.
+   *
+   * Read out of `obsidian-1.13.7.asar`, both adapters, because the first
+   * version of this method invented something easier and a test written
+   * against it would have proved nothing:
+   *
+   *   - `.trash` is created if it is not there.
+   *   - The destination is `.trash/<basename>`, so the folders a note lived
+   *     under are *not* kept. Two notes called `note.md` in different folders
+   *     land on one name.
+   *   - A taken name is numbered: `note 2.md`, then `note 3.md`, counting up
+   *     until one is free. That numbering is the only thing standing between
+   *     the second deletion and the first one's content, which makes it the
+   *     part of the trash a no-loss suite has to model.
+   *   - It is a rename, so a folder goes in with everything under it.
+   *
+   * It can fail, too: it is `mkdir` and `rename` on a real filesystem. A
+   * refusal here is the case the plugin's `remove` must not mistake for a
+   * deletion that happened, which is why it is fault-injectable.
+   */
   async trashLocal(normalizedPath: string): Promise<void> {
+    this.check("trashLocal", normalizedPath);
+    const from = this.real(normalizedPath);
+    // The move is a rename, so a path that has gone since the caller looked
+    // is an error and not a deletion that happened.
+    if (!this.files.has(from) && !this.folders.has(from)) {
+      throw new Error(`ENOENT: no such file or directory, rename '${normalizedPath}'`);
+    }
+    this.folders.add(".trash");
+    const name = from.slice(from.lastIndexOf("/") + 1);
+    const dot = name.lastIndexOf(".");
+    const stem = dot <= 0 ? name : name.slice(0, dot);
+    const ext = dot <= 0 ? "" : name.slice(dot);
+    let at = `.trash/${stem}${ext}`;
+    for (let n = 1; this.files.has(at) || this.folders.has(at);) {
+      at = `.trash/${stem} ${++n}${ext}`;
+    }
     this.trashedLocally.push(normalizedPath);
-    const file = this.files.get(normalizedPath);
-    await this.remove(normalizedPath);
-    if (file) this.files.set(`.trash/${normalizedPath}`, file);
+    await this.moveInto(from, at);
+  }
+
+  /**
+   * Takes a path out of the vault, with everything under it if it is a
+   * folder, and puts it back at `to` when there is somewhere for it to go.
+   *
+   * Both trashes are a move rather than a delete, so a folder that still has
+   * notes in it takes them along. The system trash has nowhere in the vault
+   * to put them, so they simply leave.
+   */
+  private async moveInto(from: string, to: string | undefined): Promise<void> {
+    const under = `${from}/`;
+    const at = (path: string): string | undefined =>
+      to === undefined ? undefined : to + path.slice(from.length);
+    for (const [path, file] of [...this.files]) {
+      if (path !== from && !path.startsWith(under)) continue;
+      this.files.delete(path);
+      const dest = at(path);
+      if (dest !== undefined) this.files.set(dest, file);
+    }
+    for (const path of [...this.folders]) {
+      if (path !== from && !path.startsWith(under)) continue;
+      this.folders.delete(path);
+      const dest = at(path);
+      if (dest !== undefined) this.folders.add(dest);
+    }
   }
 
   async rmdir(normalizedPath: string, recursive: boolean): Promise<void> {
@@ -300,57 +471,74 @@ export class FakeAdapter implements DataAdapter {
 
   async remove(normalizedPath: string): Promise<void> {
     this.check("remove", normalizedPath);
-    this.files.delete(normalizedPath);
-    this.folders.delete(normalizedPath);
+    const at = this.real(normalizedPath);
+    this.files.delete(at);
+    this.folders.delete(at);
   }
 
   /**
    * Refuses an occupied destination, as the shipped adapter does.
    *
-   * Read out of `obsidian-1.13.7.asar`: `FileSystemAdapter.rename` checks the
-   * destination and throws "Destination file already exists!" unless the two
-   * names differ only by case on a filesystem that folds it. The first
-   * version of this fake replaced the destination silently, which would have
-   * let a replace-by-rename pass every test here and fail in every vault.
+   * Read out of `obsidian-1.13.7.asar`, and in *both* adapters, which is worth
+   * saying because this file's own header used to leave the mobile one open:
+   * desktop and Capacitor each look the destination up and throw
+   * "Destination file already exists!" before handing anything to the
+   * platform, and each makes the same single exception, for two names that
+   * differ only by case on a filesystem that folds it. So there is no
+   * replace-by-rename on either platform. The first version of this fake
+   * replaced the destination silently, which would have let a
+   * replace-by-rename pass every test here and fail in every vault.
    *
-   * Folders move with everything under them, because Obsidian reports a
-   * folder rename as one event and the plugin has to handle it as one.
+   * The exemption is not a nicety. It is the one rename `matchCase` makes,
+   * and on macOS it is the only way to correct a spelling in place.
+   *
+   * Folders move with everything under them. The *event* is not one event,
+   * whatever an earlier version of this comment said: the adapter fires
+   * `renamed` for the folder and then once more for every path beneath it,
+   * and each one reaches a plugin as its own `rename`. `renameFolder` in the
+   * event suite fires them the way the application does.
    */
   async rename(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     this.check("rename", normalizedPath, normalizedNewPath);
     if (normalizedPath === normalizedNewPath) return;
-    if (this.files.has(normalizedNewPath) || this.folders.has(normalizedNewPath)) {
+    const from = this.real(normalizedPath);
+    const onto = this.real(normalizedNewPath);
+    const caseOnly = this.insensitive && fold(normalizedPath) === fold(normalizedNewPath);
+    if (!caseOnly && (this.files.has(onto) || this.folders.has(onto))) {
       throw new Error("Destination file already exists!");
     }
-    const file = this.files.get(normalizedPath);
+    // A rename spells the destination the way it was asked for, folding or
+    // not: that is what makes it the way to correct a name's case.
+    const to = normalizedNewPath;
+    const file = this.files.get(from);
     if (file) {
-      this.files.delete(normalizedPath);
-      this.files.set(normalizedNewPath, file);
+      this.files.delete(from);
+      this.files.set(to, file);
       return;
     }
-    if (!this.folders.has(normalizedPath)) {
+    if (!this.folders.has(from)) {
       throw new Error(`ENOENT: no such file or directory, rename '${normalizedPath}'`);
     }
-    this.folders.delete(normalizedPath);
-    this.folders.add(normalizedNewPath);
-    const under = `${normalizedPath}/`;
+    this.folders.delete(from);
+    this.folders.add(to);
+    const under = `${from}/`;
     for (const path of [...this.folders]) {
       if (path.startsWith(under)) {
         this.folders.delete(path);
-        this.folders.add(normalizedNewPath + path.slice(normalizedPath.length));
+        this.folders.add(to + path.slice(from.length));
       }
     }
     for (const [path, f] of [...this.files]) {
       if (path.startsWith(under)) {
         this.files.delete(path);
-        this.files.set(normalizedNewPath + path.slice(normalizedPath.length), f);
+        this.files.set(to + path.slice(from.length), f);
       }
     }
   }
 
   async copy(normalizedPath: string, normalizedNewPath: string): Promise<void> {
     this.check("copy", normalizedPath, normalizedNewPath);
-    const file = this.files.get(normalizedPath);
+    const file = this.files.get(this.real(normalizedPath));
     if (file) this.files.set(normalizedNewPath, { ...file, binary: file.binary.slice() });
   }
 
@@ -374,18 +562,50 @@ export class FakeAdapter implements DataAdapter {
   }
 
   /**
-   * What Obsidian's own index would hold: every file and folder, with each
-   * file's times and size attached.
+   * Whether the index leaves out dot-prefixed paths, as Obsidian's does.
+   *
+   * True, because that is what the application does, and the fake being
+   * kinder than the application is how a filter gets tested against input it
+   * will never see while the failure it exists to prevent goes unmodelled.
+   * A test that wants to prove the plugin's own filter holds anyway sets this
+   * false and hands the index a dotfile Obsidian would never have put there.
+   */
+  indexHidesDotfiles = true;
+
+  /**
+   * What Obsidian's own index holds: every file and folder, with each file's
+   * times and size attached.
    *
    * The real one is in memory and already populated, which is why the plugin
    * reads it rather than asking the adapter about every file in turn.
+   *
+   * Two things it does that a plainer listing would not, both read out of
+   * `obsidian-1.13.7.asar`:
+   *
+   * The vault root is in it, as a folder whose path is `/`. `fileMap` is
+   * seeded with it before anything is scanned and `getAllLoadedFiles` returns
+   * every value in `fileMap`, so the first entry the plugin sees is a thing
+   * that is not a file and has no name.
+   *
+   * And nothing dot-prefixed is in it, at any depth. The scan tests each path
+   * with a predicate that walks up the segments and stops at the first one
+   * starting with a dot, and a path that matches is passed to
+   * `reconcileDeletion` instead of being indexed. So `.obsidian/...`,
+   * `.trash/...`, a `.git` anywhere, and this plugin's own staging copies are
+   * invisible to `getAllLoadedFiles`, however plainly they exist on disk.
+   * That is the whole reason a write under such a name can never be allowed:
+   * it would land, never be listed, and be reported deleted on the next scan.
    */
   index(): TAbstractFile[] {
-    const out: TAbstractFile[] = [];
+    const hidden = (path: string): boolean =>
+      this.indexHidesDotfiles && path.split("/").some((part) => part.startsWith("."));
+    const out: TAbstractFile[] = [{ path: "/", name: "" } as TAbstractFile];
     for (const path of this.folders) {
+      if (hidden(path)) continue;
       out.push({ path, name: path.split("/").pop() ?? path } as TAbstractFile);
     }
     for (const [path, f] of this.files) {
+      if (hidden(path)) continue;
       out.push({
         path,
         name: path.split("/").pop() ?? path,
