@@ -115,6 +115,40 @@ Everything lives in `.basalt/` inside the vault, which is never synced:
 `index.json` is what this device knows about every path. `unlink` removes both
 and touches no notes.
 
+### Filenames
+
+Paths travel in NFC, whatever the disk spells them in. A Mac stores `café.md`
+with a combining accent (NFD) and every other platform with a precomposed one
+(NFC); the two are one name, and the plugin has always normalised. The headless
+client used to hand out the disk's bytes, so a Mac running it synced such a note
+under a spelling no other device would produce, and two devices that each
+created the note refused the other's copy for ever as "in the way", naming two
+strings nobody can tell apart.
+
+NFC is the whole keyspace, in both directions. A path arriving from another
+device in some other normal form is the same path, filed under its NFC name,
+and not a second note. Taking it for a second note is what a device joining
+such a vault used to do: it wrote the note under the NFC name, did not
+recognise what it had just written, uploaded that as a new note, and then
+reported one file `in the way` of the other on every pass for ever.
+
+A vault synced by an older headless client on a Mac holds such paths under the
+NFD spelling on the server. What the first device to meet one owes the server
+is a rename, and that is what it sends: the note keeps its content and its
+history, the NFC name goes up carrying the old one as the name it used to
+have, and nothing is re-sent that the server already has. One entry per name,
+once, and then the vault has one spelling for it. Earlier versions stay under
+the old spelling in `basalt history`.
+
+Upgrade every device. A device still running a client older than this rule
+goes on spelling its own accented names in NFD, so it will re-create the old
+spelling on the server after every rename, and the two names will keep
+arriving. Nothing is lost while that lasts, and nothing settles either.
+
+A disk that keeps the two spellings apart and holds both files refuses to sync
+until one is renamed, since neither is the right one to keep, and only a person
+can say which they meant.
+
 ### What is not synced
 
 Any file or folder whose name starts with a dot, at any depth: `.basalt`,

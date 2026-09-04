@@ -7,6 +7,7 @@ import {
   rm,
   stat,
   symlink,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -397,6 +398,45 @@ describe("the index on disk", () => {
   });
 
   /**
+   * Being there was never the question (R3).
+   *
+   * The plugin's store learned this and this one did not, so the headless
+   * client went on preserving an index somebody else had rewritten for the
+   * rest of the session. Both stores now share `LastIndexWrite` in core.
+   */
+  it("writes again when the index has been overwritten in place (R3)", async () => {
+    const file = join(root, ".basalt", "index.json");
+    const store = new JsonIndexStore(file);
+    await store.save(state(7));
+
+    // Still there, and no longer what was written: half an index, a
+    // conflicted copy of one, a tidy-up script's idea of tidy.
+    await writeFile(file, "{}");
+    await store.save(state(7));
+
+    expect(await new JsonIndexStore(file).load()).toEqual(state(7));
+  });
+
+  it("writes again when a same-size overwrite lands under it (R3)", async () => {
+    const file = join(root, ".basalt", "index.json");
+    const store = new JsonIndexStore(file);
+    await store.save(state(7));
+
+    // Exactly as long as what was written, so the size half of the stamp
+    // cannot see it and the modification time is the half that has to. Set
+    // by hand rather than left to the clock, because the residual this does
+    // not cover is a filesystem whose clock did not move: a same-size
+    // overwrite inside one tick still skips.
+    const was = await readFile(file, "utf8");
+    await writeFile(file, "!".repeat(was.length));
+    const later = new Date(Date.now() + 2_000);
+    await utimes(file, later, later);
+    await store.save(state(7));
+
+    expect(await new JsonIndexStore(file).load()).toEqual(state(7));
+  });
+
+  /**
    * Rule 2, and the incident behind it: code that read a config file, fell
    * back to an empty result on error, and wrote that back disabled every plugin
    * on a device. An index that cannot be read must stop the run, not be
@@ -771,5 +811,142 @@ describe("the index is not rewritten when it has not changed", () => {
     await expect(store.save(state), "the write should have failed").rejects.toThrow();
     // The second attempt must try again rather than think it already wrote.
     await expect(store.save(state), "a failed write was recorded as done").rejects.toThrow();
+  });
+});
+
+/**
+ * The scan does not follow symlinks, and cannot be made to loop by one.
+ *
+ * The write side proves containment against the resolved filesystem, and the
+ * question was whether the scan side agreed. `readdir` with file types answers
+ * for the entry itself rather than its target, so a link is neither a file nor
+ * a directory to the filter and is dropped before anything looks through it.
+ * These pin that, including the cyclic case where following would never end.
+ */
+describe("symlinks in the listing", () => {
+  it("does not list a link to a file, as a file or as a link", async () => {
+    await writeFile(join(root, "real.md"), "x");
+    await symlink(join(root, "real.md"), join(root, "link.md"));
+    const listed = await new NodeVault(root).list();
+    expect(listed.map((f) => f.path)).toEqual(["real.md"]);
+  });
+
+  it("does not follow a link to a folder inside the vault, so nothing is listed twice", async () => {
+    await mkdir(join(root, "notes"));
+    await writeFile(join(root, "notes", "one.md"), "x");
+    await symlink(join(root, "notes"), join(root, "alias"));
+    const listed = await new NodeVault(root).list();
+    expect(listed.map((f) => f.path)).toEqual(["notes", "notes/one.md"]);
+  });
+
+  it("terminates on a cyclic link", async () => {
+    await mkdir(join(root, "a", "b"), { recursive: true });
+    await writeFile(join(root, "a", "b", "note.md"), "x");
+    await symlink("..", join(root, "a", "b", "up"));
+    await symlink(root, join(root, "a", "self"));
+    const listed = await new NodeVault(root).list();
+    expect(listed.map((f) => f.path)).toEqual(["a", "a/b", "a/b/note.md"]);
+  });
+
+  it("writing over a link replaces the link and leaves what it pointed at alone", async () => {
+    const outside = await mkdtemp(join(tmpdir(), "basalt-target-"));
+    try {
+      const target = join(outside, "target.md");
+      await writeFile(target, "the target's own text\n");
+      await symlink(target, join(root, "link.md"));
+      const vault = new NodeVault(root);
+      await vault.write("link.md", enc.encode("from a peer\n"), {
+        mtime: 1_700_000_000_000,
+        ctime: 1_700_000_000_000,
+      });
+      expect(await readFile(target, "utf8")).toBe("the target's own text\n");
+      const { lstat } = await import("node:fs/promises");
+      expect((await lstat(join(root, "link.md"))).isSymbolicLink()).toBe(false);
+      expect(await readFile(join(root, "link.md"), "utf8")).toBe("from a peer\n");
+    } finally {
+      await removeTree(outside);
+    }
+  });
+});
+
+/**
+ * One name, spelled two ways on disk.
+ *
+ * macOS hands out filenames in NFD and everything else in NFC, and the two are
+ * the same name by definition, not two candidates for a person to choose
+ * between. The plugin normalises to NFC on the way out and maps back on the way
+ * in; this vault listed whatever `readdir` said, so the same note left a Mac
+ * under one spelling and every other device under another.
+ */
+describe("an --ignore spelled the way a Mac shell spells it", () => {
+  // The listing folds every name to NFC before asking whether it is ignored,
+  // so an ignore list left in the disk's own spelling stopped matching. What
+  // that costs is not a warning: it is a folder somebody kept off the server
+  // being uploaded on the next pass, silently. Both spellings must work,
+  // because a person gets NFD from tab completion and NFC from typing it.
+  const nfdName = "Attache\u0301s"; // e + combining acute, what a Mac disk holds
+  const nfcName = "Attach\u00e9s"; // precomposed, what typing it gives you
+
+  for (const [how, spelling] of [
+    ["the disk's spelling (NFD)", nfdName],
+    ["a typed spelling (NFC)", nfcName],
+  ] as const) {
+    it(`keeps the folder off the server when --ignore uses ${how}`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "basalt-ignore-nfc-"));
+      await mkdir(join(root, nfdName), { recursive: true });
+      await writeFile(join(root, nfdName, "private.md"), "not for the server");
+      await writeFile(join(root, "shared.md"), "fine");
+
+      const listed = (await new NodeVault(root, { alsoIgnore: [spelling] }).list()).map(
+        (f) => f.path,
+      );
+      expect(listed, `${spelling} did not match`).not.toContain(
+        `${nfcName}/private.md`.normalize("NFC"),
+      );
+      expect(
+        listed.some((p) => p.includes("private.md")),
+        "the note leaked",
+      ).toBe(false);
+      expect(listed).toContain("shared.md");
+      await rm(root, { recursive: true, force: true });
+    });
+  }
+});
+
+describe("a name the disk spells in NFD", () => {
+  const nfd = "café.md";
+  const nfc = "café.md";
+  const times = { mtime: 1_700_000_000_000, ctime: 1_700_000_000_000 };
+
+  /** The vault's files as the disk spells them, without the state folder. */
+  async function onDisk(): Promise<string[]> {
+    return (await readdir(root)).filter((n) => !n.startsWith("."));
+  }
+
+  it("is listed in NFC, which is how every other device spells it", async () => {
+    await writeFile(join(root, nfd), "x");
+    const listed = await new NodeVault(root).list();
+    expect(listed.map((f) => f.path)).toEqual([nfc]);
+  });
+
+  it("is read and written under the NFC name without making a second file", async () => {
+    await writeFile(join(root, nfd), "on disk");
+    const vault = new NodeVault(root);
+    await vault.list();
+    expect(dec.decode(await vault.read(nfc))).toBe("on disk");
+    expect(await vault.exists(nfc)).toBe(true);
+
+    await vault.write(nfc, enc.encode("updated"), times);
+    expect(await onDisk()).toHaveLength(1);
+    expect(dec.decode(await vault.read(nfc))).toBe("updated");
+    expect((await vault.list()).map((f) => f.path)).toEqual([nfc]);
+  });
+
+  it("refuses a vault that holds both spellings rather than choosing one", async () => {
+    await writeFile(join(root, nfd), "one");
+    await writeFile(join(root, nfc), "two");
+    // A disk that files the two as one file has nothing to refuse.
+    if ((await onDisk()).length < 2) return;
+    await expect(new NodeVault(root).list()).rejects.toThrow(/same path once normalized/);
   });
 });

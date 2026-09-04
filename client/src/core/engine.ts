@@ -74,14 +74,21 @@ import {
   encodedEntryBytes,
   entryBudget,
   PUTMANY_FRAME_OVERHEAD,
+  ProtocolError,
   type BatchEntry,
   type ServerLimits,
   type Transport,
   type WireEntry,
 } from "./transport.ts";
 import { validateStoredState } from "./stored-state.ts";
-import { foldPath, foldsTogether, isNeverSynced, splitName } from "./paths.ts";
-import { parents, type IndexStore, type Vault } from "./vault.ts";
+import {
+  canonicalSpelling,
+  firstFreeName,
+  foldPath,
+  foldsTogether,
+  isNeverSynced,
+} from "./paths.ts";
+import { parents, type IndexStore, type Times, type Vault } from "./vault.ts";
 
 /**
  * An index entry with its derivable fields left out.
@@ -145,15 +152,46 @@ export function contentId(chunkNames: readonly string[]): string {
  * Its own function because a real server refuses this case first, so nothing
  * short of a lying transport reaches the check and the comparison is the part
  * worth testing.
+ *
+ * The message names the way out, because an error string is the only UI a
+ * stopped device has. It used to end at "the wrong vault", which is a correct
+ * diagnosis and no help at all: the person reading it is looking at a vault
+ * that has stopped syncing, and the recovery lived in docs/server.md. Both
+ * recoveries are named, and the cost of the blunt one with them, because
+ * re-pairing resets the merge base and the next concurrent edit then makes
+ * conflict copies instead of merging.
+ *
+ * A `ProtocolError` with the server's own code for this, rather than a plain
+ * Error, for two reasons. `runForever` stops on a fatal `ProtocolError` and
+ * otherwise retries: a plain Error here was retried three times and then
+ * reported under a message about an entry no device can apply, which is a
+ * different fault with a different fix. And a shell that wants to offer the
+ * recovery has one thing to recognise however the refusal arrived, from the
+ * wire or from here.
  */
 export function refuseIfBehind(serverCursor: number, ownCursor: number): void {
   if (serverCursor < ownCursor) {
-    throw new Error(
+    throw new ProtocolError(
+      "cursor",
       `this server is at version ${serverCursor} and this device has already seen ${ownCursor}: ` +
-        `refusing to sync, because a server behind its own clients is a restored backup or the wrong vault`,
+        `refusing to sync, because a server behind its own clients is a restored backup or the wrong vault. ` +
+        `${REJOIN_ADVICE}`,
     );
   }
 }
+
+/**
+ * The way back from a server that has lost history a device already applied.
+ *
+ * One string, because the two shells say it in the same breath: the headless
+ * client prints it under the refusal and the plugin puts it in the panel beside
+ * the button that does it.
+ */
+export const REJOIN_ADVICE =
+  "To rejoin it and keep what only this device holds, back the server up and then run " +
+  "basalt rebase --backup-taken here, or press Rejoin this server in the Basalt panel. " +
+  "Unlinking and pairing again also works, and it resets the merge base, so the next " +
+  "edit made on two devices at once makes conflict copies instead of merging.";
 
 /**
  * What this device accepts whatever the server says it stores.
@@ -391,6 +429,17 @@ export interface SyncReport {
   /** Files that can never work and will not be tried again. */
   skipped: number;
   /**
+   * Which ones, sorted, and bounded the way `inTheWay` is.
+   *
+   * The count alone is not an identity, and the plugin's notice fires on a
+   * change (N2). One file being fixed in the same pass as another starts
+   * failing leaves the count at one, and the new failure was never announced:
+   * the glyph said something was wrong and nothing ever said what. Bounded
+   * because one bad folder writes off everything under it, and a list the
+   * length of a subtree is not a message.
+   */
+  skippedPaths: string[];
+  /**
    * Paths another device syncs that this one is set to ignore.
    *
    * Its own counter rather than folded into `skipped`, and deliberately not
@@ -434,6 +483,21 @@ export interface SyncReport {
  */
 const IN_THE_WAY_SHOWN = 5;
 
+/** The same bound, and the same reason, for the paths written off. */
+const SKIPPED_SHOWN = 5;
+
+/**
+ * Counts one path as written off, and records which one.
+ *
+ * One place, because the count and the names have to move together: a counter
+ * bumped without a name is exactly the report the plugin cannot tell apart
+ * from the pass before it.
+ */
+function noteSkipped(report: SyncReport, path: string): void {
+  report.skipped++;
+  report.skippedPaths.push(path);
+}
+
 function emptyReport(): SyncReport {
   return {
     uploaded: 0,
@@ -448,6 +512,7 @@ function emptyReport(): SyncReport {
     waiting: 0,
     retrying: 0,
     skipped: 0,
+    skippedPaths: [],
     ignored: 0,
     blocked: 0,
     inTheWay: [],
@@ -463,10 +528,22 @@ interface Retry {
   at: number;
 }
 
+/**
+ * The server's word about a path, plus the spelling the server has for it.
+ *
+ * `wire` is set only while the two differ, which is only for a vault an older
+ * Mac client wrote: it spelled every accented name in NFD, so the server holds
+ * `café.md` under a spelling no other device produces. This device files that
+ * note under its NFC name, and remembers the other one so the next upload can
+ * say which name it used to have. Without that the upload is a second note
+ * with a name nobody can tell from the first (C41).
+ */
+type Remote = RemoteState & { readonly wire?: string };
+
 export class Engine {
   private readonly entries = new Map<string, IndexEntry>();
   /** The server's newest word per plaintext path. */
-  private readonly remote = new Map<string, RemoteState>();
+  private readonly remote = new Map<string, Remote>();
   /** Plaintext paths with inbound work outstanding. */
   private readonly pending = new Set<string>();
   private readonly retries = new Map<string, Retry>();
@@ -633,6 +710,15 @@ export class Engine {
     pending: number;
     retrying: number;
     skipped: number;
+    /**
+     * Paths another device syncs that this one is set to ignore.
+     *
+     * Reported apart from `skipped` for the same reason the counter is (R2):
+     * one is a failure and the other is the configuration doing as it was
+     * told, and a caller reading this programmatically could not tell them
+     * apart at all.
+     */
+    ignored: number;
     syncing: boolean;
     /** How many sealed paths are cached, which prune keeps to what is referred to. */
     cachedPaths: number;
@@ -645,6 +731,7 @@ export class Engine {
       pending: this.pending.size,
       retrying: this.retries.size,
       skipped: this.skipped.size + this.refusedInbound.size,
+      ignored: this.ignoredPaths.size,
       syncing: this.syncing,
       cachedPaths: this.unsealed.size,
     };
@@ -671,7 +758,7 @@ export class Engine {
         this.entries.set(path, unpacked(path, raw as Record<string, unknown>));
       }
       for (const [path, raw] of Object.entries(stored.remote)) {
-        this.remote.set(path, raw as RemoteState);
+        this.remote.set(path, raw as Remote);
       }
       for (const path of stored.pending) this.pending.add(path);
       this.log("index loaded", {
@@ -777,15 +864,21 @@ export class Engine {
     await mustBeOurs(this.keys, batch.entries);
     for (const e of batch.entries) checkEntryShape(e);
 
-    const paths = await Promise.all(batch.entries.map((e) => this.plaintextPath(e.path)));
+    // The spelling the sender used, and the one this device files it under.
+    // They differ only when a peer spells a name in a Unicode normal form
+    // that is not NFC, which a Mac running a client older than this rule
+    // does for every accented name it uploads.
+    const wires = await Promise.all(batch.entries.map((e) => this.plaintextPath(e.path)));
+    const paths = wires.map(canonicalSpelling);
     const olds = await Promise.all(
       batch.entries.map((e) => (e.prev ? this.plaintextPath(e.prev) : undefined)),
     );
 
-    const staged = new Map<string, RemoteState>();
+    const staged = new Map<string, Remote>();
     for (let at = 0; at < batch.entries.length; at++) {
       const e = batch.entries[at]!;
       const path = paths[at]!;
+      const wire = wires[at]!;
       // A path this device would never list is refused here, once, as a
       // fact about the path rather than filed for retry (C29): written, it
       // would be invisible to the next scan and reported deleted. A path
@@ -809,6 +902,11 @@ export class Engine {
         mtime: e.mtime,
         size: e.size,
         hash: contentId(e.chunks),
+        // The sender's spelling, kept only while it is not the one this
+        // device uses (R10). It is what the next upload of this path names
+        // as the path it used to have, so the correction travels as a
+        // rename rather than as a second note.
+        ...(wire !== path ? { wire } : {}),
       });
 
       if (e.prev) {
@@ -818,15 +916,24 @@ export class Engine {
         // the decision table handle the awkward case for free: if the
         // old path was edited here since the last sync, a deletion loses
         // to an edit and the file is kept and re-uploaded.
-        const old = olds[at]!;
-        staged.set(old, {
-          uid: e.uid,
-          folder: false,
-          deleted: true,
-          mtime: e.mtime,
-          size: 0,
-          hash: "",
-        });
+        const old = canonicalSpelling(olds[at]!);
+        // Unless the two names are one name. A peer correcting the
+        // spelling of a path sends exactly that: `café.md` in NFC, moved
+        // from `café.md` in NFD. Staged as written, the deletion of the
+        // old name lands on the same key as the arrival of the new one
+        // and whichever went in last decided whether the note existed
+        // (R10). `renamed` refuses a rename to itself for the same
+        // reason, one layer up.
+        if (old !== path) {
+          staged.set(old, {
+            uid: e.uid,
+            folder: false,
+            deleted: true,
+            mtime: e.mtime,
+            size: 0,
+            hash: "",
+          });
+        }
       }
     }
 
@@ -938,13 +1045,19 @@ export class Engine {
         // Settled, and settled by the person who configured this device. It
         // is counted every pass so it stays visible, and nothing is fetched
         // to find out what is already known.
+        //
+        // Dropped from the work list, because there is no work: it was left
+        // there, so `basalt status` reported an ignored folder as "N files
+        // with work outstanding" for the rest of the vault's life. Rule 7,
+        // and the counter above is where an ignored path is meant to show.
+        this.pending.delete(path);
         report.ignored++;
         continue;
       }
       const skip = this.skipped.get(path);
       if (skip) {
         if (fingerprintOf(this.entries.get(path)) === skip.fingerprint) {
-          report.skipped++;
+          noteSkipped(report, path);
           continue;
         }
         // Changed since it was written off. Whatever was wrong with it
@@ -1004,7 +1117,12 @@ export class Engine {
     await this.flush(report);
 
     this.opts.onProgress?.(undefined);
-    report.skipped += this.refusedInbound.size;
+    for (const path of this.refusedInbound.keys()) noteSkipped(report, path);
+    // Sorted and capped once, here, after everything that could add to it.
+    // Sorted because the plugin keys its notice on the names and the same set
+    // reached in a different order is the same set; capped for the reason
+    // above the constant.
+    report.skippedPaths = [...new Set(report.skippedPaths)].sort().slice(0, SKIPPED_SHOWN);
 
     // Replaced rather than added to, so a path stops being blocked the
     // moment the file in its way is gone.
@@ -1061,7 +1179,38 @@ export class Engine {
       local = { folder: stat.folder, mtime: entry.mtime, size: entry.size, hash: entry.hash };
     }
 
-    const action = decide({ local, remote, index: entry, mergeable: this.mergeable(path) });
+    let action = decide({ local, remote, index: entry, mergeable: this.mergeable(path) });
+
+    // The server still spells this name a way this device does not (C41).
+    //
+    // Only a vault an older Mac client wrote is in this state: it uploaded
+    // `café.md` in NFD, which is the same name as `café.md` and not the same
+    // string, and nothing else produces it. This device holds the note under
+    // the NFC name, so the correction it owes the server is a rename, and
+    // `prev` is how a rename travels: one entry, no bodies, the chunks are
+    // already there. Uploading without it is what left two spellings on the
+    // server and a vault permanently `blocked` between them, which is the
+    // failure the normalisation was added to prevent
+    // (cli/normalization.test.ts, "a peer that spells the name NFD").
+    //
+    // Only with the file actually here, because a rename has to name a file.
+    // `prev` is filled only when it is free: a rename this device has not sent
+    // yet names the path the server knows, which is the older of the two, and
+    // that is the one Obsidian keeps too. The upload is forced whether or not
+    // it was free, because it is `remote.wire` going away that says the server
+    // has heard, and an attempt that failed owes another one.
+    //
+    // Files only. A folder carries no content and its entry carries no `prev`,
+    // so renaming one would add a second folder to the server and remove
+    // nothing. It does not need to: a receiving device folds the old spelling
+    // to the same name and makes the same directory.
+    const spelled = remote?.wire;
+    if (spelled !== undefined && local !== undefined && !local.folder) {
+      if (entry.prev === "") entry.prev = spelled;
+      if (action.kind === "nothing") {
+        action = { kind: "upload", why: "the server spells this name in another normal form" };
+      }
+    }
 
     if (
       coalesce &&
@@ -1199,7 +1348,7 @@ export class Engine {
     action: Action,
     entry: IndexEntry,
     local: LocalState | undefined,
-    remote: RemoteState | undefined,
+    remote: Remote | undefined,
     report: SyncReport,
     /** What the rehash read and cut, if this file was just scanned. */
     sealed?: Scanned,
@@ -1257,7 +1406,7 @@ export class Engine {
           why: `${action.why}. Rename one of them, and it will sync.`,
           fingerprint: fingerprintOf(entry),
         });
-        report.skipped++;
+        noteSkipped(report, path);
         this.log("cannot be both", path, action.why);
         return;
 
@@ -1280,7 +1429,14 @@ export class Engine {
         // twice would sign one timestamp and send another.
         const deletedAt = this.now();
         const facts: PutFacts = {
-          path: await this.sealedPath(path),
+          // Under the name the server has, where that is not the name this
+          // device uses (C41). A note downloaded from a vault an older Mac
+          // client wrote is here under its NFC name and there under an NFD
+          // one, and until the rename has gone up those are different files
+          // to the server: a deletion sent under the NFC name deletes
+          // nothing, and the note stays alive on every device that has not
+          // folded it (engine.test.ts, "deletes the note the server has").
+          path: await this.sealedPath(remote?.wire ?? path),
           meta: { size: 0, ctime: 0, mtime: deletedAt, deleted: true },
           names: [],
         };
@@ -2363,6 +2519,11 @@ export class Engine {
     if (code === "ignored") {
       if (!this.ignoredPaths.has(path)) this.log("ignored here", path, message);
       this.ignoredPaths.set(path, message);
+      // Owed nothing: it will never be fetched, so leaving it on the inbound
+      // work list reported work outstanding for ever when a single pass was
+      // all the vault needed (N4). The reconcile loop drops it too, for
+      // indexes written before this line existed.
+      this.pending.delete(path);
       report.ignored++;
       return;
     }
@@ -2373,7 +2534,7 @@ export class Engine {
 
     if (permanent) {
       this.skipped.set(path, { why: message, fingerprint: fingerprintOf(this.entries.get(path)) });
-      report.skipped++;
+      noteSkipped(report, path);
       this.log("skipped for good", path, message);
       return;
     }
@@ -2455,7 +2616,7 @@ export class Engine {
   private async save(): Promise<void> {
     const entries: Record<string, unknown> = {};
     for (const [path, e] of this.entries) entries[path] = packed(e);
-    const remote: Record<string, RemoteState> = {};
+    const remote: Record<string, Remote> = {};
     for (const [path, r] of this.remote) remote[path] = r;
     await this.opts.store.save({
       cursor: this.cursor,
@@ -2570,6 +2731,7 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     waiting: b.waiting,
     retrying: b.retrying,
     skipped: b.skipped,
+    skippedPaths: b.skippedPaths,
     ignored: b.ignored,
     blocked: b.blocked,
     inTheWay: b.inTheWay,
@@ -2606,6 +2768,19 @@ export function refusedInboundPath(path: string): string | undefined {
  * before the pass decides whether to re-read anything, and a hash would mean
  * reading every written-off file on every pass to find out whether it was still
  * written off.
+ *
+ * Taken off the index entry, which reads as though it were frozen at whatever
+ * the last successful sync recorded, and is not: every pass calls `observe`
+ * over the whole listing before any of these comparisons, and `observe` stamps
+ * the entry with the mtime and size the disk just reported. So this is the
+ * on-disk stat, one step removed, and both sides of the comparison come from
+ * the same listing. That is what makes a written-off file that somebody has
+ * since repaired get tried again, rather than staying written off until the
+ * process restarts.
+ *
+ * A path with nothing on disk is not observed, so its entry keeps whatever it
+ * had and a refusal that was never about a local file stays put, which is
+ * right: nothing here changed.
  */
 function fingerprintOf(entry: IndexEntry | undefined): string {
   return entry ? `${entry.mtime}:${entry.size}` : "gone";
@@ -2714,32 +2889,6 @@ export function planFetches(
 }
 
 /**
- * `base`, or the first numbered variant of it that nothing is using.
- *
- * Separated out and exported because it is the part that can be wrong: the
- * engine's use of it is one line, and the interesting cases are what happens
- * when a name is taken, when several are, and what a name with no extension
- * does.
- */
-export async function firstFreeName(
-  base: string,
-  taken: (path: string) => Promise<boolean>,
-): Promise<string> {
-  if (!(await taken(base))) return base;
-
-  const { stem, ext } = splitName(base);
-
-  for (let n = 2; n < 1000; n++) {
-    const candidate = `${stem} ${n}${ext}`;
-    if (!(await taken(candidate))) return candidate;
-  }
-  // A thousand of these beside one note is not a state worth inventing a name
-  // for, and inventing one silently is how the thousand-and-first overwrites
-  // something.
-  throw new Error(`cannot find an unused name beside ${base}`);
-}
-
-/**
  * Writes a copy under a free name, without ever replacing what is there.
  *
  * `exists` and then `write` is a gap, and another process, or the editor
@@ -2754,7 +2903,7 @@ export async function firstFreeName(
 export async function placeBeside(
   freeName: () => Promise<string>,
   bytes: Uint8Array,
-  times: { mtime: number; ctime: number },
+  times: Times,
   vault: Pick<Vault, "write" | "create">,
 ): Promise<string> {
   for (let attempt = 0; attempt < 100; attempt++) {

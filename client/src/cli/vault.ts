@@ -26,7 +26,9 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 
 import {
+  canonicalSpelling,
   configFolderName,
+  firstFreeName,
   foldPath,
   ignoredHere,
   ignoredHereError,
@@ -34,7 +36,8 @@ import {
   neverSync,
   splitName,
 } from "../core/paths.ts";
-import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
+import { LastIndexWrite } from "../core/vault.ts";
+import type { FileStat, IndexStamp, IndexStore, StoredState, Times, Vault } from "../core/vault.ts";
 
 /**
  * Where a deletion arriving from another device goes, rather than away.
@@ -43,6 +46,22 @@ import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts"
  * there does not travel back out and undo the deletion everywhere else.
  */
 const TRASH_DIR = ".trash";
+
+/**
+ * Whether something is at a path, for a caller about to write over it.
+ *
+ * Not `exists`: an error is not an answer. A name that cannot be looked at may
+ * well be occupied, and taking it for free is how a note lands on top of one.
+ */
+async function occupied(file: string): Promise<boolean> {
+  try {
+    await access(file, constants.F_OK);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
 
 /**
  * Names this client leaves alone on top of the rule in core/paths.ts.
@@ -79,16 +98,53 @@ export interface NodeVaultOptions {
    * syncs it until someone passes --config-dir, which is why the flag exists.
    */
   readonly configDir?: string;
+  /**
+   * The spelling this vault reports for one name, and the one it treats as
+   * the name (R9).
+   *
+   * NFC in production, always, and nothing outside a test passes this. It is
+   * here because the mechanism underneath it cannot otherwise be run: macOS
+   * folds NFC and NFD at lookup while keeping the disk's own bytes, so on a
+   * Mac `absolute` can drop the whole disk-spelling map and every test still
+   * passes, while ext4 keeps the two apart and loses a note. A test injects
+   * another normal form, over characters APFS does keep apart, and gets the
+   * non-folding filesystem it cannot mount (cli/vault-spelling.test.ts).
+   *
+   * One name, not a path: it is applied segment by segment, because that is
+   * how a filesystem files a path.
+   */
+  readonly normalForm?: (name: string) => string;
 }
 
 export class NodeVault implements Vault {
   private readonly root: string;
   private readonly ignore: Set<string>;
+  /** How this vault spells one name. NFC everywhere but a test. */
+  private readonly normal: (name: string) => string;
 
   constructor(root: string, opts: NodeVaultOptions = {}) {
     this.root = resolve(root);
-    const configDir = configFolderName(opts.configDir ?? DEFAULT_CONFIG_DIR);
-    this.ignore = new Set([...NEVER_SYNC, configDir, ...(opts.alsoIgnore ?? [])]);
+    this.normal = opts.normalForm ?? canonicalSpelling;
+    // NFC, because everything this is compared against is NFC now. `list`
+    // folds the disk's spelling before asking `isNeverSynced`, and a Mac shell
+    // hands out NFD: a name tab-completed off the disk and passed to
+    // `--ignore` stopped matching the moment that fold landed, so a folder
+    // somebody had explicitly kept off the server started syncing on the next
+    // pass, with nothing said. Same for `--config-dir`.
+    const configDir = this.normal(configFolderName(opts.configDir ?? DEFAULT_CONFIG_DIR));
+    this.ignore = new Set([
+      ...NEVER_SYNC,
+      configDir,
+      ...(opts.alsoIgnore ?? []).map((name) => this.normal(name)),
+    ]);
+  }
+
+  /** A whole path in this vault's normal form, one segment at a time. */
+  private normalPath(path: string): string {
+    return path
+      .split("/")
+      .map((part) => this.normal(part))
+      .join("/");
   }
 
   /** The vault root with its links resolved, worked out once. */
@@ -206,7 +262,7 @@ export class NodeVault implements Vault {
    * the vault key; it does not prove they meant this device well, and a bug on
    * another device is enough.
    */
-  private absolute(path: string): string {
+  private async absolute(path: string): Promise<string> {
     const full = resolve(this.root, path);
     const outside = relative(this.root, full);
     if (outside === "" || outside === ".." || outside.startsWith(`..${sep}`)) {
@@ -225,7 +281,11 @@ export class NodeVault implements Vault {
     // `list` skipped every depth, so `notes/.git/hooks/post-checkout` from
     // a peer was written, never listed, and reported deleted on the next
     // pass. One predicate, the same one `list` and `watch` use.
-    const rel = outside.split(sep).join("/");
+    // NFC, whatever spelling arrived. Every path this vault hands out is NFC
+    // (see `list`), and a path coming in is normalised the same way so there
+    // is one keyspace, as the plugin has. An NFD spelling can still arrive,
+    // from a headless client older than this rule or from an index it wrote.
+    const rel = this.normalPath(outside.split(sep).join("/"));
     if (this.neverSynced(rel)) {
       // Two refusals, because they mean opposite things to whoever reads the
       // exit status (R2). A dot-prefixed name is one this client would write
@@ -237,12 +297,106 @@ export class NodeVault implements Vault {
         ? ignoredHereError(`not writing under a name this device is set to ignore: ${path}`)
         : neverSync(`refusing to write inside a folder that is never synced: ${path}`);
     }
-    return full;
+    return resolve(this.root, await this.spelledOnDisk(rel));
   }
 
   /** The one answer to "does this path sync", asked the same way in every direction. */
   private neverSynced(rel: string): boolean {
     return isNeverSynced(rel, this.ignore);
+  }
+
+  /**
+   * The disk's own spelling of each name whose NFC form differs from it.
+   *
+   * Keyed by the NFC vault-relative path of the entry, holding the name the
+   * disk uses for its last segment. Read by `absolute`, so a path the engine
+   * names in NFC still reaches the file on a disk that keeps the two
+   * spellings apart. Empty on a vault whose names are all NFC already, which
+   * is every vault that never met a Mac.
+   */
+  private readonly diskName = new Map<string, string>();
+
+  /**
+   * Directories whose spellings are known, so the disk is asked once.
+   *
+   * `list` fills this for every directory it walks, which is why the sync
+   * path never reads a directory twice: it has just read the whole vault.
+   */
+  private readonly spellingsKnown = new Set<string>();
+
+  /**
+   * A vault-relative path in this vault's normal form, spelled the way the
+   * disk has each segment.
+   *
+   * The map used to be filled only by `list`, and `basalt restore` never
+   * calls `list` (R9). On a disk that keeps the two spellings apart that made
+   * restore invisible to itself: the file was there under the disk's NFD
+   * name, `exists` asked for the NFC one and was told no, restore wrote a
+   * second file, and the next `basalt sync` refused the whole vault with "two
+   * files in this vault are the same path once normalized" until a person
+   * renamed one of two names that look identical. So resolving a path asks
+   * the disk when it has to, rather than depending on another call having
+   * run first (cli/vault-spelling.test.ts, "a restore into a vault nothing
+   * has listed").
+   *
+   * The reads are bounded by the directories on the path, once each, and the
+   * sync path does none: `list` has already been over the whole tree.
+   */
+  private async spelledOnDisk(rel: string): Promise<string> {
+    let at = "";
+    let spelled = "";
+    for (const part of rel.split("/")) {
+      const next = at ? `${at}/${part}` : part;
+      let name = this.diskName.get(next);
+      if (name === undefined && !this.spellingsKnown.has(at)) {
+        await this.readSpellings(at, spelled);
+        name = this.diskName.get(next);
+      }
+      spelled = spelled ? `${spelled}/${name ?? part}` : (name ?? part);
+      at = next;
+    }
+    return spelled;
+  }
+
+  /**
+   * Learns how one directory spells the names in it.
+   *
+   * A directory that is not there yet is the ordinary case, and it is the
+   * parent of every file about to be created: nothing to map, and nothing
+   * remembered, because "nothing here" would outlive the moment. One that
+   * cannot be read is rule 2, and it is the difference between the two that
+   * matters: an unreadable directory may well hold this name under another
+   * spelling, and taking the answer as "it does not" is how a write lands
+   * beside a note instead of on it (cli/vault-race.test.ts, "does not write
+   * under an unverified spelling when the directory cannot be listed").
+   *
+   * Two names in one directory with the same normal form are not mapped at
+   * all: there is no right answer to which one a path means, and guessing is
+   * how a write lands on the wrong note. `list` is where that is refused,
+   * loudly, and it refuses the whole vault rather than one path.
+   */
+  private async readSpellings(dir: string, spelled: string): Promise<void> {
+    let names: string[];
+    try {
+      names = await readdir(resolve(this.root, spelled));
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Not there, or an ancestor that is a file rather than a folder.
+      // Neither holds a spelling, and both produce their own error from the
+      // operation that actually needs the path.
+      if (code === "ENOENT" || code === "ENOTDIR") return;
+      throw err;
+    }
+    this.spellingsKnown.add(dir);
+    const seen = new Set<string>();
+    for (const name of names) {
+      const normal = this.normal(name);
+      if (normal === name) continue;
+      const key = dir ? `${dir}/${normal}` : normal;
+      if (seen.has(normal)) this.diskName.delete(key);
+      else if (!this.diskName.has(key)) this.diskName.set(key, name);
+      seen.add(normal);
+    }
   }
 
   /** Temporary files of a crashed earlier run that `list` has removed. */
@@ -303,6 +457,8 @@ export class NodeVault implements Vault {
    */
   async list(): Promise<FileStat[]> {
     await this.reapStaleTemps();
+    this.diskName.clear();
+    this.spellingsKnown.clear();
     const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
       let items;
       try {
@@ -316,16 +472,51 @@ export class NodeVault implements Vault {
 
       // Symlinks and anything else are left alone: following one would
       // sync a file that is not in the vault, and copying it as a link
-      // would sync a path that means nothing elsewhere.
+      // would sync a path that means nothing elsewhere. `readdir` answers
+      // for the entry rather than its target, so a link is neither a file
+      // nor a directory here and a cyclic one is never looked through
+      // (cli/vault.test.ts, "symlinks in the listing").
       //
       // A write in flight from this client is skipped too. Listing one
       // would sync a half-written note under a name about to vanish.
-      const kept = items.filter(
-        (i) =>
-          !this.neverSynced(prefix ? `${prefix}/${i.name}` : i.name) &&
-          !isTemporary(i.name, join(dir, i.name)) &&
-          (i.isDirectory() || i.isFile()),
-      );
+      //
+      // Every name is reported in NFC, whatever the disk spells it in. A Mac
+      // hands back what Finder wrote, which is NFD, and every other device
+      // spells the same name NFC: the two are one name by definition, not
+      // two a person could choose between. Reporting the disk's bytes had
+      // this client disagree with the plugin about what one vault contains,
+      // and two devices each refusing the other's spelling of one note for
+      // ever, naming two strings nobody can tell apart. The disk's spelling
+      // is remembered where it differs so reads and writes still land on the
+      // file (cli/vault.test.ts, "a name the disk spells in NFD";
+      // cli/normalization.test.ts).
+      this.spellingsKnown.add(prefix);
+      const kept = items
+        .map((item) => ({ item, name: this.normal(item.name) }))
+        .filter(
+          ({ item, name }) =>
+            !this.neverSynced(prefix ? `${prefix}/${name}` : name) &&
+            !isTemporary(item.name, join(dir, item.name)) &&
+            (item.isDirectory() || item.isFile()),
+        );
+      // A disk that keeps the two spellings apart can hold both, and then
+      // there is no right answer to which one syncs, so neither does and the
+      // listing says which two. The plugin refuses the same way.
+      const spellings = new Map<string, string>();
+      for (const { item, name } of kept) {
+        const path = prefix ? `${prefix}/${name}` : name;
+        const other = spellings.get(name);
+        if (other !== undefined) {
+          throw new Error(
+            `two files in this vault are the same path once normalized, ` +
+              `${JSON.stringify(prefix ? `${prefix}/${other}` : other)} and ` +
+              `${JSON.stringify(prefix ? `${prefix}/${item.name}` : item.name)}, ` +
+              `and only one of them can sync. Rename one of them.`,
+          );
+        }
+        spellings.set(name, item.name);
+        if (item.name !== name) this.diskName.set(path, item.name);
+      }
 
       // A file deleted between the readdir and its stat is absent, which is
       // an ordinary state and not a failure of the listing. Anything else
@@ -333,9 +524,9 @@ export class NodeVault implements Vault {
       // and one unreadable file is a reason to stop rather than to report
       // the rest of the vault as the whole of it.
       const stats = await Promise.all(
-        kept.map((i) =>
-          i.isFile()
-            ? stat(join(dir, i.name)).catch((err: NodeJS.ErrnoException) => {
+        kept.map(({ item }) =>
+          item.isFile()
+            ? stat(join(dir, item.name)).catch((err: NodeJS.ErrnoException) => {
                 if (err.code === "ENOENT") return undefined;
                 throw err;
               })
@@ -343,17 +534,17 @@ export class NodeVault implements Vault {
         ),
       );
       const children = await Promise.all(
-        kept.map((i) =>
-          i.isDirectory()
-            ? walk(join(dir, i.name), prefix ? `${prefix}/${i.name}` : i.name)
+        kept.map(({ item, name }) =>
+          item.isDirectory()
+            ? walk(join(dir, item.name), prefix ? `${prefix}/${name}` : name)
             : undefined,
         ),
       );
 
       const out: FileStat[] = [];
       for (let k = 0; k < kept.length; k++) {
-        const item = kept[k]!;
-        const path = prefix ? `${prefix}/${item.name}` : item.name;
+        const { item, name } = kept[k]!;
+        const path = prefix ? `${prefix}/${name}` : name;
         if (item.isDirectory()) {
           out.push({ path, folder: true, mtime: 0, ctime: 0, size: 0 });
           out.push(...children[k]!);
@@ -379,7 +570,7 @@ export class NodeVault implements Vault {
   }
 
   async read(path: string): Promise<Uint8Array> {
-    return new Uint8Array(await readFile(this.absolute(path)));
+    return new Uint8Array(await readFile(await this.absolute(path)));
   }
 
   /**
@@ -389,7 +580,7 @@ export class NodeVault implements Vault {
    * small enough that peak memory is bounded by something other than the file.
    */
   async *readBlocks(path: string, blockSize = 1024 * 1024): AsyncGenerator<Uint8Array> {
-    const handle = await open(this.absolute(path), "r");
+    const handle = await open(await this.absolute(path), "r");
     try {
       const buf = new Uint8Array(blockSize);
       for (;;) {
@@ -406,7 +597,7 @@ export class NodeVault implements Vault {
   }
 
   async readRange(path: string, start: number, end: number): Promise<Uint8Array> {
-    const handle = await open(this.absolute(path), "r");
+    const handle = await open(await this.absolute(path), "r");
     try {
       const out = new Uint8Array(end - start);
       let at = 0;
@@ -432,12 +623,8 @@ export class NodeVault implements Vault {
    * locally edited on the very next pass, and the device would upload back what
    * it just received, forever.
    */
-  async write(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<void> {
-    const full = this.absolute(path);
+  async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
+    const full = await this.absolute(path);
     await this.insideForReal(full);
     const had = await this.deepestExisting(full);
     await mkdir(dirname(full), { recursive: true });
@@ -503,7 +690,7 @@ export class NodeVault implements Vault {
    * back out and undo the deletion everywhere else.
    */
   async remove(path: string): Promise<void> {
-    const full = this.absolute(path);
+    const full = await this.absolute(path);
     await this.insideForReal(full);
     try {
       await access(full, constants.F_OK);
@@ -538,7 +725,13 @@ export class NodeVault implements Vault {
    *
    * Deleting, restoring and deleting again is ordinary, and the second
    * deletion overwriting the first would quietly discard a version somebody
-   * might want. Numbered rather than timestamped so the order is obvious.
+   * might want. Numbered rather than timestamped so the order is obvious, and
+   * in brackets, which is how it has always spelled them.
+   *
+   * The search is `firstFreeName`, shared with the conflict copy and the
+   * plugin's staging name. What is local to the trash is the answer to
+   * "taken": a name that cannot be looked at may well be occupied, and moving
+   * a note onto it would replace what is there, so an error is not a "no".
    */
   private async freeTrashPath(path: string): Promise<string> {
     const base = join(this.root, TRASH_DIR, path);
@@ -546,22 +739,11 @@ export class NodeVault implements Vault {
     // and take the extension off the joined absolute one, which may not.
     const { ext } = splitName(path);
     const stem = ext === "" ? base : base.slice(0, base.length - ext.length);
-    for (let n = 0; n < 1000; n++) {
-      const candidate = n === 0 ? base : `${stem} (${n})${ext}`;
-      try {
-        await access(candidate, constants.F_OK);
-      } catch (err) {
-        // Free only if absent. A name that cannot be looked at may well be
-        // occupied, and moving a note onto it would replace what is there.
-        if ((err as NodeJS.ErrnoException).code === "ENOENT") return candidate;
-        throw err;
-      }
-    }
-    throw new Error(`the trash already holds a thousand copies of ${path}`);
+    return firstFreeName(base, occupied, (n) => `${stem} (${n})${ext}`);
   }
 
   async mkdir(path: string): Promise<void> {
-    const full = this.absolute(path);
+    const full = await this.absolute(path);
     await this.insideForReal(full);
     const had = await this.deepestExisting(join(full, "x"));
     await mkdir(full, { recursive: true });
@@ -570,7 +752,7 @@ export class NodeVault implements Vault {
 
   async exists(path: string): Promise<boolean> {
     try {
-      await access(this.absolute(path), constants.F_OK);
+      await access(await this.absolute(path), constants.F_OK);
       return true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
@@ -591,8 +773,8 @@ export class NodeVault implements Vault {
    * both copies.
    */
   canonical(path: string): string {
-    const nfc = path.normalize("NFC");
-    return this.foldsCaseSync ? nfc.toLowerCase() : nfc;
+    const normal = this.normalPath(path);
+    return this.foldsCaseSync ? normal.toLowerCase() : normal;
   }
 
   /**
@@ -648,12 +830,8 @@ export class NodeVault implements Vault {
    * Where the filesystem has no hard links, the file is opened exclusively
    * instead, which is exclusive but can leave a partial file after a crash.
    */
-  async create(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<boolean> {
-    const full = this.absolute(path);
+  async create(path: string, bytes: Uint8Array, times: Times): Promise<boolean> {
+    const full = await this.absolute(path);
     await this.insideForReal(full);
     const had = await this.deepestExisting(full);
     await mkdir(dirname(full), { recursive: true });
@@ -708,7 +886,8 @@ export class NodeVault implements Vault {
   async sameFile(a: string, b: string): Promise<boolean> {
     if (a === b) return true;
     try {
-      const [x, y] = await Promise.all([stat(this.absolute(a)), stat(this.absolute(b))]);
+      const [here, there] = await Promise.all([this.absolute(a), this.absolute(b)]);
+      const [x, y] = await Promise.all([stat(here), stat(there)]);
       return x.dev === y.dev && x.ino === y.ino;
     } catch (err) {
       // Absent is not the same file as anything. Anything else is thrown,
@@ -784,41 +963,30 @@ export class NodeVault implements Vault {
  * all: no index re-reads the vault and recovers, while a half-written one is
  * read as fact and quietly disagrees with the server about what has been synced.
  */
-/** Whether a path is still on disk, for the skip that assumes it is. */
-async function stillThere(file: string): Promise<boolean> {
-  try {
-    await access(file, constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export class JsonIndexStore implements IndexStore {
   constructor(private readonly file: string) {}
 
   /**
-   * The last thing written, so an unchanged index is not written again.
+   * What this session last wrote, and how it looked on disk (R3).
    *
-   * A pass ends by saving whether or not anything happened, and a settled
-   * vault passes on every watch tick and every keepalive. At 2000 files that
-   * was a 9 MiB serialisation and two fsyncs every thirty seconds, for ever,
-   * to record that nothing had changed; at 10k it measured 21 ms of which 11
-   * ms was the flushes. Two separate audits found this independently, which is
-   * the best evidence a thing is real.
-   *
-   * Comparing the string is not free either, but stringify is 2.1 ms against
-   * 10.7 ms of fsync, so it pays for itself the first time it matches. And a
-   * write skipped because the bytes on disk are already those bytes cannot
-   * lose anything: the failure it would cause is the failure it prevents.
-   *
-   * That last sentence holds only while the bytes are still there, which is
-   * why `save` asks for the file as well as comparing the string. An index
-   * removed from outside while a watcher is running would otherwise be
-   * skipped by every unchanged pass after it, and the next start would read
-   * a vault it has already synced as one it has never seen.
+   * The rule, and the reasoning behind it, is `LastIndexWrite` in core, shared
+   * with the plugin's store. It was not shared, and that is how this half of
+   * the client kept an existence check for a session after the other half
+   * learned that an index overwritten in place is still there.
    */
-  private lastWritten: string | undefined;
+  private readonly last = new LastIndexWrite();
+
+  /** The index's size and modification time, or undefined if it is not a file. */
+  private async stamp(): Promise<IndexStamp | undefined> {
+    try {
+      const st = await stat(this.file);
+      return st.isFile() ? { size: st.size, mtime: st.mtimeMs } : undefined;
+    } catch {
+      // Not there, or not answerable. Either way this session cannot claim
+      // the file still holds its own bytes, so the next save writes.
+      return undefined;
+    }
+  }
 
   async load(): Promise<StoredState | undefined> {
     let text: string;
@@ -842,7 +1010,7 @@ export class JsonIndexStore implements IndexStore {
     // What is on disk is what was last written, so the first pass of a vault
     // with nothing to do writes nothing rather than serialising the whole
     // index and fsyncing it twice to say so.
-    this.lastWritten = text;
+    this.last.wrote(text, await this.stamp());
     return state;
   }
 
@@ -862,14 +1030,14 @@ export class JsonIndexStore implements IndexStore {
    */
   async save(state: StoredState): Promise<void> {
     const text = JSON.stringify(state);
-    if (text === this.lastWritten && (await stillThere(this.file))) return;
+    if (this.last.matches(text, await this.stamp())) return;
     await mkdir(dirname(this.file), { recursive: true });
     await writeDurably(this.file, new TextEncoder().encode(text), true, {
       stageIn: join(dirname(this.file), "tmp"),
     });
     // Only after it is durable. Recording it first would skip the write
     // that a failed one still owes.
-    this.lastWritten = text;
+    this.last.wrote(text, await this.stamp());
   }
 }
 

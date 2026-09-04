@@ -434,3 +434,87 @@ describe("a never-synced name nested inside an ordinary folder (C3, P2)", () => 
     expect(a.vault.paths()).toEqual(["note.md"]);
   }, 120_000);
 });
+
+/**
+ * Two notes whose names differ only by case, created on two devices.
+ *
+ * `Note.md` on a device whose disk keeps case apart and `note.md` on one whose
+ * disk does not are two files to the server and one to the second device. The
+ * case-only rename is covered above; this is two people writing two notes. The
+ * folding device cannot hold both, and the one thing it must not do is let the
+ * arriving one land on top of the one it has.
+ */
+describe("two notes that differ only by case, one written on each device", () => {
+  /**
+   * A memory vault on a disk that keeps case apart, the way ext4 does, and
+   * says so. A plain `MemoryVault` cannot say, and the engine then folds
+   * everything, which is the safe fallback and not what Linux does.
+   */
+  class CaseKeepingVault extends MemoryVault {
+    canonical(path: string): string {
+      return path.normalize("NFC");
+    }
+    async sameFile(a: string, b: string): Promise<boolean> {
+      return a === b;
+    }
+  }
+
+  async function memoryDevice(name: string): Promise<{ c: Client; vault: MemoryVault }> {
+    const vault = new CaseKeepingVault();
+    const c = new Client({
+      vault,
+      store: new MemoryIndexStore(),
+      secret: SECRET,
+      url: server.wsUrl,
+      ...server.credentials(authToken(keys), wrapped),
+      vaultId: "default",
+      device: name,
+      timeoutMs: 20_000,
+      coalesceWrites: false,
+    });
+    open.push(c);
+    await c.connect();
+    return { c, vault };
+  }
+
+  it("keeps the folding device's own note, and both texts exist somewhere", async () => {
+    server = new TestServer();
+    await server.start();
+    const mac = await device("mac");
+    if (!(await foldsCase(mac.dir))) {
+      // Two names, two files, and nothing here can go wrong.
+      return;
+    }
+    const linux = await memoryDevice("linux");
+
+    // Both write before either syncs, so the collision is real.
+    await writeFile(join(mac.dir, "note.md"), "written on the mac\n");
+    await linux.vault.edit("Note.md", "written on linux\n");
+
+    let macReport = await mac.c.settle();
+    await linux.c.settle();
+    for (let i = 0; i < 4; i++) {
+      await new Promise((r) => setTimeout(r, 60));
+      macReport = await mac.c.settle();
+      await new Promise((r) => setTimeout(r, 60));
+      await linux.c.settle();
+    }
+
+    // Rule 1. The Mac's note is the Mac's note, untouched.
+    expect(await readFile(join(mac.dir, "note.md"), "utf8")).toBe("written on the mac\n");
+    // The Linux text was not lost either: the device that wrote it has it,
+    // and so does the one that could hold both.
+    expect(linux.vault.text("Note.md")).toBe("written on linux\n");
+    expect(linux.vault.text("note.md"), "linux never received the mac's note").toBe(
+      "written on the mac\n",
+    );
+    // The server does not think either was deleted.
+    const deleted = (await mac.c.deleted()).notes.map((n) => n.path);
+    expect(deleted).toEqual([]);
+
+    // The Mac says what it could not do and names the file in the way, rather
+    // than settling quietly with one note short.
+    expect(macReport.blocked, `mac: ${JSON.stringify(macReport)}`).toBeGreaterThan(0);
+    expect(macReport.inTheWay).toContainEqual({ path: "Note.md", blockedBy: "note.md" });
+  }, 120_000);
+});

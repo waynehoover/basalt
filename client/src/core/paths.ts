@@ -63,6 +63,69 @@ export function splitName(path: string): { stem: string; ext: string } {
 }
 
 /**
+ * `base`, or the first alternative spelling of it that nothing is using.
+ *
+ * The one answer to "where does this go, without displacing what is already
+ * there". Three callers asked it separately: the conflict copy and the
+ * restored copy through here, the vault's trash with a hand-rolled loop, and
+ * the plugin's staging name with a different one. They agreed on the part that
+ * matters and differed on everything else, which is how one of them ends up
+ * with a fix the others do not have.
+ *
+ * `taken` is the existence question, and it belongs to the caller because only
+ * the caller knows what "already there" means: an entry in the vault, a name
+ * on disk, or a name that cannot be looked at, which is not free.
+ *
+ * `nth` spells the nth alternative, counting from one, and defaults to the
+ * conflict copy's " 2", " 3". The trash numbers in brackets and the plugin's
+ * staging name is random rather than numbered, and both of those are the same
+ * search with a different pen.
+ *
+ * Exported and tested on its own because it is the part that can be wrong: the
+ * interesting cases are what happens when a name is taken, when several are,
+ * and what a name with no extension does.
+ */
+export async function firstFreeName(
+  base: string,
+  taken: (path: string) => Promise<boolean>,
+  nth: (n: number) => string = numbered(base),
+): Promise<string> {
+  if (!(await taken(base))) return base;
+  for (let n = 1; n < 1000; n++) {
+    const candidate = nth(n);
+    if (!(await taken(candidate))) return candidate;
+  }
+  // A thousand of these beside one note is not a state worth inventing a name
+  // for, and inventing one silently is how the thousand-and-first overwrites
+  // something.
+  throw new Error(`cannot find an unused name beside ${base}`);
+}
+
+/** " 2", " 3", and so on, with the extension kept on the end. */
+function numbered(base: string): (n: number) => string {
+  const { stem, ext } = splitName(base);
+  return (n) => `${stem} ${n + 1}${ext}`;
+}
+
+/**
+ * A path as this project spells it: one name, one spelling, always NFC.
+ *
+ * Canonical equivalence is not a choice a person makes. `café.md` written on a
+ * Mac and `café.md` written anywhere else are the same name by definition, and
+ * the bytes differ. Both vaults report NFC and normalise what they are handed,
+ * so NFC is the one keyspace there is; a path off the wire spelled otherwise
+ * has to join it before it is used as an identity, or a device holds one file
+ * and believes in two (C41).
+ *
+ * Here rather than in the engine because both shells need the same answer: the
+ * engine folds what arrives, and the headless vault folds what the disk hands
+ * it. Two copies of this rule is how they come to disagree.
+ */
+export function canonicalSpelling(path: string): string {
+  return path.normalize("NFC");
+}
+
+/**
  * A path as a filesystem that folds case and normalisation would file it.
  *
  * Not the same question as string equality, and the difference loses notes.
@@ -80,7 +143,7 @@ export function splitName(path: string): { stem: string; ext: string } {
  * deciding differently is two notes that turn into one.
  */
 export function foldPath(path: string): string {
-  return path.normalize("NFC").toLowerCase();
+  return canonicalSpelling(path).toLowerCase();
 }
 
 /** Whether two paths would be one file wherever the platform will not say. */

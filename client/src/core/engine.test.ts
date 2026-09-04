@@ -20,7 +20,6 @@ import {
   boundedBy,
   contentId,
   refuseIfBehind,
-  firstFreeName,
   sealedNames,
   type SyncReport,
 } from "./engine.ts";
@@ -28,9 +27,10 @@ import { chunkBytes, sizesFor } from "./chunk.ts";
 import { macEntry, sealChunks, sealPath } from "./crypto.ts";
 import { authToken, type VaultKeys } from "./crypto.ts";
 import { otherVaultKeys, testKeys, testWrapped } from "./test-keys.ts";
-import { Transport, type WireEntry } from "./transport.ts";
+import { ProtocolError, Transport, type WireEntry } from "./transport.ts";
 import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
-import { MemoryIndexStore, MemoryVault } from "./vault.ts";
+import { MemoryIndexStore, MemoryVault, type Times } from "./vault.ts";
+import { firstFreeName, ignoredHereError, neverSync } from "./paths.ts";
 import type { IndexEntry } from "./index-state.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 
@@ -169,11 +169,7 @@ class AliasingVault extends MemoryVault {
     const key = this.fold(path);
     return this.paths().find((p) => this.fold(p) === key);
   }
-  override async write(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<void> {
+  override async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
     const there = this.spelledAs(path);
     if (there !== undefined && there !== path) await super.remove(there);
     await super.write(path, bytes, times);
@@ -190,6 +186,20 @@ class AliasingVault extends MemoryVault {
   }
   async sameFile(a: string, b: string): Promise<boolean> {
     return this.fold(a) === this.fold(b);
+  }
+}
+
+/**
+ * A memory vault on a disk that keeps case apart, the way ext4 does, and says
+ * so. A plain `MemoryVault` cannot say, and the engine then folds everything,
+ * which is the safe fallback and not what Linux does.
+ */
+class CaseKeepingVault extends MemoryVault {
+  canonical(path: string): string {
+    return path.normalize("NFC");
+  }
+  async sameFile(a: string, b: string): Promise<boolean> {
+    return a === b;
   }
 }
 
@@ -213,6 +223,40 @@ class RacyVault extends MemoryVault {
       });
     }
     return was;
+  }
+}
+
+/**
+ * A memory vault told to leave one folder alone, the way `--ignore` tells a
+ * headless client to. It refuses the write with the code the engine reads.
+ */
+class IgnoringVault extends MemoryVault {
+  constructor(private readonly folder: string) {
+    super();
+  }
+  private refuse(path: string): void {
+    if (path.split("/").includes(this.folder)) {
+      throw ignoredHereError(`not writing under a name this device does not sync: ${path}`);
+    }
+  }
+  override async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
+    this.refuse(path);
+    await super.write(path, bytes, times);
+  }
+  // The folder too, as a real vault does: both shells answer the ignore list
+  // in `resolve`, which every write goes through whatever it is writing.
+  override async mkdir(path: string): Promise<void> {
+    this.refuse(path);
+    await super.mkdir(path);
+  }
+}
+
+/** A memory vault that will not open certain files, with a code nothing retries. */
+class RefusingVault extends MemoryVault {
+  readonly refuse = new Set<string>();
+  override async read(path: string): Promise<Uint8Array> {
+    if (this.refuse.has(path)) throw neverSync(`this vault will not open ${path}`);
+    return super.read(path);
   }
 }
 
@@ -1011,9 +1055,13 @@ describe("two notes the receiving disk cannot hold apart", () => {
     await aliased("Note.md", "note.md");
   }, 240_000);
 
-  it("refuses two names that differ only by Unicode normalisation", async () => {
-    await aliased("caf\u00e9.md", "cafe\u0301.md");
-  }, 240_000);
+  // The pair that used to be here, `café.md` in NFC against the same name in
+  // NFD, is not two names. It is one name spelled two ways, and refusing it
+  // named two strings nobody can tell apart and never cleared, because there
+  // was nothing for a person to rename. It is now folded at the wire and the
+  // test for it is below, under "one name a peer spells in another normal
+  // form". Case stays here: `Note.md` and `note.md` are two names a person
+  // chose between, and a disk that folds them really can only hold one.
 
   it("still lets a case-only rename through", async () => {
     await fresh();
@@ -1028,6 +1076,132 @@ describe("two notes the receiving disk cannot hold apart", () => {
     await convergeBoth(a, b, 6);
     expect(b.vault.text("NOTE.md")).toBe("the note\n");
     expect(b.vault.paths()).toEqual(["NOTE.md"]);
+  }, 240_000);
+});
+
+/**
+ * review finding C41. A path the server holds in a Unicode normal form no
+ * current client produces, which is every accented name a Mac running a
+ * client older than the NFC rule ever uploaded.
+ *
+ * Folded here rather than left alone, because the alternative was measured:
+ * the device wrote the note under its NFC name, found a name the index did
+ * not know, uploaded it as a second note, and then had both spellings on the
+ * server for ever, reporting `blocked: 1` on every pass and naming two
+ * strings a person cannot tell apart. That is verbatim the failure
+ * normalising was added to prevent.
+ *
+ * What the device owes the server afterwards is a rename, not an upload, and
+ * `prev` is how a rename travels: one entry, no bodies, because the chunks
+ * are already there.
+ */
+describe("one name a peer spells in another normal form", () => {
+  const NFC = "caf\u00e9.md";
+  const NFD = "cafe\u0301.md";
+
+  it("is the same file, and the correction travels as a rename", async () => {
+    await fresh();
+    // A plain MemoryVault hands out whatever spelling it was given, which is
+    // what the headless client did before it normalised: on a Mac, NFD.
+    const old = await device("old");
+    await old.vault.edit(NFD, "from the old client\n");
+    await old.engine.sync();
+    await new Promise((r) => setTimeout(r, 200));
+    old.close();
+
+    // A current device pairs into that vault. Its own keyspace is NFC, so
+    // the note has to land on the NFC name and stay one note.
+    const now = await device("now", undefined, new CaseKeepingVault());
+    const report = await now.settle(6);
+    expect(report.blocked, `blocked: ${JSON.stringify(report.inTheWay)}`).toBe(0);
+    expect(now.vault.paths()).toEqual([NFC]);
+    expect(now.vault.text(NFC)).toBe("from the old client\n");
+
+    // Rule 10: the property is not that this device is quiet, it is that the
+    // vault ends up holding one note. A third device pairing in afterwards
+    // sees the rename in its backlog and gets one file, not two.
+    const later = await device("later", undefined, new CaseKeepingVault());
+    const theirs = await later.settle(6);
+    expect(theirs.blocked, `blocked: ${JSON.stringify(theirs.inTheWay)}`).toBe(0);
+    expect(later.vault.paths()).toEqual([NFC]);
+    expect(later.vault.text(NFC)).toBe("from the old client\n");
+
+    // And it travelled as a rename rather than as a second note: an entry
+    // carrying `prev`, with no chunk of its own.
+    const renames = later.batches
+      .flatMap((b) => b.entries as { prev?: string; names?: unknown[] }[])
+      .filter((e) => e.prev);
+    expect(renames.length, "the correction did not travel as a rename").toBe(1);
+  }, 240_000);
+
+  it("folds every segment, so a note under an NFD folder lands once", async () => {
+    await fresh();
+    const old = await device("old");
+    await old.vault.edit("Note\u0301s/cafe\u0301.md", "in a folder\n");
+    await old.engine.sync();
+    await new Promise((r) => setTimeout(r, 200));
+    old.close();
+
+    const now = await device("now", undefined, new CaseKeepingVault());
+    const report = await now.settle(6);
+    expect(report.blocked, `blocked: ${JSON.stringify(report.inTheWay)}`).toBe(0);
+    expect(now.vault.paths()).toEqual(["Not\u00e9s/caf\u00e9.md"]);
+    expect(now.vault.text("Not\u00e9s/caf\u00e9.md")).toBe("in a folder\n");
+  }, 240_000);
+
+  it("deletes the note the server has, not a name it has never heard of", async () => {
+    await fresh();
+    const old = await device("old");
+    await old.vault.edit(NFD, "to be deleted\n");
+    await old.engine.sync();
+    await new Promise((r) => setTimeout(r, 200));
+    old.close();
+
+    const now = await device("now", undefined, new CaseKeepingVault());
+    await now.engine.sync();
+    expect(now.vault.paths(), "the note did not arrive").toEqual([NFC]);
+    // Deleted before this device has told the server which name it uses. A
+    // deletion sent under a name the server never had deletes nothing, and
+    // the note comes back to life on every other device.
+    await now.vault.remove(NFC);
+    await now.settle(6);
+
+    const watcher = await device("watcher", undefined, new CaseKeepingVault());
+    await watcher.settle(6);
+    expect(watcher.vault.paths(), "the deletion did not travel").toEqual([]);
+
+    // Rule 10: the property is which note the server was told to delete, not
+    // whether a device running this code happened to agree. A deletion under
+    // a name the server has never had leaves the note alive there, and every
+    // device that has not folded it keeps it.
+    const wire = await sealPath(keys, NFD);
+    const deletions = watcher.batches
+      .flatMap((b) => b.entries as { path: string; deleted?: boolean }[])
+      .filter((e) => e.deleted);
+    expect(
+      deletions.map((e) => e.path),
+      "the deletion did not name the path the server holds",
+    ).toContain(wire);
+  }, 240_000);
+
+  it("carries an edit back under the name the server already has", async () => {
+    await fresh();
+    const old = await device("old");
+    await old.vault.edit(NFD, "first\n");
+    await old.engine.sync();
+    await new Promise((r) => setTimeout(r, 200));
+    old.close();
+
+    const a = await device("a", undefined, new CaseKeepingVault());
+    await a.settle(6);
+    await a.vault.edit(NFC, "second\n");
+    const mine = await a.settle(6);
+    expect(mine.blocked).toBe(0);
+
+    const b = await device("b", undefined, new CaseKeepingVault());
+    const theirs = await b.settle(6);
+    expect(theirs.blocked, `blocked: ${JSON.stringify(theirs.inTheWay)}`).toBe(0);
+    expect(b.vault.snapshot()).toEqual({ [NFC]: "second\n" });
   }, 240_000);
 });
 
@@ -2404,6 +2578,46 @@ describe("a server that is behind this device", () => {
     expect(() => refuseIfBehind(5, 9)).toThrow(/restored backup or the wrong vault/);
   });
 
+  /**
+   * The refusal used to end at the diagnosis, and the recovery lived in
+   * docs/server.md. The person reading this is looking at a vault that has
+   * stopped syncing, on a phone as often as not; an error string is the only
+   * UI they have. Both ways back are named, and the cost of the blunt one
+   * with them, because re-pairing resets the merge base.
+   */
+  it("names both recoveries, and what the blunt one costs", () => {
+    let thrown: unknown;
+    try {
+      refuseIfBehind(5, 9);
+    } catch (err) {
+      thrown = err;
+    }
+    const message = (thrown as Error).message;
+    expect(message).toContain("basalt rebase --backup-taken");
+    expect(message).toContain("Rejoin this server");
+    expect(message).toMatch(/conflict copies instead of merging/);
+    expect(message, "the recovery pushed the numbers out of the refusal").toMatch(/5.*9|9.*5/);
+  });
+
+  /**
+   * Carried under the server's own code for this, so a shell has one thing to
+   * recognise however the refusal arrived, and so `runForever` stops on it.
+   * As a plain Error it was retried three times and then reported under a
+   * message about an entry no device can apply, which is a different fault
+   * with a different fix.
+   */
+  it("is a fatal protocol refusal, under the code the server uses", () => {
+    let thrown: unknown;
+    try {
+      refuseIfBehind(5, 9);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(ProtocolError);
+    expect((thrown as ProtocolError).code).toBe("cursor");
+    expect((thrown as ProtocolError).fatal, "a refusal no retry can help was retryable").toBe(true);
+  });
+
   it("is fine when level, which is the ordinary case", () => {
     expect(() => refuseIfBehind(9, 9)).not.toThrow();
   });
@@ -2607,4 +2821,153 @@ describe("what the index leaves out, and puts back", () => {
       expect(after.get(path), `${path} did not survive the round trip`).toBe(want);
     }
   }, 300_000);
+});
+
+/**
+ * N4. `--ignore` is a decision, not a failure, and the two counters say so.
+ * What `status()` said was neither: it had no `ignored` field at all, so a
+ * programmatic caller could not see the decision, and the path stayed on the
+ * inbound work list for ever, so what the caller did see was work
+ * outstanding on a folder that was never going to arrive. Rule 7.
+ */
+describe("what status says about a folder this device ignores (N4)", () => {
+  it("counts it as ignored and owes no work for it", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b", undefined, new IgnoringVault("Drafts"));
+
+    await a.vault.edit("Drafts/plan.md", "not for the other one\n");
+    await a.vault.edit("keep.md", "for everybody\n");
+    await convergeBoth(a, b);
+
+    const status = b.engine.status();
+    expect(status.ignored, "an ignored path is not visible to a caller").toBe(2);
+    expect(status.pending, "an ignored path was left owing work for ever").toBe(0);
+    expect(status.skipped, "a decision was filed as a failure").toBe(0);
+    // And the rest of the vault arrived, which is the other half of it.
+    expect(b.vault.text("keep.md")).toBe("for everybody\n");
+    expect(b.vault.text("Drafts/plan.md")).toBeUndefined();
+  }, 60_000);
+
+  it("owes no work for an ignored path after a single pass", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b", undefined, new IgnoringVault("Drafts"));
+
+    // Only ignored content, so one pass on b settles everything else. The
+    // multi-pass test above cannot see this: its second pass drops the path
+    // through the reconcile loop, hiding that the first pass left it owing.
+    await a.vault.edit("Drafts/plan.md", "not for the other one\n");
+    await a.settle();
+    await until("b to stage the ignored path", () => b.engine.status().pending > 0);
+
+    await b.engine.sync();
+
+    const status = b.engine.status();
+    // Two: the folder and the file under it, which the vault refuses
+    // separately, as the multi-pass test above pins.
+    expect(status.ignored, "an ignored path is not counted").toBe(2);
+    expect(status.pending, "an ignored path was left owing work after one pass").toBe(0);
+  }, 60_000);
+});
+
+/**
+ * N2. The count is not an identity. A pass that writes off a different file
+ * than the pass before it is a different report, and a shell that has only
+ * the number cannot tell: it says nothing, and the person is left with a
+ * glyph that says something is wrong and nothing that says what.
+ */
+describe("which files a pass wrote off, not just how many (N2)", () => {
+  it("names them, so a swapped failure is a different report", async () => {
+    await fresh();
+    const vault = new RefusingVault();
+    const a = await device("a", undefined, vault);
+
+    vault.refuse.add("one.md");
+    await vault.edit("one.md", "cannot be opened\n");
+    await vault.edit("two.md", "fine\n");
+    const first = await a.engine.sync();
+    expect(first.skipped).toBe(1);
+    expect(first.skippedPaths).toEqual(["one.md"]);
+
+    // Taken out of the vault, which is what stops a written-off path being
+    // counted. One pass to see it has gone.
+    await vault.remove("one.md");
+    await a.engine.sync();
+
+    // And now a different file will not open. One before, one now.
+    vault.refuse.add("two.md");
+    await vault.edit("two.md", "and now this one will not\n");
+    const second = await a.engine.sync();
+    expect(second.skipped, "the count did not move, which is the point").toBe(1);
+    expect(second.skippedPaths).toEqual(["two.md"]);
+  }, 60_000);
+});
+
+/**
+ * A file written off for good is written off for this vault's state, not for
+ * the life of the process. Nothing pinned that, and reading the code invites
+ * the opposite conclusion: the comparison is against the index entry, which
+ * looks like something only a successful sync updates. It is not, because
+ * `observe` stamps every entry from the listing at the top of every pass, so
+ * the fingerprint tracks the disk.
+ *
+ * The property somebody actually depends on: they are told a file cannot sync,
+ * they fix it, and the next pass takes it.
+ */
+describe("a written-off file that somebody has since fixed", () => {
+  it("is tried again, and syncs", async () => {
+    await fresh();
+    const vault = new RefusingVault();
+    const a = await device("a", undefined, vault);
+
+    vault.refuse.add("one.md");
+    await vault.edit("one.md", "cannot be opened\n");
+    expect((await a.engine.sync()).skipped, "not written off in the first place").toBe(1);
+
+    // Fixed: it opens now, and the file on disk has changed.
+    vault.refuse.delete("one.md");
+    await vault.edit("one.md", "opens now\n");
+
+    const second = await a.engine.sync();
+    expect(second.skipped, "still written off after being fixed").toBe(0);
+    expect(second.uploaded, "the repaired file never went up").toBe(1);
+  }, 60_000);
+});
+
+/**
+ * Two notes that differ only by case, one written on each device.
+ *
+ * The describe above hands a folding disk two notes another device already
+ * holds. Here each device writes one: `Note.md` where the disk keeps case
+ * apart, `note.md` where it does not. To the server they are two files, to the
+ * folding disk one, and the arriving one must not land on top of the note that
+ * device wrote. Rule 10: the property is that both texts survive, not that the
+ * two devices agree.
+ */
+describe("two notes that differ only by case, one written on each device", () => {
+  it("keeps the folding device's own note and both texts survive", async () => {
+    await fresh();
+    const linux = await device("linux", undefined, new CaseKeepingVault());
+    const mac = await device("mac", undefined, new AliasingVault());
+
+    await linux.vault.edit("Note.md", "written on linux\n");
+    await mac.vault.edit("note.md", "written on the mac\n");
+    await convergeBoth(linux, mac, 4);
+    const report = await mac.engine.sync();
+
+    // The Mac's note is untouched, and nothing it holds was replaced.
+    expect(mac.vault.text("note.md")).toBe("written on the mac\n");
+    expect(mac.vault.paths()).toEqual(["note.md"]);
+    // The Linux text exists on the device that wrote it and on the one that
+    // can hold both, which also received the Mac's note.
+    expect(linux.vault.snapshot()).toEqual({
+      "Note.md": "written on linux\n",
+      "note.md": "written on the mac\n",
+    });
+    // And the Mac says so, naming the file in the way, every pass until a
+    // person renames one of them.
+    expect(report.blocked).toBe(1);
+    expect(report.inTheWay).toEqual([{ path: "Note.md", blockedBy: "note.md" }]);
+  }, 240_000);
 });
