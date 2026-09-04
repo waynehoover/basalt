@@ -106,12 +106,13 @@ basalt sync --watch
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/security-dark.svg">
-  <img src="docs/assets/security.svg" alt="The recovery key derives an auth key and a wrapping key. The wrapping key opens the vault's data key, which derives the keys for names, bodies, nonces and version signatures. Only ciphertext crosses to the server, which holds sealed bodies and names and can neither read, forge nor unwrap any of it.">
+  <img src="docs/assets/security.svg" alt="The recovery key stays offline and does two things: register a device and rewrap the data key. Each paired device holds a device secret of its own, whose auth key proves it may connect, and the vault's data key, which derives the keys for names, bodies, nonces and version signatures. Only ciphertext crosses to the server, which holds sealed bodies and names, one row per device with a hash of its key, and a wrapped data key it cannot open.">
 </picture>
 
 - **The server never holds a key.** Note contents and file names are sealed on the device. What it stores is ciphertext, and what it can tell about that ciphertext is its length and that two chunks are identical, which is what deduplication is made of.
 - **It cannot write either.** Every version carries a signature under a key the server has never seen, so it cannot forge a version, alter one, or move one file's contents onto another.
-- **A leaked recovery key can be retired.** Content is sealed under a data key that the recovery key only wraps, so `basalt rotate` gives the vault a new secret and keeps every version of the history.
+- **Each device has its own credential, so one can be revoked.** No device holds the recovery key: it is written down and offline, and a device is added with a single-use invite instead. `basalt revoke ID` stops one device connecting and disturbs no other.
+- **A leaked recovery key can be retired.** Content is sealed under a data key that the recovery key only wraps, so `basalt rotate` gives the vault a new secret, keeps every version of the history, and leaves every device syncing.
 - **What it can still do is withhold.** A server can go quiet and show a device nothing. No note is altered, and two devices disagreeing is how a person notices. That is stated rather than solved, and [the design doc](docs/design.md) says why the alternative was rejected.
 
 ## What makes it fast
@@ -130,7 +131,8 @@ Notes are cut into content-defined chunks, so an edit sends the chunk that moved
 - [x] Conflicts keep both versions, and never rewrite the file you have open
 - [x] Full version history and deleted-note recovery, inside Obsidian
 - [x] Single-use invites to add a device, with the recovery key kept offline
-- [x] Rotate a leaked recovery key without losing history
+- [x] A credential per device, so a lost one is revoked without touching the others
+- [x] Rotate a leaked recovery key without losing history, or disconnecting a device
 - [x] Headless client for a machine with no Obsidian
 - [x] One static binary, verified atomic backups, and a restore runbook
 - [ ] Tested on iOS, which should work and has never been run

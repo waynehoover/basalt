@@ -273,7 +273,7 @@ connects with, of which the server stores only a hash. No password stretching
 anywhere, because every one of these is random rather than chosen.
 [protocol.md](protocol.md#crypto) has the construction.
 
-The split is what makes the three credentials above separable. A device can be
+The split is what makes the three credentials below separable. A device can be
 handed the data key without ever being handed the root, which is what an invite
 does, and what makes revoking that device mean something.
 
@@ -349,7 +349,7 @@ The separation is the point, so it is worth stating as three lines.
 | credential | held by | may |
 |---|---|---|
 | the root secret, which is the recovery key | nobody: written down, offline | register a device, rewrap the data key, read the device list, take a row off it, cancel an invite |
-| a device secret | one device | connect and sync as that device, issue and cancel invites, revoke any device but the last |
+| a device secret | one device | connect and sync as that device, read the device list, issue and cancel invites, revoke any device but the last |
 | the data key | every paired device | read and write content |
 
 The root is used twice in a vault's life: when it is created, and when every

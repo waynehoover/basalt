@@ -622,8 +622,9 @@ func pairingHosts(addr string) []string {
 // claims an unclaimed vault, and once a device has claimed one it opens
 // nothing. Printing it after that put a dead credential into the log on every
 // restart, and offered it as a pairing string that fails when pasted. Later
-// devices pair with each other, using a string that carries the root secret,
-// which this server has never seen and cannot print.
+// devices pair with each other, using an invite issued on a device that
+// already has the vault. That invite seals the vault's data key under a key
+// this server never sees, so there is nothing here it could print.
 func printSetup(out io.Writer, addr, vault, token string, fresh, local, unclaimed bool) {
 	if fresh && unclaimed {
 		fmt.Fprintln(out, "A new bootstrap token was generated for this server.")

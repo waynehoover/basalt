@@ -652,8 +652,13 @@ const MinClaimLength = 32
 // The point is that there is one secret rather than two. Before this, a vault
 // had a root secret that the devices shared and a server token that had nothing
 // to do with it, and a pairing string had to carry both. The auth key is now
-// another branch of the same HKDF schedule that produces the content and path
-// keys, so holding the root secret is what it means to have the vault.
+// another branch of the same HKDF schedule the root produces, so holding the
+// root secret is what it means to own the vault.
+//
+// Since protocol 4 that is ownership rather than access: this key registers a
+// device, rewraps the data key and administers the device list, and it may not
+// sync. What a device connects with is its own key, checked against its own
+// row; see session.go's three hello branches.
 //
 // The server stores only sha256 of that key. It never needs the key itself: it
 // checks an offered one, and a server that held the credential could write to

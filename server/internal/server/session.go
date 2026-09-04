@@ -2397,7 +2397,10 @@ func (s *Session) handleRevoke(m wire.In) error {
  * ---------------------------------------------------------------- */
 
 // handleInvite stores a single-use invite: an unguessable identifier and the
-// root secret sealed under a key the server never sees, with an expiry. The
+// vault's data key sealed under a key the server never sees, with an expiry.
+// The data key and not the root, since protocol 4: the issuing device holds no
+// root, and an invite carrying one would hand the newcomer the credential that
+// registers devices and rewraps the vault. See store.go's invites table. The
 // server learns nothing it could use; it holds a blob it cannot open under a
 // name it cannot guess, for a few minutes. docs/protocol.md, "Adding a device
 // with a single-use invite".

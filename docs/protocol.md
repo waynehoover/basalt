@@ -55,8 +55,9 @@ and `token` is that device's own auth key.
 
 **The vault's own credential.** No `deviceId`, and `token` is the key derived
 from the root secret, which is the recovery key. What comes back is a
-registrar session: it may `register` a device and `rotate` the vault's secret,
-and it may do nothing else.
+registrar session: it may `register` a device, `rotate` the vault's secret, and
+administer the device list with `devices`, `revoke` and `uninvite`. It may not
+read or write a note, and there is nothing else for it to send.
 
 ```
 -> {op:"hello", id, proto:4, vault, token, device, crypto, claim?, wrapped?}
@@ -135,8 +136,8 @@ holds. `wrapped` is the vault's wrapped data key when it has one; see
 
 Every request that expects a reply carries `id`, a client-chosen integer from 1
 to 2^32-1, unique among the requests in flight: `hello`, `put`, `putmany`,
-`get`, `fetch`, `history`, `deleted`, `invite`, `rotate`, `register`,
-`devices`, `revoke`. The reply echoes it,
+`get`, `fetch`, `history`, `deleted`, `invite`, `uninvite`, `rotate`,
+`register`, `devices`, `revoke`. The reply echoes it,
 and so does an `err` refusing that request. A request with no `id`, or one
 outside that range, is `protostate` and ends the session. `batch`, `caught-up` and pings are
 unsolicited and carry no `id`. The server never sends an `id` it was not given.
@@ -300,7 +301,7 @@ Two credentials, deliberately separated, and the separation is the point.
 | credential | held by | may |
 |---|---|---|
 | the vault's auth key, derived from the root secret | nobody, offline, written down as the recovery key | register a device, rotate the vault's secret, administer the device list |
-| a device's auth key | one device | connect and sync as that device, and revoke any device but the last |
+| a device's auth key | one device | connect and sync as that device, read the device list, issue and cancel invites, and revoke any device but the last |
 
 The server stores only `sha256` of either key, unsalted. That is right for a
 random 256-bit key, where there is nothing to guess and nothing for a slow hash
@@ -374,9 +375,14 @@ device retrying for ever, which is the same defect a duplicate invite
 identifier had. A *different* key under an id the vault already holds is
 somebody else's device and is `badentry`, and nothing is overwritten.
 
-**A device may not register a device.** It holds no vault credential, so a
-stolen laptop can read what it already had and cannot add a device of its own.
-It may list, and revoke any device but the vault's last, including itself,
+**A device may not `register`.** It holds no vault credential, so a stolen
+laptop cannot mint a row directly, cannot `rotate`, and cannot produce the
+recovery key. It **can** still add a device, by issuing an invite, and that is
+the design rather than a hole: the recovery key stays offline, so something a
+device holds has to be able to admit the next one. The honest boundary is that
+it cannot do so unseen, because both the row and the outstanding invite are in
+the same `devices` listing. What a device may send is `devices`, `invite`,
+`uninvite`, and `revoke` for any device but the vault's last, itself included,
 which is what unlinking is.
 
 **Revoking closes the device's live sessions**, and the reply means both. The

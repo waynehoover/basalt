@@ -275,10 +275,12 @@ leaves; `purges` is the generation, and `basaltd stats -json` reports the live
 store's as `purges` too. The database is the authority and this is a summary of
 it; `verify` still reads the database.
 
-**The backup is ciphertext.** Restoring it needs the vault's root secret, which
-lives on your devices and in the pairing string. Keep the pairing string
-somewhere other than the backup. The command reminds you every time because no
-command can check it.
+**The backup is ciphertext.** Reading it back needs a device that is still
+paired, because a paired device holds the vault's data key, or the recovery key
+if none is. The recovery key is on paper and nowhere else since protocol 4:
+no device holds one. Keep it somewhere other than the backup, because a backup
+and a key in the same place is one loss rather than two. The command reminds
+you every time because no command can check it.
 
 What a server backup is for:
 
@@ -370,17 +372,22 @@ and then once a year, on a machine or directory that is not the live one:
 4. Start a server on it, on another port, with no devices pointed at it:
    `basaltd serve -data /tmp/restore -addr 127.0.0.1:3004`. It must print its
    startup line with `claimed=true` and the uid from step 3.
-5. Point one device at it with a copy of the pairing string, read a note back,
-   and check the history of a file. Then unlink that device from the rehearsal
-   server, so it does not carry a cursor that is ahead of the live one.
-6. Stop it and delete `/tmp/restore`.
+5. Stop it and delete `/tmp/restore`.
 
-Step 2 is the one that pays for itself. A body that rotted in the offsite copy
-is still there, still the right length, and a shallow verify walks straight
-past it; `-deep` re-reads every body and checks it against its name, which for
-a content-addressed store is complete for the bytes. Step 5 is the other one:
-a restore that starts and serves a vault with a hole in it passes every check
-before it, and the only thing that catches it is reading a note back.
+Reading a note back over a real connection is the other check that matters, and
+it is the one your own copy cannot easily get: a device cannot be aimed at the
+rehearsal port, because the recovery key carries the server's address and
+nothing overrides it. That is why it runs in CI instead, against the built
+binary, on every push. By hand the equivalent is the real restore below, which
+puts the copy at the address every paired device already points at.
+
+Step 2 is the one that pays for itself here. A body that rotted in the offsite
+copy is still there, still the right length, and a shallow verify walks
+straight past it; `-deep` re-reads every body and checks it against its name,
+which for a content-addressed store is complete for the bytes. What it cannot
+tell you is that the vault serves: a restore with a hole in it starts, verifies
+and passes every check before the read-back, which is the clause rule 11 turns
+on.
 
 For the real thing, the steps are the same with the live directory as the
 destination:
@@ -579,7 +586,7 @@ that field before the others, and run `basaltd verify` when it is false.
 
 ## What to alert on
 
-There is no dashboard, on purpose. Six things are worth a check from a cron
+There is no dashboard, on purpose. Seven things are worth a check from a cron
 job or whatever watches your machines, all readable without a key.
 
 | Signal | How to read it | What it means |
@@ -589,6 +596,7 @@ job or whatever watches your machines, all readable without a key.
 | Repeated `cursor` refusals | `journalctl -u basalt | grep 'code=cursor'` after a restore | Devices hold versions the restored server does not, which is the expected state after restoring an older backup. `basalt rebase --backup-taken` on the headless client, or *Rejoin this server* in the plugin panel, rejoins without losing what only that device holds. The refusal each device shows names both. The log names the device. |
 | `nospace` | `journalctl -u basalt | grep nospace` | The disk is full. Nothing is lost, uploads are refused until it is not. Purge after a backup, or give it a bigger disk. |
 | A device with a wrong clock | `journalctl -u basalt \| grep 'timestamps from the future'` | That device is stamping notes with a date that has not happened, so every version it writes carries a time that reads wrong. Nothing is at risk: history is ordered by arrival, merging is by content hash. Fix the clock on the device the line names. Reported once per connection. |
+| A device you did not add | `journalctl -u basalt \| grep -E 'device registered\|invite redeemed'` | Somebody joined a device to the vault. Any device that has the vault can issue an invite and an invite registers one row, so this is what a compromised device adding another looks like, and it is the reason it cannot do so unseen. Match what the log says against `basalt devices`, and `basalt revoke` a row you do not recognise. A `device auth failed` line beside it is a device that was already revoked, still trying. |
 | A purge is worth running | `reclaimBytes` from `stats -json`, against how much disk you have | Old versions are holding space nothing needs. This is the row that exists so the one above never fires: the remedy for a full disk is a ceremony, and it should start because this said so rather than because uploads stopped. Check `reclaimComplete` first. |
 
 The startup line is the other thing to grep for after a restart, with the same
@@ -650,14 +658,24 @@ every device you have.
 Nothing on the server is re-encrypted and no history is lost. It cannot unread
 what was already read. [design.md](design.md#a-lost-or-stolen-device) says more.
 
-The new secret is written into the device's config before the request goes out,
-so a reply lost on the way cannot leave a vault whose new root nobody holds.
-`basalt rotate` prints the key and exits non-zero if that happens, saying it may
-have committed; the plugin puts the same key in the panel and says the same
-thing. The next connection from that device tries the new secret first and
-settles which one the vault has. Keep both keys until it has. If two devices
-rotate at once, one is refused with `rotated` and pairs again with the string
-the other printed.
+There is nowhere on a device to stage a new root, because not holding one is
+the point, so the durable copy is the one on paper and it goes there first.
+`basalt rotate` prints the key before the request goes out and says to write it
+down before pressing on; the plugin makes it first and puts it in the panel the
+moment the call returns.
+
+A reply lost on the way is settled by asking rather than left ambiguous: both
+clients try to open a session with the new secret, which succeeds if and only
+if the server took it, and then say which key to keep. Three answers, and each
+is worded as one: it committed and the new key is the vault's, it did not and
+the old one still is, or the server could not be reached, in which case keep
+both and run it again with whichever the server accepts. `basalt rotate` exits
+non-zero on the last two. Neither client shows a key it knows is not the
+vault's.
+
+If two devices rotate at once the loser is refused with `rotated`, nothing of
+its rotation committed, and it is told to cross out the key it printed. No
+device has to pair again either way, because a rotation touches no device row.
 
 ## A data directory from before protocol 3
 
@@ -703,7 +721,11 @@ basaltd serve -allow-origin capacitor://localhost
 | `-v` | off | verbose logging |
 
 Each vault accepts eight simultaneous devices. More are refused with
-`code:"busy"`.
+`code:"busy"`, which says come back later. A vault may also have eight devices
+*registered*, and the ninth registration is refused with `code:"full"`, which
+waiting never clears: `basalt revoke` a device you no longer use. The two are
+deliberately the same number, so a vault cannot register a device it could
+never connect.
 
 `-max-file` is bounded by the sending device's memory, not by anything the
 server pays. The headless client streams large files and stays under 300 MB at
@@ -757,7 +779,8 @@ next to their reasoning in the source; these are the numbers.
 | bodies one `fetch` may ask for | 64 MiB | `maxFetchBytes` |
 | one frame, after hello | 32 MiB | twice the largest legal message, so every legal one is read and refused with a code |
 | one frame, before hello | 64 KiB | a hello is a few hundred bytes |
-| devices per vault | 8 | refused with `busy`, `retryAfterMs` 30 s |
+| devices registered on a vault | 8 | the ninth registration is refused with `full`, which no waiting clears |
+| devices connected at once | 8 | refused with `busy`, `retryAfterMs` 30 s |
 | connections waiting to say hello | 32 in all | refused with `busy` |
 | shutting down | | every idle session gets `busy`, `retryAfterMs` 5 s |
 | time allowed to say hello | 10 s | closed with `protostate` |

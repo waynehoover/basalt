@@ -105,6 +105,14 @@ Engine's published environment.
 **A whole vault.** 200 files, 17.8 MiB, Apple M4 Pro, under protocol 3. 200
 arrived, 0 wrong, on every row.
 
+The protocol 3 label is kept because that is when the run happened, and it does
+not date the figures. Protocol 4 changed the handshake, the device list and
+what an invite carries; `put`, `putmany`, `get`, `fetch`, the chunker and the
+content key schedule are untouched, and the golden vectors that pin sealed
+bytes still pass, so a chunk has the same name and the same length it had here.
+What a protocol 4 run would move is the cost of connecting, which none of these
+rows measure.
+
 | Round trip | Up | Down | 20 notes up | 20 notes down | Nothing changed |
 |---|---|---|---|---|---|
 | loopback | 11.9 s | 0.62 s | 0.24 s | 0.11 s | 0.00 s |
@@ -191,12 +199,63 @@ does to concurrent writers, not for its arithmetic.
 - **One transaction per batch.** 10x on the SQL, worth 0.7% of an upload, in
   exchange for making "an ack means durable" a per-batch argument.
 - **A different deflate level or chunk-size targets.** Both are baked into the
-  chunk name. Changing either re-chunks every vault in existence.
+  chunk name. Changing the targets re-chunks every vault in existence, because
+  the boundaries move. Changing the level does not: it moves no boundary, so it
+  re-names and re-uploads the chunks whose compressed output actually differs,
+  and the store holds both copies. Measured while spiking a way out of this in
+  September 2026, along with the finding that naming by anything derived from
+  the plaintext cannot decouple the targets either. See improvements.md.
 - **Larger chunks** to cut fsyncs. Trades back a size chosen by measurement.
 - **Solid compression on a first sync.** 57% against 60% of plaintext, for a
   second code path through the most durability-critical part of the client.
 - **node-diff3** for the merge. It conflicted on five of eight cases that merge
   cleanly here, including two devices appending to a daily note.
+- **Naming a chunk by its plaintext rather than its ciphertext**, so that the
+  chunk size, the deflate level and the sealing construction stop being baked
+  into the name. Spiked in September 2026 against the real corpus, and not
+  taken. Three findings, in the order that decided it.
+
+  It decouples two of the three parameters and not the one that matters. The
+  level and the construction come apart; chunk-size targets cannot, because
+  moving a boundary changes the plaintext itself. Measured over one 200 KiB
+  file chunked at two targets: 0 names shared of 126, under the proposed scheme
+  and the present one alike.
+
+  The server stops being able to check itself. A chunk's name is recomputed
+  from its body in five places, and a name the server cannot compute takes all
+  five: verification at write time, matching an unlabelled frame to the name it
+  answers, the bit-rot check on the way out with its quarantine and self-heal,
+  and the deep verify. Rot would stop being something the server finds and
+  start being a note that will not decrypt. It can be rebuilt by having the
+  client send a body digest to file under, but that is a schema change, a wire
+  change, and a table whose loss orphans every body.
+
+  And the migration is the most expensive this project will ever pay, because
+  nothing but a device holding the plaintext can map an old name to a new one.
+  The first touch of each file re-uploads it whole and the store roughly
+  doubles for good. Paying that now, to avoid perhaps paying it later, is a bad
+  trade while the vault is at its smallest.
+
+  Two things worth keeping. The naive form of the idea, naming by a plain hash
+  of the plaintext, is a security regression rather than a neutral change: such
+  a name is computable by anyone, identical in every vault that will ever
+  exist, and for a note below the chunk minimum it is a hash of the whole note.
+  Keying it under the data key fixes that and costs nothing measurable, since
+  it replaces the existing hash rather than adding one. And that keyed design
+  stays on file for one case: a construction change that is forced rather than
+  chosen, where re-sealing under today's naming would rename every chunk,
+  rewrite every entry and re-MAC the whole of history. The prototype and its
+  benchmark are on the branch `worktree-agent-afcd112f19a23495e`, unmerged
+  because nothing imports them, so the numbers above can be re-run rather than
+  re-derived.
+- **A local map from plaintext to the name a chunk was uploaded under**, which
+  would let a device change encoding parameters without re-sending anything it
+  had already sent. It works: 2 chunks and 12.5 KiB against 43 and 156 KiB
+  after a level change, matching what the scheme above achieves, with no
+  protocol change and nothing new disclosed. Not built, because its benefit is
+  exactly zero until somebody retunes a parameter, it pays for itself the day
+  they do, and until then it is about a quarter again on the index, which is
+  the file the first rule is about.
 - **A SQLite index on the client**, to replace rewriting the whole index as
   JSON on every change. The worry was a rewrite cliff on a large vault, so it
   was measured before it was believed. Building a realistic index and timing

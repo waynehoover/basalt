@@ -57,25 +57,29 @@ was shown once, this device does not have it, and adding a device does not need
 it. *Pair* reaches the server before it says paired, so a mistyped string is
 refused on the spot and nothing is left behind. An invite is spent by the
 exchange that registers the device, so nothing is written here until the server
-has answered; the recovery key is saved first and used second, because that
-path registers with a credential this device is holding. *Start a new vault*
-saves first too, because that handshake is what claims the vault and the secret
-has to be on disk before the server binds to it; if the server then refuses,
-the notice says so and offers unlink.
+has answered, and the recovery key path is the same: it registers first and
+saves what came back. *Start a new vault* is the one that saves first, because
+that handshake is what claims the vault and the secret has to be on disk before
+the server binds to it; if the server then refuses, the notice says so and
+offers unlink.
 
-**A vault paired before protocol 4** converts itself the first time it
-connects: it registers a device row with the root it is holding, reads back the
-row by using it, and only then drops the root. Nothing to do, and nothing to
-notice. If it is interrupted the device tries again on the next connection, and
-if the same interruption keeps happening the panel says so with the reason.
+**A pairing that never registered a device** stops rather than retrying. That
+is what is left if a vault was claimed and the registration after it failed,
+and there is nothing the plugin can do about it that a person cannot see: the
+panel shows the vault's recovery key, which may be the only copy of it, and
+says to write it down, unlink and pair again with it.
 
 The device name is optional. Left blank it becomes `obsidian-` and four random
 characters, so two devices left at the default do not share a name. It appears
 in version history and in conflict copy filenames.
 
-The pairing is stored in the plugin's own `data.json`, with the root secret in
-the clear. That is inherent: the device has to decrypt the vault without
-asking anyone. It is the same exposure as any password manager's local store.
+The pairing is stored in the plugin's own `data.json`: this device's id, the
+secret it connects with, and the vault's data key, all in the clear. The root
+secret is not among them, which is what makes the *Devices* row below mean
+something. The data key being there is inherent: the device has to decrypt the
+vault without asking anyone. It is the same exposure as any password manager's
+local store, and it is why revoking a device does not unread what it already
+read.
 
 ## What it does
 
@@ -109,14 +113,20 @@ same sentence is the ribbon icon's tooltip.
 | offline | cannot reach the server, retrying |
 | stopped | a refusal that retrying would not fix, see below |
 
-**Stopped** means the server refused this device in a way that will repeat:
-the protocol version differs, the vault is not this device's, or the server has
-lost history this device already has. The notice says which, and it says what to
-do about it. Upgrade the server and plugin together for a protocol mismatch, and
-unlink and pair again for a vault that is not this device's. For a server that
-has lost history, see *Rejoin this server* below. An unreadable `data.json` also
-stops the plugin rather than starting over, because starting over would make
-everything on the server undecryptable from here.
+**Stopped** means retrying will not help, and mostly that is the server
+refusing this device in a way that will repeat: the protocol version differs,
+the vault is not this device's, or the server has lost history this device
+already has. The notice says which, and it says what to do about it. Upgrade
+the server and plugin together for a protocol mismatch, and unlink and pair
+again for a vault that is not this device's. For a server that has lost
+history, see *Rejoin this server* below.
+
+Two other causes are not the server's doing at all, and both stop for the same
+reason. A pairing that never registered a device has nothing to connect with,
+so nothing is asked of anybody; the notice names what is missing and prints the
+recovery key if it is still there. And an unreadable `data.json` stops the
+plugin rather than starting over, because starting over would replace what is
+in it and this device would lose its row on the vault.
 
 ## Rejoining a restored server
 
@@ -138,14 +148,18 @@ two devices at once makes conflict copies instead of merging. Use Rejoin.
 
 ## Devices, and revoking one
 
-*Devices* lists every device that may reach this vault: its name, the id that
-identifies it, when it was added and when it was last seen. The name is not an
-identity, and two laptops may both be called laptop; the id is.
+*Devices* asks the server who may reach this vault, on *Show devices*, and
+lists each one: its name, the id that identifies it, when it was added and when
+it was last seen. Nothing is fetched until you press it, because it is a
+request to the server rather than something this device already knows. The name
+is not an identity, and two laptops may both be called laptop; the id is.
 
-Each row has *Revoke*, behind a second press. Revoking removes the device's row
-and closes any connection it has open, in that order, so it stops at once
-rather than the next time it happens to reconnect. It can revoke this device
-too, which is what unlinking looks like from the server's side.
+Each row has *Revoke*, behind a second press: the button becomes *Yes, revoke*
+and says what that row will lose. Revoking removes the device's row and closes
+any connection it has open, in that order, so it stops at once rather than the
+next time it happens to reconnect. This device's own row is there too, where
+the button reads *Unlink from the server*, which is what unlinking looks like
+from the server's side.
 
 The vault's **last** device has no button, and the panel says why where the
 button would have been. Taking the last row off the server leaves a vault only
@@ -199,9 +213,12 @@ a phone, a desktop and a NAS is a weekend, and is the reason a leaked string
 went unrotated. It cannot unread what was already read;
 [design.md](design.md#a-lost-or-stolen-device) says more.
 
-The new key is on screen before the request goes out, because there is nowhere
-on a device to keep a root: not holding one is the point. If the reply is lost,
-the plugin asks the server which secret it has and says which key to keep.
+The new key is made before the request goes out and is on screen the moment the
+call returns, because there is nowhere on a device to keep a root: not holding
+one is the point, so the durable copy is the one you write down. If the reply
+is lost, the plugin asks the server which secret it has, by trying the new one,
+and says which key to keep. It never puts up a key it knows is not the vault's:
+a rotation somebody else won says so and shows nothing to write down.
 
 ## Commands
 
@@ -212,11 +229,13 @@ the plugin asks the server which secret it has and says which key to keep.
 | Show version history | for the open note |
 | Recover a deleted note | lists what the server has and this vault does not |
 
-The panel holds the rest: *Sync now*, *Devices*, *Recover a deleted note*,
-*Replace the vault's secret*, *Unlink this vault*, and *Rejoin this server*
-when a restored server has refused this device. Revoking, replacing the secret
-and unlinking are behind warnings and confirmations; nothing there is a
-setting.
+The panel holds the rest: *Sync now*, *Add another device*, *Devices*, *Recover
+a deleted note*, *Recovery key*, *Replace the vault's secret*, *Unlink this
+vault*, and *Rejoin this server* when a restored server has refused this
+device. *Recovery key* is the one with no control at all: it says the key was
+shown once, that no device holds it, and that an invite is what adds a device.
+Revoking, replacing the secret and unlinking are behind warnings and
+confirmations; nothing there is a setting.
 
 Version history is also on a note's right-click menu, where Obsidian Sync puts
 it. Both are registered on Obsidian's own command line as `basalt:history` and

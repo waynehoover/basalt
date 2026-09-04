@@ -336,10 +336,11 @@ CREATE TABLE IF NOT EXISTS vaults (
   auth_hash  TEXT    NOT NULL DEFAULT '',
   -- The vault's data key, wrapped by the first device under a key derived
   -- from the root secret, and empty only before a device has claimed the
-  -- vault. The server cannot open it and never needs to; it stores it so
-  -- every device holding the root secret can, and so a rotate can swap hash
-  -- and blob in one statement without any device losing the history sealed
-  -- under it.
+  -- vault. The server cannot open it and never needs to; it stores it so a
+  -- registrar can unwrap it for each device it registers, and so a rotate can
+  -- swap hash and blob in one statement without any device losing the history
+  -- sealed under it. Since protocol 4 a device holds the data key itself and
+  -- ignores this blob; what still reads it is a registration.
   wrapped    TEXT    NOT NULL DEFAULT '',
   -- How many times the vault's secret has been rotated. Bumped inside the
   -- rotation transaction, so it moves at exactly the moment the credential
@@ -1867,7 +1868,8 @@ func (s *Store) AuthHash(vaultID string) (string, error) {
 // other device at hello.
 func ValidWrapped(w string) bool { return validBase64URL(w, MaxWrappedLen) }
 
-// ValidSealed is ValidWrapped for the sealed root secret an invite carries.
+// ValidSealed is ValidWrapped for the sealed data key an invite carries. The
+// data key and not the root, since protocol 4; see the invites table.
 func ValidSealed(s string) bool { return validBase64URL(s, MaxSealedLen) }
 
 // ValidInvite is the same check for an invite identifier.
