@@ -20,7 +20,6 @@ import {
   checkEntryShape,
   combinePasses,
   contentId,
-  firstFreeName,
   mustBeOurs,
   placeBeside,
   type SyncOptions,
@@ -35,7 +34,8 @@ import {
   type SocketLike,
   type WireEntry,
 } from "./transport.ts";
-import type { IndexStore, Vault } from "./vault.ts";
+import { MemoryIndexStore, type IndexStore, type Vault } from "./vault.ts";
+import { validateStoredState } from "./stored-state.ts";
 import {
   authToken,
   base64urlEncode,
@@ -54,11 +54,12 @@ import {
 import {
   INVITE_ID_LENGTH,
   INVITE_KEY_LENGTH,
+  encodeConfig,
   formatInvite,
   type DeviceConfig,
   type Invite,
 } from "./pairing.ts";
-import { splitName } from "./paths.ts";
+import { firstFreeName, splitName } from "./paths.ts";
 
 export interface ClientOptions {
   readonly vault: Vault;
@@ -193,14 +194,20 @@ export class Client {
     return next;
   }
 
-  /** How many requests this client has sent, which is what latency multiplies. */
-  get requestsSent(): number {
-    return this.transport.requestsSent;
-  }
-
-  /** The newest uid the server held when this client said hello. */
+  /**
+   * The newest uid the server is known to hold: what `ready` announced at
+   * hello, raised by every batch since, because a batch is the server
+   * handing over a uid it holds. `caught-up` is no use for this, being sent
+   * once per connection when the backlog drains.
+   *
+   * Not the hello number alone. The panel prints this beside the local
+   * cursor so that a server withholding versions can be seen (I11), and on
+   * a connection that stays up for days the hello number is frozen: a vault
+   * paired when it was empty went on reporting a server holding nothing
+   * however much it went on to hold.
+   */
   get serverCursor(): number {
-    return this.limits?.cursor ?? 0;
+    return Math.max(this.limits?.cursor ?? 0, this.transport.appliedCursor);
   }
 
   /** The vault's wrapped data key as the server holds it, once connected. */
@@ -848,7 +855,7 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
       hooks.onConnecting?.(client);
       await client.connect();
       reachedTheServer = true;
-      backoff.success(Date.now());
+      backoff.success();
       // Asked again here, not only at the top of the loop. A shell that
       // said stop during the handshake has nothing else to say it with,
       // and a settle on a vault somebody has just unlinked is exactly the
@@ -903,7 +910,7 @@ export async function runForever(opts: ClientOptions, hooks: ForeverHooks = {}):
     }
     if (!(hooks.keepGoing?.() ?? true)) return;
 
-    backoff.fail(Date.now());
+    backoff.fail();
     const why = cause ?? new Error("the connection ended");
     const delay = retryWait(why, backoff.delay());
     if (reachedTheServer) hooks.onDisconnected?.(why, delay);
@@ -1022,6 +1029,134 @@ export async function credentialsFor(
 }
 
 /**
+ * The credentials to try, best first, for a config that may be mid-rotation or
+ * mid-claim.
+ *
+ * An outstanding rotation goes first, because if it committed then it is the
+ * only thing that opens the vault, and it carries the wrapping the server holds
+ * so the pin does not refuse the very connection that resolves it. Then the
+ * config as it stands. Then, for the first device only, the config without its
+ * bootstrap.
+ *
+ * That last one is the narrow case in which a bootstrap can be proven spent.
+ * Starting a vault writes the config with the bootstrap, claims the vault, and
+ * writes it again without. If the second write fails, or the claim commits and
+ * its reply is lost, the next run offers the bootstrap first and is refused, for
+ * ever. The refusal is `auth`, which is also what a wrong token and another
+ * device's vault produce, so it does not on its own say what happened. What does
+ * say is the key derived from this config's root secret: the server compares it
+ * against the hash it bound the vault to, so that key being accepted proves the
+ * vault was claimed with this secret.
+ *
+ * One function rather than the same list in both shells. The headless client had
+ * all three and the plugin had only the bootstrap one, so a rotation whose reply
+ * was lost on a phone left the new secret on disk with nothing that would ever
+ * try it: intact ciphertext and no way in. `plugin/rotate.test.ts` pins it.
+ */
+export function credentialCandidates(config: DeviceConfig): DeviceConfig[] {
+  const out: DeviceConfig[] = [];
+  if (config.pending) {
+    const promoted: DeviceConfig = {
+      ...config,
+      secret: config.pending.secret,
+      wrapped: config.pending.wrapped,
+    };
+    delete (promoted as { bootstrap?: string }).bootstrap;
+    delete (promoted as { pending?: unknown }).pending;
+    out.push(promoted);
+  }
+  out.push(config);
+  if (config.bootstrap !== undefined) {
+    const spent: DeviceConfig = { ...config };
+    delete (spent as { bootstrap?: string }).bootstrap;
+    out.push(spent);
+  }
+  return out;
+}
+
+/**
+ * What the stored config should say now that a connection has succeeded, or
+ * undefined when it already says it.
+ *
+ * `used` is the credential that actually authenticated, which is `stored` for an
+ * ordinary device and one of the fallbacks in `credentialCandidates` otherwise.
+ * The one thing neither of them knows is the vault's wrapped data key, because
+ * that arrives in `ready`.
+ *
+ * Compared against what is stored rather than against `used`, because the whole
+ * reason a fallback was needed is that the two disagree.
+ *
+ * One function rather than the same three deletions in both shells: a shell that
+ * forgot `pending` would keep trying a retired secret first on every connection,
+ * and one that forgot `bootstrap` would offer a spent token for ever.
+ */
+export function settledConfig(
+  stored: DeviceConfig,
+  used: DeviceConfig,
+  wrapped: string | undefined,
+): DeviceConfig | undefined {
+  const next: DeviceConfig = { ...used, ...(wrapped !== undefined ? { wrapped } : {}) };
+  delete (next as { bootstrap?: string }).bootstrap;
+  // The claim candidate goes with the bootstrap: nothing sends a claim once the
+  // vault is known to be claimed, so keeping it is keeping a wrapping of a data
+  // key the vault never adopted.
+  delete (next as { claimWrapped?: string }).claimWrapped;
+  delete (next as { pending?: unknown }).pending;
+  return sameConfig(next, stored) ? undefined : next;
+}
+
+function sameConfig(a: DeviceConfig, b: DeviceConfig): boolean {
+  return JSON.stringify(encodeConfig(a)) === JSON.stringify(encodeConfig(b));
+}
+
+/**
+ * Where this device and the server each are, for deciding whether a rebase is
+ * the answer.
+ *
+ * The server's number is asked for from a connection that carries no index and
+ * so cannot be refused for being ahead, which is the whole difficulty: the
+ * device that needs this is the one the server will not talk to. The backlog is
+ * not waited for either, because with an empty index the backlog is the whole
+ * vault and this connection is closed the moment the number is out of the
+ * handshake.
+ *
+ * This device's number comes from the store in `opts`, so the two shells cannot
+ * disagree about which index they are comparing.
+ */
+export async function rebaseCursors(
+  opts: ClientOptions,
+): Promise<{ local: number; server: number }> {
+  const local = validateStoredState(await opts.store.load())?.cursor ?? 0;
+  const probe = new Client({ ...opts, store: new MemoryIndexStore() });
+  try {
+    await probe.connect({ waitForBacklog: false });
+    return { local, server: probe.serverCursor };
+  } finally {
+    await probe.close();
+  }
+}
+
+/**
+ * Refuses a rebase that is not the answer to anything.
+ *
+ * A rebase forgets what this device believed it had synced, and the only thing
+ * that makes that safe is being ahead of the server: everything both sides hold
+ * identically is agreed again, and what only this device holds goes up as new
+ * versions. A device that is not ahead has nothing to rejoin from, and throwing
+ * away its index would re-upload the vault for no reason.
+ *
+ * One function rather than one comparison per shell, because the panel and the
+ * command line must not disagree about when this is allowed.
+ */
+export function refuseUnlessAhead(at: { local: number; server: number }): void {
+  if (at.local > at.server) return;
+  throw new Error(
+    `this device is not ahead of the server (${at.local} against ${at.server}), ` +
+      `so there is nothing to rebase: an ordinary sync is enough`,
+  );
+}
+
+/**
  * Redeems an invite: one connection that carries the invite in place of a
  * token, takes the sealed root, and closes.
  *
@@ -1079,11 +1214,20 @@ export function didSomething(r: SyncReport): boolean {
   );
 }
 
-/** A one-line summary for a status bar, which has room for one line. */
+/**
+ * A one-line summary for a status bar, which has room for one line.
+ *
+ * Every counter the report has, because the plugin paints this string into
+ * its state and nothing else of the pass reaches the panel. `waiting` was
+ * left out, so a file still inside its write debounce, which is tens of
+ * seconds, produced "up to date" while a save was owed: rule 7, and the kind
+ * of lie a person acts on by closing the laptop. `foldersCreated` was left
+ * out with it, and a pass that only made folders said nothing at all.
+ */
 export function summarise(r: SyncReport): string {
   const bits: string[] = [];
-  const add = (n: number, what: string) => {
-    if (n > 0) bits.push(`${n} ${what}`);
+  const add = (n: number, many: string, one = many) => {
+    if (n > 0) bits.push(`${n} ${n === 1 ? one : many}`);
   };
   add(r.uploaded, "sent");
   add(r.downloaded, "received");
@@ -1091,6 +1235,8 @@ export function summarise(r: SyncReport): string {
   add(r.conflicted, "conflicted");
   add(r.deletedLocally + r.deletedRemotely, "deleted");
   add(r.restored, "restored");
+  add(r.foldersCreated, "folders", "folder");
+  add(r.waiting, "waiting");
   add(r.retrying, "retrying");
   add(r.skipped, "stuck");
   add(r.ignored, "ignored");

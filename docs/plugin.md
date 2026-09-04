@@ -97,11 +97,50 @@ same sentence is the ribbon icon's tooltip.
 
 **Stopped** means the server refused this device in a way that will repeat:
 the protocol version differs, the vault is not this device's, or the server has
-lost history this device already has. The notice says which. Upgrade the
-server and plugin together for the first, and unlink and re-pair for the
-others. An unreadable `data.json` also stops the plugin rather than starting
-over, because starting over would make everything on the server undecryptable
-from here.
+lost history this device already has. The notice says which, and it says what to
+do about it. Upgrade the server and plugin together for a protocol mismatch, and
+unlink and pair again for a vault that is not this device's. For a server that
+has lost history, see *Rejoin this server* below. An unreadable `data.json` also
+stops the plugin rather than starting over, because starting over would make
+everything on the server undecryptable from here.
+
+## Rejoining a restored server
+
+Restoring the server from an older backup leaves every device holding versions
+the server no longer has, and the server refuses those devices rather than
+reissue their version numbers for other notes. That is deliberate; without it
+the two ends diverge silently.
+
+A device in that state shows **stopped** with the reason, and its panel grows a
+*Rejoin this server* row. The first press asks the server where it is and shows
+both versions; the second forgets what this device believed it had synced,
+starts again from the server's version, and sends what only this device holds as
+new versions. Nothing is deleted, here or on the server, and where the two sides
+disagree both copies are kept. Back the server up first.
+
+Unlinking and pairing again works too and is worse: it resets the merge base, so
+every note comes back as a version with no ancestor and the next edit made on
+two devices at once makes conflict copies instead of merging. Use Rejoin.
+
+## Replacing the vault's secret
+
+Every device holds the same root secret, and that secret is also the credential,
+so there is no way to revoke one device. What there is is replacing the secret
+for all of them. *Replace the vault's secret* sits in the panel behind a warning
+and two presses, next to the recovery key, and it is for a device that is not
+coming back or a pairing string that has been somewhere it should not have been.
+
+The vault keeps all of its history: its content is sealed under a data key that
+the root only wraps, so the wrapping changes and nothing is re-encrypted. The
+old recovery key and every outstanding invite stop working, every other device
+is disconnected and is added again with a fresh invite, and the panel shows the
+new recovery key to write down in place of the old one. It cannot unread what
+was already read; [design.md](design.md#a-lost-or-stolen-device) says more.
+
+The new secret is written into `data.json` before the request goes out, so a
+reply lost on the way cannot leave a vault whose new root nobody holds. If that
+happens the panel says so, shows the key anyway, and the next connection tries
+it first and settles which secret the vault has. Keep both until it has.
 
 ## Commands
 
@@ -111,6 +150,11 @@ from here.
 | Show status | opens the panel |
 | Show version history | for the open note |
 | Recover a deleted note | lists what the server has and this vault does not |
+
+The panel holds the rest: *Sync now*, *Add another device*, *Recover a deleted
+note*, *Show recovery key*, *Replace the vault's secret*, *Unlink this vault*,
+and *Rejoin this server* when a restored server has refused this device. The
+last three are behind warnings and confirmations; nothing there is a setting.
 
 Version history is also on a note's right-click menu, where Obsidian Sync puts
 it. Both are registered on Obsidian's own command line as `basalt:history` and

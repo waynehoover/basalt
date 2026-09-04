@@ -487,6 +487,36 @@ describe("status", () => {
     expect(human.stdout, human.all).toMatch(/work outstanding/);
     expect(human.stdout, human.all).not.toMatch(/up to date/);
   }, 300_000);
+
+  /**
+   * N3. A server that answers and will not have this device is not a server
+   * that is down, and the two used to land in the same field. After a restore
+   * from an older backup that is the difference between "the box is off" and
+   * "the box is up and has lost history", and a cron job keying on
+   * `reachable` read the second as the first.
+   */
+  it("tells a refusal apart from an outage (N3)", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+    await write(a, "one.md", "1\n");
+    await cli("sync", "--dir", a);
+
+    // This device has applied more than the server ever issued, which is what
+    // a server restored from an older backup looks like from here.
+    const index = join(a, ".basalt", "index.json");
+    const stored = JSON.parse(await readFile(index, "utf8")) as Record<string, unknown>;
+    await writeFile(index, JSON.stringify({ ...stored, cursor: 9_999 }));
+
+    const s = await cli("status", "--dir", a, "--json");
+    expect(s.code, s.all).toBe(1);
+    const answer = s.json()["server"] as Record<string, unknown>;
+    expect(answer["refused"], s.all).toBe(true);
+    expect(answer["reachable"], s.all).toBe(true);
+
+    const human = await cli("status", "--dir", a);
+    expect(human.stdout, human.all).toMatch(/refused this device/);
+    expect(human.stdout, human.all).not.toMatch(/cannot reach the server/);
+  }, 300_000);
 });
 
 describe("unlinking", () => {
@@ -586,6 +616,20 @@ describe("arguments", () => {
   it("refuses a timeout that is not a number", () => {
     expect(() => parseArgs(["sync", "--timeout", "soon"])).toThrow(/milliseconds/);
     expect(() => parseArgs(["sync", "--timeout", "0"])).toThrow(/milliseconds/);
+  });
+
+  /**
+   * N4. The list is matched against one part of a path at a time, so a value
+   * with a slash in it can never match anything. Accepted in silence, it read
+   * as a folder kept out of this device and kept nothing out.
+   */
+  it("refuses an ignore that could never match a path segment (N4)", () => {
+    expect(() => parseArgs(["sync", "--ignore", "a/b"])).toThrow(/one folder or file name/);
+    expect(() => parseArgs(["sync", "--ignore", ""])).toThrow(/one folder or file name/);
+    expect(() => parseArgs(["sync", "--ignore", "."])).toThrow(/one folder or file name/);
+    expect(() => parseArgs(["sync", "--ignore", ".."])).toThrow(/one folder or file name/);
+    expect(parseArgs(["sync", "--ignore", "Drafts"]).ignore).toEqual(["Drafts"]);
+    expect(parseArgs(["sync", "--ignore", "..."]).ignore).toEqual(["..."]);
   });
 });
 
@@ -1190,6 +1234,27 @@ describe("a folder this device ignores and another device syncs (R2)", () => {
     expect(human.stdout).toMatch(/ignored here, and synced by another device/);
   }, 300_000);
 
+  /**
+   * N4. An ignored path was left on the inbound work list for ever, so
+   * `basalt status` said "N files with work outstanding" about a folder
+   * whose owner had decided it would never arrive. Rule 7: the ignored
+   * counter is where that belongs, and nothing is outstanding.
+   */
+  it("does not leave an ignored path on the work list (N4)", async () => {
+    await fresh();
+    const { a, b } = await twoDevices();
+    await write(a, "Drafts/plan.md", "not for the other one\n");
+    await write(a, "keep.md", "for everybody\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await cli("sync", "--dir", b, "--ignore", "Drafts", "--json")).code).toBe(0);
+
+    const s = await cli("status", "--dir", b, "--ignore", "Drafts", "--json");
+    expect(s.code, s.all).toBe(0);
+    expect(s.json()["pending"], s.all).toBe(0);
+    const human = await cli("status", "--dir", b, "--ignore", "Drafts");
+    expect(human.stdout, human.all).not.toMatch(/work outstanding/);
+  }, 300_000);
+
   it("still fails for a path that cannot work here, ignore list or not (R2)", async () => {
     await fresh();
     const { a, b } = await twoDevices();
@@ -1291,6 +1356,7 @@ describe("what the CLI says about itself and the vault", () => {
       waiting: 0,
       retrying: 0,
       skipped: 0,
+      skippedPaths: [],
       ignored: 0,
       blocked: 0,
       inTheWay: [],
@@ -1355,6 +1421,10 @@ describe("rebasing onto a server that lost history (I10)", () => {
     const refused = await cli("sync", "--dir", a);
     expect(refused.code).toBe(1);
     expect(refused.all).toMatch(/cursor|ahead|behind/);
+    // The refusal is the server's, and the server has never heard of the
+    // command that fixes it. It used to stop at the diagnosis, so the only
+    // place the way out existed was docs/server.md. Error strings are UI.
+    expect(refused.all, "the refusal named no recovery").toMatch(/basalt rebase --backup-taken/);
 
     const withoutFlag = await cli("rebase", "--dir", a);
     expect(withoutFlag.code).toBe(1);

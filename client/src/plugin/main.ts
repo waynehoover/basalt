@@ -42,8 +42,12 @@ import {
 
 import {
   Client,
+  credentialCandidates,
+  rebaseCursors,
   redeemInvite,
+  refuseUnlessAhead,
   runForever,
+  settledConfig,
   summarise,
   credentialsFor,
   wrappedForClaim,
@@ -52,7 +56,7 @@ import {
   type Version,
 } from "../core/client.ts";
 import { deriveRootKeys, generateSecret } from "../core/crypto.ts";
-import type { SyncReport } from "../core/engine.ts";
+import { REJOIN_ADVICE, type SyncReport } from "../core/engine.ts";
 import {
   decodeConfig,
   encodeConfig,
@@ -104,7 +108,16 @@ type State =
    * ordinary network loss and the origin is known to be fine.
    */
   | { kind: "offline"; why: string; retryAt: number; refused: boolean }
-  | { kind: "stopped"; why: string };
+  /**
+   * Stopped, and whether there is a recovery to offer for it.
+   *
+   * `rejoin` is set for the one refusal that has a button behind it: the
+   * server is behind this device, which is what a restore from an older
+   * backup looks like. The panel showed the reason and nothing else, and the
+   * reason pointed at docs/server.md, which is not somewhere a phone goes at
+   * the moment its notes have stopped syncing. See `recoveryFor`.
+   */
+  | { kind: "stopped"; why: string; recovery?: "rejoin" };
 
 export default class BasaltPlugin extends Plugin {
   private config: DeviceConfig | undefined;
@@ -145,7 +158,7 @@ export default class BasaltPlugin extends Plugin {
   /** The pairing in progress, so a second press cannot start another. */
   private pairing: Promise<unknown> | undefined;
   /** What the notices have already said, so they say it once. */
-  private announced = { skipped: 0, inTheWay: "" };
+  private announced = { skipped: "", inTheWay: "" };
   /** What `onunload` started and could not wait for, for anything that can. */
   closing: Promise<void> | undefined;
   /**
@@ -317,7 +330,7 @@ export default class BasaltPlugin extends Plugin {
     if (!config || this.running) return;
     this.running = true;
     this.everConnected = false;
-    this.announced = { skipped: 0, inTheWay: "" };
+    this.announced = { skipped: "", inTheWay: "" };
     // Every run is numbered, and only the newest one may speak. A single
     // boolean was not enough: unlinking cleared it, pairing again set it,
     // and the *previous* run woke from its backoff, read the new run's
@@ -343,34 +356,42 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
-   * Runs the loop, and once more with the derived key when that is the one
-   * thing that can prove a spent bootstrap was ours.
+   * Runs the loop against each credential this config could still be opened
+   * with, best first, stopping at the first that gets through.
+   *
+   * The list is `credentialCandidates` in core, so this and the CLI's
+   * `connectWith` cannot disagree about it. Two of the three entries exist for
+   * a reply that was lost after the server had committed:
+   *
+   * A rotation is written down before it is sent and its new secret goes first,
+   * because if it committed then it is the only thing that opens the vault.
+   * This loop used to have no such entry, only the bootstrap one below, which
+   * is why the plugin could not be given a rotate button: a socket that went in
+   * the wrong second would have left the new secret in `data.json` with nothing
+   * that would ever try it.
    *
    * The first device claims the vault with the server's bootstrap token and
-   * then drops the token from its settings. If the claim commits and its
-   * reply is lost, or the drop fails to save, the next start offers the
-   * token first and is refused, and the refusal is `auth`, which is also
-   * what a wrong token or another device's vault produce. What does say
-   * which is the key derived from this device's root secret: the server
-   * accepting it proves the vault was claimed with this secret. That is the
-   * one case in which the bootstrap is set aside and tried without, and the
-   * original refusal is what gets reported if that fails too. The CLI's
-   * `connectWith` makes the same call.
+   * then drops the token from its settings. If the claim commits and its reply
+   * is lost, or the drop fails to save, the next start offers the token first
+   * and is refused, and the refusal is `auth`, which is also what a wrong token
+   * or another device's vault produce. What does say which is the key derived
+   * from this device's root secret: the server accepting it proves the vault
+   * was claimed with this secret.
+   *
+   * Only an `auth` refusal moves on to the next candidate, and the refusal
+   * reported when none of them opens the vault is the first one, because that
+   * is the credential this device believes in.
    */
   private async runLoop(config: DeviceConfig, mine: number): Promise<void> {
     const current = () => mine === this.generation;
-    let attempt = config;
+    const attempts = credentialCandidates(config);
     let first: Error | undefined;
-    for (;;) {
+    for (const [i, attempt] of attempts.entries()) {
       const refusal = await this.runOnce(attempt, mine);
       if (!current() || refusal === undefined) return;
-      if (attempt.bootstrap !== undefined && isAuth(refusal)) {
-        first = refusal;
-        const { bootstrap: _spent, ...withoutBootstrap } = attempt;
-        attempt = withoutBootstrap;
-        continue;
-      }
-      this.stop(first !== undefined && isAuth(refusal) ? first : refusal);
+      first ??= refusal;
+      if (i < attempts.length - 1 && isAuth(refusal)) continue;
+      this.stop(isAuth(refusal) ? first : refusal);
       return;
     }
   }
@@ -389,12 +410,13 @@ export default class BasaltPlugin extends Plugin {
         this.client = client;
         if (!client) return;
         this.everConnected = true;
-        // A connection means a bootstrap, if there was one, has been spent,
-        // and it means the vault's wrapped data key has been seen. Both are
-        // written back: the token is a second secret that no longer opens
-        // anything, and the blob is the thing every later `ready` is checked
-        // against.
-        void this.settleConfig(client.wrapped, mine);
+        // A connection settles everything the stored config was still unsure
+        // of: which of the candidates above actually opened the vault, a
+        // bootstrap that is therefore spent, a rotation that is therefore
+        // resolved, and the vault's wrapped data key as `ready` reported it.
+        // `config` is the candidate that got through, which is the half the
+        // saved settings cannot work out for themselves.
+        void this.settleConfig(config, client.wrapped, mine);
       },
       onDisconnected: (cause, retryIn) => {
         if (!current()) return;
@@ -435,11 +457,18 @@ export default class BasaltPlugin extends Plugin {
    */
   private stop(cause: Error): void {
     this.working(undefined);
-    this.setState({ kind: "stopped", why: cause.message });
+    const recovery = recoveryFor(cause);
+    this.setState({
+      kind: "stopped",
+      why: cause.message,
+      ...(recovery !== undefined ? { recovery } : {}),
+    });
     new Notice(
-      this.everConnected
-        ? `Basalt has stopped: ${cause.message}`
-        : `Basalt could not join this vault: ${cause.message}. ` +
+      recovery !== undefined
+        ? `Basalt has stopped: ${cause.message}. ${REJOIN_ADVICE}`
+        : this.everConnected
+          ? `Basalt has stopped: ${cause.message}`
+          : `Basalt could not join this vault: ${cause.message}. ` +
             `If the pairing string or setup string was wrong, unlink this vault from the Basalt panel and pair again.`,
       0,
     );
@@ -492,27 +521,35 @@ export default class BasaltPlugin extends Plugin {
    * the next restart synced a vault the person had removed. `unlink` waits
    * for whatever is already past this check.
    */
-  private settleConfig(wrapped: string | undefined, mine: number): Promise<void> {
+  private settleConfig(
+    used: DeviceConfig,
+    wrapped: string | undefined,
+    mine: number,
+  ): Promise<void> {
     // Recorded here rather than at the call site, so that however this comes
     // to be called every save is one `unlink` can wait for, and forgotten
     // again as soon as it lands so the set is the ones still owed. The catch
     // is what `void` used to do: the write below reports its own failure.
-    const saving = this.writeSettledConfig(wrapped, mine).catch(() => undefined);
+    const saving = this.writeSettledConfig(used, wrapped, mine).catch(() => undefined);
     this.settling.add(saving);
     void saving.finally(() => this.settling.delete(saving));
     return saving;
   }
 
-  private async writeSettledConfig(wrapped: string | undefined, mine: number): Promise<void> {
+  private async writeSettledConfig(
+    used: DeviceConfig,
+    wrapped: string | undefined,
+    mine: number,
+  ): Promise<void> {
     const config = this.config;
     if (!config || mine !== this.generation) return;
-    const learned = wrapped !== undefined && config.wrapped === undefined;
-    if (!learned && config.bootstrap === undefined && config.claimWrapped === undefined) return;
-    const {
-      bootstrap: _spent,
-      claimWrapped: _candidate,
-      ...rest
-    } = { ...config, ...(learned ? { wrapped } : {}) };
+    // What the file should say, worked out in core against what it says now,
+    // and undefined when the two already agree. Worked out here by hand
+    // before, which was one of the two copies of that rule; the copy in this
+    // file knew nothing about an outstanding rotation, so a phone that had
+    // rotated would have gone on offering the retired secret first for ever.
+    const rest = settledConfig(config, used, wrapped);
+    if (rest === undefined) return;
     if (mine !== this.generation) return;
     try {
       await this.saveData(encodeConfig(rest));
@@ -718,10 +755,27 @@ export default class BasaltPlugin extends Plugin {
         10_000,
       );
     }
-    if (report.skipped !== this.announced.skipped) {
-      this.announced.skipped = report.skipped;
+    // Keyed on which files, not how many (N2). One file fixed in the same
+    // pass as another starts failing leaves the count where it was, and the
+    // new failure went unannounced for as long as the numbers matched: the
+    // glyph said something was wrong and nothing ever said what.
+    // `?? []` because the type promises the list and a hand-built report may
+    // not keep it: announcing must never throw over the notice it owes.
+    const paths = report.skippedPaths ?? [];
+    const written = report.skipped === 0 ? "" : `${report.skipped}:${paths.join("\n")}`;
+    if (written !== this.announced.skipped) {
+      this.announced.skipped = written;
       if (report.skipped > 0) {
-        new Notice(`Basalt cannot sync ${report.skipped} file(s) and has stopped trying.`, 10_000);
+        // Named, because a count is not something anybody can act on. The
+        // list is capped, so it says when it is not the whole of it. An
+        // empty list still says the count rather than nothing.
+        const named = paths.map((p) => `"${p}"`).join(", ");
+        const rest = paths.length < report.skipped ? " and others" : "";
+        const detail = named === "" ? "" : `: ${named}${rest}`;
+        new Notice(
+          `Basalt cannot sync ${report.skipped} file(s) and has stopped trying${detail}.`,
+          10_000,
+        );
       }
     }
     // Named, and left up longer, because this is the one refusal that waits on
@@ -1053,6 +1107,243 @@ export default class BasaltPlugin extends Plugin {
     }
   }
 
+  /* ------------------------------------------------------------ *
+   * Rejoining a restored server, and retiring a leaked secret
+   * ------------------------------------------------------------ */
+
+  /**
+   * Where this device and the server each are, asked of the server directly.
+   *
+   * `cursors()` below reads a live connection, and the device that needs these
+   * two numbers is the one the server has refused: it has no live connection
+   * and never will until this is dealt with. So this makes its own, carrying no
+   * index, which is the only kind the server will talk to. Nothing is written.
+   */
+  async rejoinCursors(): Promise<{ local: number; server: number }> {
+    const config = this.config;
+    if (!config) throw new Error("this vault is not paired yet.");
+    return rebaseCursors(await this.clientOptions(config, this.generation));
+  }
+
+  /**
+   * Rejoins a server that has lost history this device already applied.
+   *
+   * The same operation as `basalt rebase --backup-taken`, and it exists here
+   * because the documented alternative for a plugin device was to unlink and
+   * pair again. Re-pairing throws away the index too, but it also throws away
+   * the merge base: every note comes back as an ancestor-less new version, and
+   * the next edit made on two devices at once cannot merge, so a restore was
+   * followed by a conflict-copy storm on precisely the devices least able to
+   * clean one up. A rebase keeps the pairing, so the ancestors the server
+   * agrees with survive.
+   *
+   * Nothing is deleted, here or on the server: what both sides hold identically
+   * is agreed again, what only this device holds goes up as new versions, and
+   * where the two disagree both are kept.
+   *
+   * In this order, and each step waited for. First the two cursors, from a
+   * connection that writes nothing, so a rebase that is not the answer is
+   * refused before anything has been touched. Then quiet: the run is retired
+   * and its clients closed, because the pass in flight ends by saving the index
+   * this is about to remove and two engines on one index is the state the
+   * single-flight rule exists to prevent. Then the index, both copies, proven
+   * gone. Only then the server.
+   *
+   * Whatever happens after the index goes, the loop is started again: from that
+   * moment this device has no record of what it had synced, and the only way it
+   * gets one back is by reaching the server.
+   */
+  async rebase(): Promise<SyncReport> {
+    const config = this.config;
+    if (!config) throw new Error("this vault is not paired yet.");
+    if (this.pairing) throw new Error("a pairing is already in progress");
+    refuseUnlessAhead(await this.rejoinCursors());
+
+    await this.quiet();
+    const mine = this.generation;
+    this.setState({ kind: "connecting" });
+
+    try {
+      // Inside the try, so that a removal that fails halfway still leaves the
+      // loop running. It leaves this device where it was, refused by the
+      // server, which is a state the panel offers this same row for; leaving
+      // it stopped and not running would be a device that has to be reloaded
+      // before it will even try again.
+      await this.indexStore().remove();
+      const client = new Client(await this.clientOptions(config, mine));
+      try {
+        await client.connect();
+        // The write debounce is off, as it is for every pass a person asked
+        // for by name: reporting "up to date" over an unsent paragraph is the
+        // status rule 7 forbids.
+        return await client.settle({ coalesceWrites: false });
+      } finally {
+        await client.close();
+      }
+    } finally {
+      if (mine === this.generation) this.start();
+    }
+  }
+
+  /**
+   * Gives the vault a new root secret, keeping its history.
+   *
+   * The answer to a pairing string that has been somewhere it should not have
+   * been, and to a device that is not coming back. It was a headless-client
+   * command only, which assumes a machine with the CLI is to hand; the device
+   * somebody loses is a phone, and so, often, is the only other device they
+   * have with them.
+   *
+   * Every vault can do this and it always keeps its history: the content is
+   * sealed under a data key that the root only wraps, so the data key is
+   * unwrapped under the old root and wrapped again under the new one, and the
+   * server swaps the auth hash and the blob in one transaction.
+   *
+   * The ordering is the whole of the durability here, and it is the CLI's:
+   *
+   *   - The run is retired first. The server closes every *other* session as
+   *     part of committing, so a live run left going would be evicted with
+   *     `auth` and paint "not authorised for this vault" over a rotation that
+   *     worked.
+   *   - The new secret is written to `data.json`, and read back, *before* the
+   *     request goes out. The server commits, evicts, and only then answers, so
+   *     a connection that drops in between leaves a vault whose new root this
+   *     process is the only holder of. With the pending secret saved, the next
+   *     connection tries it first and falls back to the old one, and either way
+   *     the vault opens; see `credentialCandidates`.
+   *   - The new recovery key is returned whatever happens after the request
+   *     went out, because at that moment it may be the only thing that opens
+   *     the vault.
+   */
+  async rotate(): Promise<{ recoveryKey: string; settled: boolean }> {
+    const config = this.config;
+    if (!config) throw new Error("this vault is not paired yet.");
+    if (this.pairing) throw new Error("a pairing is already in progress");
+
+    await this.quiet();
+    const mine = this.generation;
+    this.setState({ kind: "connecting" });
+
+    const secret = generateSecret();
+    const recoveryKey = formatPairing({ ...config, secret });
+    // Its own connection with the derived key, for the same reason
+    // `createInvite` uses one: a session that authenticated with the server's
+    // first-run token proved it held the token and not the root, and the
+    // server refuses to rotate under it.
+    const { bootstrap: _spent, ...derived } = config;
+    const client = new Client(await this.clientOptions(derived, mine));
+    let rewrapped: string | undefined;
+    try {
+      await client.connect();
+      await client.rotate(secret, async (wrapped) => {
+        rewrapped = wrapped;
+        const staged: DeviceConfig = { ...config, pending: { secret, wrapped } };
+        // Disk first, then memory, as everything that writes this file does.
+        // Both secrets are held while the request is in flight, and the run
+        // this method restarts reads the in-memory copy: without this line a
+        // lost reply left the new secret in `data.json` and a plugin that
+        // would not try it until Obsidian was restarted.
+        await this.saveVerified(staged);
+        this.config = staged;
+      });
+    } catch (err) {
+      if (err instanceof ProtocolError && err.code === "rotated") {
+        // Answered, and refused: another device rotated first, so nothing here
+        // committed and the staged secret is not the vault's. Putting a key
+        // that opens nothing in front of somebody to write down is worse than
+        // saying so, so the config goes back as it was.
+        await this.saveVerified(config).catch(() => undefined);
+        this.config = config;
+        this.start();
+        throw new Error(
+          "the vault was rotated by another device, so this rotation was refused. " +
+            "This device's secret was retired by that rotation too, so pair this vault again " +
+            "with the new recovery key, or with an invite from the device that rotated.",
+        );
+      }
+      this.start();
+      // Nothing was staged, so the request never got as far as going out:
+      // the connection was refused, or the server was not there. That is an
+      // ordinary failure and the vault still has the secret it had. Putting
+      // "this may have committed" and a new key in front of somebody here
+      // would have them write down a string that opens nothing, in place of
+      // the one that does.
+      if (rewrapped === undefined) throw err;
+
+      // Past that point the reply never came, and nothing here can tell a
+      // rotation that committed from one that did not. Both are survivable
+      // and neither is survivable quietly: this key is the vault if it
+      // committed, and it is on disk as `pending`, which the next connection
+      // settles.
+      return { recoveryKey, settled: false };
+    } finally {
+      await client.close();
+    }
+
+    // Committed. The pending pair is promoted, the spent bootstrap and its
+    // claim candidate go, and the re-wrapped data key is what this device pins
+    // from now on.
+    const next: DeviceConfig = { ...config, secret, ...(rewrapped ? { wrapped: rewrapped } : {}) };
+    delete (next as { bootstrap?: string }).bootstrap;
+    delete (next as { claimWrapped?: string }).claimWrapped;
+    delete (next as { pending?: unknown }).pending;
+    try {
+      await this.saveVerified(next);
+      this.config = next;
+    } catch {
+      // The server has the new secret and the file has it as `pending`, which
+      // is the state the next connection resolves. Nothing is lost and the key
+      // is returned either way; `settled: false` is what puts it on screen
+      // until somebody says they have written it down.
+      this.start();
+      return { recoveryKey, settled: false };
+    }
+    this.start();
+    return { recoveryKey, settled: true };
+  }
+
+  /**
+   * Stops everything this plugin has running, and waits for it.
+   *
+   * What `unlink` does before it touches a file, and what `rebase` and `rotate`
+   * need for the same reason: a run that is merely disconnected reconnects, a
+   * pass in flight is still writing the index, and a settle save already past
+   * its generation check is still going to write `data.json`. The bumped
+   * generation is what stops another starting.
+   */
+  private async quiet(): Promise<void> {
+    this.generation++;
+    this.running = false;
+    this.clearTimers();
+    const { live, client } = this.retireClients();
+    await live?.close();
+    await client?.close();
+    await Promise.all([...this.settling]);
+  }
+
+  /**
+   * Writes the pairing and reads it back before believing it.
+   *
+   * Rule 4: verify the outcome, not the exit code. The one write that cannot
+   * afford to be taken on trust is the rotation's staged secret, because the
+   * request that makes it the vault's only credential goes out on the strength
+   * of it. `decodeConfig` refuses a half-written rotation, so a torn write is
+   * caught here rather than on the next start.
+   */
+  private async saveVerified(config: DeviceConfig): Promise<void> {
+    const record = encodeConfig(config);
+    await this.saveData(record);
+    let back: DeviceConfig | undefined;
+    try {
+      back = await this.readConfig();
+    } catch (err) {
+      throw new Error(`${this.dataPath} could not be read back: ${(err as Error).message}`);
+    }
+    if (back === undefined || JSON.stringify(encodeConfig(back)) !== JSON.stringify(record)) {
+      throw new Error(`${this.dataPath} did not read back as it was written`);
+    }
+  }
+
   /**
    * Where this device and the server each are, for a panel that shows both.
    *
@@ -1083,20 +1374,10 @@ export default class BasaltPlugin extends Plugin {
    * vault paired and stopped, says so, and can be tried again.
    */
   async unlink(): Promise<void> {
-    // Retires every run in flight. Closing the client is not enough: a run
-    // whose client is closed simply reconnects, which is the whole point of
-    // it.
-    this.generation++;
-    this.running = false;
-    this.clearTimers();
-    const { live, client } = this.retireClients();
-    await live?.close();
-    await client?.close();
-    // A settle save already past its generation check is a write to the same
-    // file this is about to empty. Every one of them is waited for here
-    // rather than raced, and the bumped generation above is what stops
-    // another starting.
-    await Promise.all([...this.settling]);
+    // Retires every run in flight, closes their clients, and waits for every
+    // settle save that is already past its generation check, because each of
+    // those is a write to the same file this is about to empty. See `quiet`.
+    await this.quiet();
 
     try {
       await this.indexStore().remove();
@@ -1172,6 +1453,25 @@ export default class BasaltPlugin extends Plugin {
 /** Whether a refusal is the server saying this token opens nothing. */
 function isAuth(err: Error): boolean {
   return err instanceof ProtocolError && err.code === "auth";
+}
+
+/**
+ * Which recovery, if any, this refusal has a button behind it.
+ *
+ * `cursor` means the server is behind a device that has already applied more
+ * than it holds, which is a restore from an older backup or the wrong vault.
+ * The code is recognised rather than the words, because the two ends word it
+ * differently: the server says which uids it is missing, and the engine's own
+ * check says which versions each side is at. Both mean the same thing and both
+ * have the same way out.
+ */
+/** Whether this state is the one the Rejoin row exists for. */
+function offersRejoin(state: State): boolean {
+  return state.kind === "stopped" && state.recovery === "rejoin";
+}
+
+function recoveryFor(cause: Error): "rejoin" | undefined {
+  return cause instanceof ProtocolError && cause.code === "cursor" ? "rejoin" : undefined;
 }
 
 /**
@@ -1337,7 +1637,17 @@ class BasaltModal extends Modal {
     const status = contentEl.createEl("p");
     const cursors = contentEl.createEl("p", { cls: "basalt-advice" });
     const advice = contentEl.createEl("p", { cls: "basalt-advice" });
+    // Which rows this pass drew, so that a panel left open when the state
+    // changes under it grows the recovery it now needs. Everything else here
+    // is text a listener can update; a row is not, and a panel that was open
+    // when the server was restored would otherwise say "stopped" beside no way
+    // out until it was closed and opened again.
+    const drewRejoin = offersRejoin(this.plugin.currentState);
     this.unwatch = this.plugin.watchState((state) => {
+      if (offersRejoin(state) !== drewRejoin) {
+        this.render();
+        return;
+      }
       status.setText(longStatus(state));
       // Both cursors, so "behind and nothing arriving" is something a person
       // can see (I11).
@@ -1345,21 +1655,7 @@ class BasaltModal extends Modal {
       cursors.setText(
         at === undefined ? "" : `Local cursor ${at.local}, server cursor ${at.server}.`,
       );
-      // The server refuses a browser origin it does not know, and the
-      // only thing that knows this device's origin is this device. The
-      // desktop one is in the built-in list; the mobile ones are
-      // Capacitor's documented defaults and have never been checked
-      // against a device, so a phone that has never got through should
-      // be able to say what to add rather than leaving somebody to guess.
-      // A connection that was up and went is not that: the origin was
-      // fine, the network is not.
-      advice.setText(
-        state.kind === "offline" && state.refused
-          ? `If it never connects, this device's origin is ${origin()}. ` +
-              `A server that does not know it refuses the connection, and logs the same thing. ` +
-              `Restart it with -allow-origin ${origin()}`
-          : "",
-      );
+      advice.setText(originAdvice(state));
     });
 
     new Setting(contentEl)
@@ -1371,14 +1667,25 @@ class BasaltModal extends Modal {
         }),
       );
 
+    // Only while it is the answer to something. The panel is the whole
+    // interface and every row in it is a row somebody has to read past; a
+    // recovery for a state this vault is not in is noise, and a destructive
+    // button on the path people take every day is a bug waiting to be
+    // pressed. design.md: a thing that matters only when something specific
+    // happens appears in that moment.
+    if (drewRejoin) this.renderRejoin(contentEl);
+
     if (this.freshRecoveryKey !== undefined)
       this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
 
     // Where an invite goes: on screen, always, because the string is the
     // whole of what the other device needs and a phone may have no
     // clipboard to put it in.
-    const shown = contentEl.createEl("p", { cls: "basalt-pairing" });
-    const expiry = contentEl.createEl("p", { cls: "basalt-advice" });
+    //
+    // The two paragraphs are created after the setting that fills them, so
+    // they land under it. Created first, they rendered above the "Add
+    // another device" row and the invite appeared to belong to whatever
+    // setting sat above it.
     let currentInvite = "";
     new Setting(contentEl)
       .setName("Add another device")
@@ -1414,6 +1721,9 @@ class BasaltModal extends Modal {
         }),
       );
 
+    const shown = contentEl.createEl("p", { cls: "basalt-pairing" });
+    const expiry = contentEl.createEl("p", { cls: "basalt-advice" });
+
     new Setting(contentEl)
       .setName("Recover a deleted note")
       .setDesc("The server keeps every version of everything, including what you have deleted.")
@@ -1444,6 +1754,11 @@ class BasaltModal extends Modal {
           }),
       );
 
+    // Beside the recovery key, because it is the same secret and the same
+    // warning, and behind two presses, because it is the one action here that
+    // disconnects every other device.
+    this.renderRotate(contentEl);
+
     new Setting(contentEl)
       .setName("Unlink this vault")
       .setDesc("Stops syncing. Every note stays where it is, here and on the server.")
@@ -1458,6 +1773,121 @@ class BasaltModal extends Modal {
               new Notice(`Basalt: ${(err as Error).message}`, 10_000);
             }
             this.render();
+          }),
+      );
+  }
+
+  /**
+   * The way back from a server that has lost history this device applied.
+   *
+   * Two presses, and the first one is not destructive: it asks the server where
+   * it is and puts both numbers on screen, which is also how somebody finds out
+   * that this is not their problem. The confirmation is what `--backup-taken`
+   * is on the command line, and it is worth more here: a flag has to be typed
+   * and a button is one tap from a thumb.
+   */
+  private renderRejoin(contentEl: HTMLElement): void {
+    const said = contentEl.createEl("p", { cls: "basalt-advice" });
+    let confirmed = false;
+    new Setting(contentEl)
+      .setName("Rejoin this server")
+      .setDesc(
+        "The server has lost history this device already has, which is what restoring it from an " +
+          "older backup looks like. Rejoining forgets what this device believed it had synced and " +
+          "starts again from the server's version, sending what only this device holds as new " +
+          "versions. Nothing is deleted, here or on the server. Back the server up first.",
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Rejoin")
+          .setWarning()
+          .onClick(async () => {
+            try {
+              if (!confirmed) {
+                const at = await this.plugin.rejoinCursors();
+                refuseUnlessAhead(at);
+                confirmed = true;
+                b.setButtonText("Yes, rejoin");
+                said.setText(
+                  `This device is at version ${at.local} and the server is at ${at.server}. ` +
+                    `Take a backup of the server first (basaltd backup). Press again to rejoin.`,
+                );
+                return;
+              }
+              said.setText("Rejoining. This sends everything only this device holds.");
+              const report = await this.plugin.rebase();
+              said.setText(
+                `Rejoined the server: ${summarise(report)}. Nothing was deleted, and where the ` +
+                  `two sides disagreed both versions were kept.`,
+              );
+              new Notice(`Basalt rejoined the server: ${summarise(report)}`, 10_000);
+              this.render();
+            } catch (err) {
+              said.setText("");
+              new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+            }
+          }),
+      );
+  }
+
+  /**
+   * Replacing the vault's root secret, which is what a lost device costs.
+   *
+   * There is no per-device revocation: every device holds the same secret and
+   * that secret is the credential. This was a headless-client command, so the
+   * runbook assumed a machine with the CLI was to hand, which is not the
+   * assumption to make about somebody whose phone has just gone.
+   *
+   * Two presses and a warning, like the recovery key above, because it
+   * disconnects every other device and the old string stops working the moment
+   * it commits.
+   */
+  private renderRotate(contentEl: HTMLElement): void {
+    const said = contentEl.createEl("p", { cls: "basalt-advice" });
+    let confirmed = false;
+    new Setting(contentEl)
+      .setName("Replace the vault's secret")
+      .setDesc(
+        "For a lost device, or a pairing string that has been somewhere it should not have been. " +
+          "The vault gets a new root secret and keeps all of its history. The old recovery key and " +
+          "every outstanding invite stop working, every other device is disconnected and has to be " +
+          "added again with a fresh invite, and this panel shows the new recovery key to write down. " +
+          "It cannot unread what was already read.",
+      )
+      .addButton((b) =>
+        b
+          .setButtonText("Replace the secret")
+          .setWarning()
+          .onClick(async () => {
+            if (!confirmed) {
+              confirmed = true;
+              b.setButtonText("Yes, replace it");
+              said.setText(
+                "Every other device will stop syncing until you add it again from here. " +
+                  "Press again to replace the secret.",
+              );
+              return;
+            }
+            try {
+              const { recoveryKey, settled } = await this.plugin.rotate();
+              // Shown in the panel rather than in a notice, and not dismissed
+              // by anything but saying it has been written down: at this
+              // moment it is the only thing that opens the vault.
+              this.freshRecoveryKey = recoveryKey;
+              new Notice(
+                settled
+                  ? "The vault has a new secret. Write down the new recovery key shown in the panel, " +
+                      "and add your other devices again with an invite."
+                  : "The vault may already have the new secret: the server never answered. Write down " +
+                      "the new recovery key shown in the panel, in place of the old one. Basalt tries it " +
+                      "first on the next connection and settles which one the vault has.",
+                0,
+              );
+              this.render();
+            } catch (err) {
+              said.setText("");
+              new Notice(`Basalt: ${(err as Error).message}`, 10_000);
+            }
           }),
       );
   }
@@ -1696,6 +2126,27 @@ class RecoverModal extends Modal {
 }
 
 /**
+ * What to tell somebody whose handshake never completes, and nothing otherwise.
+ *
+ * The server refuses a browser origin it does not know, and the only thing
+ * that knows this device's origin is this device. The desktop one is in the
+ * built-in list; the mobile ones are Capacitor's documented defaults and have
+ * never been checked against a device, so a phone that has never got through
+ * should be able to say what to add rather than leaving somebody to guess. A
+ * connection that was up and went is not that: the origin was fine, the
+ * network is not.
+ */
+function originAdvice(state: State): string {
+  if (state.kind !== "offline" || !state.refused) return "";
+  const from = origin();
+  return (
+    `If it never connects, this device's origin is ${from}. ` +
+    `A server that does not know it refuses the connection, and logs the same thing. ` +
+    `Restart it with -allow-origin ${from}`
+  );
+}
+
+/**
  * This device's browser origin, which is what a server checks a plugin against.
  *
  * `app://obsidian.md` on desktop, and something Capacitor chooses on a phone.
@@ -1733,6 +2184,8 @@ function longStatus(state: State): string {
     case "offline":
       return `Offline: ${state.why}. Trying again shortly.`;
     case "stopped":
-      return `Stopped: ${state.why}. This will not fix itself by waiting.`;
+      return state.recovery === "rejoin"
+        ? `Stopped: ${state.why} ${REJOIN_ADVICE}`
+        : `Stopped: ${state.why}. This will not fix itself by waiting.`;
   }
 }

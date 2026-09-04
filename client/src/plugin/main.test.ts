@@ -19,6 +19,7 @@
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
+import { INVITE_PREFIX } from "../core/pairing.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
 import {
   App,
@@ -32,6 +33,7 @@ import {
 } from "./stub.ts";
 import BasaltPlugin, { describeDeleted } from "./main.ts";
 import { describeRestore } from "./history.ts";
+import type { SyncReport } from "../core/engine.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -1405,6 +1407,80 @@ describe("what is announced, and how often (P5)", () => {
     // The status still says so, because a status describes the vault.
     expect(status(plugin)).toMatch(/attention/);
   }, 300_000);
+
+  /**
+   * N2. The notice fired on the count changing, so one file being fixed in the
+   * same pass as another started failing left the number where it was and the
+   * new failure was never announced. The glyph said something was wrong and
+   * nothing said what.
+   */
+  it("announces a different stuck file even when the count did not move (N2)", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    const adapter = app.vault.adapter;
+    const cannotOpen = new Set(["one.md"]);
+    adapter.fault = (op, path) => {
+      if (op !== "readBinary" || !cannotOpen.has(path)) return undefined;
+      const err = new Error(`this device will not open ${path}`) as Error & { code: string };
+      // The code the engine writes a path off for good by.
+      err.code = "neversync";
+      return err;
+    };
+    adapter.seed("one.md", "cannot be opened");
+    adapter.seed("two.md", "fine for now");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    await until("the first refusal", () => notices.some((n) => /cannot sync/.test(n.message)));
+    expect(notices.at(-1)!.message, "the notice did not say which file").toContain("one.md");
+
+    // Taking it out of the vault is what stops a written-off path being
+    // counted. One pass to see it has gone.
+    notices.length = 0;
+    await adapter.remove("one.md");
+    await plugin.syncNow();
+
+    // A different file now, and the count is one both before and after.
+    cannotOpen.clear();
+    cannotOpen.add("two.md");
+    adapter.seed("two.md", "and now this one will not open", 9_000_000_000_000);
+    await plugin.syncNow();
+
+    const said = notices.filter((n) => /cannot sync/.test(n.message));
+    expect(said.length, "the swapped failure was never announced").toBeGreaterThan(0);
+    expect(said.at(-1)!.message).toContain("two.md");
+  }, 300_000);
+
+  /**
+   * The notice key assumes the list the type promises. A report built by hand
+   * with a count and no list must still announce the count rather than throw
+   * inside the announcement.
+   */
+  it("announces the count when a report names no paths", async () => {
+    const { plugin } = await load();
+    const report = {
+      uploaded: 0,
+      downloaded: 0,
+      merged: 0,
+      conflicted: 0,
+      deletedLocally: 0,
+      deletedRemotely: 0,
+      restored: 0,
+      foldersCreated: 0,
+      unchanged: 0,
+      waiting: 0,
+      retrying: 0,
+      skipped: 1,
+      ignored: 0,
+      blocked: 0,
+      inTheWay: [],
+      chunksSent: 0,
+      bytesSent: 0,
+    } as unknown as SyncReport;
+    (plugin as unknown as { announce(report: SyncReport): void }).announce(report);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(
+      /cannot sync 1 file\(s\) and has stopped trying\./,
+    );
+  });
 });
 
 /**
@@ -1766,6 +1842,11 @@ describe("version history on the file menu (P-D8)", () => {
     await plugin.pairFirst(server.setup, "laptop");
     await synced(plugin);
 
+    // A decoy. Proving "not the active file" against no active file at all
+    // proves nothing: a regression that reached for `getActiveFile()` would
+    // have read undefined and opened the clicked one anyway (N8).
+    app.workspace.activeFile = { path: "other.md", extension: "md" };
+
     const { menu, items } = fakeMenu();
     app.workspace.fire("file-menu", menu, { path: "daily/note.md", extension: "md" });
     expect(items.map((i) => i.title)).toEqual(["Basalt: version history"]);
@@ -1873,7 +1954,11 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
     const inner = plugin as unknown as {
       config: unknown;
       generation: number;
-      settleConfig(wrapped: string | undefined, mine: number): Promise<void>;
+      settleConfig(
+        used: Record<string, unknown>,
+        wrapped: string | undefined,
+        mine: number,
+      ): Promise<void>;
     };
     const config = decodeConfig(plugin.savedData, "test") as { wrapped?: string };
     inner.config = { ...config, bootstrap: "spent" };
@@ -1888,7 +1973,7 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
       return realSave(data);
     };
 
-    const settling = inner.settleConfig(config.wrapped, inner.generation);
+    const settling = inner.settleConfig(config, config.wrapped, inner.generation);
     await until("the settle save to start", () => saves === 1);
     const unlinking = plugin.unlink();
     await Promise.all([settling, unlinking]);
@@ -1917,7 +2002,11 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
     const inner = plugin as unknown as {
       config: unknown;
       generation: number;
-      settleConfig(wrapped: string | undefined, mine: number): Promise<void>;
+      settleConfig(
+        used: Record<string, unknown>,
+        wrapped: string | undefined,
+        mine: number,
+      ): Promise<void>;
     };
     const config = decodeConfig(plugin.savedData, "test") as { wrapped?: string };
     inner.config = { ...config, bootstrap: "spent" };
@@ -1931,9 +2020,9 @@ describe("what is still in flight when a vault is unlinked (P-D2, P-D3)", () => 
       return realSave(data);
     };
 
-    const first = inner.settleConfig(config.wrapped, inner.generation);
+    const first = inner.settleConfig(config, config.wrapped, inner.generation);
     await until("the first settle save to start", () => saves === 1);
-    const second = inner.settleConfig(config.wrapped, inner.generation);
+    const second = inner.settleConfig(config, config.wrapped, inner.generation);
     await until("the second settle save to finish", () => saves === 2);
 
     const unlinking = plugin.unlink();
@@ -2270,5 +2359,177 @@ describe("invites from the panel (I22)", () => {
     const at = plugin.cursors()!;
     expect(at.local).toBeGreaterThan(0);
     expect(shown).toContain(`Local cursor ${at.local}, server cursor ${at.server}.`);
+    // Not `at.server` against itself: reading the panel's own source proves
+    // only that it is consistent, and the number was frozen at hello for as
+    // long as this test has existed. This device has just uploaded and
+    // caught up, so the server holds what it holds.
+    expect(at.server, "the server cursor was stale").toBe(at.local);
+  }, 300_000);
+
+  it("puts the invite under the setting that made it, not above (I22)", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+
+    const panel = modals.at(-1)!;
+    const setting = built.find((s) => s.name === "Add another device")!;
+    await setting.buttons[0]!.click();
+
+    const kids = panel.contentEl.children;
+    const row = kids.indexOf(setting.settingEl);
+    const invite = kids.findIndex((el) => el.allText().startsWith(INVITE_PREFIX));
+    expect(row, "the add-a-device row is not in the panel").toBeGreaterThanOrEqual(0);
+    expect(invite, "the invite string is not in the panel").toBeGreaterThanOrEqual(0);
+    // Rendered above the row, the string read as belonging to whatever
+    // setting sat above it, which is the recovery key.
+    expect(invite, "the invite rendered above the setting that made it").toBeGreaterThan(row);
+  }, 300_000);
+
+  it("keeps the panel's server cursor current, not frozen at the handshake (I11)", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+    // Paired on an empty vault, so the server said 0 at hello. Everything
+    // after this arrives while the connection stays up, which is the case
+    // the frozen number could never report.
+    expect(plugin.cursors()!.server).toBe(0);
+
+    for (const name of ["one.md", "two.md", "three.md"]) {
+      app.vault.adapter.seed(name, name);
+      await plugin.syncNow();
+    }
+    await until("the local cursor to pass the handshake value", () => plugin.cursors()!.local > 0);
+
+    const at = plugin.cursors()!;
+    expect(at.server, "the server is still reported at its hello value").toBe(at.local);
+  }, 300_000);
+});
+
+/**
+ * A server restored from an older backup, and the way a plugin device gets
+ * back onto it (I10, improvements.md §5).
+ *
+ * The documented path for a plugin device was to unlink and pair again, which
+ * works and costs the merge base: every note returns as an ancestor-less new
+ * version, so the next edit made on two devices at once cannot merge and makes
+ * conflict copies instead. The headless client has had `basalt rebase` for
+ * this since I10; the plugin had the blunt tool on the devices least able to
+ * clear up after it.
+ *
+ * What is asserted here is not that the two ends agree (rule 10). It is that
+ * the note only this device holds is on another device afterwards, and that
+ * the note the backup did hold is still there too.
+ */
+describe("rejoining a server that lost history (I10, plugin)", () => {
+  /** A copy of the server's data directory, taken with the server stopped. */
+  async function backupServer(): Promise<string> {
+    const { cp } = await import("node:fs/promises");
+    const { mkdtemp } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(tmpdir(), "basalt-plugin-backup-"));
+    await server.whileStopped(async () => {
+      await cp(server.dataDir, dir, { recursive: true });
+    });
+    return dir;
+  }
+
+  async function restoreServer(from: string): Promise<void> {
+    const { cp, rm } = await import("node:fs/promises");
+    await server.whileStopped(async () => {
+      await rm(server.dataDir, { recursive: true, force: true });
+      await cp(from, server.dataDir, { recursive: true });
+    });
+  }
+
+  it("names the recovery, offers it behind two presses, and loses nothing", async () => {
+    await fresh();
+    const first = await load();
+    first.app.vault.adapter.seed("before.md", "in the backup\n");
+    await first.plugin.pairFirst(server.setup, "laptop");
+    await synced(first.plugin);
+    await until("before.md to reach the server", () => (first.plugin.cursors()?.local ?? 0) > 0);
+
+    const backup = await backupServer();
+
+    // Written after the backup, so it is the note only this device holds.
+    first.app.vault.adapter.seed("after.md", "written after the backup\n");
+    await first.plugin.syncNow();
+    await until("after.md to reach the server", () => (first.plugin.cursors()?.local ?? 0) > 1);
+    const ahead = first.plugin.cursors()!.local;
+
+    await restoreServer(backup);
+
+    // The server is behind this device now, and refuses it for good.
+    await until(
+      "the cursor refusal",
+      () => first.plugin.currentState.kind === "stopped",
+      60_000,
+    ).catch((err: Error) => {
+      throw new Error(`${err.message}; the state is ${JSON.stringify(first.plugin.currentState)}`);
+    });
+    const stopped = first.plugin.currentState;
+    expect(stopped.kind === "stopped" && stopped.recovery).toBe("rejoin");
+    // The reason names the way out, rather than a documentation path (I10).
+    expect(status(first.plugin)).toMatch(/basalt rebase --backup-taken/);
+    expect(status(first.plugin)).toMatch(/Rejoin this server/);
+    expect(status(first.plugin)).toMatch(/conflict copies instead of merging/);
+    expect(notices.map((n) => n.message).join("\n")).toMatch(/basalt rebase --backup-taken/);
+
+    // The panel offers it, and the first press is a question rather than an
+    // answer: nothing has been touched by it.
+    built.length = 0;
+    first.plugin.ribbonIcons[0]!.callback();
+    const row = built.find((s) => s.name === "Rejoin this server")!;
+    expect(row, "the panel offered no way back").toBeDefined();
+    expect(row.desc).toMatch(/Nothing is deleted/);
+    const button = row.buttons[0]!;
+    expect(button.warning, "a destructive action with no warning on it").toBe(true);
+    await button.click();
+    expect(modals.at(-1)!.contentEl.allText()).toContain(
+      `This device is at version ${ahead} and the server is at`,
+    );
+    expect(button.label).toBe("Yes, rejoin");
+    expect(first.plugin.paired, "the first press unpaired the vault").toBe(true);
+
+    await button.click();
+    await synced(first.plugin);
+
+    // What only this device held is on the server again, as a second device
+    // joining from scratch shows, and so is what the backup already had.
+    const invite = (await first.plugin.createInvite()).invite;
+    const second = await load();
+    await second.plugin.pair(invite, "phone");
+    await synced(second.plugin);
+    await until(
+      "both notes to arrive",
+      () =>
+        second.app.vault.adapter.text("before.md") !== undefined &&
+        second.app.vault.adapter.text("after.md") !== undefined,
+    );
+    expect(second.app.vault.adapter.text("after.md")).toBe("written after the backup\n");
+    expect(second.app.vault.adapter.text("before.md")).toBe("in the backup\n");
+  }, 300_000);
+
+  it("refuses a rejoin on a device that is not ahead, and keeps syncing", async () => {
+    await fresh();
+    const { plugin, app } = await load();
+    app.vault.adapter.seed("note.md", "one\n");
+    await plugin.pairFirst(server.setup, "laptop");
+    await synced(plugin);
+
+    await expect(plugin.rebase()).rejects.toThrow(/nothing to rebase/);
+
+    // Refused before anything was touched: the index is still there, so the
+    // next pass has nothing to re-upload.
+    app.vault.adapter.seed("second.md", "two\n");
+    await plugin.syncNow();
+    const report = plugin.currentState;
+    expect(report.kind).toBe("synced");
+    expect(plugin.paired).toBe(true);
   }, 300_000);
 });

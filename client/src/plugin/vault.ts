@@ -66,6 +66,7 @@ import {
 
 import {
   configFolderName,
+  firstFreeName,
   foldPath,
   foldsTogether,
   ignoredHere,
@@ -73,7 +74,8 @@ import {
   isNeverSynced,
   neverSync,
 } from "../core/paths.ts";
-import type { FileStat, IndexStore, StoredState, Vault } from "../core/vault.ts";
+import { LastIndexWrite } from "../core/vault.ts";
+import type { FileStat, IndexStamp, IndexStore, StoredState, Times, Vault } from "../core/vault.ts";
 
 /**
  * A file's size and times, or undefined when the thing is a folder.
@@ -112,13 +114,18 @@ function stagingPath(normalized: string, nonce: string): string {
   return `${dir}${STAGING_MARK}${nonce}-${name}`;
 }
 
-/** A staging name beside `normalized` that nothing occupies. */
+/**
+ * A staging name beside `normalized` that nothing occupies.
+ *
+ * The same search as the conflict copy and the trash, with a fresh nonce for
+ * each try rather than a number: the name is random by design, and a numbered
+ * second try would be exactly as guessable as the first. `stagingPath` puts
+ * the dot prefix back on every candidate, which is what keeps the temporary
+ * out of Obsidian's listing.
+ */
 async function freeStagingPath(adapter: Writer, normalized: string): Promise<string> {
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const candidate = stagingPath(normalized, nonce());
-    if (!(await adapter.exists(candidate))) return candidate;
-  }
-  throw new Error(`cannot find a free staging name beside ${normalized}`);
+  const named = () => stagingPath(normalized, nonce());
+  return firstFreeName(named(), (path) => adapter.exists(path), named);
 }
 
 function nonce(): string {
@@ -471,8 +478,10 @@ export class ObsidianVault implements Vault {
   private async probeCase(items: TAbstractFile[]): Promise<void> {
     if (this.probed) return;
     const paths = new Set(items.map((i) => trimLeadingSlash(i.path)));
+    let looked = false;
     for (const item of items) {
       if (statOf(item) === undefined) continue;
+      looked = true;
       const raw = trimLeadingSlash(item.path);
       const flipped = flipCase(raw);
       if (flipped === raw) continue;
@@ -482,6 +491,13 @@ export class ObsidianVault implements Vault {
       this.probed = true;
       return;
     }
+    // Files were looked at and none of them has a letter in it. A vault of
+    // numeric names would otherwise be walked in full on every `list()`, for
+    // ever, to reach the same answer (B12). Settling for the default is
+    // settling on the safe side: folding refuses two paths a case-sensitive
+    // disk could have held apart, rather than overwriting one with the other.
+    // An empty listing is not an answer and does not settle anything.
+    if (looked) this.probed = true;
   }
 
   /**
@@ -542,11 +558,7 @@ export class ObsidianVault implements Vault {
     return new Uint8Array(await this.adapter.readBinary(this.resolve(path)));
   }
 
-  async write(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<void> {
+  async write(path: string, bytes: Uint8Array, times: Times): Promise<void> {
     const normalized = this.resolve(path);
     await this.ensureParents(normalized);
     await this.matchCase(normalized);
@@ -740,11 +752,7 @@ export class ObsidianVault implements Vault {
    * narrow as this API allows, and a refusal is read as "taken" whenever
    * something is there afterwards.
    */
-  async create(
-    path: string,
-    bytes: Uint8Array,
-    times: { mtime: number; ctime: number },
-  ): Promise<boolean> {
+  async create(path: string, bytes: Uint8Array, times: Times): Promise<boolean> {
     const normalized = this.resolve(path);
     if (await this.adapter.exists(normalized)) return false;
     await this.ensureParents(normalized);
@@ -847,7 +855,15 @@ export class ObsidianVault implements Vault {
    */
   async remove(path: string): Promise<void> {
     const normalized = this.resolve(path);
-    if (!(await this.adapter.exists(normalized))) return;
+    if (!(await this.adapter.exists(normalized))) {
+      // Already gone, by hand or by another pass. It still owes nothing: a
+      // write earlier in this pass may have left the name owed, and there is
+      // no file left to open and fsync for it. The next flush's own check
+      // would drop it a cycle later; dropping it here is where the fact is
+      // known (N7, R6).
+      this.wentAway(normalized);
+      return;
+    }
     // Either way it left its directory, and a pass that only deleted used to
     // save the index without ever fsyncing the directory it changed.
     try {
@@ -914,7 +930,7 @@ export class ObsidianVault implements Vault {
 }
 
 /** The adapter's write options for the times the engine hands over. */
-function writeOptions(times: { mtime: number; ctime: number }): {
+function writeOptions(times: Times): {
   mtime?: number;
   ctime?: number;
 } {
@@ -982,8 +998,7 @@ export class ObsidianIndexStore implements IndexStore {
       // What is on disk is what was last written, so a first pass that
       // changes nothing writes nothing. Only from the live file: a state
       // read out of the staging copy is not what the live file holds.
-      this.lastWritten = live.text;
-      this.lastStamp = await this.stamp();
+      this.last.wrote(live.text!, await this.stamp());
       return live.state;
     }
     const staged = await this.readIndex(this.temp);
@@ -1011,55 +1026,24 @@ export class ObsidianIndexStore implements IndexStore {
   }
 
   /**
-   * The last thing written, so an unchanged index is not written again.
+   * What this session last wrote, and how it looked on disk (R3).
    *
-   * A pass ends by saving whether or not anything happened, and a settled
-   * vault passes on every watch tick and every keepalive. At 2000 files that
-   * was a 9 MiB serialisation and two fsyncs every thirty seconds, for ever,
-   * to record that nothing had changed; at 10k it measured 21 ms of which 11
-   * ms was the flushes. Two separate audits found this independently, which is
-   * the best evidence a thing is real.
-   *
-   * Comparing the string is not free either, but stringify is 2.1 ms against
-   * 10.7 ms of fsync, so it pays for itself the first time it matches. And a
-   * write skipped because the bytes on disk are already those bytes cannot
-   * lose anything: the failure it would cause is the failure it prevents.
-   *
-   * That last sentence is only true while the bytes are still there, which is
-   * why the file is asked about as well. An index removed from outside during a
-   * session used to be skipped by every later unchanged pass, and the restart
-   * after it started cold over a vault this device had already synced.
-   *
-   * Asking whether it exists was not enough either (R3). Something overwriting
-   * the index in place leaves a file that is there and is not what was
-   * written, and every later unchanged pass would skip over it and preserve it
-   * for the rest of the session. So what is remembered is its size and
-   * modification time, and the skip needs both to match. Not the content:
-   * reading nine megabytes back on every settled pass is the cost this skip
-   * exists to avoid, while a stat is one call whatever the index weighs.
+   * The rule, and the reasoning behind it, is `LastIndexWrite` in core, shared
+   * with the headless client's store so the two cannot drift apart again.
    */
-  private lastWritten: string | undefined;
-  /** The live file as it stood when this session last saw its own bytes in it. */
-  private lastStamp: { size: number; mtime: number } | undefined;
+  private readonly last = new LastIndexWrite();
 
   /** The live index's size and modification time, or undefined if it is not a file. */
-  private async stamp(): Promise<{ size: number; mtime: number } | undefined> {
+  private async stamp(): Promise<IndexStamp | undefined> {
     const stat = await this.adapter.stat(this.live);
     if (stat === null || stat.type !== "file") return undefined;
     return { size: stat.size, mtime: stat.mtime };
   }
 
-  private async unchangedOnDisk(): Promise<boolean> {
-    const was = this.lastStamp;
-    if (was === undefined) return false;
-    const now = await this.stamp();
-    return now !== undefined && now.size === was.size && now.mtime === was.mtime;
-  }
-
   async save(state: StoredState): Promise<void> {
     const text = JSON.stringify(state);
     const live = this.live;
-    if (text === this.lastWritten && (await this.unchangedOnDisk())) return;
+    if (this.last.matches(text, await this.stamp())) return;
     const parts = live.split("/");
     parts.pop();
     if (parts.length > 0) {
@@ -1090,8 +1074,7 @@ export class ObsidianIndexStore implements IndexStore {
       // removes it the next time the plugin starts.
       await this.adapter.remove(temp).catch(() => undefined);
     }
-    this.lastWritten = text;
-    this.lastStamp = await this.stamp();
+    this.last.wrote(text, await this.stamp());
   }
 
   /**
@@ -1108,8 +1091,7 @@ export class ObsidianIndexStore implements IndexStore {
         throw new Error(`${path} is still there after removing it`);
       }
     }
-    this.lastWritten = undefined;
-    this.lastStamp = undefined;
+    this.last.forget();
   }
 }
 

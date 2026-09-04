@@ -27,15 +27,18 @@ import { resolve } from "node:path";
 import { deriveRootKeys, generateSecret, randomBytes } from "../core/crypto.ts";
 import {
   Client,
+  credentialCandidates,
   credentialsFor,
+  rebaseCursors,
   redeemInvite,
+  refuseUnlessAhead,
   runForever,
+  settledConfig,
   wrappedForClaim,
   type ClientOptions,
 } from "../core/client.ts";
-import type { SyncReport } from "../core/engine.ts";
+import { REJOIN_ADVICE, type SyncReport } from "../core/engine.ts";
 import {
-  encodeConfig,
   formatPairing,
   isInvite,
   normaliseUrl,
@@ -57,9 +60,8 @@ import {
   saveConfig,
   type Config,
 } from "./config.ts";
-import { MemoryIndexStore } from "../core/vault.ts";
 import { lockVault } from "./lock.ts";
-import { ProtocolError } from "../core/transport.ts";
+import { ConnectionError, ProtocolError } from "../core/transport.ts";
 import { validateStoredState } from "../core/stored-state.ts";
 
 /**
@@ -173,11 +175,29 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
     // is for a bug in this program; the common failures are a server that is
     // not running and a string that was pasted wrong, and those deserve to
     // be readable.
-    const message = err instanceof Error ? err.message : String(err);
+    const message = withRecovery(err);
     if (args.json) io.out(JSON.stringify({ ok: false, error: message }));
     else io.err(`basalt: ${message}`);
     return 1;
   }
+}
+
+/**
+ * A failure as a sentence, with the way out of it when there is a known one.
+ *
+ * The server's `cursor` refusal is exact about what is wrong and says nothing
+ * about what to do, and it cannot: the recovery is a client command the server
+ * has never heard of. The engine's own copy of the refusal names it, and this
+ * puts the same words behind the server's, so a restored backup reads the same
+ * whichever end noticed. Error strings are the whole UI of a device that has
+ * stopped.
+ */
+function withRecovery(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  if (err instanceof ProtocolError && err.code === "cursor" && !message.includes(REJOIN_ADVICE)) {
+    return `${message}. ${REJOIN_ADVICE}`;
+  }
+  return message;
 }
 
 /**
@@ -582,35 +602,17 @@ async function cmdRotate(args: Args, io: Console): Promise<number> {
  */
 async function cmdRebase(args: Args, io: Console): Promise<number> {
   const config = await mustLoad(args.dir);
-  const stored = validateStoredState(await new JsonIndexStore(indexPath(args.dir)).load());
-  const local = stored?.cursor ?? 0;
-
-  // The server's cursor, asked for from a connection that carries no index
-  // and so cannot be refused for being ahead. The backlog is not waited for:
-  // this connection is closed again the moment the number is out of the
-  // handshake, and with an empty index the backlog is the whole vault.
-  const probe = new Client({
-    ...(await clientOptions(config, args, io)),
-    store: new MemoryIndexStore(),
-  });
-  let serverCursor: number;
-  try {
-    await probe.connect({ waitForBacklog: false });
-    serverCursor = probe.serverCursor;
-  } finally {
-    await probe.close();
-  }
+  // Both numbers from core, so the panel and this cannot disagree about where
+  // the two ends are or about when a rebase is allowed.
+  const at = await rebaseCursors(await clientOptions(config, args, io));
+  const { local, server: serverCursor } = at;
   const say = (line: string) => {
     if (!args.json) io.out(line);
   };
   say(`local cursor   ${local}`);
   say(`server cursor  ${serverCursor}`);
 
-  if (local <= serverCursor) {
-    throw new Error(
-      `this device is not ahead of the server (${local} against ${serverCursor}), so there is nothing to rebase; basalt sync is enough`,
-    );
-  }
+  refuseUnlessAhead(at);
   if (!args.backupTaken) {
     throw new Error(
       `the server is at ${serverCursor} and this device has applied ${local}: the server has lost history. ` +
@@ -696,7 +698,7 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
     },
   });
   if (fatal) {
-    io.err(`basalt: ${fatal.message}`);
+    io.err(`basalt: ${withRecovery(fatal)}`);
     io.err("That will not fix itself by trying again.");
     return 1;
   }
@@ -725,7 +727,20 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
 
   // Reachability is reported, never assumed. "up to date" from a client that
   // could not reach the server is the kind of status rule 7 is about.
-  let server: { reachable: boolean; cursor?: number; behind?: number; error?: string };
+  //
+  // `refused` is the other half of that rule, and it used to be collapsed into
+  // the same field (N3). A server that answers and will not have this device,
+  // because it was restored from an older backup or because the credential is
+  // no longer the vault's, is not a server that is down, and a cron job
+  // keying on `reachable` read the two as one outage. Mirrors the plugin's
+  // `offline.refused`.
+  let server: {
+    reachable: boolean;
+    refused: boolean;
+    cursor?: number;
+    behind?: number;
+    error?: string;
+  };
   try {
     // The handshake and nothing after it. What is printed below is the
     // server's own cursor out of `ready`, and waiting for the backlog first
@@ -736,17 +751,22 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     // like being up to date.
     server = {
       reachable: true,
+      refused: false,
       cursor: client.serverCursor,
       behind: client.serverCursor - local.cursor,
     };
     await client.close();
   } catch (err) {
-    server = { reachable: false, error: (err as Error).message };
+    // Only the transport failing means the server was not reached. Everything
+    // else got an answer out of it: an `auth` refusal, or the cursor check
+    // against a server that has lost history.
+    const answered = !(err instanceof ConnectionError);
+    server = { reachable: answered, refused: answered, error: (err as Error).message };
   }
 
   if (args.json) {
     io.out(JSON.stringify({ ok: true, ...local, server }));
-    return server.reachable ? 0 : 1;
+    return server.reachable && !server.refused ? 0 : 1;
   }
 
   io.out(`vault    ${local.vault}`);
@@ -760,8 +780,12 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   // something a person can see rather than something the design says cannot
   // be detected (I11).
   io.out(`local cursor   ${local.cursor}`);
-  if (server.reachable) io.out(`server cursor  ${server.cursor}`);
+  if (server.cursor !== undefined) io.out(`server cursor  ${server.cursor}`);
   if (local.pending > 0) io.out(`pending  ${local.pending} files with work outstanding`);
+  if (server.refused) {
+    io.out(`state    the server is up and refused this device: ${server.error}`);
+    return 1;
+  }
   if (server.reachable) {
     // The cursor says what this device has seen, not what it has applied. A
     // path that is a file here and a folder elsewhere is applied by nobody and
@@ -991,7 +1015,7 @@ async function open(
   opts: ConnectHow = {},
 ): Promise<Client> {
   const connected = await connectWith(config, args, io, opts);
-  const settled = settle(config, connected.config, connected.client);
+  const settled = settledConfig(config, connected.config, connected.client.wrapped);
   if (settled === undefined) return connected.client;
 
   // Something the connection proved that the file does not say yet: a
@@ -1017,34 +1041,6 @@ async function open(
 }
 
 /**
- * What the config should say now that a connection has succeeded, or undefined
- * when the file already says it.
- *
- * `used` is the credential that actually authenticated, which is `stored` for
- * an ordinary device and one of the fallbacks in `candidates` otherwise. The
- * one thing neither of them knows is the vault's wrapped data key, because that
- * arrives in `ready`.
- *
- * Compared against what is on disk rather than against `used`, because the
- * whole reason a fallback was needed is that the two disagree.
- */
-function settle(stored: Config, used: Config, client: Client): Config | undefined {
-  const wrapped = client.wrapped;
-  const next: Config = { ...used, ...(wrapped !== undefined ? { wrapped } : {}) };
-  delete (next as { bootstrap?: string }).bootstrap;
-  // The claim candidate goes with the bootstrap: nothing sends a claim once
-  // the vault is known to be claimed, so keeping it is keeping a wrapping of
-  // a data key the vault never adopted.
-  delete (next as { claimWrapped?: string }).claimWrapped;
-  delete (next as { pending?: unknown }).pending;
-  return sameConfig(next, stored) ? undefined : next;
-}
-
-function sameConfig(a: Config, b: Config): boolean {
-  return JSON.stringify(encodeConfig(a)) === JSON.stringify(encodeConfig(b));
-}
-
-/**
  * Connects, recovering the one case a spent bootstrap can be proven spent.
  *
  * `init` writes the config with the bootstrap, claims the vault, and then
@@ -1067,7 +1063,7 @@ async function connectWith(
   how: ConnectHow = {},
 ): Promise<{ client: Client; config: Config }> {
   let first: Error | undefined;
-  for (const candidate of candidates(config)) {
+  for (const candidate of credentialCandidates(config)) {
     const client = new Client(await clientOptions(candidate, args, io));
     try {
       await client.connect(how);
@@ -1085,46 +1081,6 @@ async function connectWith(
   // Nothing opened it, so nothing is proven and the first refusal stands: it is
   // the one that describes the credential this device believes in.
   throw first ?? new Error("this vault has no credential to connect with");
-}
-
-/**
- * The credentials to try, best first.
- *
- * An outstanding rotation goes first, because if it committed then it is the
- * only thing that opens the vault, and it carries the wrapping the server holds
- * so the pin does not refuse the very connection that resolves it. Then the
- * config as it stands. Then, for the first device only, the config without its
- * bootstrap.
- *
- * That last one is the narrow case in which a bootstrap can be proven spent.
- * `init` writes the config with the bootstrap, claims the vault, and writes it
- * again without. If the second write fails, or the claim commits and its reply
- * is lost, the next run offers the bootstrap first and is refused, for ever.
- * The refusal is `auth`, which is also what a wrong token and another device's
- * vault produce, so it does not on its own say what happened. What does say is
- * the key derived from this config's root secret: the server compares it
- * against the hash it bound the vault to, so that key being accepted proves the
- * vault was claimed with this secret.
- */
-function candidates(config: Config): Config[] {
-  const out: Config[] = [];
-  if (config.pending) {
-    const promoted: Config = {
-      ...config,
-      secret: config.pending.secret,
-      wrapped: config.pending.wrapped,
-    };
-    delete (promoted as { bootstrap?: string }).bootstrap;
-    delete (promoted as { pending?: unknown }).pending;
-    out.push(promoted);
-  }
-  out.push(config);
-  if (config.bootstrap !== undefined) {
-    const spent: Config = { ...config };
-    delete (spent as { bootstrap?: string }).bootstrap;
-    out.push(spent);
-  }
-  return out;
 }
 
 async function clientOptions(config: Config, args: Args, io?: Console): Promise<ClientOptions> {
@@ -1333,7 +1289,19 @@ export function parseArgs(argv: readonly string[]): Args {
       // Repeatable. One name per flag rather than a separated list,
       // because a filename may contain a comma and a vault is the wrong
       // place to find out which separator was assumed.
+      //
+      // Checked, because it is matched against one path segment at a time:
+      // an empty name or one with a slash in it matches nothing anywhere,
+      // and . and .. are never a segment of a canonical path, so all four
+      // were accepted in silence, which is the worst answer available for a
+      // flag whose whole job is to keep a folder out.
       case "--ignore":
+        if (value === "" || value === "." || value === ".." || value!.includes("/")) {
+          throw new Error(
+            `--ignore wants one folder or file name, not ${JSON.stringify(value)}: ` +
+              `it is matched against each part of a path on its own, so a name with a slash in it matches nothing, and . and .. are never a part`,
+          );
+        }
         args.ignore.push(value!);
         break;
       case "--limit": {

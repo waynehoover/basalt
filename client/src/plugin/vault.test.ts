@@ -1320,6 +1320,51 @@ describe("what flush must not forget (P-D4, P-D5)", () => {
     expect(synced, "the directory the deletion changed").toContain("/home/me/vault/daily");
   });
 
+  it("stops owing a file that had already gone when the deletion arrived (N7)", async () => {
+    const desktop = new DesktopAdapter();
+    const { fs, synced, tried } = fsOver(desktop);
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(desktop)), ".obsidian", () => {}, {
+      fs,
+    });
+
+    // The note arrives, and something outside the app removes it before the
+    // deletion another device sent for it is applied. `remove` returns early
+    // on a path that is already gone, and used to leave the name on the
+    // flush list for the next flush to work out for itself.
+    await v.write("daily/note.md", enc.encode("one"), times);
+    await desktop.remove("daily/note.md");
+    await v.remove("daily/note.md");
+
+    await expect(v.flush!()).resolves.toBeUndefined();
+    expect(tried, "a name already known to be gone was opened to be synced").not.toContain(
+      "/home/me/vault/daily/note.md",
+    );
+    expect(synced, "the directory the deletion changed").toContain("/home/me/vault/daily");
+  });
+
+  /**
+   * N5. The other trigger the flush fix was written for: a write under a
+   * spelling that differs only by case renames what is on disk, so a name the
+   * flush is still holding from earlier in the same pass no longer names what
+   * it named. The pass has to finish, under the surviving spelling.
+   */
+  it("keeps flushing after a case-only rename moves a file mid-pass (N5)", async () => {
+    const folding = new FoldingDesktopAdapter();
+    const { fs, synced } = fsOver(folding);
+    const v = new ObsidianVault(asVault(new FakeVaultIndex(folding)), ".obsidian", () => {}, {
+      fs,
+    });
+
+    await v.write("daily/Note.md", enc.encode("old"), times);
+    await v.write("daily/NOTE.md", enc.encode("new"), times);
+
+    await expect(v.flush!()).resolves.toBeUndefined();
+    // One file, spelled the way the last writer spelled it, and durable.
+    expect((await folding.list("daily")).files).toEqual(["daily/NOTE.md"]);
+    expect(synced, "the surviving spelling").toContain("/home/me/vault/daily/NOTE.md");
+    expect(synced, "the directory the rename changed").toContain("/home/me/vault/daily");
+  });
+
   it("treats a file that has gone as flushed rather than as a failure, for ever (R6)", async () => {
     const INDEX = ".obsidian/plugins/basalt/index.json";
     const state = { cursor: 1, entries: {}, remote: {}, pending: [] };
@@ -1411,16 +1456,33 @@ describe("the index write that is skipped because nothing changed (P-D6)", () =>
     expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
   });
 
-  it("writes again when a same-length overwrite lands at the same instant (R3)", async () => {
+  it("writes again when a shorter overwrite lands at the same instant (R3)", async () => {
     const store = new ObsidianIndexStore(adapter, INDEX);
     await store.save(state(1));
 
-    // The clock does not move, so the size is the half of the stamp that has
-    // to notice. A rewrite of exactly the same length in the same
-    // millisecond is the one this cannot see, and it is why the index is
-    // written through a staging copy in the first place.
-    const corrupt = "!".repeat(JSON.stringify(state(1)).length - 1);
-    await adapter.write(INDEX, corrupt);
+    // The clock does not move, so size is the half of the stamp that has to
+    // notice this one.
+    await adapter.write(INDEX, "!".repeat(JSON.stringify(state(1)).length - 1));
+    await store.save(state(1));
+
+    expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
+  });
+
+  it("writes again when a same-size overwrite lands a tick later (R3)", async () => {
+    const store = new ObsidianIndexStore(adapter, INDEX);
+    await store.save(state(1));
+
+    // Exactly as long as what was written, so size says nothing and the
+    // modification time is the half that has to notice. The named test above
+    // only ever moved the size, so this half of the stamp was never exercised.
+    //
+    // The residual, which is not a bug this can catch: a same-size overwrite
+    // inside one modification-time tick still skips. Narrow where the clock
+    // is fine grained (APFS, ext4), real where it is not (HFS+ ticks once a
+    // second, FAT once every two). Reading the index back on every settled
+    // pass is the cost the skip exists to avoid, so the window stays.
+    adapter.now += 1000;
+    await adapter.write(INDEX, "!".repeat(JSON.stringify(state(1)).length));
     await store.save(state(1));
 
     expect(await new ObsidianIndexStore(adapter, INDEX).load()).toEqual(state(1));
