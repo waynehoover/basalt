@@ -1673,10 +1673,10 @@ export class Transport {
    * is that a credential short enough to guess can be refused.
    *
    * **Registering the same id with the same key again succeeds**, and is the
-   * registration having happened. That is what makes a conversion able to run
-   * again after a crash: the row committed, the reply was lost, and a caller
-   * told `badentry` there would retry for ever. A *different* key under an id
-   * the vault already holds is somebody else's device and is refused.
+   * registration having happened: the row committed, the reply was lost, and
+   * a caller told `badentry` there would retry for ever. A *different* key
+   * under an id the vault already holds is somebody else's device and is
+   * refused.
    * docs/protocol.md, "The device list".
    */
   async register(args: {

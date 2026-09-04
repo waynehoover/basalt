@@ -895,14 +895,21 @@ describe("on a device with no status bar", () => {
    * to add rather than leaving somebody guessing.
    */
   it("says what to allow when it has never got through", async () => {
-    // A server that is not there from the start looks the same as one that
-    // refuses this origin, and this plugin cannot tell them apart, so the
-    // advice is offered while nothing has ever connected.
+    // A server that is not there looks the same as one that refuses this
+    // origin, and this plugin cannot tell them apart, so the advice is
+    // offered while nothing has ever connected. A paired phone that comes up
+    // with the server unreachable is that: joining a vault reaches the server
+    // by definition, and this is the next time it tries.
     await fresh();
-    const setup = server.setup;
+    const first = await load();
+    await startVault(first.plugin, "laptop");
+    await synced(first.plugin);
+    const saved = first.plugin.savedData;
+    first.plugin.onunload();
+    await first.plugin.closing;
     await server.cleanup();
-    const { plugin } = await load();
-    await startVault(plugin, "laptop", setup);
+
+    const { plugin } = await load(saved);
     await until("it to notice", () => plugin.currentState.kind === "offline");
 
     built.length = 0;
@@ -1301,19 +1308,27 @@ describe("unlink, in order and all the way (P15)", () => {
  * never saved, or the claim's reply was lost, the next start offered the
  * spent token first and was refused for ever.
  */
-describe("a spent bootstrap (P16)", () => {
-  it("recovers when the claim went through but the token was never dropped", async () => {
+/**
+ * review finding P16, and what protocol 4 leaves of it.
+ *
+ * Starting a vault writes the root to `data.json` and reads it back before the
+ * claim goes out, because the claim binds the server to that secret for good
+ * and a secret that never reached the disk is a vault nobody can open. If the
+ * registration after it fails, that is what is left: a root, no row, and a
+ * phone. Protocol 3 resumed from it and retried the spent token. Nothing
+ * resumes now, so the whole of the answer has to be in what the phone shows,
+ * and it is tested for the key itself rather than for advice about it.
+ */
+describe("a vault that was started and never joined (P16)", () => {
+  it("stops with the recovery key on screen rather than retrying for ever", async () => {
     await fresh();
     const first = await load();
-    first.app.vault.adapter.seed("note.md", "x");
     await startVault(first.plugin, "laptop");
     await synced(first.plugin);
-    await until("the token to be dropped", () => {
-      const saved = first.plugin.savedData as Record<string, unknown>;
-      return saved["bootstrap"] === undefined;
-    });
-    // What a lost `ready` leaves on disk: the config as it was saved before
-    // the claim, root and token and all, with no row of its own yet.
+    const recoveryKey = keyOf(first.plugin);
+
+    // What a registration that failed after the claim committed leaves on
+    // disk: the config as it was saved before the claim, root and all.
     const { parsePairing } = await import("../core/pairing.ts");
     const { base64urlEncode } = await import("../core/crypto.ts");
     const saved = first.plugin.savedData as Record<string, unknown>;
@@ -1321,71 +1336,61 @@ describe("a spent bootstrap (P16)", () => {
       url: saved["url"],
       vaultId: saved["vaultId"],
       device: saved["device"],
-      secret: base64urlEncode(parsePairing(keyOf(first.plugin)).secret),
-      bootstrap: server.token,
+      secret: base64urlEncode(parsePairing(recoveryKey).secret),
     };
     first.plugin.onunload();
     await first.plugin.closing;
 
     const again = await load(stale);
-    await synced(again.plugin);
-    expect(again.plugin.currentState.kind).toBe("synced");
-    await until("the token to be dropped this time", () => {
-      const now = again.plugin.savedData as Record<string, unknown>;
-      return now["bootstrap"] === undefined;
-    });
-    // And the root with it: the spent token being refused is what proves the
-    // vault was claimed with this secret, and once the row exists neither is
-    // needed again.
-    const now = again.plugin.savedData as Record<string, unknown>;
-    expect(now["secret"]).toBeUndefined();
-    expect(now["deviceId"]).toBeDefined();
+    await until("it to stop", () => again.plugin.currentState.kind === "stopped");
+    const why = (again.plugin.currentState as { why: string }).why;
+    expect(why).toMatch(/never registered itself/);
+    // The key, on screen. This config is the only copy of it, so a phone that
+    // said "could not connect" and no more would be a lost vault.
+    expect(why).toContain(recoveryKey);
+    expect(why).toMatch(/unlink this vault and pair again with it/);
+    // Stopped, not offline: nothing here is going to change on a retry, and a
+    // status bar saying "connecting" about that is the lie rule 7 is about.
+    expect(again.plugin.savedData).not.toBe(null);
   }, 300_000);
 
-  it("keeps memory and disk agreeing when the last save fails, and tries again", async () => {
-    // The save that drops the root and the spent token is the last of the
-    // conversion's three, and it is the one that cannot be taken on trust: a
-    // device that dropped the root in memory and not on disk would come back
-    // after a restart holding a credential it had already decided not to use.
+  it("keeps the root when the claim went through and the credential could not be saved", async () => {
+    // The save that records this device's credential is the one that cannot be
+    // taken on trust: it lands between a registration the server has committed
+    // and a phone with nothing to show for it.
     await fresh();
-    const { plugin, app } = await load();
-    app.vault.adapter.seed("note.md", "x");
+    const { plugin } = await load();
     let failing = true;
     const realSave = plugin.saveData.bind(plugin);
     plugin.saveData = async (data) => {
       const record = data as Record<string, unknown> | null;
-      if (failing && record !== null && record["secret"] === undefined) {
+      if (failing && record !== null && record["deviceId"] !== undefined) {
         throw new Error("EIO: data.json");
       }
       return realSave(data);
     };
-    void startVault(plugin, "laptop").catch(() => undefined);
-    await until(
-      "the failure to be noticed",
-      () => plugin.currentState.kind === "offline" && /EIO/.test(plugin.currentState.why),
-      60_000,
-    );
-    // On disk and in memory, the root and the token are still there: nothing
-    // was dropped, because nothing was written.
-    const held = plugin.savedData as Record<string, unknown>;
-    expect(held["bootstrap"]).toBe(server.token);
-    expect(held["secret"], "the root was dropped on disk while the save failed").toBeDefined();
-    expect(
-      (plugin as unknown as { config: { secret?: Uint8Array } }).config.secret,
-      "memory dropped the root while disk kept it",
-    ).toBeDefined();
+    await expect(startVault(plugin, "laptop")).rejects.toThrow(/could not register itself/);
 
-    // The conversion is retried like a connection, so it finishes on its own
-    // once the disk works: no reload, which on a phone is not an obvious move.
+    // On disk and in memory, the root is still there: the claim may have
+    // committed, and throwing it away is a vault nothing will ever open.
+    const held = plugin.savedData as Record<string, unknown>;
+    expect(held["secret"], "the root went with the failed save").toBeDefined();
+    await until("it to stop", () => plugin.currentState.kind === "stopped");
+    const why = (plugin.currentState as { why: string }).why;
+    expect(why).toMatch(/never registered itself/);
+    // And the key is on the panel, which is where the person was sent.
+    const printed = why.match(/basalt3_[A-Za-z0-9_-]+/)![0];
+    const { parsePairing } = await import("../core/pairing.ts");
+    expect(parsePairing(printed).vaultId).toBe("default");
+
+    // The way out the words name: forget this pairing, and pair with the key.
     failing = false;
-    await until(
-      "the conversion to finish",
-      () => (plugin.savedData as Record<string, unknown>)["secret"] === undefined,
-      60_000,
-    );
-    await synced(plugin);
-    const after = plugin.savedData as Record<string, unknown>;
-    expect(after["bootstrap"]).toBeUndefined();
+    await plugin.unlink();
+    const rejoined = await load();
+    await rejoined.plugin.pair(printed, "laptop");
+    await synced(rejoined.plugin);
+    const after = rejoined.plugin.savedData as Record<string, unknown>;
+    expect(after["secret"], "pairing with the recovery key kept it").toBeUndefined();
     expect(after["deviceId"]).toBeDefined();
   }, 300_000);
 });
@@ -1593,11 +1598,13 @@ describe("what is said while stopped (P8)", () => {
     first.plugin.onunload();
     await first.plugin.closing;
 
-    // The same server, a different secret: refused for good.
+    // The same server and the same row, a different device secret: refused
+    // for good, because a credential the vault does not know is not something
+    // another attempt improves on.
     const { decodeConfig, encodeConfig } = await import("../core/pairing.ts");
     const wrong = encodeConfig({
       ...decodeConfig(saved, "test"),
-      secret: new Uint8Array(32).fill(7),
+      deviceSecret: new Uint8Array(32).fill(7),
     });
     const other = await load(wrong);
     await until("it to stop", () => other.plugin.currentState.kind === "stopped");
@@ -1728,11 +1735,14 @@ describe("pairing honestly (P11, P32)", () => {
     expect(second.plugin.savedData).toBe(null);
   }, 300_000);
 
-  it("offers unlink when a new vault's first connection is refused for good", async () => {
+  it("offers unlink when a new vault's claim is refused for good", async () => {
     await fresh();
     const { plugin } = await load();
     // A setup string with the wrong token: the claim is refused, for ever.
-    await plugin.pairFirst(`${server.wsUrl}#not-the-token`, "laptop");
+    // Reported to whoever asked rather than left to a retry that cannot win.
+    await expect(plugin.pairFirst(`${server.wsUrl}#not-the-token`, "laptop")).rejects.toThrow(
+      /could not register itself/,
+    );
     await until("it to stop", () => plugin.currentState.kind === "stopped");
     const said = notices.map((n) => n.message).join(" ");
     expect(said).toMatch(/could not join/);

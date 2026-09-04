@@ -179,7 +179,7 @@ export function generateDataKey(): Uint8Array {
 
 /**
  * A fresh device secret: the credential one device connects with, and the only
- * credential a converted device holds.
+ * credential a paired device holds.
  *
  * It derives one key and unwraps nothing. That is the shape of the privilege
  * separation in docs/protocol.md, "Authentication": the root registers devices

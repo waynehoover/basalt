@@ -62,14 +62,17 @@ export async function loadConfig(vault: string): Promise<Config | undefined> {
  * Writes the config, durably, atomically and readable only by its owner.
  *
  * The mode is set on the temporary file before the rename, so the config is
- * never briefly world-readable. It holds the root secret: anyone who can read it
- * can read every note in the vault.
+ * never briefly world-readable. It holds this device's credential and the
+ * vault's data key: anyone who can read it can read every note in the vault.
  *
- * Durably, through the same path a note takes. This file is the only copy of
- * the root secret, and the first device claims the server the moment after
- * writing it. A write and a rename with no fsync between them can be undone
- * by a power cut, leaving a server durably bound to a key that never reached
- * the disk, and a vault nothing will ever open again. The state directory is
+ * Durably, through the same path a note takes. While a vault is being started
+ * this file is the only copy of the root secret, and the first device claims
+ * the server the moment after writing it. A write and a rename with no fsync
+ * between them can be undone by a power cut, leaving a server durably bound to
+ * a key that never reached the disk, and a vault nothing will ever open again.
+ * The same ordering is what makes a registration survive a crash: the
+ * credential the server has just committed a row for is on disk, proven
+ * readable, before anything else is attempted with it. The state directory is
  * created and synced too, so the file's name is as durable as its bytes.
  */
 export async function saveConfig(vault: string, config: Config): Promise<void> {

@@ -73,7 +73,7 @@ async function paired(): Promise<string> {
 
 /**
  * The same, and the recovery key `init` printed. Kept by the caller because
- * nothing reprints it: a converted device holds its own credential and not the
+ * nothing reprints it: a paired device holds its own credential and not the
  * vault's root.
  */
 async function pairedWithKey(): Promise<{ dir: string; recoveryKey: string }> {

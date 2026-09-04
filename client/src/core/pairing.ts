@@ -27,10 +27,16 @@
  *
  * ## One secret
  *
- * The auth key is a branch of the same HKDF schedule that produces the content
- * and path keys, and the server stores only its hash, so the root secret is the
- * only secret in the system and this string carries nothing else. The format
- * stays length-prefixed and versioned because it once carried two.
+ * The auth key is a branch of the same HKDF schedule the root produces, and the
+ * server stores only its hash, so the root is the only secret this string
+ * carries. The format stays length-prefixed and versioned because it once
+ * carried two.
+ *
+ * One secret in the string is not one secret in the system, since protocol 4. A
+ * vault also has a data key, which the root wraps and every paired device
+ * holds, and each device has a secret of its own. Neither is ever in here: this
+ * string is the recovery key, and what it buys is a registrar session that can
+ * register a device and hand it the data key.
  */
 
 import { crc32Bytes } from "./crc32.ts";
@@ -240,22 +246,29 @@ export function isInvite(input: string): boolean {
  * ---------------------------------------------------------------- */
 
 /**
- * What one device hands the next: not the root, but the way to fetch it once.
+ * What one device hands the next: the vault's data key, once, and no root.
  *
- * The root secret is sealed under `key` and stored on the server under `id`
- * with an expiry. The string carries `id` so the new device can ask, `key` so
- * it can open what it is given, and the address and vault so it knows where
- * to ask. The key never reaches the server, so a stolen disk holds blobs it
+ * The data key is sealed under `key` and stored on the server under `id` with
+ * an expiry. The string carries `id` so the new device can ask, `key` so it
+ * can open what it is given, and the address and vault so it knows where to
+ * ask. The key never reaches the server, so a stolen disk holds blobs it
  * cannot open, and the id is unguessable, so a stranger cannot redeem one by
- * trying. docs/protocol.md, "Adding a device with a single-use invite".
+ * trying.
+ *
+ * The data key and not the root, since protocol 4. The issuing device holds no
+ * root and so has none to seal, and an invite that carried one would hand the
+ * newcomer the credential that registers devices and rewraps the vault, which
+ * is everything revoking a device is meant to take back. Redeeming registers
+ * the new device's own row in the same transaction that spends the invite.
+ * docs/protocol.md, "Adding a device with a single-use invite".
  */
 export interface Invite {
   /** WebSocket URL of the server, without the path. */
   readonly url: string;
   readonly vaultId: string;
-  /** A random 128-bit identifier, which the server stores the sealed root under. */
+  /** A random 128-bit identifier, which the server stores the sealed data key under. */
   readonly id: Uint8Array;
-  /** A random 256-bit key, which the root is sealed under. Never sent to the server. */
+  /** A random 256-bit key, which the data key is sealed under. Never sent to the server. */
   readonly key: Uint8Array;
 }
 
@@ -354,22 +367,19 @@ export function generateDeviceId(): string {
 }
 
 /**
- * What a device stores, and the two states it can be in.
+ * What a paired device stores.
  *
- * A **converted** device holds `deviceId`, `deviceSecret` and `dataKey`, and
- * nothing else. That is the whole of per-device credentials: the secret
- * connects as this one device and can be revoked on its own, the data key
- * reads and writes content, and the root secret, which registers devices and
- * rewraps the data key, is not here. A stolen laptop therefore cannot register
- * itself again, cannot add a device, and cannot show anybody the recovery key.
+ * A device holds `deviceId`, `deviceSecret` and `dataKey`, and nothing else.
+ * That is the whole of per-device credentials: the secret connects as this one
+ * device and can be revoked on its own, the data key reads and writes content,
+ * and the root secret, which registers devices and rewraps the data key, is
+ * not here. A stolen laptop therefore cannot register itself again, cannot add
+ * a device, and cannot show anybody the recovery key.
  *
- * A **converting** device also holds `secret`, the root, and is a device that
- * has not finished becoming one: a protocol 3 pairing, a vault being started,
- * or a conversion that crashed part-way. `needsConversion` is that state, and
- * `convertToDevice` in core/client.ts is the only thing that ends it. The two
- * halves overlap on purpose: the root is dropped last, after the row has been
- * registered and used, so a crash anywhere in the middle leaves a device that
- * can try again rather than one that can neither convert nor connect (rule 4).
+ * The one exception is `secret`, and it is a vault being started rather than a
+ * device: see the field. Every other way in leaves a finished device or leaves
+ * nothing, because a config with a root and no credential is not a device this
+ * client can use and `deviceCredential` refuses it by name.
  *
  * The name is local: it is what appears in a conflict copy's filename, so it
  * wants to be the thing you would call the machine rather than anything the
@@ -386,11 +396,11 @@ export interface DeviceConfig {
   /**
    * This device's row in the vault's device list, and the credential for it.
    *
-   * Written together and before the `register` that creates the row, so a
-   * crash between the two leaves a device that re-registers the same id with
-   * the same key, which the server treats as the registration having happened.
-   * Generating a fresh id on every attempt instead would leave a row behind
-   * per crash and fill the vault's eight.
+   * Optional in the type and not in practice: they are written together, in
+   * the one save that records a finished device, and every path that connects
+   * goes through `deviceCredential` first. They are optional because the file
+   * on disk may predate that save, and a config that will not decode is a
+   * config whose recovery key cannot be read back out of it (rule 2).
    */
   readonly deviceId?: string;
   readonly deviceSecret?: Uint8Array;
@@ -398,78 +408,56 @@ export interface DeviceConfig {
    * The vault's data key, unwrapped.
    *
    * Held directly rather than as the wrapping the server returns, because the
-   * key that would unwrap it comes from the root and a converted device does
-   * not have one. Every content key derives from this; docs/protocol.md,
-   * "Crypto".
+   * key that would unwrap it comes from the root and a paired device does not
+   * have one. Every content key derives from this; docs/protocol.md, "Crypto".
    */
   readonly dataKey?: Uint8Array;
 
   /**
-   * The vault's root secret, held only until this device has a row of its own.
+   * The vault's root secret, held only while this device is starting a vault.
    *
-   * Present on a protocol 3 config, on a vault being started, and on a
-   * conversion that has not finished. Absent afterwards, and its absence is
-   * what makes revoking this device mean anything: with it, the device would
-   * re-derive the vault's credential and register itself again.
+   * It is here for one reason. Starting a vault binds the server, for good, to
+   * the key this secret derives, and a secret that claimed a server without
+   * reaching the disk first is a vault nobody can ever open; so it is written
+   * down before the claim goes out and replaced by this device's own
+   * credential the moment there is one. Its absence afterwards is what makes
+   * revoking this device mean anything: with it, the device would re-derive
+   * the vault's credential and register itself again.
+   *
+   * A config that still holds it and has no credential is not a device. It is
+   * a vault that was started here and never joined, and `deviceCredential`
+   * refuses it in those words and hands the recovery key back rather than
+   * leaving somebody with an unopenable vault; core/pairing.test.ts, "hands
+   * the recovery key back when the root is all that is left".
    */
   readonly secret?: Uint8Array;
-  /**
-   * The server's first-run token, kept only until this device has claimed the
-   * vault with it.
-   *
-   * Absent on every device but the first, and absent on that one too once the
-   * claim has gone through. The claim travels on the registrar hello that then
-   * registers this device's row, so it is spent by the same conversion that
-   * drops the root.
-   */
-  readonly bootstrap?: string;
-  /**
-   * The data key this device offers while it is still claiming the vault,
-   * already wrapped under this root.
-   *
-   * Made once, when the vault is started, and sent with every claim until the
-   * bootstrap is spent. It used to be made afresh on every connection, on the
-   * reasoning that only one claim can win so the others cost nothing. They cost
-   * something: a claim whose reply was lost was retried with a different data
-   * key, so the vault could be bound to one candidate while this device went on
-   * offering another. Kept here, a retry offers the same key it offered before.
-   */
-  readonly claimWrapped?: string;
-  /**
-   * The vault's wrapped data key, as this device last saw it.
-   *
-   * Only ever a protocol 3 device's, pinned from a `ready` under the old
-   * protocol. Conversion checks the wrapping `registered` hands back against
-   * it and refuses a different one, which is the last place the C40 hazard can
-   * still arise: a server that was handed a claim could otherwise echo that
-   * wrapping back as the vault's, and the device would install a schedule no
-   * other device on the vault derives. It is dropped with the root, because a
-   * converted device holds the key itself and never asks the server for it.
-   */
-  readonly wrapped?: string;
 }
 
 /**
- * Whether this config still holds the vault's root, and so still has to
- * convert before it can connect.
+ * Raised when a config holds nothing to connect with.
  *
- * One predicate rather than the same three-field test in both shells, because
- * a shell that read it differently would either connect with a credential the
- * server no longer accepts or drop the root before there was a row to use
- * instead.
+ * Its own class because a shell has to tell it apart from a refusal by a
+ * server. Nothing was asked of anybody: `basalt status` reports such a device
+ * as neither reachable nor refused (rule 7), and calling it "not authorised"
+ * sent somebody hunting a server problem that was not there.
  */
-export function needsConversion(config: DeviceConfig): boolean {
-  return config.secret !== undefined;
-}
+export class NoCredential extends Error {}
 
 /**
- * The credential a converted device connects with, or a refusal naming what is
- * missing.
+ * The credential a paired device connects with, or a refusal naming what is
+ * missing and what to do about it.
  *
  * Refused rather than defaulted. A config missing one of the three is not a
- * device with less state, it is a conversion that did not finish, and the two
- * callers of this are the ones that would otherwise connect as nobody or seal
- * under a key nothing else derives (rule 2).
+ * device with less state, it is a device that never finished joining the
+ * vault, and the callers of this are the ones that would otherwise connect as
+ * nobody or seal under a key nothing else derives (rule 2).
+ *
+ * A config still holding the root is the one case worth more than a refusal.
+ * It is a pairing that never registered a row, and if the vault was started
+ * here then the secret in it is the only copy of the recovery key there is:
+ * printing it is the difference between a vault somebody can get back into and
+ * a vault nobody can. Nothing is disclosed by it that whoever can read this
+ * config does not already hold.
  */
 export function deviceCredential(config: DeviceConfig): {
   deviceId: string;
@@ -481,12 +469,19 @@ export function deviceCredential(config: DeviceConfig): {
   if (config.deviceSecret === undefined) missing.push("a device secret");
   if (config.dataKey === undefined) missing.push("the vault's data key");
   if (missing.length > 0 || !config.deviceId || !config.deviceSecret || !config.dataKey) {
-    throw new Error(
-      `this device has not finished registering itself with the vault: it is missing ` +
-        `${missing.join(", ")}. ` +
-        (config.secret !== undefined
-          ? "It still holds the vault's recovery key, so the next command finishes the registration."
-          : "Pair this vault again with the vault's recovery key."),
+    if (config.secret !== undefined) {
+      throw new NoCredential(
+        "this device holds the vault's recovery key and never registered itself with the " +
+          "vault, so there is no credential here to connect with. If the vault was started " +
+          "here, this is the only copy of its recovery key there is:\n\n" +
+          `  ${formatPairing({ url: config.url, vaultId: config.vaultId, secret: config.secret })}\n\n` +
+          "Write it down, then unlink this vault and pair again with it.",
+      );
+    }
+    throw new NoCredential(
+      `this device has no credential for the vault: it is missing ${missing.join(", ")}. ` +
+        `Pair this vault again with an invite from another device, or with the vault's ` +
+        `recovery key.`,
     );
   }
   return { deviceId: config.deviceId, deviceSecret: config.deviceSecret, dataKey: config.dataKey };
@@ -502,9 +497,6 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
     ...(config.deviceSecret ? { deviceSecret: base64urlEncode(config.deviceSecret) } : {}),
     ...(config.dataKey ? { dataKey: base64urlEncode(config.dataKey) } : {}),
     ...(config.secret ? { secret: base64urlEncode(config.secret) } : {}),
-    ...(config.bootstrap ? { bootstrap: config.bootstrap } : {}),
-    ...(config.claimWrapped ? { claimWrapped: config.claimWrapped } : {}),
-    ...(config.wrapped ? { wrapped: config.wrapped } : {}),
   };
 }
 
@@ -516,12 +508,12 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
  * wrong. The vault would sync and decrypt nothing. `where` names the file, so
  * the error says which one.
  *
- * What is *not* refused here is a config that holds neither a root nor a
- * device credential, because the shape of a half-finished conversion is
- * exactly that: an id and a secret with no data key yet. Refusing it would
- * make the crash point it exists to survive unrecoverable. `deviceCredential`
- * is where an incomplete one is refused, at the moment something tries to
- * connect with it, and it says which half is missing.
+ * What is *not* refused here is a config that is incomplete in a way that is
+ * still readable: a root with no credential, or a credential missing a part.
+ * Refusing to decode those would be refusing to read the one thing worth
+ * reading out of them, which is the recovery key. `deviceCredential` is where
+ * an unusable config is refused, at the moment something tries to connect with
+ * it, and it says what is missing and what to do.
  */
 export function decodeConfig(raw: unknown, where: string): DeviceConfig {
   if (typeof raw !== "object" || raw === null)
@@ -532,7 +524,6 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     if (typeof value !== "string" || value === "") throw new Error(`${where} has no ${key}`);
     return value;
   };
-  const bootstrap = record["bootstrap"];
   const config: DeviceConfig = {
     url: str("url"),
     vaultId: str("vaultId"),
@@ -541,16 +532,13 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     ...key(record, "deviceSecret", DEVICE_SECRET_LENGTH, "a device secret", where),
     ...key(record, "dataKey", DATA_KEY_LENGTH, "a data key", where),
     ...key(record, "secret", SECRET_LENGTH, "a root secret", where),
-    ...(typeof bootstrap === "string" && bootstrap !== "" ? { bootstrap } : {}),
-    ...opaque(record, "claimWrapped", where),
-    ...opaque(record, "wrapped", where),
   };
   if (config.secret === undefined && config.deviceId === undefined) {
     // Neither credential, which is not a state anything here writes: a config
-    // that has begun converting has an id before it sends anything, and one
-    // that has not begun has the root. Rule 2, again: a file that cannot be
-    // read as a pairing is not an unpaired vault, and treating it as one
-    // would pair over it and replace the keys it was holding.
+    // is saved with the root while a vault is being started, and with a
+    // device id and its key once there is one. Rule 2, again: a file that
+    // cannot be read as a pairing is not an unpaired vault, and treating it
+    // as one would pair over it and replace the keys it was holding.
     throw new Error(
       `${where} holds neither the vault's recovery key nor this device's own credential, ` +
         `so there is nothing in it to connect with`,
@@ -599,28 +587,6 @@ function key(
     );
   }
   return { [field]: bytes };
-}
-
-/**
- * An opaque base64url blob the server stores and this device only ever compares
- * or repeats: absent, or present and of a shape something could have produced.
- *
- * Refused rather than dropped when it is the wrong type. Rule 2: a field that
- * cannot be read is not a field that is absent, and dropping either of these
- * silently would turn "refuse a wrapping that changed" back into "accept
- * whatever the server says", which is the check they exist for.
- */
-function opaque(
-  record: Record<string, unknown>,
-  key: string,
-  where: string,
-): Record<string, string> {
-  const value = record[key];
-  if (value === undefined || value === null) return {};
-  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) {
-    throw new Error(`${where} holds a ${key} that is not base64url, so it cannot be trusted`);
-  }
-  return { [key]: value };
 }
 
 /**

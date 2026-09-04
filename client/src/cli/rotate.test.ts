@@ -222,7 +222,7 @@ describe("what a rotation leaves on a device", () => {
   it("leaves this device's own credential exactly as it was", async () => {
     const { dir, key } = await started("pin");
     const before = (await loadConfig(dir))!;
-    expect(before.secret, "a converted device is holding the root").toBeUndefined();
+    expect(before.secret, "a paired device is holding the root").toBeUndefined();
     expect(before.deviceId).toBeDefined();
 
     expect((await cli("rotate", key, "--dir", dir)).code).toBe(0);

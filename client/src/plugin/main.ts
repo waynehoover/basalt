@@ -44,25 +44,21 @@ import {
   Client,
   Registrar,
   attentionLines,
-  convertToDevice,
-  isFatal,
   needsAttention,
-  needsConversion,
   rebaseCursors,
   redeemInvite,
-  retryWait,
+  registerAsDevice,
   refuseUnlessAhead,
   runForever,
   summarise,
   credentialsFor,
-  wrappedForClaim,
   type ClientOptions,
   type DeletedList,
   type DeviceRow,
   type InviteRow,
   type Version,
 } from "../core/client.ts";
-import { deriveRootKeys, generateSecret } from "../core/crypto.ts";
+import { generateSecret } from "../core/crypto.ts";
 import { REJOIN_ADVICE, type SyncReport } from "../core/engine.ts";
 import {
   decodeConfig,
@@ -76,7 +72,7 @@ import {
   type DeviceConfig,
   type Invite,
 } from "../core/pairing.ts";
-import { Backoff, ProtocolError } from "../core/transport.ts";
+import { ProtocolError } from "../core/transport.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
 /** What the status bar is saying, which is also what the modal shows. */
@@ -158,8 +154,9 @@ export default class BasaltPlugin extends Plugin {
    *
    * Rule 2: an unreadable config is not an unpaired vault. The panel used to
    * branch on `paired` alone and offer the pairing form over a file it could
-   * not read, and pairing writes a new root secret over the old one, after
-   * which nothing already on the server can be decrypted here.
+   * not read, and pairing writes new credentials over the old ones, after
+   * which the device row this vault already has is stranded and, if the string
+   * belonged to another vault, nothing on the server can be decrypted here.
    */
   private unreadable: string | undefined;
   /** Whether this pairing has ever completed a handshake since the plugin loaded. */
@@ -365,70 +362,31 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
-   * Finishes a conversion if one is owed, then runs the loop.
+   * Checks there is something to connect with, then runs the loop.
    *
-   * There is one credential now and no list of candidates to try. Protocol 3
-   * kept one here, because a device might have been holding a spent
-   * bootstrap, a rotation whose reply was lost, or the vault's root, and the
-   * connection was where it found out which. A converted device holds one
-   * credential for one row and either it opens the vault or nothing on this
-   * phone does.
+   * There is one credential and no list of candidates to try. Protocol 3 kept
+   * one here, because a device might have been holding a spent bootstrap, a
+   * rotation whose reply was lost, or the vault's root, and the connection was
+   * where it found out which. A paired device holds one credential for one row
+   * and either it opens the vault or nothing on this phone does.
    *
-   * The conversion in front of it is what replaced all of that, and it is the
-   * one thing here that can strand a device, so it is the one thing here with
-   * a crash test per step. It saves to `data.json` and reads back before each
-   * next step and drops the root last; see `convertToDevice`. A failure leaves
-   * the plugin stopped with the reason and whatever it got as far as saved, so
-   * the next load carries on rather than starting again.
-   *
-   * `this.config` is moved on with it. Without that, the run below would take
-   * the credential from a config object that still says root-only, and the
-   * panel would go on offering a recovery key this device no longer has.
+   * So the check in front of the loop is not a step that can be resumed, it is
+   * a refusal. A config that holds no credential is one a pairing left behind
+   * unfinished, and there is nothing this can do about it that a person cannot
+   * see: it stops with `deviceCredential`'s words, which name what is missing
+   * and, if the vault's root is still here, print the recovery key so the vault
+   * can be paired again rather than lost. Retrying it forever instead would sit
+   * there saying "connecting" about a connection nothing was going to make.
    */
   private async runLoop(config: DeviceConfig, mine: number): Promise<void> {
     const current = () => mine === this.generation;
-    let ready = config;
-    if (needsConversion(config)) {
-      // Retried like a connection, not given up on. A phone that starts a
-      // vault on a train converts on the first attempt that reaches the
-      // server, and stopping instead would leave it needing Obsidian
-      // restarted before it would even try. Only a refusal that will be the
-      // same every time stops it: a recovery key the vault does not know.
-      const backoff = new Backoff(0, 300_000, 5_000, true);
-      for (;;) {
-        if (!current()) return;
-        try {
-          ready = await convertToDevice(config, (next) => this.saveDuringRun(mine, next), {
-            log: (message, ...rest) => console.info("Basalt:", message, ...rest),
-          });
-          break;
-        } catch (err) {
-          if (!current()) return;
-          if (isFatal(err as Error)) {
-            this.stop(err as Error);
-            return;
-          }
-          backoff.fail();
-          const delay = retryWait(err as Error, backoff.delay());
-          this.setState({
-            kind: "offline",
-            why: (err as Error).message,
-            retryAt: Date.now() + delay,
-            // Never connected, so the origin advice applies: a server that
-            // refuses this origin looks exactly like one that is not there.
-            refused: !this.everConnected,
-          });
-          await new Promise((r) => setTimeout(r, delay));
-        }
-      }
-      if (!current()) return;
-      // Only if nothing has replaced or removed it meanwhile: an unlink during
-      // a slow conversion has already written `null` over this file, and
-      // putting the converted config back in memory would have the next start
-      // sync a vault somebody removed.
-      if (this.config === config) this.config = ready;
+    try {
+      deviceCredential(config);
+    } catch (err) {
+      if (current()) this.stop(err as Error);
+      return;
     }
-    const refusal = await this.runOnce(ready, mine);
+    const refusal = await this.runOnce(config, mine);
     if (!current() || refusal === undefined) return;
     this.stop(refusal);
   }
@@ -450,8 +408,8 @@ export default class BasaltPlugin extends Plugin {
         // Nothing to write back. A connection used to settle which of several
         // credentials had opened the vault, whether the first-run token was
         // spent and what the vault's wrapped data key was; all three are
-        // settled by the conversion in `runLoop`, before anything connects,
-        // and a connection now proves only what it says it proves.
+        // settled by the registration that made this device, before it ever
+        // connects, and a connection now proves only what it says it proves.
       },
       onDisconnected: (cause, retryIn) => {
         if (!current()) return;
@@ -781,7 +739,7 @@ export default class BasaltPlugin extends Plugin {
     if (this.unreadable !== undefined) {
       throw new Error(
         `the saved settings at ${this.dataPath} could not be read (${this.unreadable}), ` +
-          `and pairing over them would replace the root secret they hold. Fix or move that file, then reload the plugin.`,
+          `and pairing over them would replace the credential they hold. Fix or move that file, then reload the plugin.`,
       );
     }
     if (this.config) throw new Error("this vault is already paired");
@@ -816,11 +774,15 @@ export default class BasaltPlugin extends Plugin {
    * visible in the device list as a device that has never connected; the other
    * ordering strands this phone instead. See `redeemInvite`.
    *
-   * A **recovery key** is saved before anything is sent, and `start` is what
-   * converts. That order matters more there than anywhere: a phone that
-   * registered a row and then lost the secret for it would have burned one of
-   * the vault's eight slots and have no way to say which. `convertToDevice`
-   * holds the whole ordering and the crash points it survives.
+   * A **recovery key** buys a registrar session, which may register a device
+   * and may not sync, so that path is register-then-save and nothing is
+   * written until the row exists. The key was pasted in a moment ago, so there
+   * is nothing on this phone yet worth keeping and a key the vault does not
+   * know should leave it exactly as unpaired as it was found. The registration
+   * is *awaited*, so the server has answered before this reports a paired
+   * vault: a wrong address or a wrong key used to be saved and announced as
+   * paired, and the first sign of it was a status bar saying stopped, later
+   * (C39, I13). See `registerAsDevice`.
    */
   async pair(pairingString: string, device: string): Promise<void> {
     await this.onePairing(async () => {
@@ -828,48 +790,50 @@ export default class BasaltPlugin extends Plugin {
       if (isInvite(pairingString))
         return await this.pairWithInvite(parseInvite(pairingString), name);
       const pairing = parsePairing(pairingString);
-      const config: DeviceConfig = {
-        url: pairing.url,
-        vaultId: pairing.vaultId,
-        device: name,
-        secret: pairing.secret,
-      };
-      // Written and read back before the registration goes out, because a
-      // reply lost after the row commits leaves this device the only holder
-      // of that row's credential. Then the registration is *awaited*, so the
-      // server has answered before this reports a paired vault: a wrong
-      // address or a key the server does not know used to be saved and
-      // announced as paired, and the first sign of it was a status bar saying
-      // stopped, later (C39, I13).
-      await this.saveVerified(config);
+      const mine = this.generation;
       let registered = false;
-      let converted: DeviceConfig;
+      let paired: DeviceConfig;
       try {
-        converted = await convertToDevice(config, (next) => this.saveVerified(next), {
-          onRegistered: () => {
-            registered = true;
+        paired = await registerAsDevice(
+          {
+            url: pairing.url,
+            vaultId: pairing.vaultId,
+            device: name,
+            secret: pairing.secret,
           },
-          log: (message, ...rest) => console.info("Basalt:", message, ...rest),
-        });
+          (next) => this.saveDuringRun(mine, next),
+          {
+            onRegistered: () => {
+              registered = true;
+            },
+            log: (message, ...rest) => console.info("Basalt:", message, ...rest),
+          },
+        );
       } catch (err) {
-        if (!registered) {
-          // Nothing on the server knows about this device, so nothing here
-          // should either: the vault is left exactly as unpaired as it was
-          // found, and the pairing form is still the thing on screen.
-          await this.saveData(null).catch(() => undefined);
-          throw err;
+        if (!registered) throw err;
+        // Registered, and then two different states, told apart by what
+        // reached the disk rather than by which step threw (rule 4).
+        this.config = await this.readConfig().catch(() => undefined);
+        if (this.config) {
+          // The row is real and this phone holds the only copy of its
+          // credential, so what was written stays and the panel says as much
+          // rather than looking unpaired.
+          this.start();
+          throw new Error(
+            `${(err as Error).message}. This device is registered with the vault; ` +
+              `Basalt will connect as it on the next attempt.`,
+          );
         }
-        // The row is real and this device holds the only copy of its
-        // credential, so what was written stays and the next start finishes
-        // it. The panel says as much rather than looking unpaired.
-        this.config = (await this.readConfig()) ?? config;
-        this.start();
+        // The row is real and nothing holds the key to it, which is the same
+        // orphan a lost invite reply leaves, and goes the same way.
         throw new Error(
-          `${(err as Error).message}. This device is registered with the vault and Basalt will ` +
-            `finish adding it on the next connection.`,
+          `${(err as Error).message}. A device row was registered with the vault and its ` +
+            `credential could not be saved here, so the row is one nothing can connect as: ` +
+            `it shows in the device list as never connected, and can be revoked there. ` +
+            `Then pair again.`,
         );
       }
-      this.config = converted;
+      this.config = paired;
       this.start();
     });
   }
@@ -878,8 +842,7 @@ export default class BasaltPlugin extends Plugin {
    * The invite half of pairing: redeem, save, start.
    *
    * The redemption is the registration, so what comes back is a finished
-   * device and there is no conversion left to run: this config never holds a
-   * root, and `needsConversion` is false for it from the first save.
+   * device: this config never holds a root, at any point.
    *
    * Saved and read back before the run starts, because at the moment the reply
    * lands the only copy of the data key on this phone is in memory and the
@@ -909,35 +872,59 @@ export default class BasaltPlugin extends Plugin {
    * had to be split by hand and nothing said so. Every device now pastes one
    * thing; only the thing differs.
    *
-   * Saved before connecting, because here the handshake is the claim: the
-   * server binds the vault to this device's key the moment it says hello, and
-   * a root secret that had claimed a server without being written down first
-   * is a vault nobody can ever open. So the secret is on disk before the
-   * server hears of it.
+   * The root is saved before anything is sent, because here the handshake is
+   * the claim: the server binds the vault to this device's key the moment it
+   * says hello, and a root secret that had claimed a server without being
+   * written down first is a vault nobody can ever open. That save is the only
+   * reason a config here ever holds a root, and the registration below
+   * replaces it with this device's own credential.
+   *
+   * The claim and the registration are awaited rather than left to `start`,
+   * so what comes back is a phone that has joined the vault or an error
+   * saying it has not. If the claim went through and the registration did not,
+   * the root is still on disk and every screen from here on prints the
+   * recovery key out of it: the vault is recoverable by pairing again with
+   * that key, which is what the words say.
    *
    * The recovery key is returned for the panel to show once, and this is the
-   * only moment it exists anywhere: `start` converts, which drops the root
-   * from this device on purpose, and nothing here can print it again.
+   * only moment it exists anywhere: a paired device does not keep the root, on
+   * purpose, and nothing here can print it again.
    */
   async pairFirst(setup: string, device: string): Promise<string> {
     return this.onePairing(async () => {
       const { url, token } = parseSetup(setup);
       const secret = generateSecret();
-      const config: DeviceConfig = {
-        url,
-        vaultId: "default",
-        device: deviceName(device),
-        secret,
-        bootstrap: token,
-        // The vault's data key, made here and once, so a claim retried after a
-        // lost reply offers the key it offered before rather than a second
-        // candidate. See DeviceConfig.
-        claimWrapped: await wrappedForClaim(await deriveRootKeys(secret)),
-      };
-      await this.saveVerified(config);
-      this.config = config;
+      const name = deviceName(device);
+      const starting: DeviceConfig = { url, vaultId: "default", device: name, secret };
+      await this.saveVerified(starting);
+      this.config = starting;
+      const recoveryKey = formatPairing({ url, vaultId: "default", secret });
+
+      const mine = this.generation;
+      try {
+        this.config = await registerAsDevice(
+          { url, vaultId: "default", device: name, secret, bootstrap: token },
+          (next) => this.saveDuringRun(mine, next),
+          { log: (message, ...rest) => console.info("Basalt:", message, ...rest) },
+        );
+      } catch (err) {
+        // The config stays, whatever it now holds. If it is still the root,
+        // the claim may have committed with its reply lost and throwing it
+        // away is a vault nothing will ever open again; `start` stops on it
+        // and puts the recovery key on the panel, which is somewhere it can be
+        // read from rather than a notice that goes. If the registration got as
+        // far as saving a credential, that is what is on disk and `start`
+        // connects with it. Read back rather than assumed (rule 4).
+        this.config = (await this.readConfig().catch(() => undefined)) ?? starting;
+        this.start();
+        throw new Error(
+          `the vault was started but this device could not register itself with it: ` +
+            `${(err as Error).message}. Write the recovery key shown in the Basalt panel down ` +
+            `now, then unlink this vault and pair again with it.`,
+        );
+      }
       this.start();
-      return formatPairing({ url, vaultId: "default", secret });
+      return recoveryKey;
     });
   }
 
@@ -1381,15 +1368,16 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
-   * A config write made by a run, which `unlink` can wait for and a retired
-   * run cannot make.
+   * A config write made while something long-running is in flight, which
+   * `unlink` can wait for and a retired run cannot make.
    *
    * R10, in the shape protocol 4 gives it. The write that used to be in flight
-   * past a generation check was the settle that dropped a spent bootstrap;
-   * now it is one of the conversion's three saves, and the hazard is the same:
-   * unlinking writes `null` over the pairing, and a save that lands after it
-   * puts the pairing back, so memory says unpaired, the file says paired, and
-   * the next start syncs a vault the person removed.
+   * past a generation check was the settle that dropped a spent bootstrap; now
+   * it is the save that records this device's own credential, made in the
+   * middle of a registration that has already reached the server. The hazard
+   * is the same: unlinking writes `null` over the pairing, and a save that
+   * lands after it puts the pairing back, so memory says unpaired, the file
+   * says paired, and the next start syncs a vault the person removed.
    *
    * Two halves, because either alone leaves a window. The write is registered
    * where `unlink` waits for it, and it refuses outright once its run has been
@@ -1398,7 +1386,7 @@ export default class BasaltPlugin extends Plugin {
   private saveDuringRun(mine: number, config: DeviceConfig): Promise<void> {
     if (mine !== this.generation) {
       // Not an error to report: this run has been replaced or unlinked, and
-      // the conversion it belongs to should stop rather than finish writing.
+      // what it belongs to should stop rather than finish writing.
       return Promise.reject(new Error("this vault is no longer paired"));
     }
     const saving = this.saveVerified(config);
@@ -1411,10 +1399,10 @@ export default class BasaltPlugin extends Plugin {
    * Writes the pairing and reads it back before believing it.
    *
    * Rule 4: verify the outcome, not the exit code. The one write that cannot
-   * afford to be taken on trust is the rotation's staged secret, because the
-   * request that makes it the vault's only credential goes out on the strength
-   * of it. `decodeConfig` refuses a half-written rotation, so a torn write is
-   * caught here rather than on the next start.
+   * afford to be taken on trust is the root a vault being started is saved
+   * with, because the claim that binds the server to it goes out on the
+   * strength of it. `decodeConfig` refuses a half-written config, so a torn
+   * write is caught here rather than on the next start.
    */
   private async saveVerified(config: DeviceConfig): Promise<void> {
     const record = encodeConfig(config);
@@ -2161,7 +2149,7 @@ class BasaltModal extends Modal {
     contentEl.createEl("p", {
       text:
         `The saved settings are in ${this.plugin.dataPath}. Pairing again would replace the ` +
-        `root secret they hold, so nothing here will do that. Fix or move the file, then reload the plugin.`,
+        `credential they hold, so nothing here will do that. Fix or move the file, then reload the plugin.`,
     });
   }
 

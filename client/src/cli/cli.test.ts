@@ -117,7 +117,7 @@ async function twoDevices(): Promise<{ a: string; b: string; recoveryKey: string
  * Starts a vault and returns the directory and the recovery key.
  *
  * The key comes from `init`, because that is the only time it exists: a
- * converted device holds its own credential and not the vault's root, so
+ * paired device holds its own credential and not the vault's root, so
  * nothing reprints it. Tests that need a second device keep it the way a
  * person is told to, by writing it down.
  */
@@ -533,14 +533,16 @@ describe("status", () => {
    */
   /**
    * Rule 7, and the third state this field has to keep apart from the other
-   * two. A device that has not registered itself with the vault has asked
-   * nothing of the server, so it is neither reachable nor refused, and
-   * reporting either would be a status about a connection that was never made.
+   * two. A device with no credential has asked nothing of the server, so it is
+   * neither reachable nor refused, and reporting either would be a status
+   * about a connection that was never made. "Not authorised" in particular
+   * sends somebody hunting a server problem that is not there.
    */
-  it("says a device has not registered itself, rather than blaming the server", async () => {
+  it("says a device never registered itself, rather than blaming the server", async () => {
     await fresh();
     const { dir, recoveryKey } = await startedWithKey();
-    // A protocol 3 shaped config: the root, and no row of its own.
+    // What a vault started here and never joined leaves: the root, and no row
+    // of its own.
     const { parsePairing } = await import("../core/pairing.ts");
     const { saveConfig, loadConfig } = await import("./config.ts");
     const held = (await loadConfig(dir))!;
@@ -556,11 +558,41 @@ describe("status", () => {
     const answer = s.json()["server"] as Record<string, unknown>;
     expect(answer["reachable"], s.all).toBe(false);
     expect(answer["refused"], s.all).toBe(false);
-    expect(String(answer["error"])).toMatch(/has not registered itself/);
+    expect(String(answer["error"])).toMatch(/never registered itself/);
+    expect(String(answer["error"]), "the refusal did not hand the key back").toContain(recoveryKey);
 
-    // And a sync finishes it, without anybody being told to do anything.
-    expect((await cli("sync", "--dir", dir)).code).toBe(0);
-    expect((await cli("status", "--dir", dir, "--json")).code).toBe(0);
+    // And it says the same thing in words, with the way out named.
+    const human = await cli("status", "--dir", dir);
+    expect(human.all).toMatch(/unlink this vault and pair again/);
+    expect(human.all, "an unregistered device was reported as an outage").not.toMatch(
+      /cannot reach the server/,
+    );
+  }, 60_000);
+
+  /**
+   * The other half, and the one the words have to get right: a config with
+   * neither a root nor a credential is nothing this client can finish, so it
+   * says how to pair rather than how to retry.
+   */
+  it("tells a device with no credential at all to pair again", async () => {
+    await fresh();
+    const { dir } = await startedWithKey();
+    const { saveConfig, loadConfig } = await import("./config.ts");
+    const held = (await loadConfig(dir))!;
+    // A credential half written: an id and nothing to prove it with. Nothing
+    // writes this, and a config that predates this version can hold it.
+    await saveConfig(dir, {
+      url: held.url,
+      vaultId: held.vaultId,
+      device: held.device,
+      deviceId: held.deviceId!,
+    });
+
+    const sync = await cli("sync", "--dir", dir);
+    expect(sync.code, sync.all).toBe(1);
+    expect(sync.all).toMatch(/no credential for the vault/);
+    expect(sync.all).toMatch(/a device secret, the vault's data key/);
+    expect(sync.all).toMatch(/invite from another device/);
   }, 60_000);
 
   it("tells a refusal apart from an outage (N3)", async () => {
@@ -834,9 +866,12 @@ describe("one secret", () => {
     );
     await cli("sync", "--dir", a);
 
-    // Somebody else with the printed token and a secret of their own.
+    // Somebody else with the printed token and a secret of their own. The
+    // claim is where it is refused now, because init claims and registers
+    // before it reports anything, rather than writing a config and finding
+    // out later.
     const intruder = await vaultDir("intruder");
-    await cli(
+    const claim = await cli(
       "init",
       "--dir",
       intruder,
@@ -846,11 +881,14 @@ describe("one secret", () => {
       server.token,
       "--device",
       "intruder",
-      "--json",
     );
+    expect(claim.code, `the spent bootstrap still worked: ${claim.all}`).toBe(1);
+    expect(claim.all).toMatch(/auth|not authorised/i);
+    // And nothing it left behind syncs either: a secret the vault was never
+    // bound to is not a credential, whatever else is on this disk.
     const attempt = await cli("sync", "--dir", intruder);
-    expect(attempt.code, `the spent bootstrap still worked: ${attempt.all}`).toBe(1);
-    expect(attempt.all).toMatch(/auth|not authorised/i);
+    expect(attempt.code, attempt.all).toBe(1);
+    expect(attempt.all).toMatch(/never registered itself/);
   }, 300_000);
 });
 

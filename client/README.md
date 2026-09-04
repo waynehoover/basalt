@@ -12,7 +12,7 @@ dependencies, Node 22 or newer.
 ```bash
 npm install -g basalt-sync
 cd ~/vault
-basalt pair basalt3_...        # the vault's recovery key, written down when it was started
+basalt pair basalt3i_...       # an invite, from basalt invite on a device that has the vault
 basalt sync --watch
 ```
 
@@ -42,11 +42,13 @@ purpose: it is written down and offline, and adding a phone should not mean
 going to get it. Either way the new device keeps neither the invite nor the
 key, only a credential of its own.
 
-A vault paired before protocol 4 converts itself the first time any command
-connects: it registers a device row with the root it is holding, reads the row
-back by using it, and only then drops the root. Nothing to do. If it is
-interrupted the next command carries on from where it stopped, and it never
-registers a second row for the same device.
+A config holding the vault's recovery key and no device credential is not a
+device this client can use, and every command refuses it rather than guessing.
+That is what `basalt init` leaves if the vault is claimed and the registration
+after it does not finish. The refusal prints the recovery key out of the
+config, because that copy may be the only one, and names the way back: `basalt
+unlink`, then `basalt pair` with that key. `basalt status` reports such a vault
+as neither reachable nor refused, since nothing was asked of the server.
 
 ### Commands
 
@@ -174,8 +176,15 @@ to make a divergence visible.
 ### State
 
 Everything lives in `.basalt/` inside the vault, which is never synced:
-`config.json` holds the pairing and the root secret, mode 0600, and
-`index.json` plus `index.log` are what this device knows about every path.
+`config.json` holds the pairing, mode 0600, and `index.json` plus `index.log`
+are what this device knows about every path. What is in `config.json` is this
+device's id, the secret it connects with, and the vault's data key. The root
+secret is not, which is what makes `basalt revoke` mean something: a device
+that still had it could re-derive the vault's credential and register itself
+again. It is written there only while `basalt init` is starting a vault, since
+a secret that claimed a server without reaching the disk first is a vault
+nobody can open, and it is replaced by this device's own credential the moment
+there is one.
 The index is a snapshot and a journal of what has changed since, so an
 ordinary pass appends a few hundred bytes rather than rewriting the whole
 file; the log is folded back in when it has grown against the snapshot.

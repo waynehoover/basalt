@@ -332,7 +332,7 @@ export interface EngineOptions {
    * Held directly rather than unwrapped from what `ready` returns, because
    * the key that would unwrap it comes from the root secret and a registered
    * device does not have one. It was handed over once, at registration, by
-   * the session that did; see `convertToDevice` in client.ts.
+   * the session that did; see `registerAsDevice` in client.ts.
    *
    * The schedule is still derived in `start` rather than in the constructor,
    * so there is one moment the keys become known and no window in which

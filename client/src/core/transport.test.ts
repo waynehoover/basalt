@@ -293,7 +293,7 @@ describe("the handshake", () => {
    * the wire tells that from the real blob, so what tells it is having seen the
    * real blob before.
    */
-  it("reports the wrapped key ready carries, which a converted device does not use", async () => {
+  it("reports the wrapped key ready carries, which a paired device does not use", async () => {
     // Carried and reported, and nothing here derives a key from it: a device
     // holds the data key itself, handed over when it was registered by the
     // session that could unwrap this. What the field is still good for is the

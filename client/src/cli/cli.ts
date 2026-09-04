@@ -24,26 +24,26 @@
 import { hostname } from "node:os";
 import { resolve } from "node:path";
 
-import { deriveRootKeys, generateSecret, randomBytes } from "../core/crypto.ts";
+import { generateSecret, randomBytes } from "../core/crypto.ts";
 import {
   Client,
   Registrar,
   attentionLines,
-  convertToDevice,
   credentialsFor,
   needsAttention,
-  needsConversion,
   rebaseCursors,
   redeemInvite,
   refuseUnlessAhead,
+  registerAsDevice,
   runForever,
-  wrappedForClaim,
   type ClientOptions,
   type DeviceRow,
   type InviteRow,
+  type JoiningVault,
 } from "../core/client.ts";
 import { REJOIN_ADVICE, type SyncReport } from "../core/engine.ts";
 import {
+  NoCredential,
   deviceCredential,
   formatPairing,
   isInvite,
@@ -149,17 +149,6 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
   try {
     refuseExtras(args);
     refuseRecoveryKey(args);
-    // Before anything else, and once per device in a vault's life: a config
-    // that still holds the vault's root has not registered itself with the
-    // server yet, and under protocol 4 there is nothing it can do until it
-    // has. It takes and releases the lock on its own, so the commands below
-    // that take the lock are not nesting one inside another.
-    //
-    // `status` is not on the list and asks for itself, inside its own
-    // try: it is the command somebody runs when nothing else works, and a
-    // conversion that cannot reach the server must not stop it printing what
-    // this device knows locally.
-    if (CONVERTS_FIRST.has(args.command)) await convertIfNeeded(args, io);
     // Anything that changes the vault, its config or its index takes the
     // vault's lock for as long as it runs. Reading commands do not: they
     // load the index once and talk to the server, and holding a lock for
@@ -282,71 +271,6 @@ function refuseExtras(args: Args): void {
 }
 
 /* ---------------------------------------------------------------- *
- * Becoming a device
- * ---------------------------------------------------------------- */
-
-/**
- * The commands that need a device credential, and so finish a conversion
- * before they run.
- *
- * Everything that talks to the server as this vault. `init` and `pair` are not
- * here because they make the config and convert it themselves; `unlink` is not
- * because forgetting a pairing must work when the server does not; `rotate`
- * carries the recovery key on the command line and does not need the device's
- * own credential at all, but it does need the data key, so it converts too.
- */
-const CONVERTS_FIRST = new Set([
-  "sync",
-  "deleted",
-  "history",
-  "restore",
-  "rebase",
-  "devices",
-  "revoke",
-  "rotate",
-  "invite",
-  "uninvite",
-]);
-
-/**
- * Finishes a conversion that has not finished, under the vault's lock.
- *
- * A protocol 3 device holds the vault's root and no device row, and every
- * device converts itself once, silently. That is the alternative to telling
- * somebody to pair a laptop, a phone, a desktop and a NAS again, which is the
- * weekend this feature exists to abolish.
- *
- * Under the lock, because it writes the config three times and a second
- * basalt converting the same vault at the same moment would register two rows
- * and leave one of them holding a credential nothing on disk remembers.
- */
-async function convertIfNeeded(args: Args, io: Console): Promise<void> {
-  const config = await loadConfig(args.dir);
-  // Not paired at all is the command's own business to report, and it says
-  // so in words this could not improve on.
-  if (!config || !needsConversion(config)) return;
-  await locked(args, async () => {
-    // Read again with the lock held. Another basalt may have converted this
-    // vault between the check above and the lock, and converting a second
-    // time would register a second row for one device.
-    const held = await loadConfig(args.dir);
-    if (!held || !needsConversion(held)) return 0;
-    await convertToDevice(
-      held,
-      async (next) => {
-        await saveConfig(args.dir, next);
-        await mustReadBack(args.dir, next);
-      },
-      {
-        timeoutMs: args.timeout,
-        ...(args.verbose ? { log: (m: string) => io.err(`  ${m}`) } : {}),
-      },
-    );
-    return 0;
-  });
-}
-
-/* ---------------------------------------------------------------- *
  * Commands
  * ---------------------------------------------------------------- */
 
@@ -380,61 +304,61 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   await refuseIfPaired(args.dir);
 
   const secret = generateSecret();
-  const config: Config = {
-    url: normaliseUrl(server),
-    vaultId: args.vaultId,
-    device: deviceNameFor(args),
-    secret,
-    // The server's first-run token, kept only until this device has claimed
-    // the vault with it. The claim travels on the registrar hello that then
-    // registers this device's own row, so both are spent by the conversion
-    // below and neither survives it.
-    bootstrap: token,
-    // The vault's data key, made here and once. It is written down before the
-    // claim goes out for the same reason the root is: a claim that commits
-    // with its reply lost must be retried with the key it already offered,
-    // not with a second candidate.
-    claimWrapped: await wrappedForClaim(await deriveRootKeys(secret)),
-  };
-  await saveConfig(args.dir, config);
-  // Read back before the claim. The claim binds the server to the key this
-  // secret derives, for good, so the secret has to be provably on disk
-  // first: not written, not renamed, but readable and decoding to itself.
-  await mustReadBack(args.dir, config);
+  const url = normaliseUrl(server);
+  const device = deviceNameFor(args);
+  // The root, on disk before the claim goes out, and this is the only reason
+  // it is ever written here. The claim binds the server to the key this secret
+  // derives, for good, so a secret that claimed a server without reaching the
+  // disk first is a vault nobody can ever open. Read back rather than trusted:
+  // not written, not renamed, but readable and decoding to itself.
+  const starting: Config = { url, vaultId: args.vaultId, device, secret };
+  await saveConfig(args.dir, starting);
+  await mustReadBack(args.dir, starting);
 
   // The recovery key, worked out before anything is sent and printed after.
-  // This is the only moment it exists anywhere: the conversion below drops the
-  // root from this device on purpose, so if this string is not written down
-  // now there is no command that can print it again.
-  const recoveryKey = formatPairing({ url: config.url, vaultId: config.vaultId, secret });
+  // This is the only moment it exists anywhere: registering below replaces the
+  // root on disk with this device's own credential on purpose, so if this
+  // string is not written down now there is no command that can print it again.
+  const recoveryKey = formatPairing({ url, vaultId: args.vaultId, secret });
 
-  // Claim the vault, register this device's row, and drop the root, all now,
-  // rather than leaving any of it to whenever this device first syncs.
+  // Claim the vault and register this device's row now, rather than leaving
+  // either to whenever this device first syncs.
   //
   // init used to write a config and contact nothing, so it reported a paired
   // vault that the server had never heard of. A second device pairing and
   // syncing before this one ever did was refused with "not authorised for
   // this vault": true, unhelpful, and indistinguishable from a bad key.
   //
-  // The config is kept if this throws. The claim may have committed with the
-  // reply lost, and a config discarded in that case is a vault that nothing
-  // will ever open again: the secret in it is the only copy on this machine,
-  // and the next command finishes what this one started.
+  // The config is kept if this throws, root and all. The claim may have
+  // committed with the reply lost, and a config discarded in that case is a
+  // vault that nothing will ever open again: the secret in it is the only copy
+  // on this machine. Every command from here on refuses it and prints the key
+  // back out, which is what "pair again with it" needs to be possible.
   try {
-    await convert(config, args, io);
+    await joinVault({ url, vaultId: args.vaultId, device, secret, bootstrap: token }, args, io);
   } catch (err) {
-    io.err("basalt: the vault was started but this device could not finish registering itself:");
+    // What to do next is read off the disk rather than off which step threw
+    // (rule 4). A config that has a credential is a device that registered and
+    // whose confirming connection did not happen, and syncing finishes that.
+    // One that still holds the root has nothing here to connect with, whether
+    // or not a row was registered, and the way back is the key printed above.
+    const held = await loadConfig(args.dir).catch(() => undefined);
+    io.err("basalt: the vault was started but this device could not register itself with it:");
     io.err(`  ${(err as Error).message}`);
     io.err("Write this recovery key down now, before anything else:");
     io.err(`  ${recoveryKey}`);
-    io.err("Then run basalt sync here, which finishes the registration.");
+    io.err(
+      held?.deviceId !== undefined
+        ? "This device is registered with the vault; run basalt sync here to finish."
+        : "Then run basalt unlink here, and basalt pair with that key.",
+    );
     return 1;
   }
 
   if (args.json) {
-    io.out(JSON.stringify({ ok: true, paired: args.dir, device: config.device, recoveryKey }));
+    io.out(JSON.stringify({ ok: true, paired: args.dir, device, recoveryKey }));
   } else {
-    io.out(`Started the vault. ${args.dir} is paired as "${config.device}".`);
+    io.out(`Started the vault. ${args.dir} is paired as "${device}".`);
     io.out("");
     io.out("This is the vault's recovery key. Write it down and keep it offline:");
     io.out("");
@@ -449,18 +373,18 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   return 0;
 }
 
-/** Converts a config in place, saving durably and reading back at each step. */
-async function convert(
-  config: Config,
+/** Registers this device with a vault it holds the root of, saving durably and reading back. */
+async function joinVault(
+  joining: JoiningVault,
   args: Args,
   io: Console,
   onRegistered?: () => void,
 ): Promise<Config> {
-  return convertToDevice(
-    config,
-    async (next) => {
-      await saveConfig(args.dir, next);
-      await mustReadBack(args.dir, next);
+  return registerAsDevice(
+    joining,
+    async (device) => {
+      await saveConfig(args.dir, device);
+      await mustReadBack(args.dir, device);
     },
     {
       timeoutMs: args.timeout,
@@ -489,10 +413,12 @@ function deviceNameFor(args: Args): string {
 /**
  * Refuses to pair a vault that is paired, or that still holds an index.
  *
- * Re-pairing over a paired vault would replace the root secret, and every
- * note already on the server would become undecryptable here. An index with
- * no config beside it is an unlink that did not finish, and pairing over it
- * would load an index describing another secret's sync.
+ * Re-pairing over a paired vault would replace this device's credential and
+ * the data key it holds, and if the new string is for another vault every note
+ * already on the server becomes undecryptable here. It also strands the row
+ * this device already has, which nothing left on this machine can then revoke.
+ * An index with no config beside it is an unlink that did not finish, and
+ * pairing over it would load an index describing another vault's sync.
  */
 async function refuseIfPaired(dir: string): Promise<void> {
   if (await loadConfig(dir)) {
@@ -526,10 +452,12 @@ async function refuseIfPaired(dir: string): Promise<void> {
  *
  * A **recovery key** buys a registrar session: it may register a device and
  * rewrap the vault's secret, and it may not sync. So that path is
- * register-then-connect, the config is written before the registration goes
- * out and read back, and a crash between the two leaves a device that
- * registers the same id with the same key again and carries on. See
- * `convertToDevice`.
+ * register-then-save, and nothing is written until the row exists: the key was
+ * pasted in a moment ago, so there is nothing on this disk yet worth keeping
+ * and a key that turns out to be wrong should leave the vault exactly as
+ * unpaired as it found it (C39). A crash between the registration and the save
+ * leaves the same orphan row the invite path leaves, and the same way to see
+ * and remove it. See `registerAsDevice`.
  */
 async function cmdPair(args: Args, io: Console): Promise<number> {
   const given = args.rest[0];
@@ -538,34 +466,38 @@ async function cmdPair(args: Args, io: Console): Promise<number> {
   if (isInvite(given)) return await pairWithInvite(parseInvite(given), args, io);
 
   const pairing = parsePairing(given);
-  const config: Config = {
+  const joining: JoiningVault = {
     url: pairing.url,
     vaultId: pairing.vaultId,
     device: deviceNameFor(args),
     secret: pairing.secret,
   };
-  await saveConfig(args.dir, config);
-  await mustReadBack(args.dir, config);
-  let converted: Config;
+  let paired: Config;
   let registered = false;
   try {
-    converted = await convert(config, args, io, () => {
+    paired = await joinVault(joining, args, io, () => {
       registered = true;
     });
   } catch (err) {
-    if (!registered) {
-      // Nothing on the server knows about this device, so nothing here should
-      // either: a recovery key that turns out to be wrong, or a server that is
-      // not there, must leave the vault exactly as unpaired as it found it
-      // (C39). Otherwise the next attempt is refused for being already paired.
-      await removeState(args.dir).catch(() => undefined);
-      throw err;
+    if (!registered) throw err;
+    // Registered, and then two different states, told apart by what reached
+    // the disk rather than by which step threw (rule 4).
+    const held = await loadConfig(args.dir).catch(() => undefined);
+    if (held?.deviceId !== undefined) {
+      // The row is real and this device holds the only copy of its
+      // credential, so what was written stays and syncing finishes it.
+      throw new Error(
+        `${(err as Error).message}. This device is registered with the vault and ${args.dir} ` +
+          `holds its credential; run basalt sync here to finish, or basalt unlink to start again.`,
+      );
     }
-    // The row is real and this device holds the only copy of its credential,
-    // so the config stays and the next command finishes what this started.
+    // The row is real and nothing holds the key to it, which is the same
+    // orphan an invite leaves when its reply is lost, and goes the same way.
     throw new Error(
-      `${(err as Error).message}. This device is registered with the vault and ${args.dir} holds ` +
-        `its credential; run basalt sync here to finish, or basalt unlink to start again.`,
+      `${(err as Error).message}. A device row was registered with the vault and its credential ` +
+        `could not be written down here, so the row is one nothing can connect as: basalt ` +
+        `devices on another device shows it as never connected, and basalt revoke removes it. ` +
+        `Then pair again.`,
     );
   }
 
@@ -574,16 +506,16 @@ async function cmdPair(args: Args, io: Console): Promise<number> {
       JSON.stringify({
         ok: true,
         paired: args.dir,
-        device: converted.device,
-        deviceId: converted.deviceId,
-        url: converted.url,
+        device: paired.device,
+        deviceId: paired.deviceId,
+        url: paired.url,
       }),
     );
   } else {
-    io.out(`Paired ${args.dir} with ${converted.url} as "${converted.device}". Run basalt sync.`);
+    io.out(`Paired ${args.dir} with ${paired.url} as "${paired.device}". Run basalt sync.`);
     io.out(
       `This device has its own credential now, and not the recovery key: ` +
-        `basalt revoke ${converted.deviceId} on any device stops it connecting.`,
+        `basalt revoke ${paired.deviceId} on any device stops it connecting.`,
     );
   }
   return 0;
@@ -592,9 +524,8 @@ async function cmdPair(args: Args, io: Console): Promise<number> {
 /**
  * Pairs with an invite: redeem, save, connect.
  *
- * The redemption is the registration, so what comes back is a finished device
- * and there is no conversion to run afterwards: this config never holds a root
- * and `needsConversion` is false for it from the first save.
+ * The redemption is the registration, so what comes back is a finished device:
+ * this config never holds a root, at any point.
  *
  * Saved and read back before the connection is made, because at the moment the
  * reply lands the only copy of the data key on this machine is in this
@@ -679,7 +610,8 @@ async function cmdInvite(args: Args, io: Console): Promise<number> {
 /**
  * Proves the config is on disk and decodes to itself before anything relies
  * on it. Not written, not renamed, but readable: what is in it is the only
- * copy this device has, at every step of a conversion.
+ * copy this device has, whether that is a vault's root before its claim or a
+ * device's credential after its registration.
  */
 async function mustReadBack(dir: string, config: Config): Promise<void> {
   const back = await loadConfig(dir);
@@ -689,10 +621,10 @@ async function mustReadBack(dir: string, config: Config): Promise<void> {
   const same = (a: Uint8Array | undefined, b: Uint8Array | undefined) =>
     a === undefined ? b === undefined : b !== undefined && Buffer.compare(a, b) === 0;
   // Every key, by name, because each of the three is the only copy of itself
-  // at some point in a conversion and a read-back that checked one of them
-  // would pass over the write that lost another. `deviceId` too: a device
-  // secret that landed under a different id is a credential for a row that is
-  // not this device's.
+  // in one of the two states a config is written in, and a read-back that
+  // checked one of them would pass over the write that lost another.
+  // `deviceId` too: a device secret that landed under a different id is a
+  // credential for a row that is not this device's.
   if (
     !same(back.secret, config.secret) ||
     !same(back.deviceSecret, config.deviceSecret) ||
@@ -1308,19 +1240,13 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
     behind?: number;
     error?: string;
   };
+  // The third state, kept out of the JSON because the two booleans there
+  // already say it: nothing was asked, so neither reachable nor refused. It is
+  // here because the line printed for a person cannot be the same one, and
+  // "cannot reach the server" about a connection nobody attempted is the
+  // sentence that sends somebody to go and look at the server.
+  let unjoined = false;
   try {
-    if (needsConversion(config)) {
-      // Said rather than attempted. Converting writes the config three times
-      // and so needs the vault's lock, and `status` deliberately holds no
-      // lock: it is the command somebody runs while a watcher is running, and
-      // one that refused then would refuse exactly when it is asked. So this
-      // reports the state instead of guessing at the server, which is what it
-      // would be doing: an unconverted device cannot reach one.
-      throw new Unconverted(
-        "this device has not registered itself with the vault yet. Run basalt sync here, " +
-          "which finishes it.",
-      );
-    }
     // The handshake and nothing after it. What is printed below is the
     // server's own cursor out of `ready`, and waiting for the backlog first
     // meant a device weeks behind unsealed all of it before saying a word.
@@ -1338,10 +1264,13 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   } catch (err) {
     // Only the transport failing means the server was not reached. Everything
     // else got an answer out of it: an `auth` refusal, or the cursor check
-    // against a server that has lost history. A device that has not converted
-    // asked nothing, so it is neither reachable nor refused: rule 7, and
-    // exactly the pair of states this field exists to keep apart.
-    const answered = !(err instanceof ConnectionError) && !(err instanceof Unconverted);
+    // against a server that has lost history. A device with no credential
+    // asked nothing of anybody, so it is neither reachable nor refused: rule
+    // 7, and exactly the pair of states this field exists to keep apart. It
+    // is also the one this command must not turn into "not authorised", which
+    // sends somebody looking for a server problem that is not there.
+    const answered = !(err instanceof ConnectionError) && !(err instanceof NoCredential);
+    unjoined = err instanceof NoCredential;
     server = { reachable: answered, refused: answered, error: (err as Error).message };
   }
 
@@ -1363,6 +1292,10 @@ async function cmdStatus(args: Args, io: Console): Promise<number> {
   io.out(`local cursor   ${local.cursor}`);
   if (server.cursor !== undefined) io.out(`server cursor  ${server.cursor}`);
   if (local.pending > 0) io.out(`pending  ${local.pending} files with work outstanding`);
+  if (unjoined) {
+    io.out(`state    nothing to connect with: ${server.error}`);
+    return 1;
+  }
   if (server.refused) {
     io.out(`state    the server is up and refused this device: ${server.error}`);
     return 1;
@@ -1613,12 +1546,12 @@ interface ConnectHow {
  * There is one credential now and no candidates to try. Protocol 3 kept a list
  * here, because a device might have been holding a spent bootstrap, a rotation
  * whose reply was lost, or the root, and the connection was where it found out
- * which. A converted device has exactly one credential and either it opens the
+ * which. A paired device has exactly one credential and either it opens the
  * vault or it does not, and no other credential on this disk would.
  *
  * Nothing is written back either. What a connection used to prove, and this
- * file used to record, is settled by `convertToDevice` before any command
- * connects.
+ * file used to record, is settled by the registration that made the device,
+ * before any command connects.
  */
 async function open(
   config: Config,
@@ -1946,9 +1879,6 @@ export function parseArgs(argv: readonly string[]): Args {
 /* ---------------------------------------------------------------- *
  * Small things
  * ---------------------------------------------------------------- */
-
-/** A device that has not registered itself yet, which has reached no server. */
-class Unconverted extends Error {}
 
 async function mustLoad(dir: string): Promise<Config> {
   const config = await loadConfig(dir);

@@ -4,7 +4,7 @@
  * Every case here is about a moment when the vault has two possible answers to
  * "what is the secret" or "what is the data key". A rotation whose reply is
  * lost, a claim sent to a vault that has nothing left to claim, and a
- * registration whose reply carries a wrapping this device has seen before.
+ * registration whose reply names a row this device did not ask for.
  *
  * Rotation moved off the device in protocol 4, and the reason is the shape of
  * the whole feature: a device holds no root, so it cannot rewrap the data key
@@ -113,31 +113,6 @@ describe("the session the recovery key opens", () => {
     expect(sent["deviceId"]).toBe("dev-1");
   });
 
-  /**
-   * C40, in the one place it can still arise. A server handed a claim holds a
-   * wrapping this device made and can unwrap, and could return it as the
-   * vault's own; the device would install a schedule no other device on the
-   * vault derives and both ends would report success.
-   */
-  it("refuses a registration whose wrapped key is not the one this device saw before", async () => {
-    const root = await deriveRootKeys(RIG_SECRET);
-    const theirs = await wrapDataKey(root.wrap, TEST_DATA_KEY);
-    const { socket, registrar: reg } = await openRegistrar();
-    socket.autoReply = (frame, s) => {
-      if (frame["op"] === "register") {
-        s.reply({ res: "registered", deviceId: frame["deviceId"], wrapped: theirs });
-      }
-    };
-    await expect(
-      reg.register({
-        deviceId: "dev-1",
-        deviceSecret: generateDeviceSecret(),
-        name: "d",
-        expectWrapped: "THE-VAULTS-OWN",
-      }),
-    ).rejects.toThrow(/different wrapped data key/);
-  });
-
   it("refuses a registration naming a device other than the one asked for", async () => {
     // The device is about to store a credential for whatever row this names.
     // A row that is not its own is a device that drops the root and is then
@@ -211,9 +186,9 @@ describe("what a claim carries", () => {
   });
 
   it("makes a different key every time it is asked, so it is asked once", async () => {
-    // Why `claimWrapped` is stored rather than recomputed: a claim retried
-    // after a lost reply must offer the key it offered before, or the vault
-    // can be bound to one candidate while the device proposes another.
+    // Why one call per claim, and why nothing retries a claim from disk: two
+    // calls are two candidate data keys, and a vault bound to one while the
+    // device goes on offering the other is a vault it cannot read.
     const keys = await deriveRootKeys(RIG_SECRET);
     expect(await wrappedForClaim(keys)).not.toBe(await wrappedForClaim(keys));
   });

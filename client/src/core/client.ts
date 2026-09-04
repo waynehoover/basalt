@@ -62,7 +62,6 @@ import {
   deviceCredential,
   formatInvite,
   generateDeviceId,
-  needsConversion,
   type DeviceConfig,
   type Invite,
 } from "./pairing.ts";
@@ -207,11 +206,6 @@ export class Client {
    */
   get serverCursor(): number {
     return Math.max(this.limits?.cursor ?? 0, this.transport.appliedCursor);
-  }
-
-  /** The vault's wrapped data key as the server holds it, once connected. */
-  get wrapped(): string | undefined {
-    return this.limits?.wrapped;
   }
 
   /** The keys in use, which are the data key's and are known from `ready` onwards. */
@@ -959,11 +953,12 @@ export function retryWait(cause: Error, backoffMs: number): number {
  * A fresh data key for a vault about to be claimed, wrapped under its root so
  * the server can store it.
  *
- * Made once, when the vault is started, and written into the device config.
- * It used to be made per connection attempt, on the reasoning that only one
- * claim can win. What that missed is the retry: a claim whose reply was lost
- * came back with a different candidate, so the vault could be bound to one key
- * while the device that bound it went on offering another.
+ * Made once, on the one attempt there is. It used to be staged in the device
+ * config, because the claim was retried from disk and a fresh candidate per
+ * attempt could bind the vault to one key while the device went on offering
+ * another. Nothing retries a claim from disk any more: a claim that commits
+ * with its reply lost is recovered by pairing with the recovery key, and the
+ * server hands that session the key the claim already bound.
  */
 export async function wrappedForClaim(keys: RootKeys): Promise<string> {
   return wrapDataKey(keys.wrap, generateDataKey());
@@ -1054,32 +1049,20 @@ export class Registrar {
    * The unwrapping happens here because this session is the one that can: it
    * holds the root, and the wrapping key derives from it. That is the whole
    * mechanism by which a device ends up holding the data key without ever
-   * holding the root.
-   *
-   * `expectWrapped`, when the caller has seen the vault's wrapping before, is
-   * checked against what came back. That is the last place C40 can still
-   * arise: a server handed a claim could otherwise return that wrapping as the
-   * vault's own, and the device would install a schedule no other device on
-   * the vault derives, with both ends reporting success.
+   * holding the root, and it is also the check on what came back: a wrapping
+   * the server invented does not open under this root, so a key no other
+   * device on the vault derives cannot be installed by being handed over.
    */
   async register(args: {
     deviceId: string;
     deviceSecret: Uint8Array;
     name: string;
-    expectWrapped?: string | undefined;
   }): Promise<{ dataKey: Uint8Array; wrapped: string }> {
     const { wrapped } = await this.transport.register({
       deviceId: args.deviceId,
       auth: await deviceAuthToken(args.deviceSecret),
       name: args.name,
     });
-    if (args.expectWrapped !== undefined && wrapped !== args.expectWrapped) {
-      throw new Error(
-        "the server returned a different wrapped data key than this device saw before. " +
-          "A vault's data key does not change, so this device will not seal anything under " +
-          "a key the rest of the vault cannot derive.",
-      );
-    }
     return { dataKey: await unwrapDataKey(this.root.wrap, wrapped), wrapped };
   }
 
@@ -1158,44 +1141,65 @@ export class Registrar {
   }
 }
 
+/** Where a device is joining from, and what it holds to join with. */
+export interface JoiningVault {
+  /** WebSocket URL of the server, without the path. */
+  readonly url: string;
+  readonly vaultId: string;
+  /** This device's local name, which becomes the label on its row. */
+  readonly device: string;
+  /**
+   * The vault's root secret: a recovery key somebody pasted, or the one this
+   * device has just made for a vault it is starting.
+   */
+  readonly secret: Uint8Array;
+  /**
+   * The server's first-run token, present only while this device is claiming
+   * an unclaimed vault. The claim rides on the registrar hello below, so it is
+   * spent by the same exchange that registers this device's row.
+   */
+  readonly bootstrap?: string | undefined;
+}
+
 /**
- * Turns a config holding the vault's root into a config holding this device's
- * own credential, and drops the root only once the row has been used.
+ * Registers this device against a vault it holds the root of, and returns the
+ * config of a device that holds no root.
  *
- * This is the one step in per-device credentials that can strand a device, so
- * it is written as four saves and every one of them survives a crash on either
- * side of it. `save` must write durably and read back before returning: rule 4,
- * verify the outcome and not the exit code, and the same ordering `rotate` used
- * before it moved off the device.
+ * The two ways in are `basalt init` and the panel's "start a new vault", which
+ * arrive with a bootstrap token and a secret nobody has seen yet, and `basalt
+ * pair RECOVERY-KEY` and the panel's pairing form, which arrive with a secret
+ * somebody pasted. Both end in the same place, which is the point: a row on
+ * the vault, the credential for it, the data key, and no root.
  *
- * The order, and what a crash at each point leaves:
+ * One save, and its placement is the whole of the crash story. `save` must
+ * write durably and read back before returning (rule 4, verify the outcome and
+ * not the exit code), and it is called *after* the registration has committed
+ * and *before* anything else can fail. What a crash leaves:
  *
- *  1. **Choose an id and a secret, and save them.** Before anything is sent, so
- *     a crash after the `register` below still finds the same id and the same
- *     key on disk. Choosing a fresh id per attempt instead would leave a row
- *     behind for every crash and fill the vault's eight with ghosts.
- *     A crash before this save leaves the config untouched and protocol 3
- *     shaped; the next command starts again.
- *  2. **Register, and save the data key.** The server treats the same id with
- *     the same key as the registration having happened, so a reply lost between
- *     the commit and this save costs one repeated request and nothing else.
- *     A crash here leaves an id, a secret and the root: step 2 again.
- *  3. **Connect as the device.** The row is confirmed by being used, not by
- *     being asked about, because "the row is there" and "this credential opens
- *     it" are different facts and only the second one matters. A crash here
- *     leaves everything and the root: steps 2 and 3 again, both idempotent.
- *  4. **Drop the root.** Only now, and this is the point of the whole feature:
- *     a device that still holds the root can re-derive the vault's credential
- *     and register itself again, so revoking it would stop nothing. A crash
- *     between 3 and 4 leaves a device that has a row and still has the root,
- *     which is exactly the state step 1 detects and finishes.
+ *  - **Before the registration.** Nothing here has written anything. A vault
+ *    being started still has its root on disk from before the claim, which is
+ *    the only copy of the recovery key and is why it is written there; a
+ *    pairing has the key in somebody's hand already.
+ *  - **Between the registration and the save.** One row on the server that
+ *    nobody holds the credential for. It shows in `basalt devices` as a device
+ *    that has never connected and goes with `basalt revoke`, which is exactly
+ *    the failure the invite path has and is documented with.
+ *  - **After the save.** A finished device. The connection below only confirms
+ *    it, so failing there costs a retry and no state.
  *
- * Returns the converted config. Idempotent: run it again on the result and it
- * does nothing, because the result holds no root.
+ * There is deliberately no resumable half-state. The root and the device
+ * credential never sit on disk together, so a stolen laptop cannot re-derive
+ * the vault's credential and register itself again, and there is no shape a
+ * config can be in that some later command has to recognise and finish.
+ *
+ * The first two crash points are walked against a real server in
+ * cli/state.test.ts, "a vault that was started and never joined (C15)": the
+ * refusal that hands the recovery key back and pairs again with it, notes and
+ * all, and the row a failed save leaves for `basalt revoke` to take.
  */
-export async function convertToDevice(
-  config: DeviceConfig,
-  save: (next: DeviceConfig) => Promise<void>,
+export async function registerAsDevice(
+  joining: JoiningVault,
+  save: (device: DeviceConfig) => Promise<void>,
   opts: {
     timeoutMs?: number | undefined;
     socketFactory?: ((url: string) => SocketLike) | undefined;
@@ -1204,126 +1208,72 @@ export async function convertToDevice(
      * Called the moment the server has accepted the registration, before
      * anything else can fail.
      *
-     * For the one caller that has to know: `basalt pair` and the panel's
-     * pairing form keep a config that got this far, because the row is real
-     * and only this device knows its credential, and throw one away that did
-     * not, because a recovery key that turns out to be wrong should leave a
-     * vault exactly as unpaired as it found it.
+     * For the callers that have to tell the two failures apart: a pairing that
+     * never registered leaves the vault exactly as unpaired as it found it,
+     * because a recovery key that turns out to be wrong should cost nothing,
+     * and one that did register has a row on the server to say so.
      */
     onRegistered?: (() => void) | undefined;
   } = {},
 ): Promise<DeviceConfig> {
-  const secret = config.secret;
-  if (secret === undefined) return config;
+  const root = await deriveRootKeys(joining.secret);
+  const deviceId = generateDeviceId();
+  const deviceSecret = generateDeviceSecret();
 
-  // 1. The id and the secret, on disk before a single frame goes out.
-  let staged = config;
-  if (staged.deviceId === undefined || staged.deviceSecret === undefined) {
-    staged = { ...staged, deviceId: generateDeviceId(), deviceSecret: generateDeviceSecret() };
-    await save(staged);
-  }
-  const deviceId = staged.deviceId!;
-  const deviceSecret = staged.deviceSecret!;
-
-  // 2. Register, and write down the data key it hands back.
-  const registrar = await openRegistrar(staged, secret, opts);
+  const registrar = await Registrar.open({
+    url: joining.url,
+    vaultId: joining.vaultId,
+    device: joining.device,
+    secret: joining.secret,
+    ...(joining.bootstrap !== undefined
+      ? {
+          bootstrap: joining.bootstrap,
+          claim: { auth: authToken(root), wrapped: await wrappedForClaim(root) },
+        }
+      : {}),
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
+  });
   let dataKey: Uint8Array;
   try {
     ({ dataKey } = await registrar.register({
       deviceId,
       deviceSecret,
-      name: staged.device,
-      expectWrapped: staged.wrapped,
+      name: joining.device,
     }));
   } finally {
     registrar.close();
   }
   opts.onRegistered?.();
-  staged = { ...staged, dataKey };
-  await save(staged);
 
-  // 3. Use the row. A hello that is answered `ready` is the row existing, this
-  //    key opening it, and the server willing to serve this vault, all proven
-  //    by the one thing that has to be true afterwards.
-  await proveDeviceConnects(staged, opts);
-
-  // 4. The root goes, and everything that only existed to get here with it.
-  const converted: DeviceConfig = {
-    url: staged.url,
-    vaultId: staged.vaultId,
-    device: staged.device,
+  const device: DeviceConfig = {
+    url: joining.url,
+    vaultId: joining.vaultId,
+    device: joining.device,
     deviceId,
     deviceSecret,
     dataKey,
   };
-  await save(converted);
-  opts.log?.("converted to a per-device credential", { deviceId });
-  return converted;
-}
+  await save(device);
 
-/**
- * A registrar session for a conversion, with the one fallback a spent
- * bootstrap needs.
- *
- * C15. Starting a vault writes the config with the server's first-run token,
- * claims the vault with it, and writes the config again without it. If that
- * second write fails, or the claim commits and its reply is lost, the token on
- * disk is spent and offering it first is refused with `auth`, for ever: a vault
- * this device claimed, refusing this device.
- *
- * `auth` is also what a wrong token and another device's vault produce, so it
- * does not on its own say what happened. What does say is the key derived from
- * this config's root secret: the server compares it against the hash it bound
- * the vault to, so that key being accepted proves the vault was claimed with
- * this secret. That is the one case in which the bootstrap can be dropped, and
- * the only one in which it is tried.
- */
-async function openRegistrar(
-  config: DeviceConfig,
-  secret: Uint8Array,
-  opts: {
-    timeoutMs?: number | undefined;
-    socketFactory?: ((url: string) => SocketLike) | undefined;
-    log?: ((message: string, ...rest: unknown[]) => void) | undefined;
-  },
-): Promise<Registrar> {
-  const root = await deriveRootKeys(secret);
-  const wire = {
-    url: config.url,
-    vaultId: config.vaultId,
-    device: config.device,
-    secret,
-    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-    ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
-    ...(opts.log !== undefined ? { log: opts.log } : {}),
-  };
-  if (config.bootstrap === undefined) return Registrar.open(wire);
-  try {
-    return await Registrar.open({
-      ...wire,
-      bootstrap: config.bootstrap,
-      // The same data key on every attempt while the vault is being claimed. A
-      // fresh candidate per attempt meant a claim retried after a lost reply
-      // proposed a different key from the one that may already have committed.
-      claim: {
-        auth: authToken(root),
-        wrapped: config.claimWrapped ?? (await wrappedForClaim(root)),
-      },
-    });
-  } catch (err) {
-    if (!(err instanceof ProtocolError) || err.code !== "auth") throw err;
-    opts.log?.("the first-run token is spent; trying the key this secret derives");
-    return Registrar.open(wire);
-  }
+  // Use the row. A hello that is answered `ready` is the row existing, this
+  // key opening it, and the server willing to serve this vault, all proven by
+  // the one thing that has to be true afterwards. It comes after the save, so
+  // a device whose confirmation failed still has a credential on disk to try
+  // again with rather than a row it has forgotten the key to.
+  await proveDeviceConnects(device, opts);
+  opts.log?.("registered a per-device credential", { deviceId });
+  return device;
 }
 
 /**
  * One hello as the device, and nothing after it.
  *
  * `waitForBacklog` is not on offer: this connection exists to find out whether
- * the credential works, and a device converting after months away would
- * otherwise sit through its whole backlog twice, once here and once when the
- * command it was actually running connects.
+ * the credential works, and a device joining after months away would otherwise
+ * sit through its whole backlog twice, once here and once when the command it
+ * was actually running connects.
  */
 async function proveDeviceConnects(
   config: DeviceConfig,
@@ -1439,9 +1389,9 @@ export async function redeemInvite(
  * once, from the same stored config, and the two copies were the
  * highest-consequence drift point in the client.
  *
- * It refuses a config that has not converted, rather than falling back to the
- * root: falling back is what protocol 3 did, and what protocol 4 exists to
- * stop. `needsConversion` is the check a caller makes first.
+ * It refuses a config that holds no credential, rather than falling back to
+ * the root: falling back is what protocol 3 did, and what protocol 4 exists to
+ * stop. `deviceCredential` is where the refusal is worded.
  */
 export function credentialsFor(
   config: DeviceConfig,
@@ -1456,9 +1406,6 @@ export function credentialsFor(
     device: config.device,
   }));
 }
-
-/** Whether this config still holds the vault's root. Re-exported so a shell imports one thing. */
-export { needsConversion };
 
 /** The shapes a shell needs to show a device list, re-exported for the same reason. */
 export type { DeviceRow, InviteRow, RegistrarLimits } from "./transport.ts";

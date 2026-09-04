@@ -3,7 +3,11 @@ import { describe, expect, it } from "vitest";
 import { SECRET_LENGTH, base64urlDecode, base64urlEncode, generateSecret } from "./crypto.ts";
 import {
   INVITE_PREFIX,
+  NoCredential,
   PAIRING_PREFIX,
+  decodeConfig,
+  deviceCredential,
+  encodeConfig,
   formatInvite,
   formatPairing,
   isInvite,
@@ -11,6 +15,7 @@ import {
   parseInvite,
   parsePairing,
   parseSetup,
+  type DeviceConfig,
   type Invite,
   type Pairing,
 } from "./pairing.ts";
@@ -408,3 +413,89 @@ function untilLength(make: (vaultId: string) => string, want: number): string {
   }
   throw new Error(`no vault name of one to four characters gives a body of length %4 == ${want}`);
 }
+
+/**
+ * What a config that is not a device gets told, which is the last thing
+ * standing between somebody and a vault they cannot open.
+ *
+ * There is no conversion any more: a config holding the vault's root and no
+ * credential is not a device that has half joined, it is a vault that was
+ * started here and never joined, and nothing finishes it on its own. So the
+ * refusal has to carry the whole way out, and for the root case that means the
+ * key itself. Rule 2: a failed read is not an empty result, and a vault that
+ * cannot connect is not an unpaired vault to be quietly paired over.
+ */
+describe("a config that cannot connect", () => {
+  const base = { url: "wss://homelab:3003", vaultId: "default", device: "laptop" };
+
+  it("hands the recovery key back when the root is all that is left", () => {
+    const secret = generateSecret();
+    const config: DeviceConfig = { ...base, secret };
+    let thrown: unknown;
+    try {
+      deviceCredential(config);
+    } catch (err) {
+      thrown = err;
+    }
+    // Its own class, so a shell can tell "nothing to connect with" from "the
+    // server said no": basalt status reports the first as neither reachable
+    // nor refused.
+    expect(thrown).toBeInstanceOf(NoCredential);
+    const message = (thrown as Error).message;
+    expect(message).toMatch(/never registered itself/);
+    // The key, printed, because this config is the only copy of it there is.
+    expect(message).toContain(formatPairing({ ...base, secret }));
+    expect(message).toMatch(/unlink this vault and pair again with it/);
+    // And it is a key that works: a refusal that printed a damaged one would
+    // be worse than one that printed nothing.
+    expect(parsePairing(message.match(/basalt3_[A-Za-z0-9_-]+/)![0]).secret).toEqual(secret);
+  });
+
+  it("says to pair again when there is no root and no credential either", () => {
+    let thrown: unknown;
+    try {
+      deviceCredential({ ...base, deviceId: "abcd" });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(NoCredential);
+    const message = (thrown as Error).message;
+    // Names what is missing rather than saying "not authorised", which is the
+    // wording that sent somebody looking for a server problem.
+    expect(message).toMatch(/a device secret, the vault's data key/);
+    expect(message).toMatch(/invite from another device/);
+    expect(message).not.toMatch(/authoris/i);
+  });
+
+  it("still decodes a config it will refuse, because the key is inside it", () => {
+    // Refusing to read it would be refusing to read the one thing in it worth
+    // reading. The refusal belongs at the moment something tries to connect.
+    const secret = generateSecret();
+    const back = decodeConfig(encodeConfig({ ...base, secret }), "test");
+    expect(back.secret).toEqual(secret);
+    expect(() => deviceCredential(back)).toThrow(NoCredential);
+  });
+
+  it("keeps nothing a device is not meant to hold", () => {
+    // A paired device stores its own credential and the data key, and there is
+    // no field left for a root, a first-run token or a wrapping. An old config
+    // holding one is read for what it has and the extra is dropped.
+    const stored = encodeConfig({
+      ...base,
+      deviceId: "abcd",
+      deviceSecret: new Uint8Array(32).fill(7),
+      dataKey: new Uint8Array(32).fill(9),
+    });
+    expect(Object.keys(stored).sort()).toEqual([
+      "dataKey",
+      "device",
+      "deviceId",
+      "deviceSecret",
+      "url",
+      "vaultId",
+    ]);
+    const old = decodeConfig({ ...stored, bootstrap: "TOKEN", wrapped: "WRAP" }, "test");
+    expect("bootstrap" in old).toBe(false);
+    expect("wrapped" in old).toBe(false);
+  });
+});

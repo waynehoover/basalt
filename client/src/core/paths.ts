@@ -238,7 +238,8 @@ export function ignoredHere(relPath: string, extra: ReadonlySet<string>): boolea
  * Obsidian's config folder is one folder at the root, and if it were ever
  * anything else then quietly ignoring the wrong thing is how a vault's
  * settings get uploaded: that folder holds the plugin's `data.json`, and
- * `data.json` holds the root secret.
+ * `data.json` holds this device's credential and the vault's data key. Not the
+ * root, since protocol 4, but the data key opens every note either way.
  */
 export function configFolderName(configDir: string): string {
   const name = configDir.replace(/^\/+|\/+$/g, "");

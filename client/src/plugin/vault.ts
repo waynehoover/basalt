@@ -312,7 +312,8 @@ export class ObsidianVault implements Vault {
     this.fsOverride = opts.fs;
     // Obsidian's config folder is *not* assumed to be `.obsidian`: the API
     // says plainly that it could be something else, and that folder holds
-    // this plugin's `data.json`, which holds the root secret. So the real
+    // this plugin's `data.json`, which holds this device's credential and the
+    // vault's data key. So the real
     // name is passed in, and it is the one thing added to the rule in
     // core/paths.ts, which already covers every dot-prefixed name.
     this.ignore = new Set([configFolderName(configDir)]);
