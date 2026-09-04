@@ -43,6 +43,28 @@ export interface Times {
   readonly ctime: number;
 }
 
+/**
+ * One path that two names on disk both claim, and the names claiming it.
+ *
+ * A disk that keeps `café.md` in NFC and the same name in NFD apart holds two
+ * files for one path, and there is no right answer to which one syncs: only a
+ * person can say which they meant. Both are left alone and the path is blocked
+ * until they do.
+ *
+ * It travels beside the listing rather than in it because the two files are
+ * exactly what must not be listed: listing either would sync it under the
+ * shared path and record the other as gone, and omitting them with nothing
+ * said would have the engine report a note it can plainly see as deleted, on
+ * the strength of a spelling. Named, and no note moves under that name, and
+ * every other note in the vault keeps syncing.
+ */
+export interface Ambiguous {
+  /** The path both spellings normalize to. Nothing syncs under it. */
+  readonly path: string;
+  /** Every spelling on disk that normalizes to it, as the disk has them. */
+  readonly spellings: readonly string[];
+}
+
 /** What the engine needs from a place files live. */
 export interface Vault {
   /**
@@ -56,6 +78,15 @@ export interface Vault {
    * not, and it errs towards refusing rather than overwriting.
    */
   list(): Promise<FileStat[]>;
+  /**
+   * Paths the last `list` left out because two names on disk claim them.
+   *
+   * Optional, because a vault whose names cannot collide has none to report
+   * and a vault that cannot tell says nothing rather than guessing. Read once
+   * per pass, right after `list`, and only ever grows the blocked set: a vault
+   * that does not offer it behaves exactly as before.
+   */
+  ambiguous?(): readonly Ambiguous[];
   read(path: string): Promise<Uint8Array>;
   /**
    * Makes durable whatever the writes so far have left un-durable.

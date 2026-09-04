@@ -152,6 +152,32 @@ export function foldsTogether(a: string, b: string): boolean {
 }
 
 /**
+ * A name with every character a terminal cannot distinguish spelled out.
+ *
+ * The refusal that names two spellings of one name is the one refusal that
+ * waits on a person, and it used to print them with `JSON.stringify`, which
+ * escapes quotes and control characters and leaves everything else alone. So
+ * `café.md` in NFC and `café.md` in NFD came out as two identical strings and
+ * the message said "rename one of them" while showing the same name twice.
+ * A person cannot act on that, and this is exactly the case where they have to
+ * (paths.test.ts, "separates the two normal forms of one name";
+ * cli/vault-spelling.test.ts, "spells both of them out").
+ *
+ * Printable ASCII is left as it is, because a name that is all ASCII reads
+ * best as itself and cannot be in this trouble anyway. Everything else becomes
+ * `\u{...}`, which is what makes one combining acute visibly different from
+ * one precomposed é.
+ */
+export function spellOut(name: string): string {
+  let out = "";
+  for (const ch of name) {
+    const code = ch.codePointAt(0)!;
+    out += code >= 0x20 && code < 0x7f ? ch : `\\u{${code.toString(16)}}`;
+  }
+  return out;
+}
+
+/**
  * A refusal to write under a name this shell never syncs, with the code the
  * engine reads it by.
  *

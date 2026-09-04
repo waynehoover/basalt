@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { configFolderName, foldsTogether, isNeverSynced, splitName } from "./paths.ts";
+import { configFolderName, foldsTogether, isNeverSynced, spellOut, splitName } from "./paths.ts";
 
 const none: ReadonlySet<string> = new Set();
 
@@ -91,5 +91,33 @@ describe("folding two paths together", () => {
   it("keeps two real files apart", () => {
     expect(foldsTogether("note.md", "notes.md")).toBe(false);
     expect(foldsTogether("a/note.md", "b/note.md")).toBe(false);
+  });
+});
+
+/**
+ * The one refusal that waits on a person, and the one it cannot be printed
+ * plainly for.
+ *
+ * Two spellings of one name are the same glyphs on screen, so the message
+ * asking somebody to rename one of them used to show the same string twice.
+ */
+describe("spelling a name out so two of them can be told apart", () => {
+  it("separates the two normal forms of one name", () => {
+    const nfc = "caf\u00e9.md";
+    const nfd = "cafe\u0301.md";
+    expect(nfc, "the fixture is not two spellings").not.toBe(nfd);
+    expect(spellOut(nfc)).toBe("caf\\u{e9}.md");
+    expect(spellOut(nfd)).toBe("cafe\\u{301}.md");
+    expect(spellOut(nfc), "the message shows the same name twice").not.toBe(spellOut(nfd));
+  });
+
+  it("leaves a name that reads plainly as it is", () => {
+    expect(spellOut("a note (2020).md")).toBe("a note (2020).md");
+  });
+
+  it("keeps a character outside the basic plane in one piece", () => {
+    // Iterated by code point, not by UTF-16 unit: half a surrogate pair is
+    // not a character, and printing two of them names nothing.
+    expect(spellOut("note \u{1f389}.md")).toBe("note \\u{1f389}.md");
   });
 });

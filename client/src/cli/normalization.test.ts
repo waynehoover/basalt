@@ -77,6 +77,19 @@ async function memoryDevice(name: string): Promise<{ c: Client; vault: MemoryVau
   return { c, vault };
 }
 
+/**
+ * How this disk spells a name, so a test can edit the file that is there.
+ *
+ * Not the same as the name: `café.md` reaches the file on macOS whichever
+ * normal form it is in, and on ext4 only in the one the disk has. A test that
+ * wants to edit a note has to open the note.
+ */
+async function onDiskName(dir: string, name: string): Promise<string> {
+  const found = (await readdir(dir)).find((n) => n.normalize("NFC") === name);
+  if (found === undefined) throw new Error(`${name} is not in ${dir}`);
+  return found;
+}
+
 /** The files on disk, as text by NFC name, without the state folder. */
 async function held(dir: string): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
@@ -156,6 +169,10 @@ describe("one name spelled NFD on one disk and NFC on another", () => {
     // The Mac has the note under its own spelling before anything syncs.
     await writeFile(join(mac.dir, NFD), "first\n");
     await mac.c.settle();
+    // And after the first listing it has it under the spelling every other
+    // device uses, because a vault that reports one name and holds another is
+    // a vault two devices do not agree about (C44).
+    expect(await readdir(mac.dir).then((n) => n.filter((f) => !f.startsWith(".")))).toEqual([NFC]);
     await other.c.settle();
     expect(other.vault.paths(), "the other device got the Mac's spelling").toEqual([NFC]);
     expect(other.vault.text(NFC)).toBe("first\n");
@@ -166,8 +183,10 @@ describe("one name spelled NFD on one disk and NFC on another", () => {
     await mac.c.settle();
     expect(await held(mac.dir)).toEqual({ [NFC]: "second\n" });
 
-    // And one from the Mac travels back under the same name.
-    await writeFile(join(mac.dir, NFD), "third\n");
+    // And one from the Mac travels back under the same name. Through the
+    // spelling the disk has, because that is what editing the note means: the
+    // literal NFD name is an edit on APFS and a second file on ext4.
+    await writeFile(join(mac.dir, await onDiskName(mac.dir, NFC)), "third\n");
     await mac.c.settle();
     await other.c.settle();
     expect(other.vault.snapshot()).toEqual({ [NFC]: "third\n" });
@@ -245,9 +264,24 @@ describe("a peer that spells the name NFD", () => {
 
     const mac = await diskDevice("mac");
     await mac.c.settle();
-    await writeFile(join(mac.dir, NFD), "second\n");
+
+    // Through the name the disk actually has, which is the whole of what "an
+    // edit made here" means.
+    //
+    // It used to write the NFD spelling literally, and that is two different
+    // scenarios on two filesystems: on APFS it lands on the file already
+    // there and is an edit; on ext4 it creates a second file, which is not an
+    // edit and not what this test is named after. The Linux run then failed
+    // on a vault holding two files, having never performed the edit it meant
+    // to. A test that asserts different things on different platforms is not
+    // evidence on either (R9). Two files that really do differ only by normal
+    // form have their own tests, over a disk that keeps them apart on any
+    // machine (cli/vault-spelling.test.ts).
+    const spelled = await onDiskName(mac.dir, NFC);
+    await writeFile(join(mac.dir, spelled), "second\n");
     const mine = await mac.c.settle();
     expect(mine.blocked).toBe(0);
+    expect(await held(mac.dir), "the edit made a second file").toEqual({ [NFC]: "second\n" });
 
     const next = await memoryDevice("next");
     let theirs = await next.c.settle();

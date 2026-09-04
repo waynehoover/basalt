@@ -929,6 +929,20 @@ describe("a name the disk spells in NFD", () => {
     expect(listed.map((f) => f.path)).toEqual([nfc]);
   });
 
+  it("is renamed on disk to the spelling every other device uses (C44)", async () => {
+    // The listing said NFC and the disk went on holding NFD, so a Mac was
+    // left as the only device with that spelling and every other device had
+    // the other one. Invisible here, where the two reach one file, and two
+    // filenames in two vaults that are meant to be one on ext4. APFS does
+    // perform this rename and keeps the bytes it is given, which is what
+    // makes it checkable on this machine at all; the mechanism is pinned on
+    // any filesystem in cli/vault-spelling.test.ts.
+    await writeFile(join(root, nfd), "on disk");
+    await new NodeVault(root).list();
+    expect(await onDisk()).toEqual([nfc]);
+    expect(await readFile(join(root, nfc), "utf8")).toBe("on disk");
+  });
+
   it("is read and written under the NFC name without making a second file", async () => {
     await writeFile(join(root, nfd), "on disk");
     const vault = new NodeVault(root);
@@ -942,11 +956,16 @@ describe("a name the disk spells in NFD", () => {
     expect((await vault.list()).map((f) => f.path)).toEqual([nfc]);
   });
 
-  it("refuses a vault that holds both spellings rather than choosing one", async () => {
+  it("names both files when a vault holds both spellings, and syncs the rest", async () => {
     await writeFile(join(root, nfd), "one");
     await writeFile(join(root, nfc), "two");
-    // A disk that files the two as one file has nothing to refuse.
-    if ((await onDisk()).length < 2) return;
-    await expect(new NodeVault(root).list()).rejects.toThrow(/same path once normalized/);
+    await writeFile(join(root, "unrelated.md"), "fine");
+    // A disk that files the two as one file has nothing to be ambiguous about.
+    if ((await onDisk()).length < 3) return;
+    const vault = new NodeVault(root);
+    // Not a refusal of the whole vault, which is what this used to be: one
+    // pair nobody can name is not a reason to stop every other note.
+    expect((await vault.list()).map((f) => f.path)).toEqual(["unrelated.md"]);
+    expect(vault.ambiguous().map((a) => a.path)).toEqual([nfc]);
   });
 });

@@ -140,14 +140,39 @@ have, and nothing is re-sent that the server already has. One entry per name,
 once, and then the vault has one spelling for it. Earlier versions stay under
 the old spelling in `basalt history`.
 
+The same rename is owed to the disk the client is looking at, and it makes it.
+A name whose spelling on disk is not the one this client reports is renamed
+into that spelling the first time the vault is listed: the same file, one
+`rename`, no content copied and nothing to finish if it is interrupted. Without
+it a Mac stayed the only device holding the spelling it invented, which is
+invisible on a filesystem that folds the two and two different filenames in two
+vaults that are meant to be one on a filesystem that does not. A vault that
+cannot be renamed in, because it is read-only or the filesystem stores a normal
+form of its own, keeps the spelling it has and syncs as it always did.
+
 Upgrade every device. A device still running a client older than this rule
 goes on spelling its own accented names in NFD, so it will re-create the old
 spelling on the server after every rename, and the two names will keep
 arriving. Nothing is lost while that lasts, and nothing settles either.
 
-A disk that keeps the two spellings apart and holds both files refuses to sync
-until one is renamed, since neither is the right one to keep, and only a person
-can say which they meant.
+A disk that keeps the two spellings apart can hold both files, and then there
+is no right answer to which one syncs: only a person can say which they meant.
+That one name is blocked, both files are left exactly as they are, the rest of
+the vault carries on, and `basalt sync` counts it and exits non-zero. A folder
+two names claim blocks everything under it, for the same reason and by the same
+count. Nothing under such a name is uploaded, downloaded or reported deleted:
+the note is right there, and a listing that stopped naming it must not become a
+deletion that travels to every device.
+
+The characters that differ are spelled out, because the two names print
+identically and "rename one of them" is not something you can act on when both
+of them look the same:
+
+    "cafe\u{301}.md" and "caf\u{e9}.md" are one name here, and only one of them can sync.
+
+Refusing the whole vault is what this used to do, and it stopped every other
+note in it, including the ones being written that minute, over one pair nobody
+could name.
 
 ### What is not synced
 

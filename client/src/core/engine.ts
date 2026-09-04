@@ -87,6 +87,7 @@ import {
   foldPath,
   foldsTogether,
   isNeverSynced,
+  spellOut,
 } from "./paths.ts";
 import { parents, type IndexStore, type Times, type Vault } from "./vault.ts";
 
@@ -468,7 +469,21 @@ export interface SyncReport {
    * told which two. Bounded, because a folder converted to a file blocks
    * everything under it and a list the length of a subtree is not a message.
    */
-  inTheWay: { path: string; blockedBy: string }[];
+  inTheWay: {
+    path: string;
+    blockedBy: string;
+    /**
+     * The sentence for this one, where "a file here and a folder elsewhere"
+     * is not what happened.
+     *
+     * Optional, and absent for the clash that named this field, which every
+     * caller already spells out. Two names on disk that are one path once
+     * normalized need their own sentence: the two look identical printed
+     * plainly, so a message that did not spell them out would ask a person to
+     * rename one of two strings they cannot tell apart.
+     */
+    why?: string;
+  }[];
   /** Chunk bodies actually sent, and their size. The measure that matters. */
   chunksSent: number;
   bytesSent: number;
@@ -1026,6 +1041,26 @@ export class Engine {
     const nowBlocked = new Set<string>();
     this.nowBlocked = nowBlocked;
 
+    // Paths the vault left out of the listing because two names on disk claim
+    // them, with the sentence that names both.
+    //
+    // Read right after the listing and from the same pass, because a path in
+    // neither is a path the engine would report deleted: the vault can see
+    // both files and omitting them with nothing said would have this device
+    // tell the server a note it is looking at is gone, on the strength of a
+    // spelling. Nothing syncs under such a path and nothing under it either,
+    // since a folder two names claim has no unambiguous path inside it
+    // (cli/vault-spelling.test.ts, "blocks the one name two files claim and
+    // syncs the rest of the vault").
+    const ambiguous = new Map<string, string>();
+    for (const clash of this.opts.vault.ambiguous?.() ?? []) {
+      ambiguous.set(
+        clash.path,
+        `${clash.spellings.map((s) => `"${spellOut(s)}"`).join(" and ")} are one name here, ` +
+          `and only one of them can sync.`,
+      );
+    }
+
     // What the disk will file each local path under, for the collision
     // check in `fill`. Worked out here, once per pass, from the same listing
     // the decisions are made from.
@@ -1033,11 +1068,16 @@ export class Engine {
     for (const path of onDisk.keys()) this.localByIdentity.set(this.identity(path), path);
     this.deletingThisPass = new Set();
 
-    // 2. Every path either side knows about.
+    // 2. Every path either side knows about, plus the ones the vault could
+    //    not name. A clash between two brand new files is in no index and on
+    //    neither side, and left out of this set it would be refused in
+    //    silence, which is the one thing a refusal that waits on a person
+    //    must not be.
     const paths = new Set<string>([
       ...onDisk.keys(),
       ...this.entries.keys(),
       ...this.remote.keys(),
+      ...ambiguous.keys(),
     ]);
 
     for (const path of [...paths].sort()) {
@@ -1065,6 +1105,26 @@ export class Engine {
         this.skipped.delete(path);
         this.log("skipped file changed, trying again", path);
       }
+      // This path, or a folder above it, is one two names on disk claim.
+      // Both are left where they are and nothing moves under the name until
+      // a person renames one, which is the only outcome that keeps both
+      // notes. Worked out fresh every pass, like the clash below and for the
+      // same reason: the moment one of them is renamed there is nothing here
+      // to notice, so a remembered refusal would never clear.
+      const claimed = ambiguous.has(path)
+        ? path
+        : parents(path).find((ancestor) => ambiguous.has(ancestor));
+      if (claimed !== undefined) {
+        const why = ambiguous.get(claimed)!;
+        nowBlocked.add(path);
+        if (!this.blocked.has(path)) this.log("cannot be both", path, why);
+        report.blocked++;
+        if (report.inTheWay.length < IN_THE_WAY_SHOWN) {
+          report.inTheWay.push({ path, blockedBy: claimed, why });
+        }
+        continue;
+      }
+
       const blockedBy = parents(path).find((ancestor) => filePaths.has(ancestor));
       if (blockedBy !== undefined && !onDisk.has(path)) {
         // Something upstream is a file where this path needs a folder.

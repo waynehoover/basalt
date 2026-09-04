@@ -781,17 +781,31 @@ export default class BasaltPlugin extends Plugin {
     // Named, and left up longer, because this is the one refusal that waits on
     // a person. Nothing clears it until one of the two names changes, and a
     // notice saying only that something is in the way cannot be acted on.
-    const names = [...new Set(report.inTheWay.map((b) => b.blockedBy))].sort();
-    const key = report.inTheWay.length === 0 ? "" : `${report.blocked}:${names.join("\n")}`;
+    //
+    // A blocked path carries its own sentence where "a file here and a folder
+    // elsewhere" is not what happened, which two spellings of one name on a
+    // disk that keeps them apart are not. Obsidian's vault does not produce
+    // that one, so the branch is here for the report shape rather than for
+    // this vault, and printing the wrong sentence over it would be worse than
+    // the extra line of code.
+    const clashes = report.inTheWay.filter((b) => b.why === undefined);
+    const names = [...new Set(clashes.map((b) => b.blockedBy))].sort();
+    const spelled = [...new Set(report.inTheWay.flatMap((b) => (b.why ? [b.why] : [])))].sort();
+    const key =
+      report.inTheWay.length === 0 ? "" : `${report.blocked}:${[...names, ...spelled].join("\n")}`;
     if (key !== this.announced.inTheWay) {
       this.announced.inTheWay = key;
       if (key !== "") {
+        const said =
+          names.length === 0
+            ? ""
+            : `${names.map((n) => `"${n}"`).join(", ")} ` +
+              `${names.length === 1 ? "is a file" : "are files"} here and ` +
+              `${names.length === 1 ? "a folder" : "folders"} on another device. ` +
+              `Rename one, on whichever device meant the other thing.`;
         new Notice(
           `Basalt cannot write ${report.blocked} file(s): ` +
-            `${names.map((n) => `"${n}"`).join(", ")} ` +
-            `${names.length === 1 ? "is a file" : "are files"} here and ` +
-            `${names.length === 1 ? "a folder" : "folders"} on another device. ` +
-            `Rename one, on whichever device meant the other thing.`,
+            [said, ...spelled].filter((s) => s !== "").join(" "),
           20_000,
         );
       }

@@ -1142,7 +1142,10 @@ function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): 
   say(r.retrying, "failed, will try again");
   say(r.skipped, "cannot sync and will not be retried");
   say(r.ignored, "ignored here, and synced by another device");
-  say(r.blocked, "waiting on a name that is a file here and a folder elsewhere");
+  // Not "a file here and a folder elsewhere" any more: two spellings of one
+  // name on a disk that keeps them apart is blocked for a different reason,
+  // and the lines below say which reason applies to which name.
+  say(r.blocked, "waiting on a name two things claim");
 
   if (lines.length === 0) {
     io.out("Nothing to do. Everything here matches the server.");
@@ -1155,15 +1158,31 @@ function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): 
   // its own does not tell them which two.
   if (r.inTheWay.length > 0) {
     io.out("");
-    const blockers = [...new Set(r.inTheWay.map((b) => b.blockedBy))];
-    for (const blocker of blockers) {
-      io.out(`  "${blocker}" is a file here and a folder on another device.`);
+    // `why` where the entry has one. Two names on disk that are one path once
+    // normalized are not a file here and a folder elsewhere, and printing that
+    // sentence over them would send somebody looking for the wrong thing.
+    const reasons = [
+      ...new Set(
+        r.inTheWay.map(
+          (b) => b.why ?? `"${b.blockedBy}" is a file here and a folder on another device.`,
+        ),
+      ),
+    ];
+    for (const reason of reasons) io.out(`  ${reason}`);
+    // Two lists, because the two refusals ask for different things. A name
+    // that is a file here and a folder elsewhere is waiting on a rename on
+    // whichever device meant the other thing; two spellings of one name are
+    // both here, and the rename is here too.
+    const waiting = r.inTheWay.filter((b) => b.why === undefined).map((b) => b.path);
+    if (waiting.length > 0) {
+      io.out(
+        `  Waiting to be written: ${waiting.join(", ")}${r.blocked > r.inTheWay.length ? ", …" : ""}`,
+      );
+      io.out("  Rename one of them, on whichever device meant the other thing.");
     }
-    const waiting = r.inTheWay.map((b) => b.path);
-    io.out(
-      `  Waiting to be written: ${waiting.join(", ")}${r.blocked > waiting.length ? ", …" : ""}`,
-    );
-    io.out("  Rename one of them, on whichever device meant the other thing.");
+    if (r.inTheWay.some((b) => b.why !== undefined)) {
+      io.out("  Rename one of them here. Nothing syncs under that name until you do.");
+    }
   }
   if (r.chunksSent > 0)
     io.out(`${String(r.chunksSent).padStart(5)}  chunks sent, ${bytes(r.bytesSent)}`);

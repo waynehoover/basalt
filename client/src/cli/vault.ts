@@ -37,7 +37,15 @@ import {
   splitName,
 } from "../core/paths.ts";
 import { LastIndexWrite } from "../core/vault.ts";
-import type { FileStat, IndexStamp, IndexStore, StoredState, Times, Vault } from "../core/vault.ts";
+import type {
+  Ambiguous,
+  FileStat,
+  IndexStamp,
+  IndexStore,
+  StoredState,
+  Times,
+  Vault,
+} from "../core/vault.ts";
 
 /**
  * Where a deletion arriving from another device goes, rather than away.
@@ -399,6 +407,92 @@ export class NodeVault implements Vault {
     }
   }
 
+  /** Paths the last `list` left out because two names on disk claim them. */
+  private ambiguousPaths: Ambiguous[] = [];
+
+  /**
+   * Which paths two names on disk both claim, from the last `list`.
+   *
+   * The engine blocks these and everything under them rather than syncing
+   * either spelling, and names them so a person can rename one.
+   */
+  ambiguous(): readonly Ambiguous[] {
+    return this.ambiguousPaths;
+  }
+
+  /**
+   * Names this vault has already tried to put into their normal form.
+   *
+   * A filesystem that stores one normal form of its own accepts the rename,
+   * reports success, and hands the old spelling back on the next `readdir`:
+   * HFS+ stores NFD whatever it is given. Without this the vault would rename
+   * that name on every pass for the rest of the process's life, getting
+   * nowhere. One rename that the disk accepted is enough to know the answer,
+   * so it is not asked again; one that failed is not recorded, because a
+   * failure can pass.
+   */
+  private readonly normalized = new Set<string>();
+
+  /**
+   * Renames a file to the spelling this vault reports for it.
+   *
+   * The vault's promise is that it holds the same notes as every other
+   * device, and it was not keeping it. A Mac creates `écombining.md` with a
+   * combining acute; this vault reports it in NFC, uploads NFC, and every
+   * other device writes NFC, so the Mac was left holding the one spelling
+   * nothing else had. On a disk that folds the two that is invisible and on
+   * ext4 it is two different filenames for ever, which is the same divergence
+   * normalising was added to end, moved from the wire to the disk
+   * (stress/names.stress.ts, "round-trips every one to another device";
+   * cli/vault-spelling.test.ts, "is renamed on disk to the spelling every
+   * other device will use").
+   *
+   * The correction a device owes the server for a name spelled the old way is
+   * a rename, and this is the same correction owed to its own disk. A real
+   * rename: `rename` is atomic, so an interrupted one leaves the note under
+   * one name or the other and never under neither, and it is the same inode,
+   * so no content is copied and nothing that has the file open loses it.
+   * Never over an existing entry, which is what the caller's check of the
+   * directory's own names is for: `rename` would replace it silently, and the
+   * one case where both spellings are there is the one case where only a
+   * person can say which note to keep. That check is the `readdir` this walk
+   * has just done, so what is not covered is a file created under the normal
+   * form in the microseconds between the two, by something other than this
+   * pass. Stated rather than claimed away: Node has no `renameat2`, and the
+   * alternatives are worse. `link` then `unlink` cannot clobber but leaves
+   * two names for one file if it is interrupted, and that state does not heal
+   * itself, which trades a window nothing has been seen in for a condition a
+   * person would have to resolve by hand.
+   *
+   * A failure here is not a failure of the listing (rule 2 is about not
+   * mistaking one state for another, and there is no mistake in this one). A
+   * read-only vault, or one on a filesystem that will not have it, keeps the
+   * disk's spelling and syncs exactly as it did before this rule: the map
+   * below is what makes that correct. Stopping a sync over the spelling of a
+   * name that is already right on the wire would be the worse trade.
+   */
+  private async normalizeName(
+    dir: string,
+    entry: { name: string; disk: string },
+    path: string,
+  ): Promise<void> {
+    if (this.normalized.has(path)) return;
+    try {
+      await rename(join(dir, entry.disk), join(dir, entry.name));
+      // Remembered on success, not on the attempt. A rename that succeeded
+      // and left the name where it was is a filesystem storing its own normal
+      // form, and asking it again will get the same answer for ever. A rename
+      // that threw may have thrown for a reason that passes, and writing the
+      // name off on the first EBUSY would leave a watching client diverged
+      // from every other device until somebody restarted it.
+      this.normalized.add(path);
+      entry.disk = entry.name;
+      this.unflushed.add(dir);
+    } catch {
+      // Kept under the spelling the disk has, which is what the map is for.
+    }
+  }
+
   /** Temporary files of a crashed earlier run that `list` has removed. */
   reaped = 0;
 
@@ -459,6 +553,7 @@ export class NodeVault implements Vault {
     await this.reapStaleTemps();
     this.diskName.clear();
     this.spellingsKnown.clear();
+    this.ambiguousPaths = [];
     const walk = async (dir: string, prefix: string): Promise<FileStat[]> => {
       let items;
       try {
@@ -486,36 +581,69 @@ export class NodeVault implements Vault {
       // two a person could choose between. Reporting the disk's bytes had
       // this client disagree with the plugin about what one vault contains,
       // and two devices each refusing the other's spelling of one note for
-      // ever, naming two strings nobody can tell apart. The disk's spelling
-      // is remembered where it differs so reads and writes still land on the
-      // file (cli/vault.test.ts, "a name the disk spells in NFD";
-      // cli/normalization.test.ts).
+      // ever, naming two strings nobody can tell apart.
+      //
+      // And the disk is put into that spelling as well, because reporting one
+      // name while holding another leaves this device the only one with the
+      // spelling it invented (C44, `normalizeName`). Where the rename cannot
+      // happen the disk's spelling is remembered instead, so reads and writes
+      // still land on the file (cli/vault.test.ts, "a name the disk spells in
+      // NFD"; cli/vault-spelling.test.ts; cli/normalization.test.ts).
       this.spellingsKnown.add(prefix);
-      const kept = items
-        .map((item) => ({ item, name: this.normal(item.name) }))
+      const found = items
+        .map((item) => ({ item, name: this.normal(item.name), disk: item.name }))
         .filter(
           ({ item, name }) =>
             !this.neverSynced(prefix ? `${prefix}/${name}` : name) &&
             !isTemporary(item.name, join(dir, item.name)) &&
             (item.isDirectory() || item.isFile()),
         );
+
       // A disk that keeps the two spellings apart can hold both, and then
-      // there is no right answer to which one syncs, so neither does and the
-      // listing says which two. The plugin refuses the same way.
-      const spellings = new Map<string, string>();
-      for (const { item, name } of kept) {
+      // there is no right answer to which one syncs.
+      //
+      // It used to throw, which stopped the whole vault: one ambiguous pair
+      // and four thousand other notes went nowhere, including the ones a
+      // person was writing that minute, until somebody renamed one of two
+      // names that look identical. Fail loudly is rule 2 and it is satisfied
+      // by naming the pair; stopping every other note is not what it asks
+      // for, and a vault that syncs nothing is the larger risk to the first
+      // rule. So the pair is blocked by name and the rest of the vault keeps
+      // going, which is what the engine already does for two server paths
+      // that alias one local file (`refuseAliases`).
+      //
+      // Left out of the listing and reported separately, never silently
+      // dropped: a path that vanishes from a listing is a path the engine
+      // reports deleted (cli/vault-spelling.test.ts, "blocks the one name two
+      // files claim and syncs the rest of the vault").
+      const byNormal = new Map<string, typeof found>();
+      for (const entry of found) {
+        const same = byNormal.get(entry.name);
+        if (same) same.push(entry);
+        else byNormal.set(entry.name, [entry]);
+      }
+
+      const kept: typeof found = [];
+      const rawNames = new Set(items.map((item) => item.name));
+      for (const [name, group] of byNormal) {
         const path = prefix ? `${prefix}/${name}` : name;
-        const other = spellings.get(name);
-        if (other !== undefined) {
-          throw new Error(
-            `two files in this vault are the same path once normalized, ` +
-              `${JSON.stringify(prefix ? `${prefix}/${other}` : other)} and ` +
-              `${JSON.stringify(prefix ? `${prefix}/${item.name}` : item.name)}, ` +
-              `and only one of them can sync. Rename one of them.`,
-          );
+        if (group.length > 1) {
+          // Whole paths, because "two files called café.md" does not say
+          // which folder to look in, and the folders above are unambiguous
+          // by construction: a folder two names claim is never walked into.
+          this.ambiguousPaths.push({
+            path,
+            spellings: group.map((e) => (prefix ? `${prefix}/${e.disk}` : e.disk)).sort(),
+          });
+          // No mapping either. `absolute` would otherwise pick one of the two
+          // and a write would land on the note the person did not mean.
+          this.diskName.delete(path);
+          continue;
         }
-        spellings.set(name, item.name);
-        if (item.name !== name) this.diskName.set(path, item.name);
+        const only = group[0]!;
+        if (only.disk !== name && !rawNames.has(name)) await this.normalizeName(dir, only, path);
+        if (only.disk !== name) this.diskName.set(path, only.disk);
+        kept.push(only);
       }
 
       // A file deleted between the readdir and its stat is absent, which is
@@ -523,10 +651,13 @@ export class NodeVault implements Vault {
       // the stat says is still rule 2: unreadable is not the same as gone,
       // and one unreadable file is a reason to stop rather than to report
       // the rest of the vault as the whole of it.
+      // `disk` rather than `item.name` from here on: the entry may have just
+      // been renamed into its normal form, and statting the name it no longer
+      // has would report a note that is right there as gone.
       const stats = await Promise.all(
-        kept.map(({ item }) =>
+        kept.map(({ item, disk }) =>
           item.isFile()
-            ? stat(join(dir, item.name)).catch((err: NodeJS.ErrnoException) => {
+            ? stat(join(dir, disk)).catch((err: NodeJS.ErrnoException) => {
                 if (err.code === "ENOENT") return undefined;
                 throw err;
               })
@@ -534,9 +665,9 @@ export class NodeVault implements Vault {
         ),
       );
       const children = await Promise.all(
-        kept.map(({ item, name }) =>
+        kept.map(({ item, name, disk }) =>
           item.isDirectory()
-            ? walk(join(dir, item.name), prefix ? `${prefix}/${name}` : name)
+            ? walk(join(dir, disk), prefix ? `${prefix}/${name}` : name)
             : undefined,
         ),
       );

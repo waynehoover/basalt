@@ -59,15 +59,47 @@ describe("a vault full of awkward names", () => {
       await mkdir(dirname(full), { recursive: true });
       await writeFile(full, body === "" ? "" : `${body}\n`);
     }
-    const before = await fingerprint(a.dir);
-    expect(before.size).toBe(AWKWARD.length);
+    expect((await fingerprint(a.dir)).size).toBe(AWKWARD.length);
 
     await settle([a]);
     const b = await device(server, "b", dirs, open);
     await settle([b]);
 
-    const gaps = differences(before, await fingerprint(b.dir));
+    // A's own disk after it has synced, not before.
+    //
+    // It used to be the snapshot taken before A had ever listed, and that
+    // compared the names somebody typed against the names the vault has,
+    // which are not the same question and were not the same answer.
+    // `écombining.md` was written with a combining acute; the vault spells it
+    // precomposed, uploads it precomposed, and B writes it precomposed, so
+    // the two disks held one name in two spellings for ever and the
+    // assertion blamed both devices for it. The property is that the two
+    // vaults are the same vault, so both sides of the comparison have to be
+    // a vault (R10).
+    const onA = await fingerprint(a.dir);
+    const gaps = differences(onA, await fingerprint(b.dir));
     expect(gaps, `these names did not survive: ${gaps.join(", ")}`).toEqual([]);
+
+    // And nothing was lost on the way to agreeing: every name that went in is
+    // here, under the one spelling this project has for it. Agreement is not
+    // the property on its own, and two empty vaults agree (R10).
+    const expected = AWKWARD.map(([path]) => path.normalize("NFC")).sort();
+    expect([...onA.keys()].sort()).toEqual(expected);
+
+    // The disk itself, not the listing: a device that reports NFC while
+    // holding NFD is exactly the state this test could not see before. Both
+    // devices, because only one of them wrote the awkward spelling and only
+    // the other one had to be told about it.
+    for (const [who, files] of [
+      ["a", onA],
+      ["b", await fingerprint(b.dir)],
+    ] as const) {
+      for (const name of files.keys()) {
+        expect(name, `${who} holds a name the rest of the vault cannot spell`).toBe(
+          name.normalize("NFC"),
+        );
+      }
+    }
     expect(await server.cli("verify", "-deep")).toMatch(/0 faults/);
   }, 900_000);
 });
