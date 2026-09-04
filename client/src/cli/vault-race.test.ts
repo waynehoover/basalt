@@ -177,7 +177,7 @@ describe("the config on disk", () => {
     await saveConfig(root, c);
     const file = join(root, ".basalt", "config.json");
     expect(((await stat(file)).mode & 0o777).toString(8)).toBe("600");
-    expect(Buffer.compare((await loadConfig(root))!.secret, c.secret)).toBe(0);
+    expect(Buffer.compare((await loadConfig(root))!.secret!, c.secret!)).toBe(0);
     expect(await stateDir()).toEqual(["config.json"]);
   });
 
@@ -190,7 +190,7 @@ describe("the config on disk", () => {
       throw err;
     });
     await expect(saveConfig(root, config())).rejects.toThrow(/EIO/);
-    expect(Buffer.compare((await loadConfig(root))!.secret, first.secret)).toBe(0);
+    expect(Buffer.compare((await loadConfig(root))!.secret!, first.secret!)).toBe(0);
     // Nothing beside the config: no temporary under any name.
     expect(await stateDir()).toEqual(["config.json"]);
   });
@@ -199,7 +199,7 @@ describe("the config on disk", () => {
     shortWrites(5);
     const c = config();
     await saveConfig(root, c);
-    expect(Buffer.compare((await loadConfig(root))!.secret, c.secret)).toBe(0);
+    expect(Buffer.compare((await loadConfig(root))!.secret!, c.secret!)).toBe(0);
   });
 });
 

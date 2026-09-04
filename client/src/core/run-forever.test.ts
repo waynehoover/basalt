@@ -10,18 +10,15 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client, runForever, type ClientOptions } from "./client.ts";
-import { authToken, type VaultKeys } from "./crypto.ts";
-import { testKeys, testWrapped } from "./test-keys.ts";
+import { testWrapped } from "./test-keys.ts";
 import type { SyncReport } from "./engine.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 import { MemoryIndexStore, MemoryVault, type Times } from "./vault.ts";
 
 const SECRET = new Uint8Array(32).fill(21);
-let keys: VaultKeys;
 let wrapped: string;
 beforeAll(async () => {
   await serverBinary();
-  keys = await testKeys(SECRET);
   wrapped = await testWrapped(SECRET);
 }, 180_000);
 afterAll(async () => {
@@ -38,17 +35,16 @@ afterEach(async () => {
   if (server) await server.cleanup();
 });
 
-function options(
+async function options(
   name: string,
   vault: MemoryVault,
   extra: Partial<ClientOptions> = {},
-): ClientOptions {
+): Promise<ClientOptions> {
   return {
     vault,
     store: new MemoryIndexStore(),
-    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys), wrapped),
+    ...(await server.deviceCredentials(SECRET, wrapped)),
     vaultId: "default",
     device: name,
     timeoutMs: 20_000,
@@ -58,7 +54,7 @@ function options(
 }
 
 async function connected(name: string, vault = new MemoryVault()): Promise<Client> {
-  const c = new Client(options(name, vault));
+  const c = new Client(await options(name, vault));
   open.push(c);
   await c.connect();
   return c;
@@ -95,7 +91,7 @@ describe("a connection that ends while a pass is running (C6)", () => {
     let running = true;
     let goneWithWritesFinished = -1;
     loops.push(
-      runForever(options("b", slow), {
+      runForever(await options("b", slow), {
         onClient: (client) => {
           if (client) {
             live = client;
@@ -140,7 +136,7 @@ describe("a settle that is between passes when the client closes (C6)", () => {
     await server.start();
     const vault = new MemoryVault();
     const store = new MemoryIndexStore();
-    const c = new Client({ ...options("a", vault), store });
+    const c = new Client({ ...(await options("a", vault)), store });
     open.push(c);
     await c.connect();
     await vault.edit("note.md", "one\n");
@@ -171,7 +167,7 @@ describe("what a shell is handed and when", () => {
     const passes: SyncReport[] = [];
     let running = true;
     let live: Client | undefined;
-    const loop = runForever(options("a", vault, { onPass: (r) => void passes.push(r) }), {
+    const loop = runForever(await options("a", vault, { onPass: (r) => void passes.push(r) }), {
       onClient: (c) => {
         live = c ?? live;
       },
@@ -192,7 +188,7 @@ describe("what a shell is handed and when", () => {
     let running = true;
     const clients: (Client | undefined)[] = [];
     let synced = 0;
-    await runForever(options("b", new MemoryVault()), {
+    await runForever(await options("b", new MemoryVault()), {
       onConnecting: (client) => {
         connecting = client;
         // The shell decides to stop while the handshake is in flight.
@@ -223,7 +219,7 @@ describe("what a shell is handed and when", () => {
 
     const reports: SyncReport[] = [];
     const vault = new MemoryVault();
-    const b = new Client(options("b", vault, { onPass: (r) => void reports.push(r) }));
+    const b = new Client(await options("b", vault, { onPass: (r) => void reports.push(r) }));
     open.push(b);
     await b.connect();
     const running = b.runUntilClosed(200);
@@ -289,7 +285,7 @@ describe("what the loop does with a refusal (I2, C27)", () => {
     let fatal: Error | undefined;
     const disconnects: Error[] = [];
     let connections = 0;
-    const loop = runForever(options("a", vault), {
+    const loop = runForever(await options("a", vault), {
       onClient: (c) => {
         if (c) connections++;
       },

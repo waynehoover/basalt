@@ -27,8 +27,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 
 import { JsonIndexStore, NodeVault } from "./vault.ts";
 import { Client } from "../core/client.ts";
-import { authToken, type VaultKeys } from "../core/crypto.ts";
-import { testKeys, testWrapped } from "../core/test-keys.ts";
+import { testWrapped } from "../core/test-keys.ts";
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 
 /** The disk's spelling of the name, and the one this vault reports. */
@@ -259,7 +258,6 @@ describe("a vault nothing has listed", () => {
 
 /** Everything below runs a real client against a real server. */
 const SECRET = new Uint8Array(32).fill(43);
-let keys: VaultKeys;
 let wrapped: string;
 let server: TestServer;
 const open: Client[] = [];
@@ -267,7 +265,6 @@ const extra: string[] = [];
 
 beforeAll(async () => {
   await serverBinary();
-  keys = await testKeys(SECRET);
   wrapped = await testWrapped(SECRET);
 }, 180_000);
 afterAll(async () => await cleanupBinary());
@@ -278,13 +275,12 @@ afterEach(async () => {
   if (server) await server.cleanup();
 });
 
-function client(dir = root, device = "mac", form = normalForm): Client {
+async function client(dir = root, device = "mac", form = normalForm): Promise<Client> {
   const c = new Client({
     vault: new NodeVault(dir, { normalForm: form }),
     store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys), wrapped),
+    ...(await server.deviceCredentials(SECRET, wrapped)),
     vaultId: "default",
     device,
     timeoutMs: 20_000,
@@ -297,7 +293,7 @@ function client(dir = root, device = "mac", form = normalForm): Client {
 async function second(name: string): Promise<{ c: Client; dir: string }> {
   const dir = await mkdtemp(join(tmpdir(), `basalt-spelling-${name}-`));
   extra.push(dir);
-  const c = client(dir, name);
+  const c = await client(dir, name);
   await c.connect();
   return { c, dir };
 }
@@ -315,7 +311,7 @@ describe("two devices, both on disks that keep the spellings apart", () => {
     await server.start();
 
     await writeFile(join(root, ON_DISK), "written the disk's way\n");
-    const a = client();
+    const a = await client();
     await a.connect();
     await a.settle();
 
@@ -344,7 +340,7 @@ describe("a disk that holds both spellings, with a server behind it", () => {
     await writeFile(join(root, ON_DISK), "one\n");
     await writeFile(join(root, NAME), "two\n");
     await writeFile(join(root, "unrelated.md"), "fine\n");
-    const mac = client();
+    const mac = await client();
     await mac.connect();
     const report = await mac.settle();
 
@@ -373,7 +369,7 @@ describe("a disk that holds both spellings, with a server behind it", () => {
     await server.start();
 
     await writeFile(join(root, NAME), "the note\n");
-    const mac = client();
+    const mac = await client();
     await mac.connect();
     await mac.settle();
     const other = await second("other");
@@ -409,7 +405,7 @@ describe("a disk that holds both spellings, with a server behind it", () => {
     await mkdir(join(root, "notes"), { recursive: true });
     await writeFile(join(root, "notes", "a.md"), "a\n");
     await writeFile(join(root, "notes", "b.md"), "b\n");
-    const mac = client();
+    const mac = await client();
     await mac.connect();
     await mac.settle();
     const other = await second("other");
@@ -464,7 +460,7 @@ describe("naming two spellings a person cannot tell apart", () => {
     await writeFile(join(root, FOLDED), "one\n");
     await writeFile(join(root, PLAIN), "two\n");
 
-    const mac = client(root, "mac", slashFolds);
+    const mac = await client(root, "mac", slashFolds);
     await mac.connect();
     const report = await mac.settle();
 
@@ -489,7 +485,7 @@ describe("basalt restore into a vault whose disk spells a name its own way", () 
     await server.start();
 
     await writeFile(join(root, NAME), "the first version\n");
-    const syncing = client();
+    const syncing = await client();
     await syncing.connect();
     await syncing.settle();
     await writeFile(join(root, NAME), "the second version\n");
@@ -502,7 +498,7 @@ describe("basalt restore into a vault whose disk spells a name its own way", () 
 
     // A separate process, which is what `basalt restore` is. Nothing here
     // has listed the vault.
-    const restoring = client();
+    const restoring = await client();
     await restoring.connect();
     const versions = await restoring.history(NAME);
     expect(versions.length, "the note has no history to restore from").toBeGreaterThanOrEqual(2);

@@ -90,12 +90,23 @@ async function vaultDir(name: string): Promise<string> {
 }
 
 async function paired(name = "a"): Promise<string> {
+  return (await pairedWithKey(name)).dir;
+}
+
+/**
+ * The same, and the recovery key `init` printed.
+ *
+ * Kept by the caller because nothing reprints it: a converted device holds its
+ * own credential and not the vault's root, which is what makes revoking one
+ * device mean anything.
+ */
+async function pairedWithKey(name = "a"): Promise<{ dir: string; recoveryKey: string }> {
   server = new TestServer();
   await server.start();
   const dir = await vaultDir(name);
   const init = await cli("init", server.setup, "--dir", dir, "--device", name, "--json");
   expect(init.code, init.all).toBe(0);
-  return dir;
+  return { dir, recoveryKey: init.json()["recoveryKey"] as string };
 }
 
 /** The CLI as a separate process, which is the only way two of them contend. */
@@ -221,7 +232,7 @@ describe("unlinking as one transition (C13)", () => {
     const attempt = await cli("unlink", "--dir", dir);
     expect(attempt.code).toBe(1);
     // Still paired, which is the state that refuses to pair again.
-    await expect(readFile(configPath(dir), "utf8")).resolves.toMatch(/"secret"/);
+    await expect(readFile(configPath(dir), "utf8")).resolves.toMatch(/"deviceSecret"/);
     expect((await cli("init", server!.setup, "--dir", dir)).code).toBe(1);
 
     await rm(indexPath(dir), { recursive: true });
@@ -232,11 +243,8 @@ describe("unlinking as one transition (C13)", () => {
   }, 120_000);
 
   it("refuses to pair over an index left by an unfinished unlink", async () => {
-    const dir = await paired("orphan");
+    const { dir, recoveryKey: pairing } = await pairedWithKey("orphan");
     expect((await cli("sync", "--dir", dir)).code).toBe(0);
-    const pairing = (await cli("recovery-key", "--dir", dir, "--json")).json()[
-      "recoveryKey"
-    ] as string;
     // The old order's failure state: config gone, index still there.
     await rm(configPath(dir));
 
@@ -264,7 +272,7 @@ describe("unlinking as one transition (C13)", () => {
     const attempt = await cli("unlink", "--dir", dir);
     expect(attempt.code).toBe(1);
     expect(attempt.all).toMatch(/another basalt is using this vault/);
-    await expect(readFile(configPath(dir), "utf8")).resolves.toMatch(/"secret"/);
+    await expect(readFile(configPath(dir), "utf8")).resolves.toMatch(/"deviceSecret"/);
   }, 120_000);
 });
 
@@ -290,58 +298,92 @@ describe("an index that is valid JSON and wrong (C23)", () => {
 });
 
 /**
- * review finding C15. The claim and the removal of the spent bootstrap are two
- * writes, and the second can fail. Left as it was, the next run offered the
- * spent bootstrap first, was refused with `auth`, and gave up: a vault this
- * device had claimed, refusing this device for ever.
+ * review finding C15, at the place protocol 4 moved it to.
+ *
+ * The claim and the removal of the spent bootstrap are two writes, and the
+ * second can fail. Left as it was, the next run offered the spent bootstrap
+ * first, was refused with `auth`, and gave up: a vault this device had claimed,
+ * refusing this device for ever. Since protocol 4 both writes belong to the
+ * conversion that registers this device's row, and the fallback lives in
+ * `openRegistrar`: the key this config's root derives being accepted is what
+ * proves the vault was claimed with this secret and the token is spent.
  */
 describe("a bootstrap that was spent but not forgotten (C15)", () => {
-  async function bootstrapBack(dir: string): Promise<void> {
+  /**
+   * Puts a vault back into the state a lost reply leaves: claimed on the
+   * server, and a config on disk that still holds the root, the spent
+   * first-run token and no device row of its own.
+   *
+   * Written out rather than kept from before, because `init` gets all the way
+   * to a converted device now: the state this is about is the one it would
+   * have been left in had the second write failed.
+   */
+  async function unconverted(dir: string, recoveryKey: string): Promise<void> {
+    const { parsePairing } = await import("../core/pairing.ts");
     const config = (await loadConfig(dir))!;
-    await saveConfig(dir, { ...config, bootstrap: server!.token });
+    await saveConfig(dir, {
+      url: config.url,
+      vaultId: config.vaultId,
+      device: config.device,
+      secret: parsePairing(recoveryKey).secret,
+      bootstrap: server!.token,
+    });
   }
 
   it("recovers when the claim committed and its reply was lost", async () => {
-    const dir = await paired("lost");
+    const { dir, recoveryKey } = await pairedWithKey("lost");
     expect((await loadConfig(dir))!.bootstrap).toBeUndefined();
-    // As a lost reply leaves it: claimed on the server, bootstrap on disk.
-    await bootstrapBack(dir);
+    await unconverted(dir, recoveryKey);
 
     const sync = await cli("sync", "--dir", dir, "--json");
     expect(sync.code, sync.all).toBe(0);
-    expect((await loadConfig(dir))!.bootstrap, "the spent bootstrap was kept").toBeUndefined();
+    const after = (await loadConfig(dir))!;
+    expect(after.bootstrap, "the spent bootstrap was kept").toBeUndefined();
+    expect(after.secret, "the root was kept").toBeUndefined();
+    expect(after.deviceId, "the device never registered itself").toBeDefined();
   }, 120_000);
 
-  it("closes the connection and keeps the bootstrap when forgetting it fails, then recovers", async () => {
-    const dir = await paired("failsave");
-    await bootstrapBack(dir);
+  it("keeps the bootstrap when the conversion cannot save, then recovers", async () => {
+    const { dir, recoveryKey } = await pairedWithKey("failsave");
+    await unconverted(dir, recoveryKey);
 
     failSavesAfter = saves; // the very next save fails
     const attempt = await cli("sync", "--dir", dir);
     expect(attempt.code).toBe(1);
-    expect(attempt.all).toMatch(/claimed but .* could not be brought up to date/);
-    expect((await loadConfig(dir))!.bootstrap).toBe(server!.token);
+    // Nothing was dropped, because nothing was written: the config still
+    // holds everything the next attempt needs.
+    const held = (await loadConfig(dir))!;
+    expect(held.bootstrap).toBe(server!.token);
+    expect(held.secret, "the root went before the row was registered").toBeDefined();
 
     failSavesAfter = Infinity;
     const again = await cli("sync", "--dir", dir, "--json");
     expect(again.code, again.all).toBe(0);
-    expect((await loadConfig(dir))!.bootstrap).toBeUndefined();
+    const after = (await loadConfig(dir))!;
+    expect(after.bootstrap).toBeUndefined();
+    expect(after.secret).toBeUndefined();
+    expect(after.deviceId).toBeDefined();
   }, 120_000);
 
   it("fails init honestly when the claim succeeds and the second write does not", async () => {
     server = new TestServer();
     await server.start();
     const dir = await vaultDir("init");
-    failSavesAfter = 1; // the first save, with the bootstrap, succeeds; the one after the claim fails
+    failSavesAfter = 1; // the config is written; the conversion's first save fails
     const init = await cli("init", server.setup, "--dir", dir, "--device", "init");
     expect(init.code).toBe(1);
-    expect(init.all).toMatch(/could not be brought up to date/);
+    expect(init.all).toMatch(/could not finish registering itself/);
+    // The recovery key is printed anyway, because at that moment the secret in
+    // this config is the only copy of it on this machine.
+    expect(init.all).toMatch(/Write this recovery key down now/);
     expect((await loadConfig(dir))!.bootstrap).toBe(server.token);
 
     failSavesAfter = Infinity;
     const sync = await cli("sync", "--dir", dir, "--json");
     expect(sync.code, sync.all).toBe(0);
-    expect((await loadConfig(dir))!.bootstrap).toBeUndefined();
+    const after = (await loadConfig(dir))!;
+    expect(after.bootstrap).toBeUndefined();
+    expect(after.secret).toBeUndefined();
   }, 120_000);
 
   it("does not drop a bootstrap the derived key cannot vouch for", async () => {

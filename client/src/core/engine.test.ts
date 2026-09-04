@@ -24,9 +24,8 @@ import {
   type SyncReport,
 } from "./engine.ts";
 import { chunkBytes, sizesFor } from "./chunk.ts";
-import { macEntry, sealChunks, sealPath } from "./crypto.ts";
-import { authToken, type VaultKeys } from "./crypto.ts";
-import { otherVaultKeys, testKeys, testWrapped } from "./test-keys.ts";
+import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
+import { TEST_DATA_KEY, otherVaultKeys, testKeys, testWrapped } from "./test-keys.ts";
 import { ProtocolError, Transport, type WireEntry } from "./transport.ts";
 import { FakeSocket, engineOnFakeSocket, ready, settle } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault, type Times } from "./vault.ts";
@@ -35,7 +34,7 @@ import type { IndexEntry } from "./index-state.ts";
 import { TestServer, cleanupBinary, serverBinary, until } from "./test-server.ts";
 
 const SECRET = new Uint8Array(32).fill(33);
-let keys: VaultKeys;
+let keys: Schedule;
 let wrapped: string;
 
 beforeAll(async () => {
@@ -84,11 +83,10 @@ class Device {
     this.engine = new Engine({
       vault: this.vault,
       store: this.store,
-      secret: SECRET,
       transport: this.transport,
       device: this.name,
       vaultId: "default",
-      ...server.credentials(authToken(keys), wrapped),
+      ...(await server.deviceCredentials(SECRET, wrapped, this.name)),
       // A clock the test advances, so the size-scaled write debounce does
       // not decide when a sync may happen.
       now: () => (this.clock += 60_000),
@@ -306,10 +304,11 @@ describe("a server that answers ready with no data key (C40)", () => {
     const engine = new Engine({
       vault: new MemoryVault(),
       store: new MemoryIndexStore(),
-      secret: SECRET,
+      dataKey: TEST_DATA_KEY,
       transport,
       device: "d",
       vaultId: "default",
+      deviceId: "rig-device",
       token: "t",
     });
     const connecting = transport.connect();

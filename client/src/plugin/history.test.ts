@@ -10,8 +10,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "../core/client.ts";
-import { authToken, type VaultKeys } from "../core/crypto.ts";
-import { testKeys, testWrapped } from "../core/test-keys.ts";
+import { testWrapped } from "../core/test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
 import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
@@ -20,14 +19,12 @@ import type { Version } from "../core/client.ts";
 import { HistoryModal, PAGE, diffLines, type HistorySource } from "./history.ts";
 
 const SECRET = new Uint8Array(32).fill(91);
-let keys: VaultKeys;
 let wrapped: string;
 let server: TestServer;
 const clients: Client[] = [];
 
 beforeAll(async () => {
   await serverBinary();
-  keys = await testKeys(SECRET);
   wrapped = await testWrapped(SECRET);
 }, 180_000);
 
@@ -49,9 +46,8 @@ async function device(): Promise<{ adapter: FakeAdapter; client: Client; source:
   const client = new Client({
     vault: new ObsidianVault(asVault(new FakeVaultIndex(adapter)), ".obsidian"),
     store: new ObsidianIndexStore(adapter, ".obsidian/plugins/basalt/index.json"),
-    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys), wrapped),
+    ...(await server.deviceCredentials(SECRET, wrapped)),
     vaultId: "default",
     device: "laptop",
     timeoutMs: 20_000,

@@ -180,16 +180,25 @@ type In struct {
 
 	// rotate: the new auth key, whose hash replaces the stored one.
 	//
-	// register: the new device's auth key, whose hash becomes its row's. The
-	// key and not the hash, for the same reason `claim` is the key: the server
-	// stores only the digest either way, and a hash is a credential nobody can
-	// judge, so a device offering the hash of "password" would be registered
-	// with a straight face. MinClaimLength is the floor for both.
+	// register, and a hello redeeming an invite: the new device's auth key,
+	// whose hash becomes its row's. The key and not the hash, for the same
+	// reason `claim` is the key: the server stores only the digest either way,
+	// and a hash is a credential nobody can judge, so a device offering the
+	// hash of "password" would be registered with a straight face.
+	// MinClaimLength is the floor for both.
+	//
+	// It is Auth and not Token on a redeeming hello, deliberately. Token is
+	// what a frame authenticates with, and on that frame the invite is; this
+	// is a credential being written down for next time. Sharing the field
+	// would also make "a token and an invite together" unsayable, and that
+	// refusal exists because a hello that carried both used to authenticate on
+	// the token and leave the invite neither redeemed nor refused.
 	Auth string `json:"auth,omitempty"`
 
-	// register: Name is the label for the new device's row, defaulting to the
-	// session's own `device` name when it is empty, and bounded exactly as
-	// that name is. It is never an identifier: two devices may share one.
+	// register, and a hello redeeming an invite: Name is the label for the new
+	// device's row, defaulting to the session's own `device` name when it is
+	// empty, and bounded exactly as that name is. It is never an identifier:
+	// two devices may share one.
 	Name string `json:"name,omitempty"`
 
 	// revoke: AllowLast is the caller saying out loud that it means to leave
@@ -198,11 +207,19 @@ type In struct {
 	// and not a thing to discover you did by clicking the wrong row.
 	AllowLast bool `json:"allowLast,omitempty"`
 
-	// invite: Invite is the random identifier and Sealed the root secret sealed
-	// under the invite key, which never reaches the server. TTLMs is how long
-	// the invite lives; zero is the default. At hello, Invite in place of a
-	// token redeems one, and a hello carrying both is refused: "in place of"
-	// is the rule, and a server that picked one for you would be redeeming or
+	// invite: Invite is the random identifier and Sealed the vault's data key
+	// sealed under the invite key, which never reaches the server. TTLMs is
+	// how long the invite lives; zero is the default.
+	//
+	// At hello, Invite in place of a token redeems one, and the hello carrying
+	// it also carries DeviceID, Auth and optionally Name, because redeeming an
+	// invite is what registers the redeeming device: an invite is single use,
+	// server tracked and expiring, which is the authority to register exactly
+	// one device, and the device that issued it holds no root and so could not
+	// have registered a row on the newcomer's behalf.
+	//
+	// A hello carrying both a token and an invite is refused: "in place of" is
+	// the rule, and a server that picked one for you would be redeeming or
 	// discarding an invite the client did not decide about.
 	Invite string `json:"invite,omitempty"`
 	Sealed string `json:"sealed,omitempty"`
@@ -530,15 +547,26 @@ type Invited struct {
 	ExpiresAt int64  `json:"expiresAt"`
 }
 
-// Redeemed answers a hello that carried an invite: the sealed root secret the
-// issuing device stored, and the vault's wrapped data key when it has one, so
-// the new device can derive everything and connect again as a device. The
-// session closes after this; the invite was marked used before it was sent.
+// Redeemed answers a hello that carried an invite: the vault's data key, as
+// the issuing device sealed it under the invite key, and the id of the device
+// row this redemption registered.
+//
+// The session closes after this. It is not a device session: the row exists
+// now, but nothing on this connection has proved that anyone holds the key it
+// was registered with, and the redeemer has to write the key and the data key
+// down before it can use either. It connects again as a device, and that hello
+// is the proof.
+//
+// DeviceID echoes what was asked for so the redeemer can check the row it is
+// about to store a credential for is the one it named. There is no wrapped
+// data key here and there must not be: the wrapping opens under the root, the
+// redeeming device does not hold one, and a field a client is told to ignore
+// is a field a client eventually uses.
 type Redeemed struct {
-	Res     string `json:"res"` // "redeemed"
-	ID      int64  `json:"id,omitempty"`
-	Sealed  string `json:"sealed"`
-	Wrapped string `json:"wrapped,omitempty"`
+	Res      string `json:"res"` // "redeemed"
+	ID       int64  `json:"id,omitempty"`
+	Sealed   string `json:"sealed"`
+	DeviceID string `json:"deviceId"`
 }
 
 // Rotated answers a rotate: the vault's auth hash and wrapped data key were

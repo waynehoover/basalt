@@ -2,16 +2,20 @@
  * Rotation across a process boundary, against a real server.
  *
  * The case this file exists for is the one an ordinary lost packet produces.
- * The server commits the new credential, closes every other session, and only
- * then answers; a connection that goes in between leaves this device with a
- * vault whose new root it may be the only holder of. `rotate` used to throw at
- * that point with nothing saved and nothing printed, so the old root no longer
- * authenticated, the new one died with the process, and the ciphertext on the
- * server was intact and unopenable for ever.
+ * The server commits the new credential, closes every other registrar, and
+ * only then answers; a connection that goes in between leaves the person with
+ * a vault whose new root may exist nowhere but in this process.
+ *
+ * Protocol 4 changed where the durability lives. Rotation used to stage its new
+ * secret in the device's own config and promote it on the next connection, and
+ * there is nowhere to stage a root any more: a device does not hold one, which
+ * is what makes revoking a single device mean anything. So the new key is
+ * printed *before* the request goes out, and when the reply is lost the CLI
+ * asks the server which secret it has rather than guessing.
  *
  * Both halves are here: the reply lost after the rotation committed, where the
- * next run has to come up under the new secret, and lost before it, where the
- * next run has to come back to the old one.
+ * answer is "the key above is the vault's", and lost before it, where the
+ * answer is "cross it out".
  */
 
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
@@ -42,7 +46,7 @@ vi.mock("../core/transport.ts", async (importOriginal) => {
       }
       if (lose === "refused") {
         // What the server answers a rotate whose credential is no longer the
-        // vault's, because another device rotated first.
+        // vault's, because somebody rotated first.
         throw new actual.ProtocolError(
           "rotated",
           "the vault was rotated by another device, so this rotation was refused; " +
@@ -65,6 +69,9 @@ class Run {
   get all(): string {
     return this.out.join("\n") + "\n" + this.err.join("\n");
   }
+  get stderr(): string {
+    return this.err.join("\n");
+  }
   json(): Record<string, unknown> {
     return JSON.parse(this.out.join("\n")) as Record<string, unknown>;
   }
@@ -77,11 +84,9 @@ async function cli(...argv: string[]): Promise<Run> {
   return r;
 }
 
-/** The one recovery key a run printed, wherever it printed it. */
-function keyIn(r: Run): string {
-  const line = [...r.out, ...r.err].find((l) => l.trim().startsWith("basalt3_"));
-  expect(line, `no recovery key in:\n${r.all}`).toBeDefined();
-  return line!.trim();
+/** Every recovery key a run printed, wherever it printed it. */
+function keysIn(r: Run): string[] {
+  return [...r.out, ...r.err].filter((l) => l.trim().startsWith("basalt3_")).map((l) => l.trim());
 }
 
 beforeAll(async () => {
@@ -120,35 +125,27 @@ async function started(name = "a"): Promise<{ dir: string; key: string }> {
 }
 
 describe("a rotation whose reply never came back", () => {
-  it("prints the new key, and the next run comes up under it when it committed", async () => {
+  /**
+   * Committed, reply lost. The CLI cannot tell that from a rotation that never
+   * landed, so it asks: the new root opens a registrar session if and only if
+   * the server took it. That is a better answer than the staged secret used to
+   * give, because it settles the question rather than deferring it to the next
+   * connection.
+   */
+  it("finds out that it committed, and says the printed key is the vault's", async () => {
     const { dir, key: oldKey } = await started("committed");
 
     lose = "after-commit";
-    const rotated = await cli("rotate", "--dir", dir);
+    const rotated = await cli("rotate", oldKey, "--dir", dir);
     lose = undefined;
-    expect(rotated.code, rotated.all).toBe(1);
-    // Said plainly, because at this moment it is the only thing that opens the
-    // vault and nothing here can tell whether it committed.
-    expect(rotated.all).toMatch(/may have committed/);
-    expect(rotated.all).toMatch(/Write this recovery key down now/);
-    const newKey = keyIn(rotated);
-    expect(newKey).not.toBe(oldKey);
+    expect(rotated.code, rotated.all).toBe(0);
+    expect(rotated.all).toMatch(/the rotation did commit/);
+    const newKey = keysIn(rotated).find((k) => k !== oldKey)!;
+    expect(newKey).toBeDefined();
 
-    // On disk while it is unresolved: both secrets, so neither is lost.
-    const staged = (await loadConfig(dir))!;
-    expect(staged.pending, "the new secret was not written down before it was sent").toBeDefined();
-
-    // A fresh process, which is all a config on disk is worth. The rotation did
-    // commit, so the pending secret is the one that opens the vault, and the
-    // run promotes it.
-    const sync = await cli("sync", "--dir", dir);
-    expect(sync.code, sync.all).toBe(0);
-    const settled = (await loadConfig(dir))!;
-    expect(settled.pending).toBeUndefined();
-    expect((await cli("recovery-key", "--dir", dir)).out.join("\n").trim()).toBe(newKey);
-
-    // And the key that was printed is the vault: it pairs a device, and the
-    // one printed at init no longer does.
+    // And it is the vault: it adds a device, and the one printed at init does
+    // not. The history written before the rotation reads back, because the
+    // data key did not change.
     const other = await vaultDir("other");
     expect((await cli("pair", oldKey, "--dir", other, "--device", "other")).all).toMatch(
       /not authorised/,
@@ -157,27 +154,26 @@ describe("a rotation whose reply never came back", () => {
     expect(paired.code, paired.all).toBe(0);
     expect((await cli("sync", "--dir", other)).code).toBe(0);
     expect(await readFile(join(other, "kept.md"), "utf8")).toBe("written before the rotation\n");
+
+    // The rotating device never held either key and goes on syncing across the
+    // whole thing, which is the point of rotation touching no device row.
+    await writeFile(join(dir, "after.md"), "after\n");
+    expect((await cli("sync", "--dir", dir)).code, "the rotation evicted this device").toBe(0);
   }, 120_000);
 
-  it("comes back to the old secret when the rotation never reached the server", async () => {
+  it("finds out that it did not commit, and says to cross the printed key out", async () => {
     const { dir, key: oldKey } = await started("uncommitted");
 
     lose = "before-commit";
-    const rotated = await cli("rotate", "--dir", dir);
+    const rotated = await cli("rotate", oldKey, "--dir", dir);
     lose = undefined;
     expect(rotated.code, rotated.all).toBe(1);
-    const neverUsed = keyIn(rotated);
-    expect((await loadConfig(dir))!.pending).toBeDefined();
-
-    // A fresh process. The pending secret is tried first and refused, the
-    // current one works, and the outstanding rotation is dropped.
-    const sync = await cli("sync", "--dir", dir);
-    expect(sync.code, sync.all).toBe(0);
-    expect((await loadConfig(dir))!.pending).toBeUndefined();
-    expect((await cli("recovery-key", "--dir", dir)).out.join("\n").trim()).toBe(oldKey);
+    expect(rotated.all).toMatch(/did not commit/);
+    expect(rotated.all).toMatch(/cross out/);
+    const neverUsed = keysIn(rotated).find((k) => k !== oldKey)!;
 
     // The old key is still the vault's, and the one that was printed opens
-    // nothing, which is why both were kept until this was settled.
+    // nothing, which is what the run said.
     const other = await vaultDir("other");
     expect((await cli("pair", neverUsed, "--dir", other, "--device", "other")).all).toMatch(
       /not authorised/,
@@ -185,73 +181,80 @@ describe("a rotation whose reply never came back", () => {
     expect((await cli("pair", oldKey, "--dir", other, "--device", "other")).code).toBe(0);
   }, 120_000);
 
-  it("says so plainly when another device rotated first, and keeps one secret", async () => {
+  it("says so plainly when somebody rotated first, and does not offer a key", async () => {
     const { dir, key } = await started("raced");
     lose = "refused";
-    const rotated = await cli("rotate", "--dir", dir);
+    const rotated = await cli("rotate", key, "--dir", dir);
     lose = undefined;
     expect(rotated.code, rotated.all).toBe(1);
-    expect(rotated.all).toMatch(/rotated by another device/);
-    expect(rotated.all).toMatch(/pair it again/);
-    // Nothing committed, so there is no second secret to keep: the config is
-    // the one it started with, and a key it printed as the vault's would be a
-    // key that opens nothing.
-    expect(rotated.all).not.toMatch(/may have committed/);
-    const config = (await loadConfig(dir))!;
-    expect(config.pending).toBeUndefined();
-    expect((await cli("recovery-key", "--dir", dir)).out.join("\n").trim()).toBe(key);
+    expect(rotated.all).toMatch(/rotated by somebody else first/);
+    expect(rotated.all).toMatch(/Cross it out/);
+    // Nothing committed, so the key it printed before sending is not the
+    // vault's, and the run says which. It must not read as "this may have
+    // worked": a key that opens nothing, written down in place of one that
+    // does, is worse than either.
+    expect(rotated.all).not.toMatch(/did commit/);
   }, 120_000);
 
-  it("prints both keys while it is unresolved, rather than guessing at one", async () => {
-    const { dir, key: oldKey } = await started("both");
-    lose = "after-commit";
-    const newKey = keyIn(await cli("rotate", "--dir", dir));
+  /**
+   * The one thing that has to be true before the request goes out, now that
+   * there is nowhere on a device to stage a root: the key is on the screen, so
+   * a person can write it down, before the server can possibly have taken it.
+   */
+  it("prints the new key before sending, not after hearing back", async () => {
+    const { dir, key } = await started("printed");
+    lose = "before-commit";
+    const rotated = await cli("rotate", key, "--dir", dir);
     lose = undefined;
-
-    const reprint = await cli("recovery-key", "--dir", dir, "--json");
-    expect(reprint.code, reprint.all).toBe(0);
-    expect(reprint.json()["recoveryKey"]).toBe(oldKey);
-    expect(reprint.json()["pendingRecoveryKey"]).toBe(newKey);
+    // The rotate threw, so nothing after the request ran, and the key is still
+    // here: it was printed on the way in.
+    expect(rotated.err.some((l) => l.trim().startsWith("basalt3_"))).toBe(true);
+    expect(rotated.stderr).toMatch(/Write it down before pressing on/);
   }, 120_000);
 });
 
 /**
- * The vault's wrapped data key, pinned after the first connection so that a
- * server cannot hand this device a different one later. A rotation is the one
- * legitimate change, and it is the device that rotates which stores the new
- * blob; every other device is evicted and pairs again.
+ * What a device keeps across a rotation, which since protocol 4 is everything
+ * it had: rotation replaces the vault's secret and the wrapping of the data
+ * key, and touches no device row.
  */
-describe("the wrapped data key this device pins", () => {
-  it("is written down on the first connection and survives a rotation", async () => {
-    const { dir } = await started("pin");
-    const first = (await loadConfig(dir))!;
-    expect(first.wrapped, "the vault's data key was never pinned").toBeDefined();
-    // The candidate offered at claim is gone with the bootstrap that carried
-    // it: nothing sends a claim once the vault is known to be claimed.
-    expect(first.bootstrap).toBeUndefined();
-    expect(first.claimWrapped).toBeUndefined();
+describe("what a rotation leaves on a device", () => {
+  it("leaves this device's own credential exactly as it was", async () => {
+    const { dir, key } = await started("pin");
+    const before = (await loadConfig(dir))!;
+    expect(before.secret, "a converted device is holding the root").toBeUndefined();
+    expect(before.deviceId).toBeDefined();
 
-    const rotated = await cli("rotate", "--dir", dir);
-    expect(rotated.code, rotated.all).toBe(0);
+    expect((await cli("rotate", key, "--dir", dir)).code).toBe(0);
+
     const after = (await loadConfig(dir))!;
-    expect(after.wrapped, "the rotation left the old wrapping pinned").not.toBe(first.wrapped);
+    expect(after.deviceId).toBe(before.deviceId);
+    expect([...after.deviceSecret!]).toEqual([...before.deviceSecret!]);
+    // The data key above all: a rotation that changed it would make every
+    // note already on the server unreadable.
+    expect([...after.dataKey!]).toEqual([...before.dataKey!]);
 
-    // Which the next connection then agrees with, rather than being refused
-    // by its own pin.
     await writeFile(join(dir, "after.md"), "after\n");
     const sync = await cli("sync", "--dir", dir, "--json");
     expect(sync.code, sync.all).toBe(0);
     expect(sync.json()["uploaded"]).toBe(1);
   }, 120_000);
 
-  it("is pinned by a second device that has never claimed anything", async () => {
-    const { key } = await started("first");
+  it("leaves a second device syncing too, which is the point", async () => {
+    const { dir, key } = await started("first");
     const second = await vaultDir("second");
     expect((await cli("pair", key, "--dir", second, "--device", "second")).code).toBe(0);
     expect((await cli("sync", "--dir", second)).code).toBe(0);
-    const config = (await loadConfig(second))!;
-    expect(config.wrapped).toBeDefined();
-    expect(config.claimWrapped, "a device with no bootstrap made a claim key").toBeUndefined();
+
+    expect((await cli("rotate", key, "--dir", dir)).code).toBe(0);
+
+    // Under protocol 3 this device would have been evicted by the rotation and
+    // would have had to be paired again from the new string, which for a
+    // laptop, a phone, a desktop and a NAS is a weekend.
+    await writeFile(join(second, "still.md"), "still here\n");
+    const sync = await cli("sync", "--dir", second, "--json");
+    expect(sync.code, sync.all).toBe(0);
+    expect(sync.json()["uploaded"]).toBe(1);
     expect(await readFile(join(second, "kept.md"), "utf8")).toBe("written before the rotation\n");
   }, 120_000);
 });

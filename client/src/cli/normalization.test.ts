@@ -18,18 +18,15 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "../core/client.ts";
-import { authToken, type VaultKeys } from "../core/crypto.ts";
-import { testKeys, testWrapped } from "../core/test-keys.ts";
+import { testWrapped } from "../core/test-keys.ts";
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "../core/vault.ts";
 import { JsonIndexStore, NodeVault } from "./vault.ts";
 
 const SECRET = new Uint8Array(32).fill(29);
-let keys: VaultKeys;
 let wrapped: string;
 beforeAll(async () => {
   await serverBinary();
-  keys = await testKeys(SECRET);
   wrapped = await testWrapped(SECRET);
 }, 180_000);
 afterAll(async () => await cleanupBinary());
@@ -44,11 +41,10 @@ afterEach(async () => {
   if (server) await server.cleanup();
 });
 
-function credentials(name: string) {
+async function credentials(name: string) {
   return {
-    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys), wrapped),
+    ...(await server.deviceCredentials(SECRET, wrapped)),
     vaultId: "default",
     device: name,
     timeoutMs: 20_000,
@@ -62,7 +58,7 @@ async function diskDevice(name: string): Promise<{ c: Client; dir: string }> {
   const c = new Client({
     vault: new NodeVault(dir),
     store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-    ...credentials(name),
+    ...(await credentials(name)),
   });
   open.push(c);
   await c.connect();
@@ -71,7 +67,7 @@ async function diskDevice(name: string): Promise<{ c: Client; dir: string }> {
 
 async function memoryDevice(name: string): Promise<{ c: Client; vault: MemoryVault }> {
   const vault = new MemoryVault();
-  const c = new Client({ vault, store: new MemoryIndexStore(), ...credentials(name) });
+  const c = new Client({ vault, store: new MemoryIndexStore(), ...(await credentials(name)) });
   open.push(c);
   await c.connect();
   return { c, vault };

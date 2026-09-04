@@ -11,8 +11,8 @@
  * shipped bundle.
  */
 
-import { type VaultKeys } from "./crypto.ts";
-import { testKeys, testWrapped } from "./test-keys.ts";
+import { type Schedule } from "./crypto.ts";
+import { TEST_DATA_KEY, testKeys, testWrapped } from "./test-keys.ts";
 import { Engine } from "./engine.ts";
 import { Transport, type SocketLike } from "./transport.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
@@ -83,7 +83,7 @@ export class FakeSocket implements SocketLike {
     });
   }
 
-  /** Answers a fetch: the header, then the bodies, as a protocol 3 server does. */
+  /** Answers a fetch: the header, then the bodies, as a protocol 4 server does. */
   bodies(...bodies: Uint8Array[]): void {
     this.reply({ res: "bodies", count: bodies.length });
     for (const b of bodies) this.body(b);
@@ -98,8 +98,8 @@ export class FakeSocket implements SocketLike {
 export function ready(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     res: "ready",
-    proto: 3,
-    minProto: 3,
+    proto: 4,
+    minProto: 4,
     serverVersion: "test",
     cursor: 10,
     perFileMax: 1,
@@ -140,7 +140,7 @@ export async function engineOnFakeSocket(
   t: Transport;
   vault: MemoryVault;
   logs: string[];
-  keys: VaultKeys;
+  keys: Schedule;
 }> {
   const socket = new FakeSocket();
   const logs: string[] = [];
@@ -160,10 +160,11 @@ export async function engineOnFakeSocket(
   engine = new Engine({
     vault,
     store: new MemoryIndexStore(),
-    secret: RIG_SECRET,
+    dataKey: TEST_DATA_KEY,
     transport: t,
     device: "d",
     vaultId: "v",
+    deviceId: "rig-device",
     token: "t",
     log: (m, ...rest) => void logs.push(`${m} ${rest.map((r) => JSON.stringify(r)).join(" ")}`),
   });

@@ -25,7 +25,7 @@ Click the Basalt icon in the ribbon, or run **Basalt Sync: Show status**.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/pairing-dark.png">
-  <img src="assets/screenshots/pairing.png" alt="The pairing panel: device name and an invite or recovery key to join a vault, or the server's setup string to start a new one." width="720">
+  <img src="assets/screenshots/pairing.png" alt="The pairing panel: device name and an invite or the vault's recovery key to join a vault, or the server's setup string to start a new one." width="720">
 </picture>
 
 **The first device** pastes the line the server printed on its first run into
@@ -35,25 +35,39 @@ the `#` instead: `wss://homelab.tailnet.ts.net#K7M2PQR4-...`. The plugin
 generates the vault's root secret, claims the vault, and shows the recovery key
 once, under *Write this down*. Write it down and keep it offline: it is the
 whole vault, past and future, and the server has never seen it and cannot
-reissue it. Adding a device does not need it.
+reissue it. Adding a device does not need it: an invite does that.
 
-**Every other device** is added with an invite. On a device that has the vault,
-press *Add another device*, then *Create invite*; the panel shows a
-`basalt3i_` string and when it expires, ten minutes later. Paste it into
-*Invite or recovery key* on the new device and press *Pair*. An invite works
-once and carries no secret of its own: the new device uses it to fetch the
-vault's key from the server, sealed under a key that stays inside the invite
-string. The recovery key pastes into the same field, for a vault whose every
-device is lost.
+**Every other device** is added with an invite. On a device that already has
+the vault, press *Create invite* under *Add another device*; the string is
+shown in the panel and copied to the clipboard where there is one. Paste it
+into *Invite or recovery key* on the new device and press *Pair*. An invite
+works once, lasts ten minutes, and carries no root secret: it hands the new
+device the vault's data key and registers a credential of its own for it, which
+the *Devices* row can cut off without touching any other device.
 
-*Show recovery key* sits behind a warning in the panel and is not the way to
-add a device. *Pair* with an invite saves the key the server hands over before
-it connects, because the invite is spent the moment it is redeemed. *Pair* with
-a recovery key reaches the server before it saves anything, so a mistyped
-string is refused on the spot. *Start a new vault* saves first, because that
-handshake is what claims the vault and the secret has to be on disk before the
-server binds to it; if the server then refuses, the notice says so and offers
-unlink.
+The recovery key works in the same field, and is what to use when no device is
+left to make an invite from. It is not the ordinary way in on purpose: it is
+written down and offline, and adding a phone should not mean going to get it.
+That an invite carries the data key rather than the root is what makes revoking
+one device mean something; [design.md](design.md#a-lost-or-stolen-device) has
+the reasoning.
+
+*Recovery key* in a paired panel is a sentence rather than a button: the key
+was shown once, this device does not have it, and adding a device does not need
+it. *Pair* reaches the server before it says paired, so a mistyped string is
+refused on the spot and nothing is left behind. An invite is spent by the
+exchange that registers the device, so nothing is written here until the server
+has answered; the recovery key is saved first and used second, because that
+path registers with a credential this device is holding. *Start a new vault*
+saves first too, because that handshake is what claims the vault and the secret
+has to be on disk before the server binds to it; if the server then refuses,
+the notice says so and offers unlink.
+
+**A vault paired before protocol 4** converts itself the first time it
+connects: it registers a device row with the root it is holding, reads back the
+row by using it, and only then drops the root. Nothing to do, and nothing to
+notice. If it is interrupted the device tries again on the next connection, and
+if the same interruption keeps happening the panel says so with the reason.
 
 The device name is optional. Left blank it becomes `obsidian-` and four random
 characters, so two devices left at the default do not share a name. It appears
@@ -122,25 +136,51 @@ Unlinking and pairing again works too and is worse: it resets the merge base, so
 every note comes back as a version with no ancestor and the next edit made on
 two devices at once makes conflict copies instead of merging. Use Rejoin.
 
+## Devices, and revoking one
+
+*Devices* lists every device that may reach this vault: its name, the id that
+identifies it, when it was added and when it was last seen. The name is not an
+identity, and two laptops may both be called laptop; the id is.
+
+Each row has *Revoke*, behind a second press. Revoking removes the device's row
+and closes any connection it has open, in that order, so it stops at once
+rather than the next time it happens to reconnect. It can revoke this device
+too, which is what unlinking looks like from the server's side.
+
+**Revoking stops a device connecting. It does not unread what that device
+already read.** It still holds the vault's key for every note it had synced,
+and nothing can take that back. A device that was stolen rather than merely
+lost wants its secret replaced as well, below. A panel that let somebody read
+"revoked" as "the vault is safe again" would have them skip the one step that
+helps.
+
+Eight devices, and the ninth registration is refused rather than quietly
+allowed and then unable to connect.
+
 ## Replacing the vault's secret
 
-Every device holds the same root secret, and that secret is also the credential,
-so there is no way to revoke one device. What there is is replacing the secret
-for all of them. *Replace the vault's secret* sits in the panel behind a warning
-and two presses, next to the recovery key, and it is for a device that is not
-coming back or a pairing string that has been somewhere it should not have been.
+For a recovery key that has been somewhere it should not have been, and for the
+second half of a stolen device: revoking it stops it connecting, and this stops
+the key it was holding opening the vault again.
+
+*Replace the vault's secret* asks for the vault's current recovery key, because
+no device holds one. That is the point of the change: a device that could
+replace the secret could also register itself again after being revoked. So
+somebody without the key cannot do it from here, and the row says so rather
+than letting them find out by pressing.
 
 The vault keeps all of its history: its content is sealed under a data key that
-the root only wraps, so the wrapping changes and nothing is re-encrypted. The
-old recovery key and every outstanding invite stop working, every other device
-is disconnected and is added again with a fresh invite, and the panel shows the
-new recovery key to write down in place of the old one. It cannot unread what
-was already read; [design.md](design.md#a-lost-or-stolen-device) says more.
+the root only wraps, so the wrapping changes and nothing is re-encrypted. **No
+device row is touched and every device keeps syncing**, including this one.
+That is the expensive half of what per-device credentials removed: it used to
+disconnect every device and each one had to be added again, which for a laptop,
+a phone, a desktop and a NAS is a weekend, and is the reason a leaked string
+went unrotated. It cannot unread what was already read;
+[design.md](design.md#a-lost-or-stolen-device) says more.
 
-The new secret is written into `data.json` before the request goes out, so a
-reply lost on the way cannot leave a vault whose new root nobody holds. If that
-happens the panel says so, shows the key anyway, and the next connection tries
-it first and settles which secret the vault has. Keep both until it has.
+The new key is on screen before the request goes out, because there is nowhere
+on a device to keep a root: not holding one is the point. If the reply is lost,
+the plugin asks the server which secret it has and says which key to keep.
 
 ## Commands
 
@@ -151,10 +191,11 @@ it first and settles which secret the vault has. Keep both until it has.
 | Show version history | for the open note |
 | Recover a deleted note | lists what the server has and this vault does not |
 
-The panel holds the rest: *Sync now*, *Add another device*, *Recover a deleted
-note*, *Show recovery key*, *Replace the vault's secret*, *Unlink this vault*,
-and *Rejoin this server* when a restored server has refused this device. The
-last three are behind warnings and confirmations; nothing there is a setting.
+The panel holds the rest: *Sync now*, *Devices*, *Recover a deleted note*,
+*Replace the vault's secret*, *Unlink this vault*, and *Rejoin this server*
+when a restored server has refused this device. Revoking, replacing the secret
+and unlinking are behind warnings and confirmations; nothing there is a
+setting.
 
 Version history is also on a note's right-click menu, where Obsidian Sync puts
 it. Both are registered on Obsidian's own command line as `basalt:history` and

@@ -70,6 +70,16 @@ export const SECRET_LENGTH = 32;
 /** The data key length in bytes: what every content key derives from. */
 export const DATA_KEY_LENGTH = 32;
 
+/**
+ * A device secret's length in bytes.
+ *
+ * The same thirty-two as the root, and for the same reason: it is a random
+ * credential rather than something a person chose, so the only thing length
+ * buys is the guessing bound, and there is no reason for one of the two
+ * secrets in this system to be weaker than the other.
+ */
+export const DEVICE_SECRET_LENGTH = 32;
+
 import { deflateSync, inflateSync } from "fflate";
 
 const enc = new TextEncoder();
@@ -90,6 +100,18 @@ const INFO = {
   content: "basalt/content/1",
   nonce: "basalt/nonce/1",
   meta: "basalt/meta/1",
+  /**
+   * A device's own auth key, from its own secret.
+   *
+   * Its own string rather than reusing `auth`, so that the two can never come
+   * out equal by accident. If a device secret were ever set to the vault's
+   * root, sharing the string would derive the vault's credential and register
+   * a device row whose hash is the vault's hash: a device that the recovery
+   * key also authenticates as, and a revocation that removes a row while the
+   * credential behind it still opens the vault. Different strings make that
+   * unexpressible rather than merely unlikely.
+   */
+  deviceAuth: "basalt/device-auth/1",
 } as const;
 
 /**
@@ -153,6 +175,19 @@ export function generateSecret(): Uint8Array {
 /** A fresh data key, made once by the first device and wrapped for the server. */
 export function generateDataKey(): Uint8Array {
   return randomBytes(DATA_KEY_LENGTH);
+}
+
+/**
+ * A fresh device secret: the credential one device connects with, and the only
+ * credential a converted device holds.
+ *
+ * It derives one key and unwraps nothing. That is the shape of the privilege
+ * separation in docs/protocol.md, "Authentication": the root registers devices
+ * and rewraps the data key, a device secret connects and syncs, and neither can
+ * be used for the other's job.
+ */
+export function generateDeviceSecret(): Uint8Array {
+  return randomBytes(DEVICE_SECRET_LENGTH);
 }
 
 /** Random bytes from the platform, or a refusal. */
@@ -303,9 +338,17 @@ export async function unwrapDataKey(wrap: CryptoKey, wrapped: string): Promise<U
 }
 
 /**
- * Seals a root secret under an invite key: `n || AES-GCM-256(K_inv, n, S)`,
- * base64url. What an invite stores on the server, and what the server cannot
- * open because the invite key travels in the invite string and never to it.
+ * Seals the vault's data key under an invite key: `n || AES-GCM-256(K_inv, n,
+ * K_data)`, base64url. What an invite stores on the server, and what the
+ * server cannot open because the invite key travels in the invite string and
+ * never to it.
+ *
+ * The data key and not the root, since protocol 4. A device holds no root, so
+ * it has none to seal, and an invite that carried one would hand the newcomer
+ * the credential that registers devices and rewraps the vault: everything
+ * revoking a device is meant to take back. What the newcomer gets is what a
+ * device has, the data key, and a credential of its own that the redemption
+ * registers.
  */
 export async function sealSecret(inviteKey: Uint8Array, secret: Uint8Array): Promise<string> {
   const key = await importAesKey(inviteKey);
@@ -325,7 +368,7 @@ export async function unsealSecret(inviteKey: Uint8Array, sealed: string): Promi
   }
   if (secret.length !== SECRET_LENGTH) {
     throw new Error(
-      `the invite unsealed to a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH} bytes`,
+      `the invite unsealed to ${secret.length} bytes, and the vault's data key is ${SECRET_LENGTH} bytes`,
     );
   }
   return secret;
@@ -432,11 +475,11 @@ async function syntheticNonce(nonceKey: CryptoKey, plaintext: Uint8Array): Promi
  * recover the name to write it to disk, and LiveSync only gets away with it
  * because it keeps a second copy of the name inside the encrypted document.
  */
-export async function sealPath(keys: VaultKeys, path: string): Promise<string> {
+export async function sealPath(keys: Schedule, path: string): Promise<string> {
   return base64urlEncode(await seal(keys.path, keys.nonce, enc.encode(path)));
 }
 
-export async function openPath(keys: VaultKeys, sealedPath: string): Promise<string> {
+export async function openPath(keys: Schedule, sealedPath: string): Promise<string> {
   const plain = await open(keys.path, base64urlDecode(sealedPath));
   return dec.decode(plain);
 }
@@ -552,7 +595,7 @@ export interface SealedChunk {
  * for a 700 MB attachment beats a 3.7x gain that does not.
  */
 export async function sealChunks(
-  keys: VaultKeys,
+  keys: Schedule,
   chunks: Iterable<Uint8Array>,
 ): Promise<SealedChunk[]> {
   return Promise.all(
@@ -563,7 +606,7 @@ export async function sealChunks(
   );
 }
 
-export async function openChunk(keys: VaultKeys, sealed: Uint8Array): Promise<Uint8Array> {
+export async function openChunk(keys: Schedule, sealed: Uint8Array): Promise<Uint8Array> {
   const framed = await open(keys.content, sealed);
   if (framed.length === 0) {
     throw new Error("sealed chunk carries no marker byte");
@@ -615,6 +658,26 @@ export function isChunkName(v: unknown): v is string {
 /** The auth token as it goes on the wire. Derived from the root, so a device has it before it connects. */
 export function authToken(keys: RootKeys): string {
   return base64urlEncode(keys.auth);
+}
+
+/**
+ * A device's own auth token, from its own secret.
+ *
+ * What `deviceId` is checked against on a protocol 4 hello, and what
+ * `register` hands the server so it can store the digest. Derived rather than
+ * sent raw for the same reason the vault's is: the secret on disk is a seed,
+ * and the thing on the wire is a key with one purpose written into its
+ * derivation.
+ *
+ * The server keeps only `sha256` of what it is sent, so what travels is the
+ * key rather than the digest: a digest is a credential nobody can judge, and
+ * the server enforces a floor on the length of what it is offered. The floor
+ * is 32 characters and this is 43, being base64url of 32 bytes.
+ */
+export async function deviceAuthToken(deviceSecret: Uint8Array): Promise<string> {
+  const { s, ikm, hkdf } = await ikmOf(deviceSecret);
+  const auth = await s.deriveBits(hkdf(INFO.deviceAuth), ikm, 256);
+  return base64urlEncode(new Uint8Array(auth));
 }
 
 /* ---------------------------------------------------------------- *
@@ -774,7 +837,7 @@ function canonical(e: EntryFacts): Uint8Array {
 }
 
 /** The authenticator for one entry, as hex. */
-export async function macEntry(keys: VaultKeys, e: EntryFacts): Promise<string> {
+export async function macEntry(keys: Schedule, e: EntryFacts): Promise<string> {
   const mac = await subtle().sign("HMAC", keys.meta, toBuffer(canonical(e)));
   return hex(new Uint8Array(mac));
 }
@@ -786,7 +849,7 @@ export async function macEntry(keys: VaultKeys, e: EntryFacts): Promise<string> 
  * is a server that can guess the rest, and this runs on every entry of every
  * batch.
  */
-export async function entryIsOurs(keys: VaultKeys, e: EntryFacts, mac: string): Promise<boolean> {
+export async function entryIsOurs(keys: Schedule, e: EntryFacts, mac: string): Promise<boolean> {
   const want = await macEntry(keys, e);
   if (want.length !== mac.length) return false;
   let diff = 0;

@@ -30,6 +30,8 @@ import {
   ConnectionError,
   ProtocolError,
   Transport,
+  type DeviceRow,
+  type RegistrarLimits,
   type ServerLimits,
   type SocketLike,
   type WireEntry,
@@ -40,7 +42,9 @@ import {
   authToken,
   base64urlEncode,
   deriveRootKeys,
+  deviceAuthToken,
   generateDataKey,
+  generateDeviceSecret,
   openPath,
   randomBytes,
   sealPath,
@@ -49,13 +53,15 @@ import {
   unwrapDataKey,
   wrapDataKey,
   type RootKeys,
-  type VaultKeys,
+  type Schedule,
 } from "./crypto.ts";
 import {
   INVITE_ID_LENGTH,
   INVITE_KEY_LENGTH,
-  encodeConfig,
+  deviceCredential,
   formatInvite,
+  generateDeviceId,
+  needsConversion,
   type DeviceConfig,
   type Invite,
 } from "./pairing.ts";
@@ -64,21 +70,14 @@ import { firstFreeName, splitName } from "./paths.ts";
 export interface ClientOptions {
   readonly vault: Vault;
   readonly store: IndexStore;
-  /**
-   * The root secret: what unwraps the data key `ready` returns, what an
-   * invite seals, and what a rotation replaces. See EngineOptions.
-   */
-  readonly secret: Uint8Array;
+  /** The vault's data key, which every content key derives from. See EngineOptions. */
+  readonly dataKey: Uint8Array;
   /** WebSocket URL of the server. */
   readonly url: string;
+  /** This device's row in the vault's device list. */
+  readonly deviceId: string;
+  /** This device's own auth key, derived from its own secret. */
   readonly token: string;
-  /** What to bind the vault to if it has not been claimed. See EngineOptions. */
-  readonly claim?: { auth: string; wrapped: string };
-  /**
-   * The vault's wrapped data key as this device last saw it. A `ready` with a
-   * different blob is refused. See DeviceConfig.
-   */
-  readonly wrapped?: string;
   readonly vaultId: string;
   readonly device: string;
   readonly timeoutMs?: number;
@@ -152,13 +151,12 @@ export class Client {
     engine = new Engine({
       vault: opts.vault,
       store: opts.store,
-      secret: opts.secret,
+      dataKey: opts.dataKey,
       transport: this.transport,
       device: opts.device,
       vaultId: opts.vaultId,
+      deviceId: opts.deviceId,
       token: opts.token,
-      ...(opts.claim !== undefined ? { claim: opts.claim } : {}),
-      ...(opts.wrapped !== undefined ? { wrapped: opts.wrapped } : {}),
       ...(opts.coalesceWrites !== undefined ? { coalesceWrites: opts.coalesceWrites } : {}),
       ...(opts.log !== undefined ? { log: opts.log } : {}),
       ...(opts.onProgress !== undefined ? { onProgress: opts.onProgress } : {}),
@@ -216,7 +214,7 @@ export class Client {
   }
 
   /** The keys in use, which are the data key's and are known from `ready` onwards. */
-  get keys(): VaultKeys {
+  get keys(): Schedule {
     return this.engine.vaultKeys;
   }
 
@@ -594,25 +592,30 @@ export class Client {
   }
 
   /* ------------------------------------------------------------ *
-   * Adding a device, and retiring a leaked secret
+   * Adding a device
    * ------------------------------------------------------------ */
 
   /**
    * Issues a single-use invite for another device.
    *
-   * The root secret is sealed under a fresh key the server never sees and
-   * stored under a fresh identifier it cannot guess, for `ttlMs` (the
-   * server's default and cap apply when this is absent or over). What comes
-   * back is the string to hand over and the moment it stops working, in
-   * server milliseconds. The string is the only copy of the key; nothing here
-   * keeps it.
+   * The vault's data key goes to the server sealed under a fresh key the
+   * server never sees, under a fresh identifier it cannot guess, for `ttlMs`
+   * (the server's default and cap apply when this is absent or over). What
+   * comes back is the string to hand over and the moment it stops working, in
+   * server milliseconds. The string is the only copy of the invite key;
+   * nothing here keeps it.
+   *
+   * This is how a device is added, and the recovery key is not. A device holds
+   * the data key and its own credential and no root, so an invite is the most
+   * a device can give away, and it is exactly enough: the redeeming device
+   * gets the data key and a row of its own, and nothing that could register a
+   * third device or rewrap the vault. The recovery key stays written down for
+   * the day every device is gone.
    */
   async invite(ttlMs?: number): Promise<{ invite: string; expiresAt: number }> {
-    this.refuseIfRotated("issue an invite");
-    const secret = this.opts.secret;
     const id = randomBytes(INVITE_ID_LENGTH);
     const key = randomBytes(INVITE_KEY_LENGTH);
-    const sealed = await sealSecret(key, secret);
+    const sealed = await sealSecret(key, this.opts.dataKey);
     const expiresAt = await this.serial(() =>
       this.transport.invite({
         invite: base64urlEncode(id),
@@ -624,71 +627,53 @@ export class Client {
     return { invite: formatInvite(invite), expiresAt };
   }
 
+  /* ------------------------------------------------------------ *
+   * The device list
+   * ------------------------------------------------------------ */
+
   /**
-   * Gives the vault a new root secret, keeping its history.
+   * Every device that may reach this vault, and the cap on how many there
+   * may be.
    *
-   * Always available, and it always keeps the history: the data key does not
-   * change, it is unwrapped under the old root and wrapped again under the
-   * new one, and the server swaps the auth hash and the blob together.
-   *
-   * `beforeSend` is handed the re-wrapped data key and is awaited before the
-   * request goes out, so a caller can put the new secret somewhere durable
-   * first. It is not optional in spirit: the server commits, evicts every other
-   * session and only then replies, so a socket that drops in between leaves a
-   * vault whose new root exists nowhere but in this process. Whatever this
-   * callback wrote is what the next connection tries.
-   *
-   * After this returns the client is spent, and says so on every later
-   * operation; see `refuseIfRotated`.
+   * A device's operation, not a registrar's: the list is what somebody reads
+   * to answer "what is still connected to my notes", and a registrar reads
+   * nothing.
    */
-  async rotate(
-    newSecret: Uint8Array,
-    beforeSend?: (rewrapped: string) => Promise<void> | void,
-  ): Promise<void> {
-    this.refuseIfRotated("rotate the vault's secret");
-    const wrapped = this.wrapped;
-    if (wrapped === undefined) {
-      // Not a vault without a data key, of which there are none: a client
-      // that has not connected, and so has not been told what to re-wrap.
-      throw new Error("this client is not connected, so it cannot rotate the vault's secret");
-    }
-    const old = await deriveRootKeys(this.opts.secret);
-    const dataKey = await unwrapDataKey(old.wrap, wrapped);
-    const fresh = await deriveRootKeys(newSecret);
-    const rewrapped = await wrapDataKey(fresh.wrap, dataKey);
-    await beforeSend?.(rewrapped);
-    await this.serial(() => this.transport.rotate({ auth: authToken(fresh), wrapped: rewrapped }));
-    this.rotated = true;
+  async devices(): Promise<{ devices: DeviceRow[]; maxDevices: number }> {
+    return this.serial(() => this.transport.devices());
   }
 
   /**
-   * Whether this client's root secret has been replaced under it.
+   * Removes a device's row and closes every session it has open.
    *
-   * A rotation retires the secret this object was built with, and nothing here
-   * adopts the new one: `opts.secret` is what an invite seals and what the next
-   * rotation would unwrap with, and both would be the retired root. Refusing is
-   * the simpler half of the choice. Adopting would mean this object holding two
-   * answers to "what is the vault's secret" for the rest of its life, with
-   * every later operation having to pick the right one, and the shells close
-   * the client immediately after rotating anyway. So the connection stays
-   * usable for nothing: whoever rotated saved the new secret and reconnects
-   * with it.
+   * Both, in that order, and the reply means both: a row removed while the
+   * revoked device holds an authenticated connection is a revocation it does
+   * not notice, because nothing on a live session is re-checked.
    *
-   * What is refused is everything that uses the root: `invite`, which would
-   * seal a secret the server no longer accepts and hand it to somebody as a way
-   * in, and a second `rotate`, which would re-wrap under a key derived from the
-   * retired root. Syncing is not refused, because nothing it touches changed: a
-   * rotation replaces the wrapping of the data key and not the data key, and
-   * this session is the one the server did not evict.
+   * A device may revoke another and may revoke itself. Revoking the last one
+   * is refused without `allowLast`, because what it leaves is a vault only the
+   * recovery key can reach.
+   *
+   * What this does **not** do is un-read what that device already read: it
+   * still holds the vault's data key and can decrypt every note it had synced.
+   * A device that was stolen rather than merely lost wants a rotation as well.
+   * Every surface that offers this has to say so; the honesty is the feature.
    */
-  private rotated = false;
-
-  private refuseIfRotated(what: string): void {
-    if (!this.rotated) return;
-    throw new Error(
-      `this client's connection holds the vault's old secret, which was retired by the rotation ` +
-        `it just performed, so it cannot ${what}. Reconnect with the new secret.`,
+  async revoke(
+    deviceId: string,
+    opts: { allowLast?: boolean } = {},
+  ): Promise<{ deviceId: string; self: boolean }> {
+    return this.serial(() =>
+      this.transport.revoke({
+        deviceId,
+        ...(opts.allowLast !== undefined ? { allowLast: opts.allowLast } : {}),
+      }),
     );
+  }
+
+  /** This device's own row id, so a caller can tell itself out of the list. */
+  get deviceId(): string {
+    return this.opts.deviceId;
   }
 
   /**
@@ -961,153 +946,444 @@ export async function wrappedForClaim(keys: RootKeys): Promise<string> {
   return wrapDataKey(keys.wrap, generateDataKey());
 }
 
+/* ---------------------------------------------------------------- *
+ * The registrar, and becoming a device
+ * ---------------------------------------------------------------- */
+
 /**
- * The claim to send with a hello, or nothing.
+ * A connection holding the vault's own credential, which is the recovery key.
  *
- * Nothing, once the vault is known to be claimed, which is when the bootstrap
- * has been spent. A claim after that is ignored by an honest server and is a
- * gift to a dishonest one: it is a wrapping of a data key, made by this device
- * and unwrappable by it, which the server can hand back in `ready` as the
- * vault's own. The device would install a schedule no other device derives, and
- * the server would have split the vault in two without learning a key. Not
- * sending it is what makes that unexpressible; the pinned blob in DeviceConfig
- * is what covers everything else.
+ * It may register a device and rotate the vault's secret, and it may do
+ * nothing else: no entries, no history, no device list, no catch-up. That is
+ * the server's shape rather than a promise this class keeps, and it is the
+ * whole of the privilege separation per-device credentials are made of. See
+ * docs/protocol.md, "Authentication".
  *
- * One function rather than the same condition in both shells, because two
- * copies of a rule are two rules and only one of them has a test.
- *
- * The fallback is for a config written before `claimWrapped` existed, which can
- * only be one whose init never got its claim committed. It behaves as that
- * build did rather than refusing to connect at all.
+ * A separate class from `Client` on purpose. One object that was sometimes a
+ * device and sometimes a registrar would have every caller asking which, and
+ * the one place that must never get it wrong is the one that decides whether
+ * a credential may sync.
  */
-export async function claimFor(
-  config: { readonly bootstrap?: string | undefined; readonly claimWrapped?: string | undefined },
-  auth: string,
-  keys: RootKeys,
-): Promise<{ auth: string; wrapped: string } | undefined> {
-  if (config.bootstrap === undefined) return undefined;
-  return { auth, wrapped: config.claimWrapped ?? (await wrappedForClaim(keys)) };
+export class Registrar {
+  private constructor(
+    readonly transport: Transport,
+    readonly limits: RegistrarLimits,
+    private readonly root: RootKeys,
+  ) {}
+
+  /**
+   * Opens one, with the root secret the caller holds.
+   *
+   * `claim` binds an unclaimed vault and is sent only while the caller still
+   * holds the server's first-run token; see `wrappedForClaim`.
+   */
+  static async open(opts: {
+    url: string;
+    vaultId: string;
+    device: string;
+    secret: Uint8Array;
+    /** The server's first-run token, while the vault is still being claimed. */
+    bootstrap?: string | undefined;
+    claim?: { auth: string; wrapped: string } | undefined;
+    timeoutMs?: number | undefined;
+    socketFactory?: ((url: string) => SocketLike) | undefined;
+    log?: ((message: string, ...rest: unknown[]) => void) | undefined;
+  }): Promise<Registrar> {
+    const root = await deriveRootKeys(opts.secret);
+    const transport = new Transport(opts.url, {
+      onBatch: () => {
+        // A registrar is in no vault's fan-out, so this is unreachable
+        // against any server that keeps the protocol. Present because the
+        // transport requires a handler, and doing nothing is right: there is
+        // no engine here and no keys to open an entry with.
+      },
+      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+      ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
+      ...(opts.log !== undefined ? { log: opts.log } : {}),
+    });
+    try {
+      await transport.connect();
+      const limits = await transport.helloAsRegistrar({
+        vault: opts.vaultId,
+        device: opts.device,
+        // The bootstrap while there is one, and what the root derives once
+        // the vault has been claimed.
+        token: opts.bootstrap ?? authToken(root),
+        ...(opts.claim !== undefined ? { claim: opts.claim } : {}),
+      });
+      return new Registrar(transport, limits, root);
+    } catch (err) {
+      transport.close();
+      throw err;
+    }
+  }
+
+  /**
+   * Registers a device row and returns the vault's data key, unwrapped.
+   *
+   * The unwrapping happens here because this session is the one that can: it
+   * holds the root, and the wrapping key derives from it. That is the whole
+   * mechanism by which a device ends up holding the data key without ever
+   * holding the root.
+   *
+   * `expectWrapped`, when the caller has seen the vault's wrapping before, is
+   * checked against what came back. That is the last place C40 can still
+   * arise: a server handed a claim could otherwise return that wrapping as the
+   * vault's own, and the device would install a schedule no other device on
+   * the vault derives, with both ends reporting success.
+   */
+  async register(args: {
+    deviceId: string;
+    deviceSecret: Uint8Array;
+    name: string;
+    expectWrapped?: string | undefined;
+  }): Promise<{ dataKey: Uint8Array; wrapped: string }> {
+    const { wrapped } = await this.transport.register({
+      deviceId: args.deviceId,
+      auth: await deviceAuthToken(args.deviceSecret),
+      name: args.name,
+    });
+    if (args.expectWrapped !== undefined && wrapped !== args.expectWrapped) {
+      throw new Error(
+        "the server returned a different wrapped data key than this device saw before. " +
+          "A vault's data key does not change, so this device will not seal anything under " +
+          "a key the rest of the vault cannot derive.",
+      );
+    }
+    return { dataKey: await unwrapDataKey(this.root.wrap, wrapped), wrapped };
+  }
+
+  /**
+   * Gives the vault a new root secret, keeping its history and every device.
+   *
+   * The data key does not change: it is unwrapped under the old root and
+   * wrapped again under the new one, and the server swaps the auth hash and
+   * the blob together. **No device row is touched and every device goes on
+   * syncing across a rotation**, which is the expensive half of what per-device
+   * credentials removed. Under protocol 3 the vault's hash was the credential
+   * every device held, so a rotation evicted the lot.
+   *
+   * The data key comes from the caller rather than from a wrapping, because a
+   * registrar is handed no wrapping at hello and the caller has the key
+   * already: it is a paired device on this vault, and holding the data key is
+   * what being one means.
+   */
+  async rotate(newSecret: Uint8Array, dataKey: Uint8Array): Promise<{ rewrapped: string }> {
+    const fresh = await deriveRootKeys(newSecret);
+    const rewrapped = await wrapDataKey(fresh.wrap, dataKey);
+    await this.transport.rotate({ auth: authToken(fresh), wrapped: rewrapped });
+    return { rewrapped };
+  }
+
+  close(): void {
+    this.transport.close();
+  }
+}
+
+/**
+ * Turns a config holding the vault's root into a config holding this device's
+ * own credential, and drops the root only once the row has been used.
+ *
+ * This is the one step in per-device credentials that can strand a device, so
+ * it is written as four saves and every one of them survives a crash on either
+ * side of it. `save` must write durably and read back before returning: rule 4,
+ * verify the outcome and not the exit code, and the same ordering `rotate` used
+ * before it moved off the device.
+ *
+ * The order, and what a crash at each point leaves:
+ *
+ *  1. **Choose an id and a secret, and save them.** Before anything is sent, so
+ *     a crash after the `register` below still finds the same id and the same
+ *     key on disk. Choosing a fresh id per attempt instead would leave a row
+ *     behind for every crash and fill the vault's eight with ghosts.
+ *     A crash before this save leaves the config untouched and protocol 3
+ *     shaped; the next command starts again.
+ *  2. **Register, and save the data key.** The server treats the same id with
+ *     the same key as the registration having happened, so a reply lost between
+ *     the commit and this save costs one repeated request and nothing else.
+ *     A crash here leaves an id, a secret and the root: step 2 again.
+ *  3. **Connect as the device.** The row is confirmed by being used, not by
+ *     being asked about, because "the row is there" and "this credential opens
+ *     it" are different facts and only the second one matters. A crash here
+ *     leaves everything and the root: steps 2 and 3 again, both idempotent.
+ *  4. **Drop the root.** Only now, and this is the point of the whole feature:
+ *     a device that still holds the root can re-derive the vault's credential
+ *     and register itself again, so revoking it would stop nothing. A crash
+ *     between 3 and 4 leaves a device that has a row and still has the root,
+ *     which is exactly the state step 1 detects and finishes.
+ *
+ * Returns the converted config. Idempotent: run it again on the result and it
+ * does nothing, because the result holds no root.
+ */
+export async function convertToDevice(
+  config: DeviceConfig,
+  save: (next: DeviceConfig) => Promise<void>,
+  opts: {
+    timeoutMs?: number | undefined;
+    socketFactory?: ((url: string) => SocketLike) | undefined;
+    log?: ((message: string, ...rest: unknown[]) => void) | undefined;
+    /**
+     * Called the moment the server has accepted the registration, before
+     * anything else can fail.
+     *
+     * For the one caller that has to know: `basalt pair` and the panel's
+     * pairing form keep a config that got this far, because the row is real
+     * and only this device knows its credential, and throw one away that did
+     * not, because a recovery key that turns out to be wrong should leave a
+     * vault exactly as unpaired as it found it.
+     */
+    onRegistered?: (() => void) | undefined;
+  } = {},
+): Promise<DeviceConfig> {
+  const secret = config.secret;
+  if (secret === undefined) return config;
+
+  // 1. The id and the secret, on disk before a single frame goes out.
+  let staged = config;
+  if (staged.deviceId === undefined || staged.deviceSecret === undefined) {
+    staged = { ...staged, deviceId: generateDeviceId(), deviceSecret: generateDeviceSecret() };
+    await save(staged);
+  }
+  const deviceId = staged.deviceId!;
+  const deviceSecret = staged.deviceSecret!;
+
+  // 2. Register, and write down the data key it hands back.
+  const registrar = await openRegistrar(staged, secret, opts);
+  let dataKey: Uint8Array;
+  try {
+    ({ dataKey } = await registrar.register({
+      deviceId,
+      deviceSecret,
+      name: staged.device,
+      expectWrapped: staged.wrapped,
+    }));
+  } finally {
+    registrar.close();
+  }
+  opts.onRegistered?.();
+  staged = { ...staged, dataKey };
+  await save(staged);
+
+  // 3. Use the row. A hello that is answered `ready` is the row existing, this
+  //    key opening it, and the server willing to serve this vault, all proven
+  //    by the one thing that has to be true afterwards.
+  await proveDeviceConnects(staged, opts);
+
+  // 4. The root goes, and everything that only existed to get here with it.
+  const converted: DeviceConfig = {
+    url: staged.url,
+    vaultId: staged.vaultId,
+    device: staged.device,
+    deviceId,
+    deviceSecret,
+    dataKey,
+  };
+  await save(converted);
+  opts.log?.("converted to a per-device credential", { deviceId });
+  return converted;
+}
+
+/**
+ * A registrar session for a conversion, with the one fallback a spent
+ * bootstrap needs.
+ *
+ * C15. Starting a vault writes the config with the server's first-run token,
+ * claims the vault with it, and writes the config again without it. If that
+ * second write fails, or the claim commits and its reply is lost, the token on
+ * disk is spent and offering it first is refused with `auth`, for ever: a vault
+ * this device claimed, refusing this device.
+ *
+ * `auth` is also what a wrong token and another device's vault produce, so it
+ * does not on its own say what happened. What does say is the key derived from
+ * this config's root secret: the server compares it against the hash it bound
+ * the vault to, so that key being accepted proves the vault was claimed with
+ * this secret. That is the one case in which the bootstrap can be dropped, and
+ * the only one in which it is tried.
+ */
+async function openRegistrar(
+  config: DeviceConfig,
+  secret: Uint8Array,
+  opts: {
+    timeoutMs?: number | undefined;
+    socketFactory?: ((url: string) => SocketLike) | undefined;
+    log?: ((message: string, ...rest: unknown[]) => void) | undefined;
+  },
+): Promise<Registrar> {
+  const root = await deriveRootKeys(secret);
+  const wire = {
+    url: config.url,
+    vaultId: config.vaultId,
+    device: config.device,
+    secret,
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
+  };
+  if (config.bootstrap === undefined) return Registrar.open(wire);
+  try {
+    return await Registrar.open({
+      ...wire,
+      bootstrap: config.bootstrap,
+      // The same data key on every attempt while the vault is being claimed. A
+      // fresh candidate per attempt meant a claim retried after a lost reply
+      // proposed a different key from the one that may already have committed.
+      claim: {
+        auth: authToken(root),
+        wrapped: config.claimWrapped ?? (await wrappedForClaim(root)),
+      },
+    });
+  } catch (err) {
+    if (!(err instanceof ProtocolError) || err.code !== "auth") throw err;
+    opts.log?.("the first-run token is spent; trying the key this secret derives");
+    return Registrar.open(wire);
+  }
+}
+
+/**
+ * One hello as the device, and nothing after it.
+ *
+ * `waitForBacklog` is not on offer: this connection exists to find out whether
+ * the credential works, and a device converting after months away would
+ * otherwise sit through its whole backlog twice, once here and once when the
+ * command it was actually running connects.
+ */
+async function proveDeviceConnects(
+  config: DeviceConfig,
+  opts: {
+    timeoutMs?: number | undefined;
+    socketFactory?: ((url: string) => SocketLike) | undefined;
+    log?: ((message: string, ...rest: unknown[]) => void) | undefined;
+  },
+): Promise<void> {
+  const { deviceId, deviceSecret } = deviceCredential(config);
+  const transport = new Transport(config.url, {
+    onBatch: () => {},
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
+  });
+  try {
+    await transport.connect();
+    await transport.hello({
+      vault: config.vaultId,
+      deviceId,
+      token: await deviceAuthToken(deviceSecret),
+      device: config.device,
+      // Zero, because nothing here applies anything. A cursor is only ever
+      // refused for being ahead of the server, so zero cannot be refused and
+      // this connection cannot fail for a reason that is not about the
+      // credential it is testing.
+      cursor: 0,
+    });
+  } finally {
+    transport.close();
+  }
+}
+
+/**
+ * Redeems an invite: one connection that hands over the invite, asks for a
+ * device row, takes the vault's data key, and closes.
+ *
+ * What comes back is everything a paired device is: a row of its own, the
+ * credential for it, and the data key. No root, which is the point. A device
+ * added this way cannot register a third, cannot rewrap the vault and cannot
+ * show anybody the recovery key, so revoking it means something.
+ *
+ * The id and the secret are made here and sent in the same frame as the
+ * invite, because the server registers the row in the same transaction that
+ * spends it. There is no separate `register` to make: a device holds no root,
+ * so the device that issued this invite could not have made the row, and this
+ * connection holds nothing else the server would accept one under.
+ *
+ * **Nothing is written to disk before this runs, and everything after it.**
+ * The other order was considered and is worse. Saving the id and the secret
+ * first would mean a crash between the save and the reply leaves a device
+ * holding a credential for a row it cannot use, because the data key it needs
+ * is in a reply that never arrived and the invite that carried it is spent:
+ * that device is stuck, and the retry with a fresh invite registers a second
+ * row and strands the first. This way a crash costs a row nobody holds the key
+ * to, which is visible in `basalt devices` as a device that has never
+ * connected and is removed with `basalt revoke`, and the local vault is left
+ * exactly as unpaired as it was found, so the retry is the ordinary path.
+ *
+ * The caller saves what this returns, durably, and reads it back before it
+ * relies on it (rule 4). Until it does, the only copy of the data key on this
+ * machine is in this process.
+ */
+export async function redeemInvite(
+  invite: Invite,
+  device: string,
+  opts: {
+    timeoutMs?: number | undefined;
+    socketFactory?: ((url: string) => SocketLike) | undefined;
+    log?: ((message: string, ...rest: unknown[]) => void) | undefined;
+  } = {},
+): Promise<{ deviceId: string; deviceSecret: Uint8Array; dataKey: Uint8Array }> {
+  const deviceId = generateDeviceId();
+  const deviceSecret = generateDeviceSecret();
+  const transport = new Transport(invite.url, {
+    onBatch: () => {
+      // A redeeming connection joins no vault's fan-out, so this is
+      // unreachable against any server that keeps the protocol. Present
+      // because the transport requires a handler, and doing nothing is right:
+      // there is no engine here and, until the reply lands, no key to open an
+      // entry with.
+    },
+    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
+    ...(opts.log !== undefined ? { log: opts.log } : {}),
+  });
+  try {
+    await transport.connect();
+    const redeemed = await transport.redeem({
+      vault: invite.vaultId,
+      device,
+      invite: base64urlEncode(invite.id),
+      deviceId,
+      auth: await deviceAuthToken(deviceSecret),
+      name: device,
+    });
+    // Unsealed with the key that travelled in the string and never to the
+    // server, so a server holding every invite it was ever handed holds blobs
+    // it cannot open. A wrong key fails here rather than later as content that
+    // will not decrypt.
+    return { deviceId, deviceSecret, dataKey: await unsealSecret(invite.key, redeemed.sealed) };
+  } finally {
+    transport.close();
+  }
 }
 
 /**
  * The half of a client's options that says who this device is.
  *
- * Which key authenticates, and what the vault gets bound to if it is not
- * bound yet. Both shells worked this out for themselves, from the same stored
- * config, in the same four steps, with near-verbatim copies of the comments
- * below; the two copies were the highest-consequence drift point in the
- * client, because a shell that got the token-or-bootstrap choice wrong
- * authenticates as nobody and a shell that got the claim wrong binds the
- * vault to a data key the rest of the vault cannot derive.
+ * Which row it connects as, which key proves it, and the data key it reads and
+ * writes content with. Both shells worked the equivalent out for themselves
+ * once, from the same stored config, and the two copies were the
+ * highest-consequence drift point in the client.
  *
- * It takes a whole `DeviceConfig` rather than the fields it reads, because
- * the set of fields it reads is exactly the thing that keeps changing.
+ * It refuses a config that has not converted, rather than falling back to the
+ * root: falling back is what protocol 3 did, and what protocol 4 exists to
+ * stop. `needsConversion` is the check a caller makes first.
  */
-export async function credentialsFor(
+export function credentialsFor(
   config: DeviceConfig,
-): Promise<
-  Pick<ClientOptions, "secret" | "url" | "token" | "claim" | "wrapped" | "vaultId" | "device">
-> {
-  const keys = await deriveRootKeys(config.secret);
-  const derived = authToken(keys);
-  const claim = await claimFor(config, derived, keys);
-  return {
-    secret: config.secret,
+): Promise<Pick<ClientOptions, "dataKey" | "url" | "token" | "deviceId" | "vaultId" | "device">> {
+  const { deviceId, deviceSecret, dataKey } = deviceCredential(config);
+  return deviceAuthToken(deviceSecret).then((token) => ({
+    dataKey,
     url: config.url,
-    // The bootstrap while there is one, and what the root secret derives
-    // once the vault has been claimed.
-    token: config.bootstrap ?? derived,
-    // A claim only while this device is still claiming, and always with the
-    // same data key; see claimFor.
-    ...(claim !== undefined ? { claim } : {}),
-    // And the blob this device has already seen, so a server that returns a
-    // different one is refused rather than believed.
-    ...(config.wrapped !== undefined ? { wrapped: config.wrapped } : {}),
+    token,
+    deviceId,
     vaultId: config.vaultId,
     device: config.device,
-  };
+  }));
 }
 
-/**
- * The credentials to try, best first, for a config that may be mid-rotation or
- * mid-claim.
- *
- * An outstanding rotation goes first, because if it committed then it is the
- * only thing that opens the vault, and it carries the wrapping the server holds
- * so the pin does not refuse the very connection that resolves it. Then the
- * config as it stands. Then, for the first device only, the config without its
- * bootstrap.
- *
- * That last one is the narrow case in which a bootstrap can be proven spent.
- * Starting a vault writes the config with the bootstrap, claims the vault, and
- * writes it again without. If the second write fails, or the claim commits and
- * its reply is lost, the next run offers the bootstrap first and is refused, for
- * ever. The refusal is `auth`, which is also what a wrong token and another
- * device's vault produce, so it does not on its own say what happened. What does
- * say is the key derived from this config's root secret: the server compares it
- * against the hash it bound the vault to, so that key being accepted proves the
- * vault was claimed with this secret.
- *
- * One function rather than the same list in both shells. The headless client had
- * all three and the plugin had only the bootstrap one, so a rotation whose reply
- * was lost on a phone left the new secret on disk with nothing that would ever
- * try it: intact ciphertext and no way in. `plugin/rotate.test.ts` pins it.
- */
-export function credentialCandidates(config: DeviceConfig): DeviceConfig[] {
-  const out: DeviceConfig[] = [];
-  if (config.pending) {
-    const promoted: DeviceConfig = {
-      ...config,
-      secret: config.pending.secret,
-      wrapped: config.pending.wrapped,
-    };
-    delete (promoted as { bootstrap?: string }).bootstrap;
-    delete (promoted as { pending?: unknown }).pending;
-    out.push(promoted);
-  }
-  out.push(config);
-  if (config.bootstrap !== undefined) {
-    const spent: DeviceConfig = { ...config };
-    delete (spent as { bootstrap?: string }).bootstrap;
-    out.push(spent);
-  }
-  return out;
-}
+/** Whether this config still holds the vault's root. Re-exported so a shell imports one thing. */
+export { needsConversion };
 
-/**
- * What the stored config should say now that a connection has succeeded, or
- * undefined when it already says it.
- *
- * `used` is the credential that actually authenticated, which is `stored` for an
- * ordinary device and one of the fallbacks in `credentialCandidates` otherwise.
- * The one thing neither of them knows is the vault's wrapped data key, because
- * that arrives in `ready`.
- *
- * Compared against what is stored rather than against `used`, because the whole
- * reason a fallback was needed is that the two disagree.
- *
- * One function rather than the same three deletions in both shells: a shell that
- * forgot `pending` would keep trying a retired secret first on every connection,
- * and one that forgot `bootstrap` would offer a spent token for ever.
- */
-export function settledConfig(
-  stored: DeviceConfig,
-  used: DeviceConfig,
-  wrapped: string | undefined,
-): DeviceConfig | undefined {
-  const next: DeviceConfig = { ...used, ...(wrapped !== undefined ? { wrapped } : {}) };
-  delete (next as { bootstrap?: string }).bootstrap;
-  // The claim candidate goes with the bootstrap: nothing sends a claim once the
-  // vault is known to be claimed, so keeping it is keeping a wrapping of a data
-  // key the vault never adopted.
-  delete (next as { claimWrapped?: string }).claimWrapped;
-  delete (next as { pending?: unknown }).pending;
-  return sameConfig(next, stored) ? undefined : next;
-}
-
-function sameConfig(a: DeviceConfig, b: DeviceConfig): boolean {
-  return JSON.stringify(encodeConfig(a)) === JSON.stringify(encodeConfig(b));
-}
+/** The shapes a shell needs to show a device list, re-exported for the same reason. */
+export type { DeviceRow, RegistrarLimits } from "./transport.ts";
 
 /**
  * Where this device and the server each are, for deciding whether a rebase is
@@ -1154,40 +1430,6 @@ export function refuseUnlessAhead(at: { local: number; server: number }): void {
     `this device is not ahead of the server (${at.local} against ${at.server}), ` +
       `so there is nothing to rebase: an ordinary sync is enough`,
   );
-}
-
-/**
- * Redeems an invite: one connection that carries the invite in place of a
- * token, takes the sealed root, and closes.
- *
- * Returns the root secret, which is all a device needs: it connects again as
- * an ordinary device and takes the vault's data key from that connection's
- * `ready`. Nothing here is a device: the connection proved only that it held
- * an unused invite, which the server burned before answering, so a reply lost
- * on the way leaves the invite spent and the caller with nothing saved, which
- * is a usable state: the issuing device makes another.
- */
-export async function redeemInvite(
-  invite: Invite,
-  device: string,
-  opts: { timeoutMs?: number; socketFactory?: (url: string) => SocketLike } = {},
-): Promise<{ secret: Uint8Array }> {
-  const transport = new Transport(invite.url, {
-    onBatch: () => {},
-    ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-    ...(opts.socketFactory !== undefined ? { socketFactory: opts.socketFactory } : {}),
-  });
-  try {
-    await transport.connect();
-    const redeemed = await transport.redeem({
-      vault: invite.vaultId,
-      device,
-      invite: base64urlEncode(invite.id),
-    });
-    return { secret: await unsealSecret(invite.key, redeemed.sealed) };
-  } finally {
-    transport.close();
-  }
 }
 
 /**

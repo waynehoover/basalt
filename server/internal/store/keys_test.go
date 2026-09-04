@@ -2,7 +2,9 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -16,6 +18,10 @@ const (
 	hash1    = "0000000000000000000000000000000000000000000000000000000000000001"
 	hash2    = "0000000000000000000000000000000000000000000000000000000000000002"
 	hash3    = "0000000000000000000000000000000000000000000000000000000000000003"
+	// A device's auth hash, the same shape as a vault's because it is the same
+	// thing per device: a digest of a key the server never holds.
+	devHash1 = "00000000000000000000000000000000000000000000000000000000000000a1"
+	devHash2 = "00000000000000000000000000000000000000000000000000000000000000a2"
 	wrapped3 = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCD"
 )
 
@@ -113,23 +119,32 @@ func TestI23InvitesAreSingleUseAndExpire(t *testing.T) {
 	if err := h.AddInvite("v1", "BBBBBBBBBBBBBBBBBBBBBB", sealed1, 500, 1000); !errors.Is(err, ErrBadEntry) {
 		t.Fatalf("err = %v, want ErrBadEntry", err)
 	}
-	// Redeem once.
-	sealed, ok, err := h.RedeemInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", 1500)
-	if err != nil || !ok || sealed != sealed1 {
-		t.Fatalf("redeem: %q %v %v", sealed, ok, err)
+	// Redeem once, which registers the device that redeemed it.
+	sealed, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500)
+	if err != nil || sealed != sealed1 {
+		t.Fatalf("redeem: %q %v", sealed, err)
 	}
-	if _, ok, _ := h.RedeemInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", 1500); ok {
-		t.Fatal("an invite was redeemed twice")
+	if ds, err := h.Devices("v1"); err != nil || len(ds) != 1 || ds[0].ID != "dev-one" {
+		t.Fatalf("the redemption registered %v, %v", ds, err)
 	}
-	// Expired: refused, and unknown looks the same.
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-two", "two", devHash2, 0, 1500); !errors.Is(err, ErrNoInvite) {
+		t.Fatalf("an invite was redeemed twice: %v", err)
+	}
+	// Expired: refused, and unknown and malformed look the same.
 	if err := h.AddInvite("v1", "CCCCCCCCCCCCCCCCCCCCCC", sealed1, 2000, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := h.RedeemInvite("v1", "CCCCCCCCCCCCCCCCCCCCCC", 2001); ok {
-		t.Fatal("an expired invite was redeemed")
-	}
-	if _, ok, _ := h.RedeemInvite("v1", "DDDDDDDDDDDDDDDDDDDDDD", 1500); ok {
-		t.Fatal("an unknown invite was redeemed")
+	for _, c := range []struct {
+		what, invite string
+		now          int64
+	}{
+		{"expired", "CCCCCCCCCCCCCCCCCCCCCC", 2001},
+		{"unknown", "DDDDDDDDDDDDDDDDDDDDDD", 1500},
+		{"malformed", "not base64!", 1500},
+	} {
+		if _, err := h.RedeemInviteFor("v1", c.invite, "dev-two", "two", devHash2, 0, c.now); !errors.Is(err, ErrNoInvite) {
+			t.Fatalf("an %s invite was answered %v, want ErrNoInvite", c.what, err)
+		}
 	}
 	// Another vault's invite does not open this one.
 	if _, err := h.ClaimVault("v2", hash2, wrapped2, 1); err != nil {
@@ -138,8 +153,16 @@ func TestI23InvitesAreSingleUseAndExpire(t *testing.T) {
 	if err := h.AddInvite("v2", "EEEEEEEEEEEEEEEEEEEEEE", sealed1, 5000, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := h.RedeemInvite("v1", "EEEEEEEEEEEEEEEEEEEEEE", 1500); ok {
-		t.Fatal("an invite was redeemed against the wrong vault")
+	if _, err := h.RedeemInviteFor("v1", "EEEEEEEEEEEEEEEEEEEEEE", "dev-two", "two", devHash2, 0, 1500); !errors.Is(err, ErrNoInvite) {
+		t.Fatalf("an invite was redeemed against the wrong vault: %v", err)
+	}
+	// Not one of the refusals wrote a row, and none of them spent the invite
+	// on v2 either: a redemption is both halves or neither.
+	if ds, _ := h.Devices("v1"); len(ds) != 1 {
+		t.Fatalf("a refused redemption registered a device: %v", ds)
+	}
+	if n, _ := h.OutstandingInvites("v2", 1500); n != 1 {
+		t.Fatalf("%d outstanding invites on v2, want the one that was issued", n)
 	}
 }
 
@@ -185,9 +208,14 @@ func TestI23InvitesTravelInTheBackup(t *testing.T) {
 		t.Fatalf("backup: %v", err)
 	}
 	restored := openAt(t, dest)
-	sealed, ok, err := restored.RedeemInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", 2000)
-	if err != nil || !ok || sealed != sealed1 {
-		t.Fatalf("redeem from the restored store: %q %v %v", sealed, ok, err)
+	sealed, err := restored.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 2000)
+	if err != nil || sealed != sealed1 {
+		t.Fatalf("redeem from the restored store: %q %v", sealed, err)
+	}
+	// And the device row it wrote is in the restored store too, because the
+	// two halves are one transaction wherever the database is.
+	if ds, _ := restored.Devices("v1"); len(ds) != 1 || ds[0].ID != "dev-one" {
+		t.Fatalf("the restored store has devices %v", ds)
 	}
 }
 
@@ -319,5 +347,272 @@ func TestValidBase64URLTakesPaddingOnlyAtTheEnd(t *testing.T) {
 	// And through the three callers, which differ only in their ceiling.
 	if ValidWrapped("ab=c") || ValidSealed("ab=c") || ValidInvite("ab=c") {
 		t.Error("padding in the middle passed one of the named checks")
+	}
+}
+
+/* ---------------------------------------------------------------- *
+ * Spending an invite and registering a device are one commit
+ * ---------------------------------------------------------------- */
+
+// A crash between spending the invite and writing the row spends neither.
+//
+// This is the partial state RedeemInviteFor exists to make unreachable, and
+// it has two bad halves. An invite spent with no row behind it is a string
+// that stopped working and a device that was never added, and the only sign of
+// it is somebody's phone failing to pair with an invite they watched being
+// made. A row under an invite still marked live is a device registered twice
+// over by a string that was supposed to work once.
+//
+// Injected rather than timed: the window is a few microseconds wide and a test
+// that tried to hit it by racing would be a test that passes when the machine
+// is busy. An error returned from inside the transaction is what a process
+// dying there leaves behind, because SQLite rolls an uncommitted transaction
+// back either way.
+func TestACrashBetweenSpendingAnInviteAndRegisteringSpendsNeither(t *testing.T) {
+	h := newTestStore(t)
+	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	boom := errors.New("the power went off here")
+	betweenSpendAndRegister = func() error { return boom }
+	_, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500)
+	betweenSpendAndRegister = nil
+	if !errors.Is(err, boom) {
+		t.Fatalf("the redemption returned %v, want the injected failure", err)
+	}
+
+	// Neither half happened.
+	if ds, _ := h.Devices("v1"); len(ds) != 0 {
+		t.Fatalf("a device was registered under an invite that was not spent: %v", ds)
+	}
+	if n, _ := h.OutstandingInvites("v1", 1500); n != 1 {
+		t.Fatalf("%d outstanding invites, want the one that was issued: the invite was spent "+
+			"with nothing to show for it", n)
+	}
+	// And the same string still works, which is what makes the crash cost
+	// nothing but a retry.
+	sealed, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500)
+	if err != nil || sealed != sealed1 {
+		t.Fatalf("the invite did not survive the crash: %q %v", sealed, err)
+	}
+	if ids := ids(t, h, "v1"); len(ids) != 1 || ids[0] != "dev-one" {
+		t.Fatalf("devices after the retry: %v", ids)
+	}
+}
+
+// A redeem racing a revoke never leaves the vault with no devices, and never
+// leaves one half of a redemption behind.
+//
+// The two orderings are both legal and both fine, which is the point: if the
+// revoke commits first it is refused for being the last device and the redeem
+// then adds one, and if the redeem commits first there are two and the revoke
+// takes one away. What must never happen is an empty vault, reachable only by
+// a recovery key nobody was told they now need, or an invite spent with no
+// device to show for it.
+//
+// Two handles, because the guarantee has to be in the SQL rather than in
+// writeMu: `basaltd backup` and `basaltd purge` run against a live server's
+// directory, so the store is opened by more than one process.
+func TestARedeemRacingARevokeLeavesTheVaultConsistent(t *testing.T) {
+	for attempt := 0; attempt < 20; attempt++ {
+		dir := t.TempDir()
+		one := openAt(t, dir)
+		if _, err := one.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
+			t.Fatal(err)
+		}
+		if err := one.RegisterDevice("v1", "alfa", "laptop", hashA, 1000); err != nil {
+			t.Fatal(err)
+		}
+		if err := one.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+			t.Fatal(err)
+		}
+		two := openAt(t, dir)
+
+		var redeemErr, revokeErr error
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, redeemErr = one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 0, 2000)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			revokeErr = two.RevokeDevice("v1", "alfa", false)
+		}()
+		close(start)
+		wg.Wait()
+
+		left := ids(t, one, "v1")
+		if len(left) == 0 {
+			t.Fatalf("attempt %d: the vault has no devices at all, reachable only by its recovery "+
+				"key (redeem: %v, revoke: %v)", attempt, redeemErr, revokeErr)
+		}
+		// The redemption is both halves or neither, whichever way it landed.
+		registered := false
+		for _, id := range left {
+			registered = registered || id == "bravo"
+		}
+		outstanding, _ := one.OutstandingInvites("v1", 2000)
+		switch {
+		case redeemErr == nil && (!registered || outstanding != 0):
+			t.Fatalf("attempt %d: a redemption reported success with devices %v and %d invites left",
+				attempt, left, outstanding)
+		case redeemErr != nil && (registered || outstanding != 1):
+			t.Fatalf("attempt %d: a refused redemption left devices %v and %d invites (%v)",
+				attempt, left, outstanding, redeemErr)
+		}
+		if revokeErr != nil && !errors.Is(revokeErr, ErrLastDevice) {
+			t.Fatalf("attempt %d: the revoke failed with %v", attempt, revokeErr)
+		}
+	}
+}
+
+// A redeem racing a rotation cannot outlive it.
+//
+// Rotation is the answer to a leaked recovery key, and it deliberately leaves
+// device rows alone, so anything that can register a device after one is
+// permanent access to a vault somebody thought they had taken back. For the
+// registrar path the guard is the vault hash inside the insert. For an invite
+// it is one table over: rotation deletes every invite on the vault in the same
+// transaction that swaps the credential, so an invite issued before a rotation
+// cannot be redeemed after one, and the two are never both true.
+func TestARedeemRacingARotationCannotWin(t *testing.T) {
+	for attempt := 0; attempt < 20; attempt++ {
+		dir := t.TempDir()
+		one := openAt(t, dir)
+		if _, err := one.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
+			t.Fatal(err)
+		}
+		if err := one.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+			t.Fatal(err)
+		}
+		two := openAt(t, dir)
+
+		var redeemErr, rotateErr error
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, redeemErr = one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 0, 2000)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			rotateErr = two.Rotate("v1", hash1, hash2, wrapped2)
+		}()
+		close(start)
+		wg.Wait()
+		if rotateErr != nil {
+			t.Fatalf("attempt %d: the rotation failed with %v", attempt, rotateErr)
+		}
+
+		// Whichever way it landed, the invite is gone and the device exists
+		// only if the redemption said so.
+		if n, _ := one.InviteRows("v1"); n != 0 {
+			t.Fatalf("attempt %d: %d invite rows survived the rotation", attempt, n)
+		}
+		_, _, registered, err := one.DeviceByID("v1", "bravo")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if registered != (redeemErr == nil) {
+			t.Fatalf("attempt %d: the row exists=%v and the redemption returned %v", attempt, registered, redeemErr)
+		}
+		if redeemErr != nil && !errors.Is(redeemErr, ErrNoInvite) {
+			t.Fatalf("attempt %d: the redemption was refused with %v, want ErrNoInvite", attempt, redeemErr)
+		}
+		// And after the rotation the string is dead for good.
+		if _, err := one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "charlie", "tablet", hashC, 0, 2001); !errors.Is(err, ErrNoInvite) {
+			t.Fatalf("attempt %d: an invite issued before the rotation still redeems: %v", attempt, err)
+		}
+	}
+}
+
+// An invite is not a way past the device cap.
+//
+// The cap is what stops a vault's list of devices becoming a list nobody
+// reads, and a second way to register that did not check it would be the cap
+// applying to whichever path somebody happened to use.
+func TestAnInviteCannotExceedTheDeviceCap(t *testing.T) {
+	h := newTestStore(t)
+	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
+		t.Fatal(err)
+	}
+	const cap = 3
+	for i := 0; i < cap; i++ {
+		id := fmt.Sprintf("seated-%d", i)
+		if err := h.Store.RegisterDevice("v1", id, id, hashA, hash1, cap, int64(1000+i)); err != nil {
+			t.Fatalf("seeding: %v", err)
+		}
+	}
+	if err := h.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, cap, 2000); !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("a redemption onto a full vault returned %v, want ErrDeviceLimit", err)
+	}
+	if n := len(ids(t, h, "v1")); n != cap {
+		t.Fatalf("%d devices, want the cap %d", n, cap)
+	}
+	// Refused, and so not spent: revoking something makes room and the same
+	// string works.
+	if err := h.RevokeDevice("v1", "seated-0", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, cap, 2001); err != nil {
+		t.Fatalf("the invite did not survive being refused for the cap: %v", err)
+	}
+}
+
+// An unclaimed vault has no invites, so a redemption against one is the same
+// refusal an unknown invite gets.
+func TestAnUnclaimedVaultHasNothingToRedeem(t *testing.T) {
+	h := newTestStore(t)
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, 0, 1000); !errors.Is(err, ErrNoInvite) {
+		t.Fatalf("redeeming against an unclaimed vault returned %v, want ErrNoInvite", err)
+	}
+}
+
+// A redemption that names a device the vault already holds is refused and
+// changes nothing, including the invite.
+//
+// Refused rather than treated as the registration having happened, which is
+// what `register` does for a repeated id with the same key. The two are
+// different callers: a conversion retries a registration it may already have
+// made, and a redeemer chooses a fresh id every time, so an id already there
+// is somebody else's device and the answer is to pick another and redeem
+// again. Which the invite, still unspent, allows.
+func TestARedemptionOntoAnExistingIdChangesNothing(t *testing.T) {
+	h := newTestStore(t)
+	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RegisterDevice("v1", "alfa", "laptop", hashA, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "alfa", "impostor", hashB, 0, 2000); !errors.Is(err, ErrDeviceExists) {
+		t.Fatalf("a redemption onto an existing id returned %v, want ErrDeviceExists", err)
+	}
+	_, hash, ok, err := h.DeviceByID("v1", "alfa")
+	if err != nil || !ok || hash != hashA {
+		t.Fatalf("the existing row was changed: ok=%v hash=%q err=%v", ok, hash, err)
+	}
+	if ds, _ := h.Devices("v1"); len(ds) != 1 || ds[0].Name != "laptop" {
+		t.Fatalf("the existing row was overwritten: %v", ds)
+	}
+	if n, _ := h.OutstandingInvites("v1", 2000); n != 1 {
+		t.Fatalf("%d outstanding invites after a refused redemption, want 1", n)
 	}
 }

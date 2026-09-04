@@ -40,8 +40,8 @@ inverts one.
 
 ## Handshake
 
-A hello offers one of two credentials, and which one it offers decides what the
-session may do.
+A hello offers one of three credentials, and which one it offers decides what
+the session may do.
 
 **A device connecting.** `deviceId` names its row in the vault's device list
 and `token` is that device's own auth key.
@@ -67,6 +67,16 @@ A registrar gets no `ready`, no catch-up and no place in the vault's fan-out,
 because there is nothing it may be sent. `ready` promises the ceilings for a
 `put` and a backlog behind it, and a reply that promised a catch-up nobody
 would send is how a client comes to wait for a frame that is not coming.
+
+**An invite being redeemed.** `invite` in place of a token, beside the device
+row the redemption is to register. It is answered `redeemed` and closed; see
+**Adding a device with a single-use invite**, which is the ordinary way a
+device is added and the reason the recovery key stays offline.
+
+```
+-> {op:"hello", id, proto:4, vault, device, crypto, invite, deviceId, auth, name?}
+<- {res:"redeemed", id, sealed, deviceId}
+```
 
 `cursor` is the last uid the client applied, or 0. The server speaks every
 version from `minProto` to `proto` and answers in the version the client asked
@@ -106,9 +116,11 @@ no minimum: the server cannot check that sixteen random bytes were random, and
 a minimum would admit a string of A's anyway. A malformed one is `badname` too,
 rather than `auth`, because it is a fact about the request and answering it
 with `auth` would make the shape of an id look like the answer to whether that
-device is registered. A hello carrying a `deviceId` and also a `claim` or an
-`invite` is `badentry`: those are how a vault is bound and how a device is
-added, and a server that picked one would be choosing which the client meant.
+device is registered. A hello carrying a `deviceId` and also a `claim` is
+`badentry`: one is a registered device connecting and the other is how a vault
+is bound, and a server that picked one would be choosing which the client
+meant. A `deviceId` beside an `invite` is not that case and is required: see
+**Adding a device with a single-use invite**.
 
 `ready` carries every ceiling the server enforces, before any catch-up, so a
 client knows all of them before its first `put`: the largest file, chunk and
@@ -445,53 +457,82 @@ the history.
 ### Adding a device with a single-use invite
 
 The root secret is shown once, to the person who starts the vault, as a
-recovery key to write down. It is never shown again to add a device. A device
-that already has the vault issues an invite instead:
+recovery key to write down. It is never shown again, and adding a device does
+not need it. A device that already has the vault issues an invite instead:
 
 ```
 -> {op:"invite", id, invite, sealed, ttlMs?}      device sessions only
 <- {res:"invited", id, expiresAt}
 ```
 
-`invite` is a random 128-bit identifier and `sealed` is the root secret sealed
-under a random 256-bit invite key, `n || AES-GCM-256(K_inv, n, S)`, both
-base64url. The server stores the identifier, the blob and an expiry, and
-returns nothing but the expiry. `ttlMs` defaults to ten minutes and may not
-exceed one hour. The issuing device hands the person an invite string:
+`invite` is a random 128-bit identifier and `sealed` is the **vault's data
+key** sealed under a random 256-bit invite key, `n || AES-GCM-256(K_inv, n,
+K_data)`, both base64url. The server stores the identifier, the blob and an
+expiry, and returns nothing but the expiry. `ttlMs` defaults to ten minutes and
+may not exceed one hour. The issuing device hands the person an invite string:
 `basalt3i_` followed by base64url of a version byte, the identifier, the invite
 key, the length-prefixed server address and vault id, and a CRC-32. The invite
 key never reaches the server, so a stolen disk holds blobs it cannot open, and
 the identifier is unguessable, so a stranger cannot redeem one by trying.
 
-The new device redeems it at hello, in place of a token:
+The data key and not the root, since protocol 4. A device holds no root, so it
+has none to seal, and an invite that carried one would hand the new device the
+credential that registers devices and rewraps the vault: everything revoking a
+device is meant to take back.
+
+The new device redeems it at hello, in place of a token, and names the device
+row it is asking for:
 
 ```
--> {op:"hello", id, proto:4, vault, device, crypto, invite}
-<- {res:"redeemed", id, sealed, wrapped}
+-> {op:"hello", id, proto:4, vault, device, crypto, invite, deviceId, auth, name?}
+<- {res:"redeemed", id, sealed, deviceId}
 ```
 
-The server marks the invite used before it answers, so it can be redeemed once
-even if the reply is lost, and then closes the session. The new device unseals
-the blob with the invite key and connects again, and what it connects as
-depends on what the blob held: today the issuing device seals the root secret,
-so the new device comes back as a registrar, registers a device row for itself
-and then connects as that device. Folding the registration into the redemption,
-so that the invite carries the data key and the redeeming hello carries the new
-device's id, is a client change and is not in this server yet. An unknown, expired or already used
-invite is `auth`, never saying which. A hello carrying both a token and an
-invite is refused with `badentry`, because an invite stands in for a token and
+**Redeeming registers the device.** The invite is unguessable, single use,
+server tracked and expiring, which is exactly the authority to register exactly
+one device, and it has to be: the issuing device holds no root and so cannot
+register a row on the newcomer's behalf, and the newcomer holds nothing else
+the server would accept a registration under. `deviceId` and `auth` are the
+row's id and the key its hash is taken from, the same fields `register` takes
+and bounded the same way; `name` defaults to `device`.
+
+The spend and the insert are one transaction. An invite is never spent without
+a row, and no row is ever written under an invite that is still live, so every
+refusal below leaves the string in somebody's hand still working.
+
+The session closes after `redeemed`. It is not a device session: nothing on it
+has proved that anybody holds the key just registered, and the redeemer has to
+write that key and the data key down before it can use either. Its next hello,
+as an ordinary device, is the proof. There is no `wrapped` in the reply and
+there must not be: the wrapping opens under the root and a redeemer holds none.
+
+Refusals. An unknown, expired, already used or malformed invite is `auth`,
+never saying which, and an unclaimed vault is the same answer. A hello carrying
+an invite without a `deviceId`, or with an `auth` key shorter than 32
+characters, or with a name the server will not store, is `badname` or
+`badentry`: those are facts about the frame rather than about the vault, and
+naming them cannot leak whether the invite exists. An id the vault already
+holds is `badentry`, and the invite stays unspent so the redeemer can pick
+another. A vault already at its device cap is `full`, not `busy`, because
+waiting never makes room; revoke a device and the same string works. A hello
+carrying both a token and an invite, or both a claim and an invite, is
+`badentry`, because an invite stands in for the one and excludes the other, and
 sending both leaves the server choosing which credential was meant. Issuing an
 invite under an identifier the vault already holds is `badentry` too, rather
 than a retryable `internal` a client would repeat for ever.
-`rotate` deletes every outstanding
-invite on the vault, because they seal the root that was just retired.
-`invite` is refused with `auth` on a session that authenticated with the
-bootstrap token.
+
+`rotate` deletes every outstanding invite on the vault. That is the same guard
+registration has: a rotation exists to end access somebody should not have, and
+an invite issued before one is a device somebody could still add after it.
+`invite` is refused with `auth` on a registrar session, which is what a session
+holding the vault credential or the bootstrap token gets: an invite seals the
+data key, which a registrar does not hold.
 
 The recovery key is still a pairing string (`basalt3_`) and `pair` still
 accepts one, because a vault whose every device is lost has nothing else: it is
 the credential that opens a registrar session, registers a device and hands it
-the data key. The CLI reprints it only on request and says what it is each time.
+the data key. That is the last resort, not the ordinary path, and both shells
+say so where they offer it.
 
 ## Which clients may connect
 

@@ -1,153 +1,220 @@
 /**
- * Rotation and the claim, from the client's side.
+ * Rotation, the claim, and registering a device, from the client's side.
  *
- * Three review findings meet here, and all three are about a moment when the
- * vault has two possible answers to "what is the secret" or "what is the data
- * key". A rotation whose reply is lost, a rotation followed by an invite, and a
- * claim sent to a vault that has nothing left to claim.
+ * Every case here is about a moment when the vault has two possible answers to
+ * "what is the secret" or "what is the data key". A rotation whose reply is
+ * lost, a claim sent to a vault that has nothing left to claim, and a
+ * registration whose reply carries a wrapping this device has seen before.
+ *
+ * Rotation moved off the device in protocol 4, and the reason is the shape of
+ * the whole feature: a device holds no root, so it cannot rewrap the data key
+ * and cannot mint a credential. What is left here is `Registrar`, which is the
+ * connection somebody opens with the recovery key in their hand.
  */
 
 import { describe, expect, it } from "vitest";
 
-import { Client, claimFor } from "./client.ts";
-import { deriveRootKeys, generateSecret, unwrapDataKey } from "./crypto.ts";
-import { FakeSocket, RIG_SECRET, ready, settle } from "./fake-socket.ts";
-import { MemoryIndexStore, MemoryVault } from "./vault.ts";
+import { Registrar, wrappedForClaim } from "./client.ts";
+import {
+  deriveRootKeys,
+  deviceAuthToken,
+  generateDeviceSecret,
+  generateSecret,
+  unwrapDataKey,
+  wrapDataKey,
+} from "./crypto.ts";
+import { FakeSocket, RIG_SECRET, settle } from "./fake-socket.ts";
+import { TEST_DATA_KEY } from "./test-keys.ts";
 
-async function connectedClient() {
-  const socket = new FakeSocket();
-  const client = new Client({
-    vault: new MemoryVault(),
-    store: new MemoryIndexStore(),
-    secret: RIG_SECRET,
-    url: "ws://test",
-    token: "t",
-    vaultId: "v",
-    device: "d",
-    timeoutMs: 2000,
-    socketFactory: () => socket,
-  });
-  const connecting = client.connect();
-  await settle();
-  socket.open();
-  for (let i = 0; i < 50 && !socket.sentText.some((m) => m["op"] === "hello"); i++) await settle();
-  socket.reply(ready({ cursor: 0 }));
-  await settle();
-  socket.raw({ op: "caught-up", cursor: 0 });
-  await connecting;
-  return { socket, client };
-}
-
-/** Answers the rotate the moment it is sent, as a server that stays up does. */
-function answerRotate(socket: FakeSocket): void {
-  socket.autoReply = (frame, s) => {
-    if (frame["op"] === "rotate") s.reply({ res: "rotated" });
+/** A well-formed registrar reply, with whatever the case wants changed. */
+function registrar(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    res: "registrar",
+    proto: 4,
+    minProto: 4,
+    serverVersion: "test",
+    maxDevices: 8,
+    ...over,
   };
 }
 
-describe("a rotation whose reply may never arrive", () => {
+/** A registrar session on a socket the test drives. */
+async function openRegistrar(
+  opts: { secret?: Uint8Array; bootstrap?: string; claim?: { auth: string; wrapped: string } } = {},
+) {
+  const socket = new FakeSocket();
+  const opening = Registrar.open({
+    url: "ws://test",
+    vaultId: "v",
+    device: "d",
+    secret: opts.secret ?? RIG_SECRET,
+    ...(opts.bootstrap !== undefined ? { bootstrap: opts.bootstrap } : {}),
+    ...(opts.claim !== undefined ? { claim: opts.claim } : {}),
+    timeoutMs: 2000,
+    socketFactory: () => socket,
+  });
+  // Waited for rather than settled once: `Registrar.open` derives the root
+  // keys before it builds the transport, so the socket has no handlers for
+  // several turns and an `open()` sent early is an open nobody hears.
+  for (let i = 0; i < 200 && socket.onopen === null; i++) await settle();
+  socket.open();
+  for (let i = 0; i < 200 && !socket.sentText.some((m) => m["op"] === "hello"); i++) await settle();
+  socket.reply(registrar());
+  return { socket, registrar: await opening };
+}
+
+describe("the session the recovery key opens", () => {
   /**
-   * The server commits, closes every other session, and only then replies. A
-   * socket that drops in between used to leave the caller throwing with nothing
-   * saved: the old root no longer authenticated and the only copy of the new
-   * one was in a process about to exit, which is intact ciphertext nobody can
-   * ever open. So the new secret is handed to the caller, and the caller is
-   * given the chance to write it down, before the request goes out.
+   * The one field that decides whether a session may sync. A registrar hello
+   * carries no `deviceId`, so there is no row for the server to check the
+   * credential against and no syncing session it could build.
    */
-  it("hands over the re-wrapped key and waits for the caller before sending", async () => {
-    const { socket, client } = await connectedClient();
-    answerRotate(socket);
-    const next = generateSecret();
-    let sentWhenCalled: unknown[] = [];
-    let handed: string | undefined;
-    await client.rotate(next, async (rewrapped) => {
-      handed = rewrapped;
-      sentWhenCalled = socket.sentText.filter((m) => m["op"] === "rotate");
-      await Promise.resolve();
-    });
-    expect(handed, "the caller was never handed the new wrapping").toBeDefined();
-    expect(sentWhenCalled, "the rotate went out before the caller could save it").toEqual([]);
-    expect(socket.sentText.filter((m) => m["op"] === "rotate")).toHaveLength(1);
+  it("offers the vault's credential and names no device", async () => {
+    const { socket } = await openRegistrar();
+    const hello = socket.sentText.find((m) => m["op"] === "hello")!;
+    expect(hello["proto"]).toBe(4);
+    expect("deviceId" in hello).toBe(false);
+    expect(hello["token"]).toBe(
+      (await import("./crypto.ts")).authToken(await deriveRootKeys(RIG_SECRET)),
+    );
   });
 
-  it("hands over a wrapping of the same data key, under the new root", async () => {
-    // The point of rotating in place: the content keys do not move, so the
-    // history stays readable. A wrapping of anything else would be a vault
-    // whose past nothing can open.
-    const { socket, client } = await connectedClient();
-    answerRotate(socket);
-    const old = await deriveRootKeys(RIG_SECRET);
-    const before = await unwrapDataKey(old.wrap, client.wrapped!);
-    const next = generateSecret();
-    let handed = "";
-    await client.rotate(next, (rewrapped) => {
-      handed = rewrapped;
-    });
-    const after = await unwrapDataKey((await deriveRootKeys(next)).wrap, handed);
-    expect([...after]).toEqual([...before]);
-    expect(handed).not.toBe(client.wrapped);
+  it("offers the server's first-run token while the vault is being claimed", async () => {
+    const claim = { auth: "AUTH", wrapped: "WRAPPED" };
+    const { socket } = await openRegistrar({ bootstrap: "TOKEN", claim });
+    const hello = socket.sentText.find((m) => m["op"] === "hello")!;
+    // The bootstrap rather than the derived key, because the vault has no
+    // hash yet for the derived key to match, and the claim beside it, because
+    // a vault is bound to a credential and a data key together.
+    expect(hello["token"]).toBe("TOKEN");
+    expect(hello["claim"]).toBe("AUTH");
+    expect(hello["wrapped"]).toBe("WRAPPED");
   });
 
-  it("does not save anything when the caller's own save fails", async () => {
-    // A caller that cannot write the pending secret must not have the rotation
-    // sent on its behalf: an uncommitted rotation is recoverable and a
-    // committed one whose secret was never written down is not.
-    const { socket, client } = await connectedClient();
-    answerRotate(socket);
+  it("hands the registering device the data key, unwrapped", async () => {
+    // The whole mechanism by which a device ends up holding the data key
+    // without ever holding the root: this session can unwrap it and the
+    // device it is registering never could.
+    const root = await deriveRootKeys(RIG_SECRET);
+    const wrapped = await wrapDataKey(root.wrap, TEST_DATA_KEY);
+    const { socket, registrar: reg } = await openRegistrar();
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "register") {
+        s.reply({ res: "registered", deviceId: frame["deviceId"], wrapped });
+      }
+    };
+    const secret = generateDeviceSecret();
+    const { dataKey } = await reg.register({ deviceId: "dev-1", deviceSecret: secret, name: "d" });
+    expect([...dataKey]).toEqual([...TEST_DATA_KEY]);
+    const sent = socket.sentText.find((m) => m["op"] === "register")!;
+    // The key, not its digest: the server keeps only the digest either way,
+    // and what the key buys is a floor on how short a credential may be.
+    expect(sent["auth"]).toBe(await deviceAuthToken(secret));
+    expect(sent["deviceId"]).toBe("dev-1");
+  });
+
+  /**
+   * C40, in the one place it can still arise. A server handed a claim holds a
+   * wrapping this device made and can unwrap, and could return it as the
+   * vault's own; the device would install a schedule no other device on the
+   * vault derives and both ends would report success.
+   */
+  it("refuses a registration whose wrapped key is not the one this device saw before", async () => {
+    const root = await deriveRootKeys(RIG_SECRET);
+    const theirs = await wrapDataKey(root.wrap, TEST_DATA_KEY);
+    const { socket, registrar: reg } = await openRegistrar();
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "register") {
+        s.reply({ res: "registered", deviceId: frame["deviceId"], wrapped: theirs });
+      }
+    };
     await expect(
-      client.rotate(generateSecret(), () => {
-        throw new Error("the disk is full, as it were");
+      reg.register({
+        deviceId: "dev-1",
+        deviceSecret: generateDeviceSecret(),
+        name: "d",
+        expectWrapped: "THE-VAULTS-OWN",
       }),
-    ).rejects.toThrow(/disk is full/);
-    expect(socket.sentText.filter((m) => m["op"] === "rotate")).toEqual([]);
+    ).rejects.toThrow(/different wrapped data key/);
+  });
+
+  it("refuses a registration naming a device other than the one asked for", async () => {
+    // The device is about to store a credential for whatever row this names.
+    // A row that is not its own is a device that drops the root and is then
+    // refused at every hello.
+    const { socket, registrar: reg } = await openRegistrar();
+    socket.autoReply = (_frame, s) => {
+      s.reply({ res: "registered", deviceId: "somebody-else", wrapped: "W" });
+    };
+    await expect(
+      reg.register({ deviceId: "dev-1", deviceSecret: generateDeviceSecret(), name: "d" }),
+    ).rejects.toThrow(/which is not the "dev-1"/);
+  });
+
+  it("refuses a registration with no wrapped data key, which no claimed vault has", async () => {
+    const { socket, registrar: reg } = await openRegistrar();
+    socket.autoReply = (frame, s) => {
+      s.reply({ res: "registered", deviceId: frame["deviceId"] });
+    };
+    await expect(
+      reg.register({ deviceId: "dev-1", deviceSecret: generateDeviceSecret(), name: "d" }),
+    ).rejects.toThrow(/no wrapped data key/);
   });
 });
 
-/**
- * review finding on a rotated client. `rotate` changed neither the secret this
- * object holds nor the wrapping it connected under, and nothing marked the
- * client spent, so a later `invite` sealed the retired root and handed somebody
- * a way in that no longer works: they redeem it, store it, and are refused.
- */
-describe("a client whose secret was rotated under it", () => {
-  it("refuses to issue an invite, rather than sealing the retired root", async () => {
-    const { socket, client } = await connectedClient();
-    answerRotate(socket);
-    await client.rotate(generateSecret());
-    const sentBefore = socket.sentText.length;
-    await expect(client.invite()).rejects.toThrow(/old secret/);
-    await expect(client.invite()).rejects.toThrow(/Reconnect with the new secret/);
-    expect(socket.sentText.length, "an invite was put on the wire anyway").toBe(sentBefore);
+describe("rotating the vault's secret", () => {
+  /**
+   * The point of rotating in place: the content keys do not move, so the
+   * history stays readable and every device row is untouched. A wrapping of
+   * anything else would be a vault whose past nothing can open.
+   */
+  it("sends the same data key, wrapped under the new root", async () => {
+    const { socket, registrar: reg } = await openRegistrar();
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "rotate") s.reply({ res: "rotated" });
+    };
+    const next = generateSecret();
+    const { rewrapped } = await reg.rotate(next, TEST_DATA_KEY);
+    const sent = socket.sentText.find((m) => m["op"] === "rotate")!;
+    expect(sent["wrapped"]).toBe(rewrapped);
+    const after = await unwrapDataKey((await deriveRootKeys(next)).wrap, rewrapped);
+    expect([...after]).toEqual([...TEST_DATA_KEY]);
   });
 
-  it("refuses a second rotation, which would re-wrap under the retired root", async () => {
-    const { socket, client } = await connectedClient();
-    answerRotate(socket);
-    await client.rotate(generateSecret());
-    await expect(client.rotate(generateSecret())).rejects.toThrow(/old secret/);
-    expect(socket.sentText.filter((m) => m["op"] === "rotate")).toHaveLength(1);
+  it("sends the new auth key, which the old root does not open", async () => {
+    const { socket, registrar: reg } = await openRegistrar();
+    socket.autoReply = (frame, s) => {
+      if (frame["op"] === "rotate") s.reply({ res: "rotated" });
+    };
+    const next = generateSecret();
+    await reg.rotate(next, TEST_DATA_KEY);
+    const sent = socket.sentText.find((m) => m["op"] === "rotate")!;
+    const { authToken } = await import("./crypto.ts");
+    expect(sent["auth"]).toBe(authToken(await deriveRootKeys(next)));
+    expect(sent["auth"]).not.toBe(authToken(await deriveRootKeys(RIG_SECRET)));
   });
 });
 
 /**
  * The claim, and when there is no longer any point sending one. A claim on a
  * claimed vault is ignored by an honest server and is a free wrapping for a
- * dishonest one to hand back in `ready` as the vault's own.
+ * dishonest one to hand back as the vault's own.
  */
-describe("what a hello offers to claim with", () => {
-  it("sends nothing once the bootstrap has been spent", async () => {
+describe("what a claim carries", () => {
+  it("wraps a fresh data key under the root that will hold it", async () => {
     const keys = await deriveRootKeys(RIG_SECRET);
-    expect(await claimFor({}, "AUTH", keys)).toBeUndefined();
-    expect(await claimFor({ claimWrapped: "STORED" }, "AUTH", keys)).toBeUndefined();
+    const wrapped = await wrappedForClaim(keys);
+    // It unwraps, which is the only thing that has to be true of it: the
+    // vault's data key is whatever this claim binds, and the device that made
+    // it must be able to open it again.
+    expect((await unwrapDataKey(keys.wrap, wrapped)).length).toBe(32);
   });
 
-  it("sends the same data key on every attempt while the vault is being claimed", async () => {
-    // A fresh candidate per attempt meant a claim retried after a lost reply
-    // proposed a different key from the one that may already have committed.
+  it("makes a different key every time it is asked, so it is asked once", async () => {
+    // Why `claimWrapped` is stored rather than recomputed: a claim retried
+    // after a lost reply must offer the key it offered before, or the vault
+    // can be bound to one candidate while the device proposes another.
     const keys = await deriveRootKeys(RIG_SECRET);
-    const config = { bootstrap: "TOKEN", claimWrapped: "STORED" };
-    for (let attempt = 0; attempt < 3; attempt++) {
-      expect(await claimFor(config, "AUTH", keys)).toEqual({ auth: "AUTH", wrapped: "STORED" });
-    }
+    expect(await wrappedForClaim(keys)).not.toBe(await wrappedForClaim(keys));
   });
 });

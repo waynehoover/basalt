@@ -25,7 +25,6 @@ import { join } from "node:path";
 import { cpus, totalmem } from "node:os";
 
 import { Client } from "./src/core/client.ts";
-import { authToken, deriveRootKeys } from "./src/core/crypto.ts";
 import { testWrapped } from "./src/core/test-keys.ts";
 
 import { TestServer, serverBinary } from "./src/core/test-server.ts";
@@ -203,9 +202,8 @@ async function run(wire: Wire) {
     const c = new Client({
       vault: new NodeVault(dir),
       store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-      secret,
       url: proxy.url,
-      ...server.credentials(authToken(await deriveRootKeys(secret)), await testWrapped(secret)),
+      ...(await server.deviceCredentials(secret, await testWrapped(secret), name)),
       vaultId: "default",
       device: name,
       timeoutMs: 120_000,

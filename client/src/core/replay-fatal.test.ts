@@ -11,7 +11,7 @@ import { describe, expect, it } from "vitest";
 
 import { runForever } from "./client.ts";
 import { sealPath } from "./crypto.ts";
-import { testKeys } from "./test-keys.ts";
+import { TEST_DATA_KEY, testKeys } from "./test-keys.ts";
 import { FakeSocket, RIG_SECRET, ready } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
@@ -39,8 +39,9 @@ describe("a batch no reconnection can get past (C28)", () => {
       {
         vault: new MemoryVault(),
         store: new MemoryIndexStore(),
-        secret: RIG_SECRET,
+        dataKey: TEST_DATA_KEY,
         url: "ws://test",
+        deviceId: "rig-device",
         token: "t",
         vaultId: "v",
         device: "d",
@@ -89,8 +90,9 @@ describe("a batch no reconnection can get past (C28)", () => {
       {
         vault: new MemoryVault(),
         store: new MemoryIndexStore(),
-        secret: RIG_SECRET,
+        dataKey: TEST_DATA_KEY,
         url: "ws://test",
+        deviceId: "rig-device",
         token: "t",
         vaultId: "v",
         device: "d",

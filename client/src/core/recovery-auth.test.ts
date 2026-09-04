@@ -10,8 +10,8 @@
 import { describe, expect, it } from "vitest";
 
 import { Client } from "./client.ts";
-import { macEntry, sealChunks, sealPath, type VaultKeys } from "./crypto.ts";
-import { testKeys } from "./test-keys.ts";
+import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
+import { TEST_DATA_KEY, testKeys } from "./test-keys.ts";
 import { FakeSocket, RIG_SECRET, ready, settle } from "./fake-socket.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
@@ -24,8 +24,9 @@ async function rig() {
   const client = new Client({
     vault,
     store: new MemoryIndexStore(),
-    secret: RIG_SECRET,
+    dataKey: TEST_DATA_KEY,
     url: "ws://test",
+    deviceId: "rig-device",
     token: "t",
     vaultId: "v",
     device: "d",
@@ -44,7 +45,7 @@ async function rig() {
 }
 
 async function version(
-  keys: VaultKeys,
+  keys: Schedule,
   uid: number,
   path: string,
   text: string,

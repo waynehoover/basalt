@@ -43,7 +43,7 @@
 
 import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
 import {
-  deriveKeys,
+  deriveSchedule,
   entryIsOurs,
   macEntry,
   openChunk,
@@ -51,8 +51,8 @@ import {
   parentOf,
   sealChunks,
   sealPath,
+  type Schedule,
   type SealedChunk,
-  type VaultKeys,
 } from "./crypto.ts";
 import { conflictCopyPath, mergeText } from "./merge.ts";
 import {
@@ -246,7 +246,7 @@ export function boundedBy(fromServer: number, own: number): number {
  * recovery adding that the entry is not being shown either.
  */
 export async function mustBeOurs(
-  keys: VaultKeys,
+  keys: Schedule,
   entries: readonly WireEntry[],
   suffix = "",
 ): Promise<void> {
@@ -326,39 +326,25 @@ export interface EngineOptions {
   readonly vault: Vault;
   readonly store: IndexStore;
   /**
-   * The root secret. Every key this engine uses comes from it and from the
-   * wrapped data key `ready` returns, and none of them exist before that.
+   * The vault's data key. Every key this engine uses derives from it.
    *
-   * The engine holds no keys until the handshake, which is deliberate: there
-   * is one key schedule per vault and one moment it becomes known, so there
-   * is no window in which something could be sealed under the wrong one.
+   * Held directly rather than unwrapped from what `ready` returns, because
+   * the key that would unwrap it comes from the root secret and a registered
+   * device does not have one. It was handed over once, at registration, by
+   * the session that did; see `convertToDevice` in client.ts.
+   *
+   * The schedule is still derived in `start` rather than in the constructor,
+   * so there is one moment the keys become known and no window in which
+   * something could be sealed under a different one.
    */
-  readonly secret: Uint8Array;
+  readonly dataKey: Uint8Array;
   readonly transport: Transport;
   readonly device: string;
   readonly vaultId: string;
+  /** This device's row in the vault's device list. */
+  readonly deviceId: string;
+  /** This device's own auth key, derived from its own secret. */
   readonly token: string;
-  /**
-   * What to bind the vault to if it has not been claimed: the auth key, and
-   * the data key this device is claiming with, wrapped under its root.
-   *
-   * Sent only while this device is still claiming, which is while it holds the
-   * server's first-run token, and the same pair every time: a retry after a
-   * lost reply must offer the key it offered before, or the vault can be bound
-   * to one candidate while this device goes on proposing another. Absent
-   * everywhere else, because a vault that is known to be claimed has nothing to
-   * claim and a claim sent anyway is a wrapping handed to the server for free.
-   *
-   * The engine never seals anything under this copy: the key it uses is the one
-   * `ready` returns, so a claim that committed with its reply lost still leaves
-   * every device on the same key.
-   */
-  readonly claim?: { auth: string; wrapped: string };
-  /**
-   * The vault's wrapped data key as this device last saw it, when it has seen
-   * it. A `ready` carrying a different blob is refused; see DeviceConfig.
-   */
-  readonly wrapped?: string;
   readonly now?: () => number;
   readonly log?: (message: string, ...rest: unknown[]) => void;
   /**
@@ -643,7 +629,7 @@ export class Engine {
    * through `keys`, which refuses rather than sealing anything under a
    * schedule nobody has agreed on yet.
    */
-  private derived: VaultKeys | undefined;
+  private derived: Schedule | undefined;
   /**
    * Settled once `derived` is set, which is after `ready`. The first batch can
    * arrive in the same moment, and a batch opened under the wrong schedule
@@ -675,7 +661,7 @@ export class Engine {
    * that reaches it before the handshake is a bug, and the message says which
    * bug rather than letting WebCrypto complain about an undefined key.
    */
-  private get keys(): VaultKeys {
+  private get keys(): Schedule {
     if (this.derived === undefined) {
       throw new Error(
         "this engine has not finished its handshake, so the vault's keys are not known yet",
@@ -685,7 +671,7 @@ export class Engine {
   }
 
   /** The keys in use, which a shell needs to seal a path for recovery. */
-  get vaultKeys(): VaultKeys {
+  get vaultKeys(): Schedule {
     return this.keys;
   }
 
@@ -787,11 +773,10 @@ export class Engine {
     try {
       limits = await this.opts.transport.hello({
         vault: this.opts.vaultId,
+        deviceId: this.opts.deviceId,
         token: this.opts.token,
         device: this.opts.device,
         cursor: this.cursor,
-        ...(this.opts.claim !== undefined ? { claim: this.opts.claim } : {}),
-        ...(this.opts.wrapped !== undefined ? { knownWrapped: this.opts.wrapped } : {}),
       });
       // The docs present the client-ahead case as what catches a server
       // restored from an old backup or pointed at the wrong vault, and the
@@ -800,12 +785,11 @@ export class Engine {
       // the status line reported `behind` clamped at zero, so it looked like
       // being up to date.
       refuseIfBehind(limits.cursor, this.cursor);
-      // The vault's keys, from the data key the server just handed over. This
-      // is the only place they are set, and it happens before the first batch
-      // is opened: a batch unsealed under any other schedule fails its
-      // authenticator. A `ready` carrying no wrapped key never reaches here,
-      // because the transport ends the session on one; see readReady, C40.
-      this.derived = await deriveKeys(this.opts.secret, limits.wrapped);
+      // The vault's keys, from the data key this device was registered with.
+      // This is the only place they are set, and it happens before the first
+      // batch is opened: a batch unsealed under any other schedule fails its
+      // authenticator.
+      this.derived = await deriveSchedule(this.opts.dataKey);
     } catch (err) {
       this.failKeys(err instanceof Error ? err : new Error(String(err)));
       throw err;
@@ -2884,7 +2868,7 @@ export const SEAL_WINDOW = 16;
  * produces, or a file would be stored under names no other device agrees with.
  */
 export async function sealedNames(
-  keys: VaultKeys,
+  keys: Schedule,
   parts: readonly Uint8Array[],
   window = SEAL_WINDOW,
 ): Promise<string[]> {

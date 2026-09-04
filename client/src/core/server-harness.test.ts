@@ -22,13 +22,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { chunkBytes, looksLikeText, sizesFor } from "./chunk.ts";
 import {
   authToken,
+  deriveRootKeys,
   macEntry,
   openChunk,
   openPath,
   parentOf,
   sealChunks,
   sealPath,
-  type VaultKeys,
+  type Schedule,
 } from "./crypto.ts";
 import { testKeys, testWrapped } from "./test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
@@ -45,8 +46,8 @@ const run = promisify(execFile);
  * One vault, one root secret, and the auth key is a branch of the same schedule,
  * so every device that has the secret authenticates with the same key.
  */
-let sharedKeys: VaultKeys | undefined;
-async function vaultKeys(): Promise<VaultKeys> {
+let sharedKeys: Schedule | undefined;
+async function vaultKeys(): Promise<Schedule> {
   sharedKeys ??= await testKeys(SECRET);
   return sharedKeys;
 }
@@ -98,7 +99,7 @@ class Client {
   transport!: Transport;
 
   constructor(
-    readonly keys: VaultKeys,
+    readonly keys: Schedule,
     readonly device: string,
   ) {}
 
@@ -118,7 +119,7 @@ class Client {
       vault: "default",
       device: this.device,
       cursor,
-      ...server.credentials(authToken(this.keys), await testWrapped(SECRET)),
+      ...(await server.deviceCredentials(SECRET, await testWrapped(SECRET), this.device)),
     });
   }
 
@@ -259,9 +260,9 @@ describe("the handshake, against the real server", () => {
     const c = new Client(await testKeys(SECRET), "a");
     clients.push(c);
     const ready = await c.connect(server);
-    expect(ready.proto).toBe(3);
+    expect(ready.proto).toBe(4);
     // One protocol, so the range the server speaks is one number wide.
-    expect(ready.minProto).toBe(3);
+    expect(ready.minProto).toBe(4);
     expect(ready.serverVersion).not.toBe("");
     // And a data key, which every vault has.
     expect(ready.wrapped).not.toBe("");
@@ -281,7 +282,14 @@ describe("the handshake, against the real server", () => {
     const t = new Transport(server.wsUrl, { onBatch: () => {}, timeoutMs: 10_000 });
     await t.connect();
     await expect(
-      t.hello({ vault: "default", token: "not-the-token", device: "impostor", cursor: 0 }),
+      t.hello({
+        vault: "default",
+        deviceId: (await server.deviceCredentials(SECRET, await testWrapped(SECRET), "impostor"))
+          .deviceId,
+        token: "not-the-token",
+        device: "impostor",
+        cursor: 0,
+      }),
     ).rejects.toMatchObject({ code: "auth" });
     t.close();
   });
@@ -292,7 +300,7 @@ describe("the handshake, against the real server", () => {
     await expect(
       t.hello({
         vault: "someone-elses",
-        token: authToken(await vaultKeys()),
+        ...(await server.deviceCredentials(SECRET, await testWrapped(SECRET), "a")),
         device: "a",
         cursor: 0,
       }),
@@ -307,7 +315,7 @@ describe("the handshake, against the real server", () => {
     await t.connect();
     await expect(
       t.hello({
-        ...server.credentials(authToken(await vaultKeys()), await testWrapped(SECRET)),
+        ...(await server.deviceCredentials(SECRET, await testWrapped(SECRET), "a")),
         vault: "default",
         device: "a",
         cursor: 999_999,
@@ -785,7 +793,7 @@ describe("refusals that the session survives", () => {
         vault: "default",
         device: "ids",
         cursor: 0,
-        ...server.credentials(authToken(keys), await testWrapped(SECRET)),
+        ...(await server.deviceCredentials(SECRET, await testWrapped(SECRET), "ids")),
       });
       const hello = frames.find((f) => f["op"] === "hello")!;
       const ready = seen.find((f) => f["res"] === "ready")!;
@@ -823,15 +831,17 @@ describe("refusals that the session survives", () => {
   });
 
   /**
-   * The other side of the version check: this client says `proto: 3`, and a
-   * hello in any other version is refused rather than answered. Protocol 2
-   * was withdrawn with the vaults that had no data key, and a server still
-   * answering it would let a device seal notes under the root-derived
-   * schedule that nothing else on the vault could read.
+   * The other side of the version check: this client says `proto: 4`, and a
+   * hello in any other version is refused rather than answered. Protocol 3 is
+   * the one somebody might still be running, and a server still answering it
+   * would hand a connection the vault's own credential as a sync credential,
+   * which is exactly the thing per-device credentials took away.
    */
   it("refuses a hello in any protocol but this one", async () => {
-    const keys = await vaultKeys();
-    const creds = server.credentials(authToken(keys), await testWrapped(SECRET));
+    const creds = server.credentials(
+      authToken(await deriveRootKeys(SECRET)),
+      await testWrapped(SECRET),
+    );
     const ws = new WebSocket(server.wsUrl);
     const answer = new Promise<Record<string, unknown>>((resolve, reject) => {
       ws.addEventListener("message", (ev) => {
@@ -844,7 +854,7 @@ describe("refusals that the session survives", () => {
     ws.send(
       JSON.stringify({
         op: "hello",
-        proto: 2,
+        proto: 3,
         crypto: "basalt/hkdf-aes-gcm/1",
         vault: "default",
         device: "old-phone",
@@ -858,9 +868,10 @@ describe("refusals that the session survives", () => {
     ws.close();
     expect(refusal["res"]).toBe("err");
     expect(refusal["code"]).toBe("proto");
-    // Named, with the server's own version, because that is how somebody
-    // works out which end to upgrade.
-    expect(String(refusal["msg"])).toMatch(/2/);
+    // Both numbers named, because that is how somebody works out which end to
+    // upgrade, and this is the refusal a protocol 3 device actually gets.
+    expect(String(refusal["msg"])).toMatch(/protocol 3 not supported/);
+    expect(String(refusal["msg"])).toMatch(/4 to 4/);
   });
 });
 

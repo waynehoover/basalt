@@ -12,7 +12,7 @@ dependencies, Node 22 or newer.
 ```bash
 npm install -g basalt-sync
 cd ~/vault
-basalt pair basalt3i_...       # an invite from a device that has the vault
+basalt pair basalt3_...        # the vault's recovery key, written down when it was started
 basalt sync --watch
 ```
 
@@ -30,21 +30,34 @@ into the vault if every device is lost, and anyone who has it has the vault.
 `--server URL --token TOKEN` still works if you would rather pass the two
 halves.
 
-To add a device, run `basalt invite` on a device that has the vault and paste
-the `basalt3i_` string into `basalt pair` on the new one. An invite works once
-and expires after `--ttl` (default 10m, at most 1h). It carries no secret of
-its own: the new device uses it to fetch the vault's key from the server,
-sealed under a key that never leaves the invite string. `basalt pair` also
-accepts the recovery key, for a vault whose every device is lost.
+To add a device, run `basalt invite` on one that already has the vault and
+paste what it prints into `basalt pair` on the new one. An invite works once,
+lasts ten minutes, and carries no root secret: it hands the new device the
+vault's data key and registers a credential of its own for it, which `basalt
+revoke` can cut off without touching any other device.
+
+The recovery key also works in `basalt pair`, and is what to use when there is
+no device left to make an invite from. It is not the ordinary way in on
+purpose: it is written down and offline, and adding a phone should not mean
+going to get it. Either way the new device keeps neither the invite nor the
+key, only a credential of its own.
+
+A vault paired before protocol 4 converts itself the first time any command
+connects: it registers a device row with the root it is holding, reads the row
+back by using it, and only then drops the root. Nothing to do. If it is
+interrupted the next command carries on from where it stopped, and it never
+registers a second row for the same device.
 
 ### Commands
 
 ```
 basalt init HOST:PORT#TOKEN               start a new vault, with the line the server printed
 basalt invite [--ttl 10m]                 print a single-use invite for another device
-basalt pair INVITE                        join a vault with an invite, or with its recovery key
-basalt recovery-key                       reprint the recovery key, which is the vault itself
-basalt rotate                             give the vault a new secret, keeping its history
+basalt pair INVITE                        add this device to a vault, with an invite or its
+                                          recovery key
+basalt devices                            every device that may reach this vault
+basalt revoke ID [--allow-last]           stop one device connecting, from basalt devices
+basalt rotate RECOVERY-KEY                give the vault a new secret, keeping its history
 basalt rebase --backup-taken              rejoin a server restored from an older backup
 basalt sync                               sync once and exit
 basalt sync --watch                       sync, then keep syncing
@@ -68,6 +81,8 @@ basalt --version                          which release this is
 | `--uid N` | restore one exact version, from `basalt history` |
 | `--to PATH` | restore somewhere other than where it came from |
 | `--limit N` | how many versions `history` shows (default 20), or how many deletions `deleted` lists (default: all) |
+| `--allow-last` | revoke the last device, leaving the vault reachable only by its recovery key |
+| `--` | everything after it is a word rather than an option, for a device id that begins with `-` |
 | `-v`, `--verbose` | engine logging |
 
 **Exit codes.** 0 worked. 1 failed, could not reach the server, finished with
@@ -84,18 +99,33 @@ that has lost history this device already has. It also stops after three
 identical failures applying the same batch, naming the cursor and the version,
 so a poisoned entry is heard about rather than replayed forever.
 
-`basalt rotate` gives the vault a new root secret and prints the new recovery
-key; every other device is disconnected and is added again with `basalt
-invite`. It always keeps the history, because the content is sealed under a
-data key that the root only wraps, so a new root re-wraps the same key and
-nothing on the server is re-encrypted.
+`basalt devices` lists every device that may reach this vault: its id, its
+name, when it was added and when it was last seen. The name is not an identity
+and two laptops may both be called laptop; the id is, and it is what `basalt
+revoke` takes.
 
-The new secret is written down locally before the request goes out, so a reply
-lost in flight cannot leave a vault whose new root nobody holds: the next
-connection tries the new secret first and falls back to the old, keeping
-whichever the server accepts. If another device rotated first, this one is
-refused by name and told to reconnect with the new string rather than
-overwriting it.
+`basalt revoke ID` removes that device's row and closes any connection it has
+open, in that order, so it stops at once rather than the next time it happens
+to reconnect. A device may revoke itself. Revoking the last one is refused
+without `--allow-last`, because what it leaves is a vault only the recovery key
+can reach.
+
+**Revoking stops a device connecting. It does not unread what that device
+already read**: it still holds the vault's key for every note it had synced. A
+device that was stolen rather than merely lost wants `basalt rotate` as well.
+
+`basalt rotate RECOVERY-KEY` gives the vault a new root secret and prints the
+new one. It takes the old key on the command line because no device holds one:
+a device that could rotate could also register itself again after being
+revoked. It always keeps the history, because the content is sealed under a
+data key that the root only wraps, so a new root re-wraps the same key and
+nothing on the server is re-encrypted. **No device row is touched and every
+device keeps syncing across it.**
+
+The new key is printed before the request goes out, because there is nowhere on
+a device to keep a root. If the reply is lost, `rotate` asks the server which
+secret it has and says which key to keep. If somebody rotated first, it says so
+by name and says to cross the printed key out.
 
 `basalt rebase` is for a server restored from an older backup, which refuses
 this device with `cursor`. It prints both cursors and refuses without

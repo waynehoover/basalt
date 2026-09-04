@@ -41,15 +41,17 @@ import { CRYPTO_SUITE, chunkName, isChunkName } from "./crypto.ts";
 /**
  * The protocol version this client speaks. A mismatch is refused, not negotiated.
  *
- * Three, and nothing else: request ids, the `bodies` header on a fetch,
- * `retryable` on every error, the per-entry authenticator, the batch and fetch
- * caps in `ready`, the wrapped data key, invites and `rotate`. Every earlier
- * version was withdrawn before anyone was running one.
+ * Four, and nothing else. Four is not compatible with three and there is no
+ * shim: a hello now carries a `deviceId` and the credential beside it is that
+ * device's own, where in three it was the vault's, used by every device. A
+ * client that guessed would be asking a protocol 4 server for exactly the sync
+ * rights per-device credentials exist to make revocable. Three was in use by
+ * one person for one day.
  *
  * The number still travels, and a mismatch still names both ends and the
  * server's version, because that is how the next upgrade gets diagnosed.
  */
-export const PROTO = 3;
+export const PROTO = 4;
 
 /** How long a request may go unanswered before the connection is considered dead. */
 export const REQUEST_TIMEOUT_MS = 60_000;
@@ -154,8 +156,42 @@ export interface ServerLimits {
    *
    * Every vault has one, so this is not optional: see `readReady` for what an
    * absent one would mean. docs/protocol.md, "The data key".
+   *
+   * A protocol 4 device does not use it. It was handed the data key itself
+   * when it was registered, by the session holding the root that could unwrap
+   * this, and it has held it ever since. What the field is still good for is
+   * the check in `readReady`: a vault with a hash and no data key is one an
+   * older build wrote, and nothing here can read it.
    */
   readonly wrapped: string;
+}
+
+/**
+ * What the server advertises in reply to a hello that offered the vault's own
+ * credential rather than a device's.
+ *
+ * Four fields, and deliberately not `ServerLimits`. A registrar may register a
+ * device and rotate the vault's secret; it gets no cursor, no ceilings and no
+ * catch-up, because it may not put anything and nothing will be sent to it.
+ * Giving it the same type would be a promise of a backlog nobody would send.
+ */
+export interface RegistrarLimits {
+  readonly proto: number;
+  readonly minProto: number;
+  readonly serverVersion: string;
+  /** The most devices this vault may have registered at once. */
+  readonly maxDevices: number;
+}
+
+/** One device's row in the vault's list, as the server hands it over. */
+export interface DeviceRow {
+  /** The identity: chosen by that device, unique in the vault, never the name. */
+  readonly id: string;
+  /** A label a person reads. Two devices may share one. */
+  readonly name: string;
+  readonly createdAt: number;
+  /** Zero until that device has connected once. */
+  readonly lastSeen: number;
 }
 
 /** Metadata for a put. Mirrors the protocol's `meta` object exactly. */
@@ -945,28 +981,12 @@ export class Transport {
    */
   async hello(args: {
     vault: string;
+    /** This device's row in the vault's device list. */
+    deviceId: string;
+    /** This device's own auth key, derived from its own secret. */
     token: string;
     device: string;
     cursor: number;
-    /**
-     * What this device offers to bind an unclaimed vault to: the auth key,
-     * and a data key wrapped under this device's root.
-     *
-     * One argument rather than two, so a claim cannot be sent without a data
-     * key. The server refuses that pair anyway, and a vault bound with no
-     * data key is the state protocol 3 exists to remove.
-     *
-     * Sent every time and meaningful only once: the server ignores it for a
-     * vault that has already been claimed. Sending it unconditionally means
-     * a device never has to know whether it is the first one, and which key
-     * the vault actually has comes back in `ready`, never from here.
-     */
-    claim?: { auth: string; wrapped: string };
-    /**
-     * The vault's wrapped data key as this device last saw it, when it has
-     * seen it. A `ready` carrying a different one is refused; see readReady.
-     */
-    knownWrapped?: string;
   }): Promise<ServerLimits> {
     checkName("vault", args.vault);
     checkName("device", args.device);
@@ -979,37 +999,119 @@ export class Transport {
           proto: PROTO,
           crypto: CRYPTO_SUITE,
           vault: args.vault,
+          deviceId: args.deviceId,
           token: args.token,
           device: args.device,
           cursor: args.cursor,
-          ...(args.claim !== undefined
-            ? { claim: args.claim.auth, wrapped: args.claim.wrapped }
-            : {}),
         },
         "ready",
       );
     } catch (err) {
       throw protoRefusal(err);
     }
-    return this.readReady(reply, args.knownWrapped);
+    return this.readReady(reply);
   }
 
   /**
-   * Redeems a single-use invite: a hello with the invite in place of a token.
+   * Opens a registrar session: a hello offering the vault's own credential,
+   * with no `deviceId`.
    *
-   * The server answers with the root secret sealed under the invite key, then
-   * closes; this connection is not a device and never becomes one. The caller
-   * unseals, stores, and connects again with the derived key like any other
-   * device, and takes the vault's data key from that connection's `ready`.
-   * The `redeemed` frame carries the wrapped key too and this ignores it:
-   * one place decides which keys a vault uses, and it is `ready`.
-   * docs/protocol.md, "Adding a device with a single-use invite".
+   * What comes back may register a device and rotate the vault's secret, and
+   * may do nothing else. It is given no `ready`, no cursor and no place in the
+   * vault's fan-out, so there is deliberately no `ServerLimits` here: a caller
+   * that was handed ceilings and a cursor would be holding the promise of a
+   * catch-up nobody is going to send.
+   *
+   * `claim` binds an unclaimed vault to this key and data key. It is sent only
+   * while this device still holds the server's first-run token, and the same
+   * pair every time, so a claim retried after a lost reply offers the key it
+   * offered before rather than a second candidate.
+   */
+  async helloAsRegistrar(args: {
+    vault: string;
+    token: string;
+    device: string;
+    claim?: { auth: string; wrapped: string };
+  }): Promise<RegistrarLimits> {
+    checkName("vault", args.vault);
+    checkName("device", args.device);
+    let reply: Reply;
+    try {
+      reply = await this.request(
+        {
+          op: "hello",
+          proto: PROTO,
+          crypto: CRYPTO_SUITE,
+          vault: args.vault,
+          token: args.token,
+          device: args.device,
+          cursor: 0,
+          ...(args.claim !== undefined
+            ? { claim: args.claim.auth, wrapped: args.claim.wrapped }
+            : {}),
+        },
+        "registrar",
+      );
+    } catch (err) {
+      throw protoRefusal(err);
+    }
+    if (reply["res"] !== "registrar") {
+      throw new ProtocolError("protostate", `expected registrar, got ${JSON.stringify(reply)}`);
+    }
+    const version = reply["serverVersion"];
+    const limits: RegistrarLimits = {
+      proto: this.count(reply, "proto", "registrar"),
+      minProto: this.count(reply, "minProto", "registrar"),
+      serverVersion: typeof version === "string" ? version : "unknown",
+      maxDevices: this.count(reply, "maxDevices", "registrar"),
+    };
+    if (limits.proto !== PROTO) {
+      const err = new ProtocolError(
+        "proto",
+        `server (version ${limits.serverVersion}) answered in protocol ${limits.proto}, ` +
+          `this client speaks ${PROTO}; upgrade the server first`,
+      );
+      this.die(err);
+      throw err;
+    }
+    this.log("registrar", limits);
+    return limits;
+  }
+
+  /**
+   * Redeems a single-use invite, which is how this device is registered.
+   *
+   * The hello carries the invite in place of a credential and, beside it, the
+   * device row it is asking for: an id of its own and the auth key it will
+   * connect with. Both halves are one server transaction, so a redemption is
+   * either an invite spent and a row written or neither of the two, and a
+   * refusal leaves the string in somebody's hand still working.
+   *
+   * It has to be one exchange. Under protocol 4 the device that issued the
+   * invite holds no root, so it cannot register a row for the newcomer, and
+   * the newcomer holds nothing the server would accept a registration under.
+   * The invite is the only authority either of them has, and it is a good one:
+   * unguessable, single use and expiring.
+   *
+   * What comes back is the vault's data key sealed under the invite key, which
+   * never reached the server, and the id of the row that was written. The
+   * server closes the session after it: this connection has proved that
+   * somebody held an invite and not that anybody holds the key just
+   * registered. The caller writes both down and connects again as a device,
+   * and that hello is the proof. docs/protocol.md, "Adding a device with a
+   * single-use invite".
    */
   async redeem(args: {
     vault: string;
     device: string;
     invite: string;
-  }): Promise<{ sealed: string }> {
+    /** The row this device is asking the invite to register. */
+    deviceId: string;
+    /** The auth key that row will be recognised by, derived from a fresh device secret. */
+    auth: string;
+    /** The label for the row. Defaults, at the server, to `device`. */
+    name?: string;
+  }): Promise<{ sealed: string; deviceId: string }> {
     checkName("vault", args.vault);
     checkName("device", args.device);
     let reply: Reply;
@@ -1023,6 +1125,9 @@ export class Transport {
           device: args.device,
           cursor: 0,
           invite: args.invite,
+          deviceId: args.deviceId,
+          auth: args.auth,
+          ...(args.name !== undefined ? { name: args.name } : {}),
         },
         "redeemed",
       );
@@ -1034,12 +1139,21 @@ export class Transport {
     }
     const sealed = reply["sealed"];
     if (typeof sealed !== "string" || sealed === "") {
-      throw this.malformed("redeemed with no sealed secret");
+      throw this.malformed("redeemed with no sealed data key");
     }
-    return { sealed };
+    if (reply["deviceId"] !== args.deviceId) {
+      // The reply names the row that was written. A different id means this
+      // device is about to store a credential for a row that is not its own,
+      // and it would be refused at every hello from then on with nothing to
+      // say why. The same check `register` makes, for the same reason.
+      throw this.malformed(
+        `a redeemed naming device ${JSON.stringify(reply["deviceId"])}, which is not the ${JSON.stringify(args.deviceId)} that was redeemed for`,
+      );
+    }
+    return { sealed, deviceId: args.deviceId };
   }
 
-  private readReady(reply: Reply, knownWrapped?: string): ServerLimits {
+  private readReady(reply: Reply): ServerLimits {
     if (reply["res"] !== "ready") {
       throw new ProtocolError("protostate", `expected ready, got ${JSON.stringify(reply)}`);
     }
@@ -1055,22 +1169,6 @@ export class Transport {
       // here, before a single path is sealed, and the session ends.
       throw this.malformed(
         "a ready with no wrapped data key, which no vault has; this device will not seal anything under a key the rest of the vault cannot derive",
-      );
-    }
-    if (knownWrapped !== undefined && wrapped !== knownWrapped) {
-      // The vault's data key is one key, chosen once, and this device has
-      // already seen which. A different blob is a server choosing a second
-      // schedule: it can hand back the wrapping it was just given with a claim,
-      // which unwraps perfectly under this root and is a key no other device on
-      // the vault derives. Nothing on the wire distinguishes that from the real
-      // thing, so the only thing that can is remembering the real thing.
-      //
-      // The one legitimate change is a rotation, and neither side of that
-      // reaches here: the device that rotates stores the new blob itself, and
-      // every other device is evicted with `auth` and pairs again.
-      throw this.malformed(
-        "a ready whose wrapped data key is not the one this device saw before; " +
-          "the vault's data key does not change except at a rotation, and a rotation ends this session",
       );
     }
     const limits: ServerLimits = {
@@ -1550,9 +1648,70 @@ export class Transport {
   }
 
   /**
-   * Registers a single-use invite: an identifier, and the root secret sealed
-   * under a key the server never sees. Returns when it expires, in server
-   * milliseconds.
+   * Registers a device row and returns the vault's wrapped data key.
+   *
+   * A registrar's operation, because it is the vault's credential that
+   * authorises it: a device holds no root and so may not add a device.
+   *
+   * `auth` is the new device's auth key rather than its digest, for the same
+   * reason a claim is the key: the server stores only the digest either way,
+   * so the key reveals nothing the digest would have hidden, and what it buys
+   * is that a credential short enough to guess can be refused.
+   *
+   * **Registering the same id with the same key again succeeds**, and is the
+   * registration having happened. That is what makes a conversion able to run
+   * again after a crash: the row committed, the reply was lost, and a caller
+   * told `badentry` there would retry for ever. A *different* key under an id
+   * the vault already holds is somebody else's device and is refused.
+   * docs/protocol.md, "The device list".
+   */
+  async register(args: {
+    deviceId: string;
+    auth: string;
+    name?: string;
+  }): Promise<{ deviceId: string; wrapped: string }> {
+    const reply = await this.request(
+      {
+        op: "register",
+        deviceId: args.deviceId,
+        auth: args.auth,
+        ...(args.name !== undefined ? { name: args.name } : {}),
+      },
+      "registered",
+    );
+    if (reply["res"] !== "registered") {
+      throw new ProtocolError("protostate", `expected registered, got ${JSON.stringify(reply)}`);
+    }
+    const deviceId = reply["deviceId"];
+    const wrapped = reply["wrapped"];
+    if (deviceId !== args.deviceId) {
+      // The reply names the row that was written. A different id means the
+      // server registered something other than what was asked for, and this
+      // device is about to store a credential for a row that is not its own:
+      // it would drop the root and then be refused at every hello.
+      throw this.malformed(
+        `a registered naming device ${JSON.stringify(deviceId)}, which is not the ${JSON.stringify(args.deviceId)} that was registered`,
+      );
+    }
+    if (typeof wrapped !== "string" || wrapped === "") {
+      // Every claimed vault has a data key, and this is how the registering
+      // session hands it over. Without it there is nothing to unwrap and the
+      // device would have a row it could connect with and no way to read a
+      // note; see readReady for the other half of the same rule.
+      throw this.malformed("a registered with no wrapped data key, which no claimed vault has");
+    }
+    return { deviceId, wrapped };
+  }
+
+  /**
+   * Registers a single-use invite: an identifier, and the vault's data key
+   * sealed under a key the server never sees. Returns when it expires, in
+   * server milliseconds.
+   *
+   * A device's operation, and only a device's: the sealed blob is the data
+   * key, which is exactly what a paired device holds and a registrar does not.
+   * The server holds a blob it cannot open under a name it cannot guess, for a
+   * few minutes.
    */
   async invite(args: { invite: string; sealed: string; ttlMs?: number }): Promise<number> {
     const reply = await this.request(
@@ -1568,6 +1727,77 @@ export class Transport {
       throw new ProtocolError("protostate", `expected invited, got ${JSON.stringify(reply)}`);
     }
     return this.count(reply, "expiresAt", "invited");
+  }
+
+  /** Every device that may reach this vault, and the cap on how many there may be. */
+  async devices(): Promise<{ devices: DeviceRow[]; maxDevices: number }> {
+    const reply = await this.request({ op: "devices" }, "devices");
+    if (reply["res"] !== "devices") {
+      throw new ProtocolError("protostate", `expected devices, got ${JSON.stringify(reply)}`);
+    }
+    const list = reply["devices"];
+    if (!Array.isArray(list)) {
+      throw this.malformed("a devices reply with no list of devices");
+    }
+    return {
+      devices: list.map((raw, i) => this.deviceRow(raw, i)),
+      maxDevices: this.count(reply, "maxDevices", "devices"),
+    };
+  }
+
+  /** One row, read strictly: a list somebody acts on is not a place to guess. */
+  private deviceRow(raw: unknown, i: number): DeviceRow {
+    const row = raw as Record<string, unknown>;
+    const id = row?.["id"];
+    if (typeof id !== "string" || id === "") {
+      throw this.malformed(`a devices reply whose entry ${i} has no id`);
+    }
+    const name = row["name"];
+    const num = (key: string): number => {
+      const v = row[key];
+      return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+    };
+    return {
+      id,
+      name: typeof name === "string" ? name : "",
+      createdAt: num("createdAt"),
+      lastSeen: num("lastSeen"),
+    };
+  }
+
+  /**
+   * Removes a device's row and closes every session it has open.
+   *
+   * The reply means both, in that order, and the ordering is the guarantee:
+   * see docs/protocol.md, "The device list". `allowLast` is the caller saying
+   * out loud that it means to leave the vault reachable only by the recovery
+   * key; without it the last device is refused with `badentry`.
+   *
+   * `self` says the row removed was this session's own, in which case this is
+   * the last frame on the connection.
+   */
+  async revoke(args: {
+    deviceId: string;
+    allowLast?: boolean;
+  }): Promise<{ deviceId: string; self: boolean }> {
+    const reply = await this.request(
+      {
+        op: "revoke",
+        deviceId: args.deviceId,
+        ...(args.allowLast ? { allowLast: true } : {}),
+      },
+      "revoked",
+    );
+    if (reply["res"] !== "revoked") {
+      throw new ProtocolError("protostate", `expected revoked, got ${JSON.stringify(reply)}`);
+    }
+    const deviceId = reply["deviceId"];
+    if (deviceId !== args.deviceId) {
+      throw this.malformed(
+        `a revoked naming device ${JSON.stringify(deviceId)}, which is not the ${JSON.stringify(args.deviceId)} that was revoked`,
+      );
+    }
+    return { deviceId, self: reply["self"] === true };
   }
 
   /**

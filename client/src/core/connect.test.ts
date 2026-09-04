@@ -13,7 +13,8 @@
 import { describe, expect, it } from "vitest";
 
 import { Client } from "./client.ts";
-import { FakeSocket, RIG_SECRET, ready, settle } from "./fake-socket.ts";
+import { FakeSocket, ready, settle } from "./fake-socket.ts";
+import { TEST_DATA_KEY } from "./test-keys.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
 /** A client on a socket that will say `ready` and never say `caught-up`. */
@@ -22,8 +23,9 @@ function clientOnFakeSocket(): { socket: FakeSocket; client: Client } {
   const client = new Client({
     vault: new MemoryVault(),
     store: new MemoryIndexStore(),
-    secret: RIG_SECRET,
+    dataKey: TEST_DATA_KEY,
     url: "ws://test",
+    deviceId: "rig-device",
     token: "t",
     vaultId: "v",
     device: "d",

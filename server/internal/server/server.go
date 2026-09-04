@@ -151,15 +151,17 @@ const (
 // and ignored once a vault has been claimed. Wrapped travels with Claim: the
 // vault's data key, wrapped under the root secret, stored beside the hash.
 //
-// Invite, in place of Token, redeems a single-use invite on a claimed vault;
-// the grant then carries the sealed secret and the session ends after handing
-// it over.
+// There is no invite here, and there was. An authenticator answers whether a
+// token opens a vault, and redeeming an invite is not that question: it spends
+// a single-use row and registers a device in one transaction. Leaving it here
+// meant a pluggable interface could be handed the one credential whose whole
+// point is that it is checked in the same statement that consumes it. See
+// Session.helloAsInvite.
 type Credentials struct {
 	VaultID string
 	Token   string
 	Claim   string
 	Wrapped string
-	Invite  string
 }
 
 // Grant is what a successful authentication says about how it succeeded.
@@ -170,17 +172,12 @@ type Credentials struct {
 // root, and a caller that never proved it held the old one has no business
 // choosing the new.
 //
-// Redeemed is true when the hello carried an invite that was just marked used;
-// Sealed is then the root secret the issuing device sealed for the new one.
-//
 // AuthHash is the vault's stored hash that this credential matched, or the one
 // a claim just bound the vault to. The session keeps it and rotation swaps
 // against it, so a device can only replace the credential it proved it holds;
-// see store.Rotate. It is empty on a redeemed grant, which is not a device.
+// see store.Rotate.
 type Grant struct {
 	Bootstrap bool
-	Redeemed  bool
-	Sealed    string
 	AuthHash  string
 }
 
@@ -696,25 +693,6 @@ func DerivedAuth(st *store.Store, allowedVault, bootstrap string, now func() int
 		hash, _, _, err := st.VaultKeys(c.VaultID)
 		if err != nil {
 			return Grant{}, fmt.Errorf("reading the vault's auth hash: %w", err)
-		}
-
-		if c.Invite != "" {
-			// An invite is redeemed only on a claimed vault, because an
-			// unclaimed one has no root to have sealed. Unknown, expired and
-			// used are one answer: saying which would tell a guesser it had
-			// found a real identifier. The mark-used is the same statement as
-			// the read, so the invite is burned before anything is replied.
-			if hash == "" {
-				return Grant{}, errors.New("an unclaimed vault has no invites to redeem")
-			}
-			sealed, ok, err := st.RedeemInvite(c.VaultID, c.Invite, now())
-			if err != nil {
-				return Grant{}, fmt.Errorf("redeeming an invite: %w", err)
-			}
-			if !ok {
-				return Grant{}, errors.New("invite is unknown, expired or already used")
-			}
-			return Grant{Redeemed: true, Sealed: sealed}, nil
 		}
 
 		if hash != "" {

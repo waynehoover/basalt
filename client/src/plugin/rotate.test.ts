@@ -4,17 +4,22 @@
  * Rotation was a headless-client command, and the runbook for a lost device
  * therefore assumed a machine with the CLI was to hand. The device somebody
  * loses is a phone, and so, often, is the only other device in their pocket
- * (improvements.md §1 and §5). This file is what makes the button safe to
- * offer, and it is deliberately the same shape as `cli/rotate.test.ts`: the
- * case that matters is not the happy one, it is the ordinary lost packet.
+ * (improvements.md §1 and §5). This file is what makes the row safe to offer,
+ * and it is deliberately the same shape as `cli/rotate.test.ts`: the case that
+ * matters is not the happy one, it is the ordinary lost packet.
  *
- * The server commits the new credential, closes every other session, and only
- * then answers. A connection that goes in between leaves this device holding a
- * vault whose new root it may be the only holder of, and on a phone there is no
- * terminal to read a printed key out of. So the new secret is in `data.json`
- * before the request goes out, and the next connection tries it first: both
- * halves are here, the reply lost after the rotation committed and lost before
- * it.
+ * Protocol 4 moved two things. The panel asks for the current recovery key,
+ * because no device holds one: a device that could rotate could also register
+ * itself again after being revoked, which is the whole thing per-device
+ * credentials removed. And every device keeps syncing across a rotation,
+ * including this one, because no device row is touched.
+ *
+ * The server commits the new credential, closes every other registrar, and
+ * only then answers. A connection that goes in between leaves a vault whose new
+ * root may exist nowhere but in this process, and there is nowhere on a device
+ * to stage a root any more. So the panel shows the new key and `settled` says
+ * whether the server was heard from; when it was not, the plugin asks the
+ * server which secret it has rather than guessing.
  */
 
 import type { App as ObsidianApp, PluginManifest } from "obsidian";
@@ -136,43 +141,57 @@ async function started(): Promise<{ plugin: Testable; app: App; key: string }> {
 const saved = (p: Testable) => p.savedData as Record<string, string> | null;
 
 describe("replacing the vault's secret from the panel", () => {
-  it("keeps the history, retires the old key, and shows the new one to write down", async () => {
+  it("keeps the history and every device, and shows the new key to write down", async () => {
     const { plugin, key: oldKey } = await started();
-    const before = saved(plugin)!["secret"];
+    const before = { ...saved(plugin)! };
 
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
     const row = built.find((s) => s.name === "Replace the vault's secret")!;
     expect(row, "the panel offers no way to retire a leaked secret").toBeDefined();
-    expect(row.desc).toMatch(/every other device is disconnected/i);
-    const button = row.buttons[0]!;
-    expect(button.warning, "the root secret behind a button with no warning on it").toBe(true);
+    // The copy has to say the two things a person would otherwise get wrong:
+    // that this needs the key they wrote down, and that every device keeps
+    // syncing, which is the opposite of what protocol 3 did.
+    expect(row.desc).toMatch(/Paste the vault's current recovery key/);
+    expect(row.desc).toMatch(/every device including this one keeps/i);
+    expect(row.desc).toMatch(/cannot un-read/i);
+    // The field, and the button that reads it, are separate rows.
+    const field = row.texts[0]!;
+    const button = built.find((s) => s.buttons.some((b) => b.label === "Replace the secret"))!
+      .buttons[0]!;
+    expect(button.warning, "the vault's credential behind a button with no warning").toBe(true);
 
-    // One press asks, and changes nothing: this is the whole vault's
-    // credential and a thumb is one tap from it.
+    // Nothing happens without the key, and nothing is said that sounds like
+    // it did.
     await button.click();
-    expect(button.label).toBe("Yes, replace it");
-    expect(saved(plugin)!["secret"], "one press replaced the secret").toBe(before);
+    expect(notices.map((n) => n.message).join("\n")).not.toMatch(/new secret/);
 
+    field.setValue(oldKey);
     await button.click();
-    await until("the new secret to be saved", () => saved(plugin)!["secret"] !== before);
-    const newKey = plugin.recoveryKey()!;
-    expect(newKey).not.toBe(oldKey);
-    // On screen, in the panel, until it is acknowledged: on a phone there is
-    // no terminal it could have been printed to.
-    expect(modals.at(-1)!.contentEl.allText()).toContain(newKey);
-    expect(modals.at(-1)!.contentEl.allText()).toMatch(/Write this down/);
-    // Nothing is left half-written: the staged pair is gone once it committed.
-    expect(saved(plugin)!["pendingSecret"]).toBeUndefined();
+    await until("the new key to be shown", () =>
+      modals.at(-1)!.contentEl.allText().includes("Write this down"),
+    );
+    const shown = modals
+      .at(-1)!
+      .contentEl.allText()
+      .split(/\s+/)
+      .find((w) => w.startsWith("basalt3_") && w !== oldKey)!;
+    expect(shown, "no new recovery key was put on screen").toBeDefined();
 
-    // The vault still syncs from here, with its history intact.
+    // This device's own credential is untouched, which is why it keeps
+    // syncing: a rotation replaces the vault's secret and no device row.
+    const after = saved(plugin)!;
+    expect(after["deviceId"]).toBe(before["deviceId"]);
+    expect(after["deviceSecret"]).toBe(before["deviceSecret"]);
+    expect(after["dataKey"]).toBe(before["dataKey"]);
+    expect(after["secret"], "a device is holding the vault's root").toBeUndefined();
     await synced(plugin);
 
-    // The new key opens the vault and the old one does not.
+    // The new key adds a device and the old one does not.
     const stale = await load();
     await expect(stale.plugin.pair(oldKey, "stale")).rejects.toThrow(/auth/i);
     const other = await load();
-    await other.plugin.pair(newKey, "other");
+    await other.plugin.pair(shown, "other");
     await synced(other.plugin);
     await until(
       "the note to arrive under the new secret",
@@ -181,47 +200,21 @@ describe("replacing the vault's secret from the panel", () => {
     expect(other.app.vault.adapter.text("kept.md")).toBe("written before the rotation\n");
   }, 300_000);
 
-  it("comes up under the new secret when the reply was lost after it committed", async () => {
+  it("finds out that a lost reply committed, and says the key is the vault's", async () => {
     const { plugin, key: oldKey } = await started();
 
     lose = "after-commit";
-    const { recoveryKey: newKey, settled } = await plugin.rotate();
+    const { recoveryKey: newKey, settled } = await plugin.rotate(oldKey);
     lose = undefined;
-    expect(settled, "an unanswered rotation was reported as settled").toBe(false);
+    // The reply was lost and the probe found the new root does open the
+    // vault, so this is settled: better than the staged secret it replaced,
+    // which deferred the question to the next connection.
+    expect(settled, "a rotation the server had taken was left unresolved").toBe(true);
     expect(newKey).not.toBe(oldKey);
 
-    // Both secrets are in the file while it is unresolved, so neither is lost.
-    const staged = saved(plugin)!;
-    expect(
-      staged["pendingSecret"],
-      "the new secret was not written down before it was sent",
-    ).toBeDefined();
-    expect(staged["pendingWrapped"]).toBeDefined();
-
-    // The plugin that rotated comes back on its own, without Obsidian being
-    // restarted. The rotation did commit, so the pending secret is the only
-    // thing that opens the vault; a plugin that had written it to the file and
-    // not to itself would sit at "not authorised for this vault" until
-    // somebody thought to reload, which on a phone is not an obvious move.
+    // This device never held either key and goes on syncing regardless.
     await synced(plugin);
-    await until(
-      "the running plugin to settle the rotation",
-      () => saved(plugin)!["pendingSecret"] === undefined,
-    );
-    expect(plugin.recoveryKey()).toBe(newKey);
 
-    // And a fresh load of what was on disk while it was unresolved, which is
-    // all a file is worth: the same promotion, from nothing but the file.
-    const restarted = await load(staged);
-    await synced(restarted.plugin);
-    await until(
-      "the outstanding rotation to be settled",
-      () => saved(restarted.plugin)!["pendingSecret"] === undefined,
-    );
-    expect(restarted.plugin.recoveryKey()).toBe(newKey);
-
-    // And the key the panel showed is the vault's: it pairs a device, and the
-    // one from before the rotation does not.
     const stale = await load();
     await expect(stale.plugin.pair(oldKey, "stale")).rejects.toThrow(/auth/i);
     const other = await load();
@@ -230,65 +223,37 @@ describe("replacing the vault's secret from the panel", () => {
     await until("the note to arrive", () => other.app.vault.adapter.text("kept.md") !== undefined);
   }, 300_000);
 
-  it("comes back to the old secret when the rotation never reached the server", async () => {
+  it("says the vault's secret was not replaced when the request never went out", async () => {
     const { plugin, key: oldKey } = await started();
 
     lose = "before-commit";
-    const { recoveryKey: neverUsed, settled } = await plugin.rotate();
+    await expect(plugin.rotate(oldKey)).rejects.toThrow(/was not replaced/);
     lose = undefined;
-    expect(settled).toBe(false);
-    expect(saved(plugin)!["pendingSecret"]).toBeDefined();
 
-    // A fresh load. The pending secret is tried first and refused, the current
-    // one works, and the outstanding rotation is dropped.
-    const restarted = await load(saved(plugin));
-    await synced(restarted.plugin);
-    await until(
-      "the outstanding rotation to be dropped",
-      () => saved(restarted.plugin)!["pendingSecret"] === undefined,
-    );
-    expect(restarted.plugin.recoveryKey()).toBe(oldKey);
-
-    // The old key is still the vault's, and the one that was shown opens
-    // nothing, which is why both were kept until this was settled.
-    const stale = await load();
-    await expect(stale.plugin.pair(neverUsed, "stale")).rejects.toThrow(/auth/i);
+    // The old key is still the vault's, and nothing put a key that opens
+    // nothing in front of somebody to write down.
     const other = await load();
     await other.plugin.pair(oldKey, "other");
     await synced(other.plugin);
   }, 300_000);
 
-  it("does not offer a key for a rotation that never left this device", async () => {
+  it("says so plainly when somebody rotated first, and offers no key", async () => {
     const { plugin, key } = await started();
-    // The server is gone, so the connection fails before anything is staged.
-    // Reporting that as "it may have committed", which is what every other
-    // failure after this point is, would have somebody write down a string
-    // that opens nothing in place of the one that does.
-    await server.stop();
-
-    await expect(plugin.rotate()).rejects.toThrow();
-    expect(
-      saved(plugin)!["pendingSecret"],
-      "a secret was staged for a request never sent",
-    ).toBeUndefined();
-    expect(plugin.recoveryKey()).toBe(key);
-    expect(notices.map((n) => n.message).join("\n")).not.toMatch(/may already have the new secret/);
-  }, 300_000);
-
-  it("says so plainly when another device rotated first, and keeps one secret", async () => {
-    const { plugin, key } = await started();
-    const before = saved(plugin)!["secret"];
 
     lose = "refused";
-    await expect(plugin.rotate()).rejects.toThrow(/rotated by another device/);
+    await expect(plugin.rotate(key)).rejects.toThrow(/replaced by somebody else first/);
     lose = undefined;
 
-    // Nothing committed, so there is no second secret to keep: a key shown as
-    // the vault's here would be a key that opens nothing, written down by
-    // somebody who now believes they have one.
-    expect(saved(plugin)!["pendingSecret"]).toBeUndefined();
-    expect(saved(plugin)!["secret"]).toBe(before);
-    expect(plugin.recoveryKey()).toBe(key);
+    // Nothing committed, so there is no key to show: one shown as the vault's
+    // here would be a key that opens nothing, written down by somebody who now
+    // believes they have one.
     expect(notices.map((n) => n.message).join("\n")).not.toMatch(/Write down/);
+  }, 300_000);
+
+  it("refuses a recovery key for another vault rather than rotating this one", async () => {
+    const { plugin, key } = await started();
+    const { parsePairing, formatPairing } = await import("../core/pairing.ts");
+    const elsewhere = formatPairing({ ...parsePairing(key), vaultId: "another" });
+    await expect(plugin.rotate(elsewhere)).rejects.toThrow(/is paired with/);
   }, 300_000);
 });

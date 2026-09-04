@@ -17,6 +17,10 @@ import { join } from "node:path";
 import { createServer } from "node:net";
 import { promisify } from "node:util";
 
+import { Registrar } from "./client.ts";
+import { authToken, deriveRootKeys, deviceAuthToken, generateDeviceSecret } from "./crypto.ts";
+import { generateDeviceId } from "./pairing.ts";
+
 const run = promisify(execFile);
 const GO_DIR = new URL("../../../server", import.meta.url).pathname;
 
@@ -205,15 +209,14 @@ export class TestServer {
   }
 
   /**
-   * What a client should authenticate with.
+   * What a registrar should authenticate with.
    *
-   * The first device to connect uses the token the server printed on its
-   * first run, and offers the auth key the vault should belong to from then
-   * on, with a data key for the server to store. Every device after that uses
-   * the key and offers the same pair, which the server ignores. This mirrors
-   * what the shells do, and a harness that handed out the bootstrap for ever,
-   * or that claimed without a data key, would be testing a server that does
-   * not exist.
+   * The first session uses the token the server printed on its first run, and
+   * offers the auth key the vault should belong to from then on, with a data
+   * key for the server to store. Every session after that uses the key and
+   * offers the same pair, which the server ignores. This mirrors what the
+   * shells do, and a harness that handed out the bootstrap for ever, or that
+   * claimed without a data key, would be testing a server that does not exist.
    *
    * The wrapped data key comes from the caller rather than from here, because
    * a test derives it from the same fixed key it derives its own keys from;
@@ -229,6 +232,49 @@ export class TestServer {
   }
 
   private claimed = false;
+
+  /**
+   * Registers a device row and returns what a protocol 4 hello needs.
+   *
+   * Every test that connects goes through here, because under protocol 4 the
+   * vault's own credential may not sync: a hello has to name a row that
+   * exists. Doing it in one place is what keeps two dozen test files from each
+   * having their own idea of how a device comes to exist, which is how a
+   * harness ends up testing a server that does not exist.
+   */
+  async deviceCredentials(
+    secret: Uint8Array,
+    wrapped: string,
+    device = "test",
+  ): Promise<{ deviceId: string; token: string; dataKey: Uint8Array }> {
+    const root = await deriveRootKeys(secret);
+    const wire = { url: this.wsUrl, vaultId: "default", device, secret, timeoutMs: 15_000 };
+    // The first-run token, and then the key this secret derives if that token
+    // has already been spent by somebody else. The same fallback the shells
+    // have, for the same reason: a harness that offered a spent bootstrap for
+    // ever would be testing a server that does not exist.
+    const registrar = await Registrar.open({
+      ...wire,
+      ...this.registrarCredentials(authToken(root), wrapped),
+    }).catch(() => Registrar.open(wire));
+    try {
+      const deviceId = generateDeviceId();
+      const deviceSecret = generateDeviceSecret();
+      const { dataKey } = await registrar.register({ deviceId, deviceSecret, name: device });
+      return { deviceId, token: await deviceAuthToken(deviceSecret), dataKey };
+    } finally {
+      registrar.close();
+    }
+  }
+
+  /** `credentials`, in the shape `Registrar.open` takes. */
+  registrarCredentials(
+    derivedAuthKey: string,
+    wrapped: string,
+  ): { bootstrap?: string; claim: { auth: string; wrapped: string } } {
+    const { token, claim } = this.credentials(derivedAuthKey, wrapped);
+    return { ...(token === claim.auth ? {} : { bootstrap: token }), claim };
+  }
 
   async stop(): Promise<void> {
     if (this.proc && this.proc.exitCode === null) {

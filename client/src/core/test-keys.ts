@@ -18,19 +18,32 @@
  * none of this reaches a shipped bundle.
  */
 
-import { deriveKeys, deriveRootKeys, wrapDataKey, type VaultKeys } from "./crypto.ts";
+import { deriveRootKeys, deriveSchedule, wrapDataKey, type Schedule } from "./crypto.ts";
 
-/** The data key every test vault is claimed with. Not random, and not a secret. */
-const TEST_DATA_KEY = new Uint8Array(32).map((_, i) => (i * 7 + 3) & 0xff);
+/**
+ * The data key every test vault is claimed with. Not random, and not a secret.
+ *
+ * Exported since protocol 4, because a device holds the data key itself rather
+ * than a root that unwraps one: a fixture building an engine hands it this.
+ */
+export const TEST_DATA_KEY = new Uint8Array(32).map((_, i) => (i * 7 + 3) & 0xff);
 
 /** The fixed data key wrapped under a root, which is what a claim carries. */
 export async function testWrapped(secret: Uint8Array): Promise<string> {
   return wrapDataKey((await deriveRootKeys(secret)).wrap, TEST_DATA_KEY);
 }
 
-/** The keys a device holding `secret` has on a vault claimed by these fixtures. */
-export async function testKeys(secret: Uint8Array): Promise<VaultKeys> {
-  return deriveKeys(secret, await testWrapped(secret));
+/**
+ * The keys a device on a vault claimed by these fixtures has.
+ *
+ * The root is no longer part of the answer: every content key hangs off the
+ * data key, and the root only ever wrapped it. The parameter stays so the
+ * hundreds of call sites reading `testKeys(SECRET)` keep saying which vault
+ * they mean, and it is deliberately ignored: two roots holding one data key
+ * seal identically, which is the whole point of the data key.
+ */
+export async function testKeys(_secret?: Uint8Array): Promise<Schedule> {
+  return deriveSchedule(TEST_DATA_KEY);
 }
 
 /**
@@ -40,8 +53,6 @@ export async function testKeys(secret: Uint8Array): Promise<VaultKeys> {
  * one data key seal identically, which is the whole point of the data key.
  * What makes another vault is another data key, so this takes one.
  */
-export async function otherVaultKeys(seed: number): Promise<VaultKeys> {
-  const secret = new Uint8Array(32).fill(seed);
-  const dataKey = new Uint8Array(32).fill(seed);
-  return deriveKeys(secret, await wrapDataKey((await deriveRootKeys(secret)).wrap, dataKey));
+export async function otherVaultKeys(seed: number): Promise<Schedule> {
+  return deriveSchedule(new Uint8Array(32).fill(seed));
 }

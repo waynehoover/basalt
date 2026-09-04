@@ -10,17 +10,14 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "./client.ts";
-import { authToken, type VaultKeys } from "./crypto.ts";
-import { testKeys, testWrapped } from "./test-keys.ts";
+import { testWrapped } from "./test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "./test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "./vault.ts";
 
 const SECRET = new Uint8Array(32).fill(44);
-let keys: VaultKeys;
 let wrapped: string;
 beforeAll(async () => {
   await serverBinary();
-  keys = await testKeys(SECRET);
   wrapped = await testWrapped(SECRET);
 }, 180_000);
 afterAll(async () => {
@@ -38,9 +35,8 @@ async function connected(name: string, vault: MemoryVault): Promise<Client> {
   const c = new Client({
     vault,
     store: new MemoryIndexStore(),
-    secret: SECRET,
     url: server.wsUrl,
-    ...server.credentials(authToken(keys), wrapped),
+    ...(await server.deviceCredentials(SECRET, wrapped)),
     vaultId: "default",
     device: name,
     timeoutMs: 60_000,

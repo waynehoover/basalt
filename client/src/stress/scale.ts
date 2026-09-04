@@ -10,10 +10,8 @@ import { mkdtemp, mkdir, writeFile, stat, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Client } from "../core/client.ts";
-import { authToken, deriveRootKeys } from "../core/crypto.ts";
-import { testWrapped } from "../core/test-keys.ts";
 import { sealChunks } from "../core/crypto.ts";
-import { testKeys } from "../core/test-keys.ts";
+import { testKeys, testWrapped } from "../core/test-keys.ts";
 import { chunkBytes, sizesFor } from "../core/chunk.ts";
 import { TestServer } from "../core/test-server.ts";
 import { JsonIndexStore, NodeVault } from "../cli/vault.ts";
@@ -113,9 +111,8 @@ await server.start();
 const client = new Client({
   vault: new NodeVault(dir),
   store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-  secret: SECRET,
   url: server.wsUrl,
-  ...server.credentials(authToken(await deriveRootKeys(SECRET)), await testWrapped(SECRET)),
+  ...(await server.deviceCredentials(SECRET, await testWrapped(SECRET), "scale")),
   vaultId: "default",
   device: "scale",
   timeoutMs: 600_000,

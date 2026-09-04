@@ -7,6 +7,8 @@ import {
   chunkName,
   deriveKeys,
   deriveRootKeys,
+  deriveSchedule,
+  deviceAuthToken,
   entryIsOurs,
   generateDataKey,
   generateSecret,
@@ -26,7 +28,7 @@ import {
   sealChunk,
   sealChunks,
   sealPath,
-  type VaultKeys,
+  type Schedule,
 } from "./crypto.ts";
 import { otherVaultKeys, testKeys } from "./test-keys.ts";
 
@@ -38,7 +40,7 @@ const SECRET = new Uint8Array([
   0x11, 0x12, 0x13, 0x14,
 ]);
 
-async function keys(): Promise<VaultKeys> {
+async function keys(): Promise<Schedule> {
   return testKeys(SECRET);
 }
 
@@ -46,18 +48,37 @@ describe("the key schedule", () => {
   it("derives the same keys from the same secret, every time", async () => {
     // If this ever stops holding, every device pairs into a different vault
     // and none of them can read the others.
-    const a = await keys();
-    const b = await keys();
+    const a = await deriveRootKeys(SECRET);
+    const b = await deriveRootKeys(SECRET);
     expect(hex(a.auth)).toBe(hex(b.auth));
-    expect(await sealPath(a, "notes/a.md")).toBe(await sealPath(b, "notes/a.md"));
+    expect(await sealPath(await keys(), "notes/a.md")).toBe(
+      await sealPath(await keys(), "notes/a.md"),
+    );
   });
 
-  it("derives different keys from different secrets", async () => {
+  it("derives different auth keys from different root secrets", async () => {
     const other = new Uint8Array(SECRET);
     other[0] = (other[0] ?? 0) ^ 0xff;
-    const a = await keys();
-    const b = await testKeys(other);
+    const a = await deriveRootKeys(SECRET);
+    const b = await deriveRootKeys(other);
     expect(hex(a.auth)).not.toBe(hex(b.auth));
+  });
+
+  // The device auth key hangs off its own info string, so a device secret and
+  // a root secret of the same bytes derive different credentials. Sharing the
+  // string would let a device registered with the vault's own root hold a row
+  // whose hash is the vault's, and revoking that row would remove a device
+  // while the credential behind it went on opening the vault.
+  it("keeps a device's auth key apart from the vault's, even from the same bytes", async () => {
+    const vault = await deriveRootKeys(SECRET);
+    expect(await deviceAuthToken(SECRET)).not.toBe(base64urlEncode(vault.auth));
+  });
+
+  it("derives a device's auth key from its own secret and nothing else", async () => {
+    const other = new Uint8Array(SECRET);
+    other[0] = (other[0] ?? 0) ^ 0xff;
+    expect(await deviceAuthToken(SECRET)).toBe(await deviceAuthToken(new Uint8Array(SECRET)));
+    expect(await deviceAuthToken(SECRET)).not.toBe(await deviceAuthToken(other));
   });
 
   it("separates the four keys, so one purpose cannot open another's", async () => {
@@ -70,19 +91,25 @@ describe("the key schedule", () => {
     await expect(open(k.content, sealedPath)).rejects.toThrow(/authentication/);
   });
 
-  it("refuses a secret with too little entropy to be one", async () => {
+  it("refuses keying material with too little entropy to be a key", async () => {
     // Silently accepting a short secret produces a vault that looks
-    // encrypted and is not.
-    await expect(testKeys(new Uint8Array(8))).rejects.toThrow(/at least 16/);
+    // encrypted and is not. Every entry point is checked, because each of
+    // the three is somebody's only copy of something: the root, a device
+    // secret, and the data key every content key hangs off.
+    await expect(deriveRootKeys(new Uint8Array(8))).rejects.toThrow(/at least 16/);
+    await expect(deviceAuthToken(new Uint8Array(8))).rejects.toThrow(/at least 16/);
+    await expect(deriveSchedule(new Uint8Array(8))).rejects.toThrow(/at least 16/);
   });
 
   it("names a suite the server also names", () => {
     expect(CRYPTO_SUITE).toBe("basalt/hkdf-aes-gcm/1");
   });
 
-  it("produces a wire-safe auth token", async () => {
-    const k = await keys();
-    expect(authToken(k)).toMatch(/^[A-Za-z0-9_-]+$/);
+  it("produces a wire-safe auth token, for a vault and for a device", async () => {
+    expect(authToken(await deriveRootKeys(SECRET))).toMatch(/^[A-Za-z0-9_-]+$/);
+    // At least the 32 characters the server insists on: it refuses a
+    // credential short enough to guess, and this is what it is offered.
+    expect(await deviceAuthToken(SECRET)).toMatch(/^[A-Za-z0-9_-]{32,}$/);
   });
 });
 
@@ -503,32 +530,35 @@ describe("the data key", () => {
 });
 
 /**
- * review finding I21. An invite seals the root under a key the server never sees.
+ * review finding I21. An invite seals the vault's data key under a key the
+ * server never sees. It used to seal the root; a device holds no root since
+ * protocol 4, and handing one over would give a newly added phone the
+ * credential that registers devices and rewraps the vault.
  */
-describe("sealing a root for an invite", () => {
+describe("sealing a data key for an invite", () => {
   it("opens under the invite key and under nothing else", async () => {
-    const secret = generateSecret();
+    const dataKey = generateDataKey();
     const key = randomBytes(32);
-    const sealed = await sealSecret(key, secret);
+    const sealed = await sealSecret(key, dataKey);
     expect(sealed.length).toBeLessThanOrEqual(256);
-    expect([...(await unsealSecret(key, sealed))]).toEqual([...secret]);
+    expect([...(await unsealSecret(key, sealed))]).toEqual([...dataKey]);
     await expect(unsealSecret(randomBytes(32), sealed)).rejects.toThrow(/invite key does not open/);
   });
 
-  it("seals the same root differently each time, so two invites do not compare equal", async () => {
-    const secret = generateSecret();
+  it("seals the same key differently each time, so two invites do not compare equal", async () => {
+    const dataKey = generateDataKey();
     const key = randomBytes(32);
-    expect(await sealSecret(key, secret)).not.toBe(await sealSecret(key, secret));
+    expect(await sealSecret(key, dataKey)).not.toBe(await sealSecret(key, dataKey));
   });
 
-  it("refuses to unseal anything that is not a root secret's length", async () => {
-    // A vault's root is 32 bytes and nothing else is one. An invite that
+  it("refuses to unseal anything that is not a data key's length", async () => {
+    // A vault's data key is 32 bytes and nothing else is one. An invite that
     // unsealed to something shorter would configure a device with keying
     // material no other device has.
     const key = randomBytes(32);
     const short = new Uint8Array(20).fill(9);
     await expect(unsealSecret(key, await sealSecret(key, short))).rejects.toThrow(
-      /20 byte secret, and a root secret is 32 bytes/,
+      /unsealed to 20 bytes, and the vault's data key is 32 bytes/,
     );
   });
 });

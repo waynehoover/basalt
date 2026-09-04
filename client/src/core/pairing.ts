@@ -34,7 +34,14 @@
  */
 
 import { crc32Bytes } from "./crc32.ts";
-import { SECRET_LENGTH, base64urlDecode, base64urlEncode } from "./crypto.ts";
+import {
+  DATA_KEY_LENGTH,
+  DEVICE_SECRET_LENGTH,
+  SECRET_LENGTH,
+  base64urlDecode,
+  base64urlEncode,
+  randomBytes,
+} from "./crypto.ts";
 
 /**
  * Marks the string as ours, and says which layout follows.
@@ -319,21 +326,101 @@ const checksum = crc32Bytes;
  * ---------------------------------------------------------------- */
 
 /**
- * A pairing plus this device's name for itself.
+ * How a device identifies its own row in the vault's device list.
+ *
+ * Sixteen random bytes, base64url, chosen here rather than by the server. The
+ * server cannot check that the bytes were random and does not try; what makes
+ * a collision safe is the primary key refusing the second registration. See
+ * docs/protocol.md, "The device list".
+ */
+export const DEVICE_ID_BYTES = 16;
+
+/**
+ * A fresh device id.
+ *
+ * Base64url's alphabet includes `-`, and an id beginning with one is a word a
+ * command line reads as an option: `basalt revoke -Xy...` was refused with "no
+ * such option" rather than revoking anything. `basalt revoke` accepts `--`
+ * before an id for the ones that arrive from elsewhere, and this makes sure
+ * none arrives from here. One character of entropy is given up out of 128 bits,
+ * which is not a bound anybody was relying on: what makes a collision safe is
+ * the primary key refusing the second registration.
+ */
+export function generateDeviceId(): string {
+  for (;;) {
+    const id = base64urlEncode(randomBytes(DEVICE_ID_BYTES));
+    if (!id.startsWith("-")) return id;
+  }
+}
+
+/**
+ * What a device stores, and the two states it can be in.
+ *
+ * A **converted** device holds `deviceId`, `deviceSecret` and `dataKey`, and
+ * nothing else. That is the whole of per-device credentials: the secret
+ * connects as this one device and can be revoked on its own, the data key
+ * reads and writes content, and the root secret, which registers devices and
+ * rewraps the data key, is not here. A stolen laptop therefore cannot register
+ * itself again, cannot add a device, and cannot show anybody the recovery key.
+ *
+ * A **converting** device also holds `secret`, the root, and is a device that
+ * has not finished becoming one: a protocol 3 pairing, a vault being started,
+ * or a conversion that crashed part-way. `needsConversion` is that state, and
+ * `convertToDevice` in core/client.ts is the only thing that ends it. The two
+ * halves overlap on purpose: the root is dropped last, after the row has been
+ * registered and used, so a crash anywhere in the middle leaves a device that
+ * can try again rather than one that can neither convert nor connect (rule 4).
  *
  * The name is local: it is what appears in a conflict copy's filename, so it
  * wants to be the thing you would call the machine rather than anything the
- * other devices agreed on.
+ * other devices agreed on. It is also the label the device's row carries, and
+ * it is never an identity: two laptops may both be called laptop.
  */
-export interface DeviceConfig extends Pairing {
+export interface DeviceConfig {
+  /** WebSocket URL of the server, without the path. */
+  readonly url: string;
+  /** Which vault on that server. */
+  readonly vaultId: string;
   readonly device: string;
+
+  /**
+   * This device's row in the vault's device list, and the credential for it.
+   *
+   * Written together and before the `register` that creates the row, so a
+   * crash between the two leaves a device that re-registers the same id with
+   * the same key, which the server treats as the registration having happened.
+   * Generating a fresh id on every attempt instead would leave a row behind
+   * per crash and fill the vault's eight.
+   */
+  readonly deviceId?: string;
+  readonly deviceSecret?: Uint8Array;
+  /**
+   * The vault's data key, unwrapped.
+   *
+   * Held directly rather than as the wrapping the server returns, because the
+   * key that would unwrap it comes from the root and a converted device does
+   * not have one. Every content key derives from this; docs/protocol.md,
+   * "Crypto".
+   */
+  readonly dataKey?: Uint8Array;
+
+  /**
+   * The vault's root secret, held only until this device has a row of its own.
+   *
+   * Present on a protocol 3 config, on a vault being started, and on a
+   * conversion that has not finished. Absent afterwards, and its absence is
+   * what makes revoking this device mean anything: with it, the device would
+   * re-derive the vault's credential and register itself again.
+   */
+  readonly secret?: Uint8Array;
   /**
    * The server's first-run token, kept only until this device has claimed the
    * vault with it.
    *
    * Absent on every device but the first, and absent on that one too once the
-   * claim has gone through. What authenticates after that is derived from the
-   * root secret, so there is nothing else to keep.
+   * claim has gone through. The claim travels on the registrar hello that then
+   * registers this device's row, so it is spent by the same conversion that
+   * drops the root.
    */
   readonly bootstrap?: string;
   /**
@@ -346,40 +433,63 @@ export interface DeviceConfig extends Pairing {
    * something: a claim whose reply was lost was retried with a different data
    * key, so the vault could be bound to one candidate while this device went on
    * offering another. Kept here, a retry offers the same key it offered before.
-   *
-   * Absent once the vault is known to be claimed, which is when the bootstrap
-   * has gone, because a claim is not sent after that.
    */
   readonly claimWrapped?: string;
   /**
-   * The vault's wrapped data key, as this device first saw it in `ready`.
+   * The vault's wrapped data key, as this device last saw it.
    *
-   * The pin against a server choosing the key schedule. A hostile server that
-   * was handed a claim could echo that wrapping back as the vault's, and the
-   * device would install a schedule no other device on the vault derives: the
-   * server learns nothing either way and the vault quietly splits in two.
-   * Remembering the blob turns the second `ready` into a check. The one
-   * legitimate change is a rotation, which this device either performs, and
-   * stores the new blob, or is evicted by, and re-pairs.
+   * Only ever a protocol 3 device's, pinned from a `ready` under the old
+   * protocol. Conversion checks the wrapping `registered` hands back against
+   * it and refuses a different one, which is the last place the C40 hazard can
+   * still arise: a server that was handed a claim could otherwise echo that
+   * wrapping back as the vault's, and the device would install a schedule no
+   * other device on the vault derives. It is dropped with the root, because a
+   * converted device holds the key itself and never asks the server for it.
    */
   readonly wrapped?: string;
-  /**
-   * A rotation this device sent and never heard the answer to.
-   *
-   * Written before the request goes out, so the new secret exists somewhere
-   * other than in memory from the moment it could possibly have committed. The
-   * server commits, evicts every other session, and only then replies; a socket
-   * that drops in between used to leave the caller throwing, nothing saved, the
-   * old root no longer authenticating and the only copy of the new one in a
-   * process that is about to exit. That is intact ciphertext nothing can ever
-   * open again.
-   *
-   * The next connection tries this secret first and falls back to the current
-   * one, promoting whichever authenticates. `wrapped` is the blob the server
-   * holds if the rotation did commit, so the pin above accepts it too while
-   * this is outstanding.
-   */
-  readonly pending?: { readonly secret: Uint8Array; readonly wrapped: string };
+}
+
+/**
+ * Whether this config still holds the vault's root, and so still has to
+ * convert before it can connect.
+ *
+ * One predicate rather than the same three-field test in both shells, because
+ * a shell that read it differently would either connect with a credential the
+ * server no longer accepts or drop the root before there was a row to use
+ * instead.
+ */
+export function needsConversion(config: DeviceConfig): boolean {
+  return config.secret !== undefined;
+}
+
+/**
+ * The credential a converted device connects with, or a refusal naming what is
+ * missing.
+ *
+ * Refused rather than defaulted. A config missing one of the three is not a
+ * device with less state, it is a conversion that did not finish, and the two
+ * callers of this are the ones that would otherwise connect as nobody or seal
+ * under a key nothing else derives (rule 2).
+ */
+export function deviceCredential(config: DeviceConfig): {
+  deviceId: string;
+  deviceSecret: Uint8Array;
+  dataKey: Uint8Array;
+} {
+  const missing: string[] = [];
+  if (config.deviceId === undefined) missing.push("a device id");
+  if (config.deviceSecret === undefined) missing.push("a device secret");
+  if (config.dataKey === undefined) missing.push("the vault's data key");
+  if (missing.length > 0 || !config.deviceId || !config.deviceSecret || !config.dataKey) {
+    throw new Error(
+      `this device has not finished registering itself with the vault: it is missing ` +
+        `${missing.join(", ")}. ` +
+        (config.secret !== undefined
+          ? "It still holds the vault's recovery key, so the next command finishes the registration."
+          : "Pair this vault again with the vault's recovery key."),
+    );
+  }
+  return { deviceId: config.deviceId, deviceSecret: config.deviceSecret, dataKey: config.dataKey };
 }
 
 /** The stored form, which is JSON on both platforms. */
@@ -388,16 +498,13 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
     url: config.url,
     vaultId: config.vaultId,
     device: config.device,
-    secret: base64urlEncode(config.secret),
+    ...(config.deviceId ? { deviceId: config.deviceId } : {}),
+    ...(config.deviceSecret ? { deviceSecret: base64urlEncode(config.deviceSecret) } : {}),
+    ...(config.dataKey ? { dataKey: base64urlEncode(config.dataKey) } : {}),
+    ...(config.secret ? { secret: base64urlEncode(config.secret) } : {}),
     ...(config.bootstrap ? { bootstrap: config.bootstrap } : {}),
     ...(config.claimWrapped ? { claimWrapped: config.claimWrapped } : {}),
     ...(config.wrapped ? { wrapped: config.wrapped } : {}),
-    ...(config.pending
-      ? {
-          pendingSecret: base64urlEncode(config.pending.secret),
-          pendingWrapped: config.pending.wrapped,
-        }
-      : {}),
   };
 }
 
@@ -405,9 +512,16 @@ export function encodeConfig(config: DeviceConfig): Record<string, string> {
  * Reads stored config, refusing anything incomplete.
  *
  * Same reasoning as the pairing string: a config that half-parses gives a device
- * a truncated secret, which derives keys that are perfectly valid and completely
+ * a truncated key, which derives keys that are perfectly valid and completely
  * wrong. The vault would sync and decrypt nothing. `where` names the file, so
  * the error says which one.
+ *
+ * What is *not* refused here is a config that holds neither a root nor a
+ * device credential, because the shape of a half-finished conversion is
+ * exactly that: an id and a secret with no data key yet. Refusing it would
+ * make the crash point it exists to survive unrecoverable. `deviceCredential`
+ * is where an incomplete one is refused, at the moment something tries to
+ * connect with it, and it says which half is missing.
  */
 export function decodeConfig(raw: unknown, where: string): DeviceConfig {
   if (typeof raw !== "object" || raw === null)
@@ -418,23 +532,73 @@ export function decodeConfig(raw: unknown, where: string): DeviceConfig {
     if (typeof value !== "string" || value === "") throw new Error(`${where} has no ${key}`);
     return value;
   };
-  const secret = base64urlDecode(str("secret"));
-  if (secret.length !== SECRET_LENGTH) {
-    throw new Error(
-      `${where} holds a ${secret.length} byte secret, and a root secret is ${SECRET_LENGTH} bytes`,
-    );
-  }
   const bootstrap = record["bootstrap"];
-  return {
+  const config: DeviceConfig = {
     url: str("url"),
     vaultId: str("vaultId"),
     device: str("device"),
-    secret,
+    ...deviceId(record, where),
+    ...key(record, "deviceSecret", DEVICE_SECRET_LENGTH, "a device secret", where),
+    ...key(record, "dataKey", DATA_KEY_LENGTH, "a data key", where),
+    ...key(record, "secret", SECRET_LENGTH, "a root secret", where),
     ...(typeof bootstrap === "string" && bootstrap !== "" ? { bootstrap } : {}),
     ...opaque(record, "claimWrapped", where),
     ...opaque(record, "wrapped", where),
-    ...pendingRotation(record, where),
   };
+  if (config.secret === undefined && config.deviceId === undefined) {
+    // Neither credential, which is not a state anything here writes: a config
+    // that has begun converting has an id before it sends anything, and one
+    // that has not begun has the root. Rule 2, again: a file that cannot be
+    // read as a pairing is not an unpaired vault, and treating it as one
+    // would pair over it and replace the keys it was holding.
+    throw new Error(
+      `${where} holds neither the vault's recovery key nor this device's own credential, ` +
+        `so there is nothing in it to connect with`,
+    );
+  }
+  return config;
+}
+
+/** The device id: absent, or base64url within the server's bound. */
+function deviceId(record: Record<string, unknown>, where: string): { deviceId?: string } {
+  const value = record["deviceId"];
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(value)) {
+    throw new Error(
+      `${where} holds a deviceId that is not base64url of at most 64 characters, ` +
+        `which is not an id any server would answer to`,
+    );
+  }
+  return { deviceId: value };
+}
+
+/**
+ * One of the three stored keys: absent, or exactly the length it must be.
+ *
+ * Length-checked rather than merely decoded, because keying material that is
+ * short by a byte still derives keys. They are the wrong keys, and the vault
+ * syncs and decrypts nothing, which is the failure the whole of this file is
+ * shaped around.
+ */
+function key(
+  record: Record<string, unknown>,
+  field: string,
+  length: number,
+  what: string,
+  where: string,
+): Record<string, Uint8Array> {
+  const value = record[field];
+  if (value === undefined || value === null) return {};
+  if (typeof value !== "string" || value === "") {
+    throw new Error(`${where} holds a ${field} that is not a string`);
+  }
+  const bytes = base64urlDecode(value);
+  if (bytes.length !== length) {
+    throw new Error(
+      `${where} holds a ${bytes.length} byte ${field}, and ${what} is ${length} bytes`,
+    );
+  }
+  return { [field]: bytes };
 }
 
 /**
@@ -457,41 +621,6 @@ function opaque(
     throw new Error(`${where} holds a ${key} that is not base64url, so it cannot be trusted`);
   }
   return { [key]: value };
-}
-
-/**
- * The outstanding rotation, if there is one: both halves or neither.
- *
- * One half alone is a file that was written in the middle of something, and
- * guessing which half is missing is guessing which secret opens the vault.
- */
-function pendingRotation(
-  record: Record<string, unknown>,
-  where: string,
-): { pending?: { secret: Uint8Array; wrapped: string } } {
-  const rawSecret = record["pendingSecret"];
-  const rawWrapped = record["pendingWrapped"];
-  if (
-    (rawSecret === undefined || rawSecret === null) &&
-    (rawWrapped === undefined || rawWrapped === null)
-  ) {
-    return {};
-  }
-  if (typeof rawSecret !== "string" || typeof rawWrapped !== "string") {
-    throw new Error(
-      `${where} holds half of an outstanding rotation, so it cannot be told which secret opens the vault`,
-    );
-  }
-  const secret = base64urlDecode(rawSecret);
-  if (secret.length !== SECRET_LENGTH) {
-    throw new Error(
-      `${where} holds a ${secret.length} byte pending secret, and a root secret is ${SECRET_LENGTH} bytes`,
-    );
-  }
-  if (!/^[A-Za-z0-9_-]+$/.test(rawWrapped)) {
-    throw new Error(`${where} holds a pendingWrapped that is not base64url`);
-  }
-  return { pending: { secret, wrapped: rawWrapped } };
 }
 
 /**

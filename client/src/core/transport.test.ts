@@ -44,7 +44,7 @@ async function connected(
 /** Completes a handshake so the tests below start from a live session. */
 async function helloed(cursor = 0, opts: Parameters<typeof connected>[0] = {}) {
   const rig = await connected(opts);
-  const hello = rig.t.hello({ vault: "v", token: "tok", device: "d", cursor });
+  const hello = rig.t.hello({ vault: "v", deviceId: "dev", token: "tok", device: "d", cursor });
   rig.socket.reply(ready());
   await hello;
   return rig;
@@ -193,11 +193,11 @@ describe("caught-up", () => {
 describe("the handshake", () => {
   it("refuses a server answering in another protocol version, naming both", async () => {
     const { t, socket } = await connected();
-    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    const hello = t.hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 });
     socket.reply(ready({ proto: 2, serverVersion: "0.2.2" }));
     await expect(hello).rejects.toMatchObject({ code: "proto" });
     await expect(hello).rejects.toThrow(/protocol 2/);
-    await expect(hello).rejects.toThrow(/speaks 3/);
+    await expect(hello).rejects.toThrow(/speaks 4/);
     await expect(hello).rejects.toThrow(/upgrade the server first/);
   });
 
@@ -212,7 +212,7 @@ describe("the handshake", () => {
    */
   it("names both versions when a server refuses the protocol, and says which end to upgrade", async () => {
     const { t, socket } = await connected();
-    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    const hello = t.hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 });
     socket.raw({
       res: "err",
       code: "proto",
@@ -220,20 +220,22 @@ describe("the handshake", () => {
     });
     await expect(hello).rejects.toMatchObject({ code: "proto", retryable: false });
     await expect(hello).rejects.toThrow(/speaks 2 to 2/);
-    await expect(hello).rejects.toThrow(/This client speaks protocol 3/);
+    await expect(hello).rejects.toThrow(/This client speaks protocol 4/);
     await expect(hello).rejects.toThrow(/upgrade the server first/);
     expect(t.isClosed).toBe(true);
   });
 
-  it("sends protocol 3, an id, and the crypto suite this client actually implements", async () => {
+  it("sends protocol 4, a device id, an id, and the crypto suite this client implements", async () => {
     // A client that names a scheme it does not implement gets a session it
     // cannot decrypt anything in.
     const { t, socket } = await connected();
-    void t.hello({ vault: "v", token: "t", device: "d", cursor: 0 }).catch(() => {});
+    void t
+      .hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 })
+      .catch(() => {});
     await settle();
     expect(socket.sentText[0]).toMatchObject({
       op: "hello",
-      proto: 3,
+      proto: 4,
       crypto: "basalt/hkdf-aes-gcm/1",
     });
     expect(socket.sentText[0]!["id"]).toBe(1);
@@ -241,7 +243,7 @@ describe("the handshake", () => {
 
   it("reads every ceiling ready carries, and the wrapped key", async () => {
     const { t, socket } = await connected();
-    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    const hello = t.hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 });
     socket.reply(
       ready({
         minProto: 3,
@@ -252,7 +254,7 @@ describe("the handshake", () => {
       }),
     );
     expect(await hello).toMatchObject({
-      proto: 3,
+      proto: 4,
       minProto: 3,
       serverVersion: "1.2.3",
       maxBatchBytes: 1234,
@@ -273,7 +275,7 @@ describe("the handshake", () => {
   it("ends the session on a ready with no wrapped data key", async () => {
     for (const missing of [{ wrapped: undefined }, { wrapped: "" }]) {
       const { t, socket } = await connected();
-      const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+      const hello = t.hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 });
       socket.reply(ready(missing));
       await expect(hello).rejects.toMatchObject({ code: "protostate" });
       await expect(hello).rejects.toThrow(/no wrapped data key/);
@@ -291,45 +293,13 @@ describe("the handshake", () => {
    * the wire tells that from the real blob, so what tells it is having seen the
    * real blob before.
    */
-  it("refuses a ready whose wrapped key is not the one this device saw before", async () => {
-    for (const [why, answered] of [
-      ["the wrapping it was just handed with the claim", "ECHOED-CLAIM"],
-      ["some other blob entirely", "SOMETHING-ELSE"],
-    ] as const) {
-      const { t, socket } = await connected();
-      const hello = t.hello({
-        vault: "v",
-        token: "t",
-        device: "d",
-        cursor: 0,
-        claim: { auth: "AUTH", wrapped: "ECHOED-CLAIM" },
-        knownWrapped: "THE-VAULTS-OWN",
-      });
-      socket.reply(ready({ wrapped: answered }));
-      await expect(hello, why).rejects.toMatchObject({ code: "protostate" });
-      await expect(hello, why).rejects.toThrow(/not the one this device saw before/);
-      expect(t.isClosed, why).toBe(true);
-    }
-  });
-
-  it("accepts the ready whose wrapped key is the one it saw before", async () => {
+  it("reports the wrapped key ready carries, which a converted device does not use", async () => {
+    // Carried and reported, and nothing here derives a key from it: a device
+    // holds the data key itself, handed over when it was registered by the
+    // session that could unwrap this. What the field is still good for is the
+    // refusal above, which says the vault is one an older build wrote.
     const { t, socket } = await connected();
-    const hello = t.hello({
-      vault: "v",
-      token: "t",
-      device: "d",
-      cursor: 0,
-      knownWrapped: "THE-VAULTS-OWN",
-    });
-    socket.reply(ready({ wrapped: "THE-VAULTS-OWN" }));
-    expect((await hello).wrapped).toBe("THE-VAULTS-OWN");
-  });
-
-  it("takes whatever ready says when this device has never seen the vault's key", async () => {
-    // A device on its first connection has no other source, so there is
-    // nothing to check against; what it takes here is what it pins.
-    const { t, socket } = await connected();
-    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    const hello = t.hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 });
     socket.reply(ready({ wrapped: "FIRST-SIGHT" }));
     expect((await hello).wrapped).toBe("FIRST-SIGHT");
   });
@@ -337,11 +307,10 @@ describe("the handshake", () => {
   it("sends the claim and its wrapped data key together, or neither", async () => {
     const { t, socket } = await connected();
     void t
-      .hello({
+      .helloAsRegistrar({
         vault: "v",
         token: "t",
         device: "d",
-        cursor: 0,
         claim: { auth: "AUTH", wrapped: "WRAPPED" },
       })
       .catch(() => {});
@@ -351,10 +320,39 @@ describe("the handshake", () => {
     expect(socket.sentText[0]).toMatchObject({ claim: "AUTH", wrapped: "WRAPPED" });
 
     const bare = await connected();
-    void bare.t.hello({ vault: "v", token: "t", device: "d", cursor: 0 }).catch(() => {});
+    void bare.t.helloAsRegistrar({ vault: "v", token: "t", device: "d" }).catch(() => {});
     await settle();
     expect("claim" in bare.socket.sentText[0]!).toBe(false);
     expect("wrapped" in bare.socket.sentText[0]!).toBe(false);
+  });
+
+  /**
+   * A device hello names a row and a registrar hello does not, and that one
+   * field is what decides whether the session may sync. Two methods rather
+   * than a flag, so a caller cannot ask for the wrong one by leaving an
+   * argument out. docs/protocol.md, "Authentication".
+   */
+  it("names the device on a device hello and no device on a registrar hello", async () => {
+    const { t, socket } = await connected();
+    void t
+      .hello({ vault: "v", deviceId: "dev-1", token: "t", device: "d", cursor: 0 })
+      .catch(() => {});
+    await settle();
+    expect(socket.sentText[0]).toMatchObject({ op: "hello", proto: 4, deviceId: "dev-1" });
+
+    const reg = await connected();
+    void reg.t.helloAsRegistrar({ vault: "v", token: "t", device: "d" }).catch(() => {});
+    await settle();
+    expect("deviceId" in reg.socket.sentText[0]!).toBe(false);
+  });
+
+  it("refuses a registrar reply that is not a registrar", async () => {
+    const { t, socket } = await connected();
+    const hello = t.helloAsRegistrar({ vault: "v", token: "t", device: "d" });
+    // A `ready` here would be a server handing the vault's own credential a
+    // syncing session, which is exactly what protocol 4 took away.
+    socket.reply(ready());
+    await expect(hello).rejects.toMatchObject({ code: "protostate" });
   });
 
   /**
@@ -374,7 +372,14 @@ describe("the handshake", () => {
       ["device", "del\x7f"],
     ] as const) {
       const { socket, t } = await connected();
-      const args = { vault: "v", token: "t", device: "d", cursor: 0, [what]: name };
+      const args = {
+        vault: "v",
+        deviceId: "dev",
+        token: "t",
+        device: "d",
+        cursor: 0,
+        [what]: name,
+      };
       await expect(t.hello(args), `${what} ${JSON.stringify(name)}`).rejects.toMatchObject({
         code: "badname",
       });
@@ -383,7 +388,7 @@ describe("the handshake", () => {
     // And exactly sixty-four bytes is fine, as is any printable character.
     const { socket, t } = await connected();
     void t
-      .hello({ vault: "v".repeat(64), token: "t", device: "café ~", cursor: 0 })
+      .hello({ vault: "v".repeat(64), deviceId: "dev", token: "t", device: "café ~", cursor: 0 })
       .catch(() => {});
     await settle();
     expect(socket.sentText).toHaveLength(1);
@@ -391,7 +396,7 @@ describe("the handshake", () => {
 
   it("refuses anything other than ready", async () => {
     const { t, socket } = await connected();
-    const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+    const hello = t.hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 });
     socket.reply({ res: "pong" });
     await expect(hello).rejects.toBeInstanceOf(ProtocolError);
   });
@@ -549,7 +554,7 @@ describe("an acknowledgement that arrives as fast as a loopback server sends it"
     const connecting = t.connect();
     socket.open();
     await connecting;
-    const hello = t.hello({ vault: "v", token: "tok", device: "d", cursor: 0 });
+    const hello = t.hello({ vault: "v", deviceId: "dev", token: "tok", device: "d", cursor: 0 });
     socket.reply(ready());
     await hello;
     return t;
@@ -769,7 +774,7 @@ describe("errors", () => {
       const connecting = t.connect();
       socket.open();
       await connecting;
-      const hello = t.hello({ vault: "v", token: "tok", device: "d", cursor: 0 });
+      const hello = t.hello({ vault: "v", deviceId: "dev", token: "tok", device: "d", cursor: 0 });
       socket.reply(ready({ cursor: 0 }));
       await hello;
       return { t, socket, cause: () => cause };
@@ -909,7 +914,7 @@ describe("errors", () => {
     vi.useFakeTimers();
     try {
       const { t, socket } = await connected({ timeoutMs: 50 });
-      const hello = t.hello({ vault: "v", token: "t", device: "d", cursor: 0 });
+      const hello = t.hello({ vault: "v", deviceId: "dev", token: "t", device: "d", cursor: 0 });
       const rejected = expect(hello).rejects.toBeInstanceOf(ConnectionError);
       await vi.advanceTimersByTimeAsync(60);
       await rejected;
@@ -1180,7 +1185,7 @@ describe("a success reply that is not the shape it should be", () => {
       "minProto",
     ]) {
       const { t, socket } = await connected();
-      const hello = t.hello({ vault: "v", token: "tok", device: "d", cursor: 0 });
+      const hello = t.hello({ vault: "v", deviceId: "dev", token: "tok", device: "d", cursor: 0 });
       socket.reply(ready({ [field]: "lots" }));
       await expect(hello, field).rejects.toMatchObject({ code: "protostate" });
       expect(t.isClosed).toBe(true);

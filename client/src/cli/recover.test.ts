@@ -68,6 +68,15 @@ afterEach(async () => {
 
 /** One paired vault against a fresh server. */
 async function paired(): Promise<string> {
+  return (await pairedWithKey()).dir;
+}
+
+/**
+ * The same, and the recovery key `init` printed. Kept by the caller because
+ * nothing reprints it: a converted device holds its own credential and not the
+ * vault's root.
+ */
+async function pairedWithKey(): Promise<{ dir: string; recoveryKey: string }> {
   server = new TestServer();
   await server.start();
   const dir = await vaultDir("a");
@@ -84,7 +93,7 @@ async function paired(): Promise<string> {
     "--json",
   );
   expect(init.code, init.all).toBe(0);
-  return dir;
+  return { dir, recoveryKey: init.json()["recoveryKey"] as string };
 }
 
 const read = (dir: string, path: string) => readFile(join(dir, path), "utf8");
@@ -322,14 +331,11 @@ describe("restoring", () => {
    * would mean somebody who has just recovered a note has to know that.
    */
   it("sends the restored note to the other devices", async () => {
-    const dir = await paired();
+    const { dir, recoveryKey: pairing } = await pairedWithKey();
     await write(dir, "shared.md", "the original\n");
     await cli("sync", "--dir", dir);
 
     const other = await vaultDir("b");
-    const pairing = (await cli("recovery-key", "--dir", dir, "--json")).json()[
-      "recoveryKey"
-    ] as string;
     await cli("pair", pairing, "--dir", other, "--device", "b");
     await cli("sync", "--dir", other);
     expect(await read(other, "shared.md")).toBe("the original\n");

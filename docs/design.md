@@ -210,12 +210,20 @@ healthcheck has to say so.
 
 ## The keys
 
-One root secret, 256 random bits, generated on the first device. Everything
-else is derived with HKDF-SHA256, one key per purpose: `auth` to prove a device
-may connect, of which the server stores only a hash; `path` for filenames;
-`content` for chunk bodies; `nonce` for synthetic nonces; `meta` for the entry
-authenticator. No password stretching, because the secret is random rather than
-chosen. [protocol.md](protocol.md#crypto) has the construction.
+One root secret, 256 random bits, generated on the first device, and one data
+key that it wraps. The root derives `auth`, which proves to the server that a
+caller may register a device, and `wrap`, which opens the data key. Everything
+that touches content derives from the **data key**, with HKDF-SHA256 and one
+key per purpose: `path` for filenames; `content` for chunk bodies; `nonce` for
+synthetic nonces; `meta` for the entry authenticator. A device also has a
+secret of its own, which derives one key and unwraps nothing: the credential it
+connects with, of which the server stores only a hash. No password stretching
+anywhere, because every one of these is random rather than chosen.
+[protocol.md](protocol.md#crypto) has the construction.
+
+The split is what makes the three credentials above separable. A device can be
+handed the data key without ever being handed the root, which is what an invite
+does, and what makes revoking that device mean something.
 
 Sealing is deterministic: the nonce is an HMAC of the plaintext. Equal paths
 must seal equal or the server cannot group versions of a file, and equal chunks
@@ -228,28 +236,63 @@ and is a bound rather than an impossibility.
 
 ## What a device can do to another device
 
-Anyone holding the root secret is a device. A leaked pairing string or a buggy
-device is inside the trust boundary. What is enforced regardless: a path a
-client would never upload is one it will never accept, so a peer cannot write
+A paired device holds the vault's data key and a credential of its own, so it
+can read and write every note. A buggy or hostile one is inside the trust
+boundary for content. What is enforced regardless: a path a client would never
+upload is one it will never accept, so a peer cannot write
 `.obsidian/plugins/<any>/main.js`; containment is checked against the resolved
 filesystem, so a symlink inside the vault cannot lead a write out; and a path
 from the wire cannot climb out with `..` or an absolute path.
 
+What a device cannot do is add another one behind you, or take the vault away
+from you, because it does not hold the root.
+
+## Three credentials, and who holds which
+
+The separation is the point, so it is worth stating as three lines.
+
+| credential | held by | may |
+|---|---|---|
+| the root secret, which is the recovery key | nobody: written down, offline | register a device, rewrap the data key |
+| a device secret | one device | connect and sync as that device |
+| the data key | every paired device | read and write content |
+
+The root is used twice in a vault's life: when it is created, and when every
+device is gone. **Adding a device is not one of those.** A device that already
+has the vault issues a single-use invite, which carries the data key sealed
+under a key that travels in the string and never to the server, and redeeming
+it registers the new device's own credential. So the recovery key stays written
+down, and a stolen laptop cannot register itself again, cannot mint a
+credential for anything else, and cannot show anybody the recovery key.
+
 ## A lost or stolen device
 
-There is no per-device revocation. Every device holds the same root secret, and
-that secret is also the credential, which is what makes a pairing string one
-string. What you can do is rotate the secret. The vault's content is sealed
-under a data key that the root secret only wraps, so `basalt rotate` gives the
-vault a new root, re-wraps the same data key, and swaps the server's auth hash.
-The old string stops working, history stays, and every other device pairs again
-with the new string. The steps are in
+Revoke it. `basalt devices` lists every device that may reach the vault and
+`basalt revoke ID` deletes one's row and closes whatever it has open, and no
+other device is disturbed: each holds a credential of its own, so there is
+nothing shared to retire. That is the cheap, common case, and it is the one
+that used to cost a weekend of re-pairing everything.
+
+**Revoking does not un-read what that device already read.** It still holds the
+data key and can decrypt every note it had synced. Revocation stops future
+connection, not past knowledge, and any surface that offers it has to say so:
+somebody who reads "revoked" as "the vault is safe again" skips the step below,
+which is the one that actually helps.
+
+For a device that was stolen rather than merely lost, and for a recovery key
+that has been somewhere it should not have been, rotate as well. The vault's
+content is sealed under a data key that the root only wraps, so `basalt rotate`
+gives the vault a new root, re-wraps the same data key, and swaps the server's
+auth hash. The old key stops working, every outstanding invite is deleted,
+history stays, and every device goes on syncing, because a rotation replaces
+the vault's credential and touches no device row. The steps are in
 [server.md](server.md#rotating-the-vault-secret).
 
-Rotation does not unread what was already read. Whoever held the old string
+Rotation does not unread what was already read either. Whoever held the old key
 could decrypt everything the server held while they had it. Do it anyway if a
-pairing string has been in a chat, a screenshot, a shell history, a repository,
-or on a device you no longer hold.
+recovery key has been in a chat, a screenshot, a shell history, a repository,
+or on a device you no longer hold, and check `basalt devices` afterwards for a
+row you do not recognise: a rotation deliberately leaves device rows alone.
 
 ## Provenance
 
@@ -270,7 +313,8 @@ published from CI over OIDC with no stored token.
 - Withholding is not detected.
 - iOS is untested. It should work; the phone that has synced a vault was an
   Android.
-- A device holding the key is trusted.
+- A device holding the data key is trusted with content. Revoking it stops it
+  connecting and does not un-read what it already read.
 - Availability. The server can always refuse to serve. The answer is
   `basaltd backup`.
 - TLS. The server speaks plain HTTP and expects `tailscale serve` or a proxy in

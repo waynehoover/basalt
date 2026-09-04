@@ -14,20 +14,17 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { Client } from "../core/client.ts";
-import { authToken, type VaultKeys } from "../core/crypto.ts";
-import { testKeys, testWrapped } from "../core/test-keys.ts";
+import { testWrapped } from "../core/test-keys.ts";
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
 import { MemoryIndexStore, MemoryVault } from "../core/vault.ts";
 import { FakeAdapter, FakeVaultIndex, asVault } from "./fake.ts";
 import { ObsidianIndexStore, ObsidianVault } from "./vault.ts";
 
 const SECRET = new Uint8Array(32).fill(77);
-let keys: VaultKeys;
 let wrapped: string;
 
 beforeAll(async () => {
   await serverBinary();
-  keys = await testKeys(SECRET);
   wrapped = await testWrapped(SECRET);
 }, 180_000);
 
@@ -48,9 +45,8 @@ class Device {
       // Where the plugin puts it: inside its own folder, under
       // `.obsidian`, which never syncs.
       store: new ObsidianIndexStore(this.adapter, ".obsidian/plugins/basalt/index.json"),
-      secret: SECRET,
       url: server.wsUrl,
-      ...server.credentials(authToken(keys), wrapped),
+      ...(await server.deviceCredentials(SECRET, wrapped)),
       vaultId: "default",
       device: this.name,
       timeoutMs: 20_000,
@@ -348,9 +344,8 @@ describe("a dotfile a headless peer holds (P2)", () => {
     const cli = new Client({
       vault: cliVault,
       store: new MemoryIndexStore(),
-      secret: SECRET,
       url: server.wsUrl,
-      ...server.credentials(authToken(keys), wrapped),
+      ...(await server.deviceCredentials(SECRET, wrapped)),
       vaultId: "default",
       device: "cli",
       timeoutMs: 20_000,
@@ -362,9 +357,8 @@ describe("a dotfile a headless peer holds (P2)", () => {
     const plugin = new Client({
       vault: new ObsidianVault(asVault(new HidingIndex(adapter)), ".obsidian"),
       store: new ObsidianIndexStore(adapter, ".obsidian/plugins/basalt/index.json"),
-      secret: SECRET,
       url: server.wsUrl,
-      ...server.credentials(authToken(keys), wrapped),
+      ...(await server.deviceCredentials(SECRET, wrapped)),
       vaultId: "default",
       device: "phone",
       timeoutMs: 20_000,

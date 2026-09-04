@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { macEntry, sealChunks, sealPath, type VaultKeys } from "./crypto.ts";
+import { macEntry, sealChunks, sealPath, type Schedule } from "./crypto.ts";
 import { FakeSocket, engineOnFakeSocket, settle } from "./fake-socket.ts";
 import type { WireEntry } from "./transport.ts";
 import { MemoryVault } from "./vault.ts";
@@ -20,7 +20,7 @@ const enc = new TextEncoder();
 
 /** One authenticated entry with real sealed content behind it. */
 async function entryFor(
-  keys: VaultKeys,
+  keys: Schedule,
   uid: number,
   path: string,
   text: string,

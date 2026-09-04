@@ -103,17 +103,18 @@ with both numbers, which is the message to read as "upgrade the server". The
 refusal does not say which release the server is, because nothing has
 authenticated when it is sent; `basaltd version` on the server does.
 
-Today that range is one version wide. Protocol 3 is the only protocol: the two
-before it were removed rather than carried, because nothing had been deployed
-under them and a compatibility path nobody would use is a second set of code
-paths through the part of the system that must not be wrong. The range stays in
-the handshake for the next version, whose compatibility gets written then,
-against a protocol 3 that has actually run.
+Today that range is one version wide. Protocol 4 is the only protocol: the
+three before it were removed rather than carried, because a compatibility path
+is a second set of code paths through the part of the system that must not be
+wrong, and 3 had been in use by one person for one day when 4 replaced it. The
+range stays in the handshake for the next version, whose compatibility gets
+written then, against a protocol 4 that has actually run.
 
 | Release | Protocol | Notes |
 |---|---|---|
 | plugin, `basalt` and `basaltd` 0.1.x and 0.2.x | 1 and 2 | withdrawn before deployment; a data directory from one of these cannot be served |
-| current | 3 | request ids, retryable errors, the data key, invites |
+| 0.3.x | 3 | request ids, retryable errors, the data key, invites |
+| current | 4 | per-device credentials: a hello names a device and carries that device's own key, and an invite registers the device that redeems it |
 
 The plugin, the headless client and the server are released on their own tags
 and move on their own clocks, and the protocol version is what decides whether
@@ -578,10 +579,19 @@ and two presses. It matters that the plugin has this: the device somebody loses
 is usually a phone, and so, often, is the only other one they have with them.
 
 The server replaces the auth hash and the wrapped key in one transaction,
-deletes every outstanding invite, closes every other device's session with
-`code:"auth"`, and from then on only the new secret opens the vault. The device
-that rotated prints the new recovery key, to write down in place of the old
-one, and every other device is added again with a fresh `basalt invite`.
+deletes every outstanding invite, and from then on only the new secret opens
+the vault. The device that rotated prints the new recovery key, to write down
+in place of the old one.
+
+**Every device keeps syncing.** Since protocol 4 a device connects with a
+credential of its own, and a rotation replaces the vault's credential and
+touches no device row, so re-pairing the laptop, the phone and the NAS is no
+longer the price of retiring a leaked key. What a rotation does not do is
+remove a device somebody else added: check `basalt devices` afterwards and
+`basalt revoke` anything you do not recognise. Outstanding invites go because
+an invite is a standing authority to add a device, which is the thing a
+rotation exists to take away.
+
 Nothing on the server is re-encrypted and no history is lost. It cannot unread
 what was already read. [design.md](design.md#a-lost-or-stolen-device) says more.
 

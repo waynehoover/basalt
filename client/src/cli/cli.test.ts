@@ -87,7 +87,7 @@ afterEach(async () => {
 });
 
 /** Pairs two directories against the running server and returns them. */
-async function twoDevices(): Promise<{ a: string; b: string }> {
+async function twoDevices(): Promise<{ a: string; b: string; recoveryKey: string }> {
   const a = await vaultDir("a");
   const b = await vaultDir("b");
 
@@ -108,7 +108,33 @@ async function twoDevices(): Promise<{ a: string; b: string }> {
 
   const paired = await cli("pair", pairing, "--dir", b, "--device", "b", "--json");
   expect(paired.code, paired.all).toBe(0);
-  return { a, b };
+  return { a, b, recoveryKey: pairing };
+}
+
+/**
+ * Starts a vault and returns the directory and the recovery key.
+ *
+ * The key comes from `init`, because that is the only time it exists: a
+ * converted device holds its own credential and not the vault's root, so
+ * nothing reprints it. Tests that need a second device keep it the way a
+ * person is told to, by writing it down.
+ */
+async function startedWithKey(name = "a"): Promise<{ dir: string; recoveryKey: string }> {
+  const dir = await vaultDir(name);
+  const init = await cli(
+    "init",
+    "--dir",
+    dir,
+    "--server",
+    server.wsUrl,
+    "--token",
+    server.token,
+    "--device",
+    name,
+    "--json",
+  );
+  expect(init.code, init.all).toBe(0);
+  return { dir, recoveryKey: init.json()["recoveryKey"] as string };
 }
 
 const read = (dir: string, path: string) => readFile(join(dir, path), "utf8");
@@ -168,12 +194,24 @@ describe("pairing a vault", () => {
     expect(mode.toString(8)).toBe("600");
   }, 240_000);
 
-  it("reprints the pairing string for a third device", async () => {
+  /**
+   * The recovery key is shown once and no device keeps it. That is not a
+   * missing feature: a device holding the root could re-derive the vault's
+   * credential and register itself again after being revoked, so revoking it
+   * would stop nothing. The refusal says that rather than saying "no such
+   * command", because somebody typing it is looking for the key.
+   */
+  it("cannot reprint the recovery key, and says why", async () => {
     await fresh();
-    const { a } = await twoDevices();
-    const invite = await cli("recovery-key", "--dir", a, "--json");
-    expect(invite.code).toBe(0);
-    expect(invite.json()["recoveryKey"] as string).toMatch(new RegExp(`^${PAIRING_PREFIX}`));
+    const { dir } = await startedWithKey();
+    const asked = await cli("recovery-key", "--dir", dir);
+    expect(asked.code).toBe(1);
+    expect(asked.all).toMatch(/does not hold the vault's recovery key/);
+    expect(asked.all).toMatch(/shown once/);
+    // And it is not on disk either, which is the fact the sentence rests on.
+    const config = JSON.parse(await read(dir, ".basalt/config.json")) as Record<string, string>;
+    expect(config["secret"], "the root secret is still on this device").toBeUndefined();
+    expect(config["deviceId"]).toMatch(/^[A-Za-z0-9_-]+$/);
   }, 240_000);
 
   /**
@@ -189,19 +227,15 @@ describe("pairing a vault", () => {
     expect(again.code).toBe(1);
     expect(again.all).toMatch(/already paired/);
 
-    const invite = await cli("recovery-key", "--dir", a, "--json");
-    const repair = await cli("pair", invite.json()["recoveryKey"] as string, "--dir", b);
+    const repair = await cli("pair", "basalt3_anything", "--dir", b);
     expect(repair.code).toBe(1);
     expect(repair.all).toMatch(/already paired/);
   }, 240_000);
 
   it("refuses a pairing string that was mangled on the way", async () => {
     await fresh();
-    const { a } = await twoDevices();
+    const { recoveryKey: pairing } = await startedWithKey();
     const c = await vaultDir("c");
-    const pairing = (await cli("recovery-key", "--dir", a, "--json")).json()[
-      "recoveryKey"
-    ] as string;
 
     const truncated = await cli("pair", pairing.slice(0, -4), "--dir", c);
     expect(truncated.code).toBe(1);
@@ -495,6 +529,38 @@ describe("status", () => {
    * "the box is up and has lost history", and a cron job keying on
    * `reachable` read the second as the first.
    */
+  /**
+   * Rule 7, and the third state this field has to keep apart from the other
+   * two. A device that has not registered itself with the vault has asked
+   * nothing of the server, so it is neither reachable nor refused, and
+   * reporting either would be a status about a connection that was never made.
+   */
+  it("says a device has not registered itself, rather than blaming the server", async () => {
+    await fresh();
+    const { dir, recoveryKey } = await startedWithKey();
+    // A protocol 3 shaped config: the root, and no row of its own.
+    const { parsePairing } = await import("../core/pairing.ts");
+    const { saveConfig, loadConfig } = await import("./config.ts");
+    const held = (await loadConfig(dir))!;
+    await saveConfig(dir, {
+      url: held.url,
+      vaultId: held.vaultId,
+      device: held.device,
+      secret: parsePairing(recoveryKey).secret,
+    });
+
+    const s = await cli("status", "--dir", dir, "--json");
+    expect(s.code, s.all).toBe(1);
+    const answer = s.json()["server"] as Record<string, unknown>;
+    expect(answer["reachable"], s.all).toBe(false);
+    expect(answer["refused"], s.all).toBe(false);
+    expect(String(answer["error"])).toMatch(/has not registered itself/);
+
+    // And a sync finishes it, without anybody being told to do anything.
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+    expect((await cli("status", "--dir", dir, "--json")).code).toBe(0);
+  }, 60_000);
+
   it("tells a refusal apart from an outage (N3)", async () => {
     await fresh();
     const { a } = await twoDevices();
@@ -520,9 +586,31 @@ describe("status", () => {
 });
 
 describe("unlinking", () => {
-  it("forgets the pairing and keeps every note", async () => {
+  it("names the row it leaves behind, and what removes it", async () => {
+    // Unlinking is local on purpose: it has to work when the server does not.
+    // The cost is a row nothing here can remove afterwards, because the
+    // credential for it is what was just forgotten.
     await fresh();
     const { a, b } = await twoDevices();
+    const listed = await cli("devices", "--dir", b, "--json");
+    const mine = listed.json()["thisDevice"] as string;
+
+    const gone = await cli("unlink", "--dir", b);
+    expect(gone.code, gone.all).toBe(0);
+    expect(gone.stdout).toContain(mine);
+    expect(gone.stdout).toMatch(new RegExp(`basalt revoke ${mine}`));
+
+    // And it is true: the row is still there, and that command removes it.
+    const still = await cli("devices", "--dir", a, "--json");
+    expect((still.json()["devices"] as Record<string, unknown>[]).map((d) => d["id"])).toContain(
+      mine,
+    );
+    expect((await cli("revoke", mine, "--dir", a)).code).toBe(0);
+  }, 60_000);
+
+  it("forgets the pairing and keeps every note", async () => {
+    await fresh();
+    const { a, b, recoveryKey } = await twoDevices();
     await write(a, "keep.md", "still here\n");
     await cli("sync", "--dir", a);
     await cli("sync", "--dir", b);
@@ -534,10 +622,7 @@ describe("unlinking", () => {
 
     // And the server still has it, because unlinking is a local decision.
     const c = await vaultDir("c");
-    const pairing = (await cli("recovery-key", "--dir", a, "--json")).json()[
-      "recoveryKey"
-    ] as string;
-    await cli("pair", pairing, "--dir", c, "--device", "c");
+    await cli("pair", recoveryKey, "--dir", c, "--device", "c");
     await cli("sync", "--dir", c);
     expect(await read(c, "keep.md")).toBe("still here\n");
   }, 300_000);
@@ -680,12 +765,19 @@ describe("one secret", () => {
     await write(a, "note.md", "claimed\n");
     expect((await cli("sync", "--dir", a, "--json")).code).toBe(0);
 
-    // Keeping it is keeping a second secret that opens nothing.
+    // Keeping it is keeping a second secret that opens nothing, and so is
+    // keeping the root: init registers this device and drops both, so what is
+    // left is a credential for one row and the data key it reads with.
     const after = JSON.parse(await read(a, ".basalt/config.json")) as Record<string, string>;
     expect(after["bootstrap"]).toBeUndefined();
-    // `wrapped` arrives with it: the vault's data key as the server holds it,
-    // pinned so a server cannot hand this device a different schedule later.
-    expect(Object.keys(after).sort()).toEqual(["device", "secret", "url", "vaultId", "wrapped"]);
+    expect(Object.keys(after).sort()).toEqual([
+      "dataKey",
+      "device",
+      "deviceId",
+      "deviceSecret",
+      "url",
+      "vaultId",
+    ]);
 
     // And the vault still syncs, on a credential derived from the secret.
     await write(a, "again.md", "still working\n");
@@ -694,25 +786,10 @@ describe("one secret", () => {
 
   it("has no token in the pairing string at all", async () => {
     await fresh();
-    const a = await vaultDir("a");
-    await cli(
-      "init",
-      "--dir",
-      a,
-      "--server",
-      server.wsUrl,
-      "--token",
-      server.token,
-      "--device",
-      "a",
-      "--json",
-    );
+    const { dir: a, recoveryKey: pairing } = await startedWithKey();
     await write(a, "note.md", "x\n");
     await cli("sync", "--dir", a);
 
-    const pairing = (await cli("recovery-key", "--dir", a, "--json")).json()[
-      "recoveryKey"
-    ] as string;
     // The bootstrap is not in it, and neither is anything else that a
     // second device would need beyond the secret and the address.
     expect(pairing).not.toContain(server.token);
@@ -934,217 +1011,335 @@ describe("a vault is claimed when init says it is", () => {
 });
 
 /**
- * I21 and review finding I13. Adding a device is an invite; the recovery key is
- * shown once by init, named for what it is, and reprinted only on request.
+ * Adding a device: an invite from a device that has the vault, and the
+ * recovery key only when there is no such device left.
+ *
+ * The invite is the ordinary path and it has to stay the ordinary path. The
+ * recovery key is written down and offline, and requiring it to add a phone
+ * would mean fetching it, typing it into the phone, and having it on two more
+ * surfaces than it should ever be on. What an invite carries is the vault's
+ * data key, which is what a device holds anyway, and the redemption registers
+ * the new device's own row.
  */
-describe("invites (I21)", () => {
-  async function started(): Promise<string> {
-    const a = await vaultDir("a");
-    const init = await cli("init", server.setup, "--dir", a, "--device", "a", "--json");
-    expect(init.code, init.all).toBe(0);
-    return a;
-  }
-
-  it("prints an invite another device joins with, which works once", async () => {
+describe("adding a device", () => {
+  it("adds a device with an invite, which carries no root", async () => {
     await fresh();
-    const a = await started();
+    const { dir: a } = await startedWithKey();
     await write(a, "note.md", "from a\n");
     expect((await cli("sync", "--dir", a)).code).toBe(0);
 
-    const invited = await cli("invite", "--dir", a);
-    expect(invited.code, invited.all).toBe(0);
-    const invite = invited.out[0]!;
-    expect(invite).toMatch(/^basalt3i_[A-Za-z0-9_-]+$/);
-    expect(invited.stdout).toMatch(/works once and expires at/);
-    // The root is not in it: the invite carries an id and a key of its own.
-    const config = JSON.parse(await read(a, ".basalt/config.json")) as Record<string, string>;
-    expect(
-      Buffer.from(invite.slice("basalt3i_".length), "base64url").toString("latin1"),
-    ).not.toContain(Buffer.from(config["secret"]!, "base64url").toString("latin1"));
+    const issued = await cli("invite", "--dir", a, "--json");
+    expect(issued.code, issued.all).toBe(0);
+    const invite = issued.json()["invite"] as string;
+    expect(invite).toMatch(/^basalt3i_/);
+    expect(issued.json()["expiresAt"] as number).toBeGreaterThan(Date.now());
 
     const b = await vaultDir("b");
-    const paired = await cli("pair", invite, "--dir", b, "--device", "b");
+    const paired = await cli("pair", invite, "--dir", b, "--device", "b", "--json");
     expect(paired.code, paired.all).toBe(0);
-    expect(paired.stdout).toMatch(/Paired .* as "b"/);
-    const configB = JSON.parse(await read(b, ".basalt/config.json")) as Record<string, string>;
-    expect(configB["secret"]).toBe(config["secret"]);
-    expect(configB["url"]).toBe(config["url"]);
+    expect(paired.json()["deviceId"]).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    // What the new device holds: its own credential and the data key, and no
+    // root. That is the whole point of an invite carrying the data key. With
+    // the root here, this device could register itself again after a revoke.
+    const config = JSON.parse(await read(b, ".basalt/config.json")) as Record<string, string>;
+    expect(config["secret"], "an invite handed over the vault's root").toBeUndefined();
+    expect(config["deviceId"]).toBe(paired.json()["deviceId"]);
+    expect(config["deviceSecret"]).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(config["dataKey"]).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    // And it is a device: it syncs, and it appears in the list as its own row.
     expect((await cli("sync", "--dir", b)).code).toBe(0);
     expect(await read(b, "note.md")).toBe("from a\n");
+    const listed = await cli("devices", "--dir", a, "--json");
+    const devices = listed.json()["devices"] as Record<string, unknown>[];
+    expect(devices.map((d) => d["name"]).sort()).toEqual(["a", "b"]);
+  }, 120_000);
 
-    // Spent. A third device with the same string is refused and saves nothing.
+  it("spends an invite once, and says so the second time", async () => {
+    await fresh();
+    const { dir: a } = await startedWithKey();
+    const invite = (await cli("invite", "--dir", a, "--json")).json()["invite"] as string;
+
+    const b = await vaultDir("b");
+    expect((await cli("pair", invite, "--dir", b, "--device", "b")).code).toBe(0);
+
     const c = await vaultDir("c");
     const again = await cli("pair", invite, "--dir", c, "--device", "c");
     expect(again.code).toBe(1);
     expect(again.all).toMatch(/not authorised/);
+    // Nothing kept, so the next attempt with a fresh invite is the ordinary
+    // path rather than an unlink first (C39).
     await expect(stat(join(c, ".basalt", "config.json"))).rejects.toMatchObject({ code: "ENOENT" });
-  });
+    // And the vault gained one device, not two.
+    const devices = (await cli("devices", "--dir", a, "--json")).json()["devices"] as unknown[];
+    expect(devices).toHaveLength(2);
+  }, 120_000);
 
-  it("refuses an invite that has expired", async () => {
+  it("refuses a damaged invite before it reaches the server", async () => {
     await fresh();
-    const a = await started();
-    const invited = await cli("invite", "--dir", a, "--ttl", "1ms", "--json");
-    expect(invited.code, invited.all).toBe(0);
-    await new Promise((r) => setTimeout(r, 100));
+    await startedWithKey();
     const b = await vaultDir("b");
-    const late = await cli("pair", invited.json()["invite"] as string, "--dir", b);
-    expect(late.code).toBe(1);
-    expect(late.all).toMatch(/not authorised/);
+    const given = await cli("pair", "basalt3i_notreallyaninvite", "--dir", b);
+    expect(given.code).toBe(1);
+    expect(given.all).toMatch(/this invite is damaged/);
     await expect(stat(join(b, ".basalt", "config.json"))).rejects.toMatchObject({ code: "ENOENT" });
-  });
-
-  it("refuses an invite for another vault, and one whose key was changed", async () => {
-    await fresh();
-    const a = await started();
-    const { parseInvite, formatInvite } = await import("../core/pairing.ts");
-    const invite = parseInvite(
-      (await cli("invite", "--dir", a, "--json")).json()["invite"] as string,
-    );
-
-    const b = await vaultDir("b");
-    const wrongVault = await cli("pair", formatInvite({ ...invite, vaultId: "other" }), "--dir", b);
-    expect(wrongVault.code).toBe(1);
-    expect(wrongVault.all).toMatch(/not authorised/);
-
-    // The invite is still unspent, so a changed key can be tried against it:
-    // the server hands over the sealed root and the wrong key does not open
-    // it. Nothing is saved, and the invite is now spent.
-    const key = new Uint8Array(invite.key);
-    key[0]! ^= 0xff;
-    const wrongKey = await cli("pair", formatInvite({ ...invite, key }), "--dir", b);
-    expect(wrongKey.code).toBe(1);
-    expect(wrongKey.all).toMatch(/invite key does not open/);
-    await expect(stat(join(b, ".basalt", "config.json"))).rejects.toMatchObject({ code: "ENOENT" });
-    const spent = await cli("pair", formatInvite(invite), "--dir", b);
-    expect(spent.all).toMatch(/not authorised/);
-  });
-
-  it("leaves a usable state when the redeemed reply is lost: nothing saved, the invite spent, a new one works", async () => {
-    await fresh();
-    const a = await started();
-    const { parseInvite } = await import("../core/pairing.ts");
-    const { redeemInvite } = await import("../core/client.ts");
-    const inviteString = (await cli("invite", "--dir", a, "--json")).json()["invite"] as string;
-    const invite = parseInvite(inviteString);
-
-    // A socket that loses the one text frame the server sends back.
-    const b = await vaultDir("b");
-    const lossy = (url: string) => {
-      const ws = new WebSocket(url) as unknown as import("../core/transport.ts").SocketLike & {
-        addEventListener(type: string, fn: (ev: { data: unknown }) => void): void;
-      };
-      const proxy: import("../core/transport.ts").SocketLike = {
-        binaryType: "arraybuffer",
-        onopen: null,
-        onclose: null,
-        onerror: null,
-        onmessage: null,
-        send: (d) => ws.send(d as never),
-        close: () => ws.close(),
-      };
-      ws.onopen = (ev) => proxy.onopen?.(ev);
-      ws.onclose = (ev) => proxy.onclose?.(ev);
-      ws.onerror = (ev) => proxy.onerror?.(ev);
-      ws.onmessage = () => {
-        /* dropped on the floor, as a connection cut at the wrong moment would */
-      };
-      return proxy;
-    };
-    await expect(
-      redeemInvite(invite, "b", { timeoutMs: 5_000, socketFactory: lossy }),
-    ).rejects.toThrow();
-    await expect(stat(join(b, ".basalt", "config.json"))).rejects.toMatchObject({ code: "ENOENT" });
-
-    // The server burned the invite before answering, so it is spent.
-    const spent = await cli("pair", inviteString, "--dir", b, "--device", "b");
-    expect(spent.code).toBe(1);
-    expect(spent.all).toMatch(/not authorised/);
-
-    // And the issuing device makes another, which works.
-    const fresh2 = (await cli("invite", "--dir", a, "--json")).json()["invite"] as string;
-    const paired = await cli("pair", fresh2, "--dir", b, "--device", "b");
-    expect(paired.code, paired.all).toBe(0);
   }, 60_000);
 
-  it("still pairs with the recovery key, which init printed once and recovery-key reprints", async () => {
+  it("has nothing to print for the recovery key, and says to use an invite", async () => {
+    // No device holds the root, which is what makes revoking one mean
+    // something. Somebody running this is usually trying to add a device, so
+    // the refusal names the command that does that.
     await fresh();
-    const a = await vaultDir("a");
-    const init = await cli("init", server.setup, "--dir", a, "--device", "a");
-    expect(init.code, init.all).toBe(0);
-    expect(init.stdout).toMatch(/recovery key/);
-    expect(init.stdout).toMatch(/Write it down and keep it offline/);
-    expect(init.stdout).toMatch(/only way back/);
-    expect(init.stdout).not.toMatch(/pairing string/);
-    const key = init.out.find((l) => l.trim().startsWith("basalt3_"))!.trim();
+    const { dir } = await startedWithKey();
+    const asked = await cli("recovery-key", "--dir", dir);
+    expect(asked.code).toBe(1);
+    expect(asked.all).toMatch(/does not hold the vault's recovery key/);
+    expect(asked.all).toMatch(/basalt invite/);
+  }, 60_000);
 
-    const reprint = await cli("recovery-key", "--dir", a);
-    expect(reprint.code).toBe(0);
-    expect(reprint.stdout.trim()).toBe(key);
-    expect(reprint.stderr).toMatch(/Anyone who has it has the vault/);
-    expect(reprint.stderr).toMatch(/basalt invite/);
+  it("pairs with the recovery key, registers a row, and then forgets the key", async () => {
+    await fresh();
+    const { dir: a, recoveryKey } = await startedWithKey();
+    await write(a, "note.md", "from a\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
 
     const b = await vaultDir("b");
-    const paired = await cli("pair", key, "--dir", b, "--device", "b");
+    const paired = await cli("pair", recoveryKey, "--dir", b, "--device", "b", "--json");
     expect(paired.code, paired.all).toBe(0);
-  });
+    expect(paired.json()["deviceId"]).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    // The key is used once and dropped. This is the assertion the whole
+    // feature rests on: with the root on disk, this device could re-derive
+    // the vault's credential and register itself again, so revoking it would
+    // stop nothing.
+    const config = JSON.parse(await read(b, ".basalt/config.json")) as Record<string, string>;
+    expect(config["secret"], "the root secret is still on the new device").toBeUndefined();
+    expect(config["deviceId"]).toBe(paired.json()["deviceId"]);
+    expect(config["deviceSecret"]).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(config["dataKey"]).toMatch(/^[A-Za-z0-9_-]+$/);
+
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+    expect(await read(b, "note.md")).toBe("from a\n");
+  }, 60_000);
 
   it("reaches the server before it says paired (C39)", async () => {
     await fresh();
-    const a = await vaultDir("a");
-    const init = await cli("init", server.setup, "--dir", a, "--device", "a", "--json");
-    const key = init.json()["recoveryKey"] as string;
+    const { recoveryKey } = await startedWithKey();
     const b = await vaultDir("b");
     await server.cleanup();
-    const paired = await cli("pair", key, "--dir", b, "--device", "b", "--timeout", "3000");
+    const paired = await cli("pair", recoveryKey, "--dir", b, "--device", "b", "--timeout", "3000");
     expect(paired.code).toBe(1);
     expect(paired.all).not.toMatch(/Paired/);
-    await expect(stat(join(b, ".basalt", "config.json"))).rejects.toMatchObject({ code: "ENOENT" });
-  });
+  }, 60_000);
+
+  it("refuses a recovery key the vault does not know", async () => {
+    await fresh();
+    const { recoveryKey } = await startedWithKey();
+    // A well-formed key for another vault's root: the same address and vault
+    // id, a different secret.
+    const { parsePairing, formatPairing } = await import("../core/pairing.ts");
+    const stranger = formatPairing({
+      ...parsePairing(recoveryKey),
+      secret: new Uint8Array(32).fill(9),
+    });
+    const b = await vaultDir("b");
+    const paired = await cli("pair", stranger, "--dir", b, "--device", "b");
+    expect(paired.code).toBe(1);
+    expect(paired.all).toMatch(/not authorised/);
+    // And nothing is left behind. A key the server does not know has to leave
+    // the vault exactly as unpaired as it found it (C39), or the next attempt
+    // is refused for being already paired and the person has to unlink first.
+    await expect(stat(join(b, ".basalt", "config.json"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  }, 60_000);
 });
 
 /**
- * review finding I5. A vault claimed under protocol 3 has a data key the root
- * only wraps, so the root can be replaced without the history going with it.
+ * The device list, and revoking one.
+ *
+ * The point of per-device credentials, and the only place the honesty
+ * requirement can be checked: revoking stops a device connecting and does not
+ * un-read what it already read.
  */
-describe("rotating the secret (I5)", () => {
-  it("retires the old key, keeps the history, and every other device pairs again", async () => {
+describe("the device list", () => {
+  it("lists every device with its id, name and last seen", async () => {
     await fresh();
-    const a = await vaultDir("a");
-    const init = await cli("init", server.setup, "--dir", a, "--device", "a", "--json");
-    const oldKey = init.json()["recoveryKey"] as string;
-    await write(a, "kept.md", "written before the rotation\n");
+    const { a, b } = await twoDevices();
     expect((await cli("sync", "--dir", a)).code).toBe(0);
-    const b = await vaultDir("b");
-    expect((await cli("pair", oldKey, "--dir", b, "--device", "b")).code).toBe(0);
     expect((await cli("sync", "--dir", b)).code).toBe(0);
 
-    const rotated = await cli("rotate", "--dir", a);
+    const listed = await cli("devices", "--dir", a, "--json");
+    expect(listed.code, listed.all).toBe(0);
+    const devices = listed.json()["devices"] as Record<string, unknown>[];
+    expect(devices).toHaveLength(2);
+    expect(devices.map((d) => d["name"]).sort()).toEqual(["a", "b"]);
+    for (const d of devices) {
+      expect(d["id"], "a device with no id").toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(d["createdAt"] as number).toBeGreaterThan(0);
+      // Both have connected, so both have been seen. Zero would mean the
+      // server never stamped one, which is a device that cannot be told from
+      // one that has never been used.
+      expect(d["lastSeen"] as number, `${String(d["name"])} was never seen`).toBeGreaterThan(0);
+    }
+    expect(listed.json()["thisDevice"]).toBe(devices.find((d) => d["name"] === "a")!["id"]);
+    expect(listed.json()["maxDevices"]).toBe(8);
+  }, 60_000);
+
+  it("says, in the listing, that revoking does not un-read anything", async () => {
+    // Not decoration. Somebody who reads "revoked" as "the vault is safe
+    // again" skips the rotation, which is the one thing that actually helps
+    // after a theft, and this feature is then worse than not having it.
+    await fresh();
+    const { a } = await twoDevices();
+    const listed = await cli("devices", "--dir", a);
+    expect(listed.stdout).toMatch(/does not un-read/);
+    expect(listed.stdout).toMatch(/basalt rotate/);
+  }, 60_000);
+
+  it("stops a revoked device connecting, and says why in words to act on", async () => {
+    await fresh();
+    const { a, b } = await twoDevices();
+    await write(a, "note.md", "one\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+
+    const list = await cli("devices", "--dir", a, "--json");
+    const bId = (list.json()["devices"] as Record<string, unknown>[]).find(
+      (d) => d["name"] === "b",
+    )!["id"] as string;
+
+    const revoked = await cli("revoke", bId, "--dir", a);
+    expect(revoked.code, revoked.all).toBe(0);
+    expect(revoked.stdout).toMatch(/cannot connect again/);
+    expect(revoked.stdout).toMatch(/still holds the vault's key/);
+
+    const refused = await cli("sync", "--dir", b);
+    expect(refused.code).toBe(1);
+    expect(refused.all).toMatch(/not authorised/);
+
+    // And the other device is untouched.
+    await write(a, "after.md", "two\n");
+    expect((await cli("sync", "--dir", a)).code, "revoking one disturbed another").toBe(0);
+  }, 60_000);
+
+  /**
+   * Base64url's alphabet includes `-`, so an id can begin with one and be read
+   * as an option. Ids made here no longer do, and `--` says "the next word is
+   * a word" for the ones that arrive from anywhere else.
+   */
+  it("takes a device id that looks like an option, after --", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+    // `--` means every word after it is a word, options included, so the
+    // options come first. That is what `--` means everywhere else too.
+    const refused = await cli("revoke", "--dir", a, "--", "-not-a-real-id");
+    expect(refused.code).toBe(1);
+    expect(refused.all, refused.all).toMatch(/no device with id -not-a-real-id/);
+    // And every id this client makes is safe without it.
+    const listed = await cli("devices", "--dir", a, "--json");
+    for (const d of listed.json()["devices"] as Record<string, unknown>[]) {
+      expect(String(d["id"]).startsWith("-"), `${String(d["id"])} reads as an option`).toBe(false);
+    }
+  }, 60_000);
+
+  it("refuses an id the vault does not have, and says the list is stale", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+    const missing = await cli("revoke", "no-such-device", "--dir", a);
+    expect(missing.code).toBe(1);
+    expect(missing.all).toMatch(/no device with id no-such-device/);
+    expect(missing.all).toMatch(/basalt devices again/);
+  }, 60_000);
+
+  it("refuses to revoke the last device unless it is said out loud", async () => {
+    await fresh();
+    const { dir: a } = await startedWithKey();
+    const list = await cli("devices", "--dir", a, "--json");
+    const only = (list.json()["devices"] as Record<string, unknown>[])[0]!["id"] as string;
+
+    const refused = await cli("revoke", only, "--dir", a);
+    expect(refused.code).toBe(1);
+    expect(refused.all).toMatch(/--allow-last/);
+
+    const done = await cli("revoke", only, "--dir", a, "--allow-last", "--json");
+    expect(done.code, done.all).toBe(0);
+    expect(done.json()["self"]).toBe(true);
+    // And the vault is now reachable only by the recovery key, which is what
+    // the confirmation was about.
+    expect((await cli("sync", "--dir", a)).all).toMatch(/not authorised/);
+  }, 60_000);
+});
+
+/**
+ * review finding I5, and the half of it protocol 4 changed.
+ *
+ * A vault's content is sealed under a data key the root only wraps, so the root
+ * can be replaced without the history going with it. What is new is that no
+ * device row is touched either, so every device keeps syncing across a
+ * rotation: under protocol 3 the vault's hash was the credential every device
+ * held, and a rotation evicted the lot.
+ */
+describe("rotating the secret (I5)", () => {
+  it("keeps the history and every device, and retires the old key", async () => {
+    await fresh();
+    const { a, b, recoveryKey: oldKey } = await twoDevices();
+    await write(a, "kept.md", "written before the rotation\n");
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect((await cli("sync", "--dir", b)).code).toBe(0);
+
+    const rotated = await cli("rotate", oldKey, "--dir", a);
     expect(rotated.code, rotated.all).toBe(0);
     expect(rotated.stdout).toMatch(/new recovery key/);
     const newKey = rotated.out.find((l) => l.trim().startsWith("basalt3_"))!.trim();
     expect(newKey).not.toBe(oldKey);
 
-    // The old string is refused, on a device that had it and on a new one.
-    const stale = await cli("sync", "--dir", b);
-    expect(stale.code).toBe(1);
-    expect(stale.all).toMatch(/not authorised/);
+    // The expensive half of what per-device credentials removed: both devices
+    // go on syncing, with no pairing and no interruption.
+    await write(b, "after.md", "after\n");
+    expect((await cli("sync", "--dir", b)).code, "a rotation evicted a device").toBe(0);
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
+    expect(await read(a, "after.md")).toBe("after\n");
+
+    // The old string opens nothing, and the new one adds a device whose
+    // history reads back: the data key did not change.
     const c = await vaultDir("c");
     expect((await cli("pair", oldKey, "--dir", c, "--device", "c")).all).toMatch(/not authorised/);
-
-    // The new one works, and the history written before the rotation reads
-    // back under it: the data key did not change.
     expect((await cli("pair", newKey, "--dir", c, "--device", "c")).code).toBe(0);
     expect((await cli("sync", "--dir", c)).code).toBe(0);
     expect(await read(c, "kept.md")).toBe("written before the rotation\n");
     const history = await cli("history", "kept.md", "--dir", c, "--json");
-    expect(history.code, history.all).toBe(0);
     expect((history.json()["versions"] as unknown[]).length).toBe(1);
+  }, 90_000);
 
-    // And the rotating device carries on with the new secret.
-    await write(a, "after.md", "after\n");
-    expect((await cli("sync", "--dir", a)).code).toBe(0);
-    expect((await cli("sync", "--dir", c)).code).toBe(0);
-    expect(await read(c, "after.md")).toBe("after\n");
+  it("prints the new key before it sends the request", async () => {
+    // There is nowhere on a device to stage a root any more: not holding one
+    // is the point. So the durable copy is the one on paper, and it has to be
+    // there before the server can possibly have committed.
+    await fresh();
+    const { dir: a, recoveryKey } = await startedWithKey();
+    const rotated = await cli("rotate", recoveryKey, "--dir", a);
+    expect(rotated.stderr).toMatch(/Write it down before pressing on/);
+    expect(rotated.err.some((l) => l.trim().startsWith("basalt3_"))).toBe(true);
+  }, 60_000);
+
+  it("refuses a recovery key for another vault rather than rotating this one", async () => {
+    await fresh();
+    const { dir: a, recoveryKey } = await startedWithKey();
+    const { parsePairing, formatPairing } = await import("../core/pairing.ts");
+    const elsewhere = formatPairing({ ...parsePairing(recoveryKey), vaultId: "another" });
+    const refused = await cli("rotate", elsewhere, "--dir", a);
+    expect(refused.code).toBe(1);
+    expect(refused.all).toMatch(/is paired with/);
+  }, 60_000);
+
+  it("needs the recovery key, because no device holds one", async () => {
+    await fresh();
+    const { dir: a } = await startedWithKey();
+    const bare = await cli("rotate", "--dir", a);
+    expect(bare.code).toBe(1);
+    expect(bare.all).toMatch(/needs the vault's current recovery key/);
   }, 60_000);
 
   /**
@@ -1155,45 +1350,22 @@ describe("rotating the secret (I5)", () => {
    * token: the first device offered a data key and every device after it
    * offered a claim with none. That left a vault that could be bound without
    * one, whose content was then sealed under the root itself: unrotatable,
-   * and readable only by a device that guessed the same schedule (C40). The
-   * server now refuses a claim with no data key, so the condition is not an
-   * optimisation, it is a device that cannot connect.
+   * and readable only by a device that guessed the same schedule (C40).
    */
   it("offers a data key with every claim, from the first device and the second", async () => {
     await fresh();
-    const a = await vaultDir("a");
-    const init = await cli("init", server.setup, "--dir", a, "--device", "a", "--json");
-    expect(init.code, init.all).toBe(0);
+    const { dir: a, recoveryKey } = await startedWithKey();
     await write(a, "note.md", "one\n");
     expect((await cli("sync", "--dir", a)).code).toBe(0);
 
-    // The second device has no bootstrap token and still sends a claim, which
-    // the server ignores and would refuse if it carried no data key.
     const b = await vaultDir("b");
-    const key = init.json()["recoveryKey"] as string;
-    expect((await cli("pair", key, "--dir", b, "--device", "b")).code).toBe(0);
+    expect((await cli("pair", recoveryKey, "--dir", b, "--device", "b")).code).toBe(0);
     expect((await cli("sync", "--dir", b)).code).toBe(0);
     expect(await read(b, "note.md")).toBe("one\n");
 
-    // And what the server stored for the claim, read back from a bare
-    // handshake: the vault has a data key, so it can be rotated.
-    const { Transport } = await import("../core/transport.ts");
-    const { authToken, deriveRootKeys } = await import("../core/crypto.ts");
-    const { loadConfig } = await import("./config.ts");
-    const config = (await loadConfig(a))!;
-    const t = new Transport(server.wsUrl, { onBatch: () => {}, timeoutMs: 10_000 });
-    await t.connect();
-    const ready = await t.hello({
-      vault: "default",
-      token: authToken(await deriveRootKeys(config.secret)),
-      device: "reader",
-      cursor: 0,
-    });
-    t.close();
-    expect(ready.wrapped).toMatch(/^[A-Za-z0-9_-]+$/);
-
-    const rotated = await cli("rotate", "--dir", a);
-    expect(rotated.code, rotated.all).toBe(0);
+    // And the vault can be rotated, which is only true of a vault with a
+    // data key.
+    expect((await cli("rotate", recoveryKey, "--dir", a)).code).toBe(0);
   }, 60_000);
 });
 
@@ -1329,16 +1501,6 @@ describe("what the CLI says about itself and the vault", () => {
     expect(r.out).toEqual(["development"]);
     const j = await cli("--version", "--json");
     expect(j.json()["version"]).toBe("development");
-  });
-
-  it("parses a ttl the way a person types one", async () => {
-    const { parseDuration } = await import("./cli.ts");
-    expect(parseDuration("10m")).toBe(600_000);
-    expect(parseDuration("1h")).toBe(3_600_000);
-    expect(parseDuration("90s")).toBe(90_000);
-    expect(parseDuration("45")).toBe(45_000);
-    expect(() => parseDuration("2h")).toThrow(/at most 1h/);
-    expect(() => parseDuration("soon")).toThrow(/like 10m/);
   });
 
   it("exits non-zero for a report with only blocked paths (C33)", async () => {

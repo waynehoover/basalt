@@ -134,8 +134,8 @@ const (
 	// to every device at hello.
 	MaxWrappedLen = 256
 
-	// MaxSealedLen bounds the sealed root secret an invite carries, and
-	// MaxInviteLen the invite identifier. A sealed 32-byte secret is 60 bytes,
+	// MaxSealedLen bounds the sealed data key an invite carries, and
+	// MaxInviteLen the invite identifier. A sealed 32-byte key is 60 bytes,
 	// 80 in base64url; a 128-bit identifier is 22. The bounds are generous for
 	// the same reason MaxWrappedLen is and for the same cost.
 	MaxSealedLen = 256
@@ -232,6 +232,17 @@ var (
 	// thing to want and not a thing to do by accident, so RevokeDevice refuses
 	// it unless the caller says the word. See its comment.
 	ErrLastDevice = errors.New("that is the vault's last device")
+
+	// ErrNoInvite is a redemption naming an invite that is unknown, expired or
+	// already used, and it is deliberately one error for the three. Saying
+	// which would tell somebody guessing identifiers that it had found a real
+	// one, and after a redemption it would confirm that this vault had an
+	// invite out a moment ago. The session turns every one of them into the
+	// same `auth` refusal a wrong credential gets.
+	//
+	// A malformed identifier is this too, for the same reason: the shape of an
+	// invite must not be the answer to whether that invite exists.
+	ErrNoInvite = errors.New("no invite on this vault under that identifier")
 )
 
 // Entry is one version of one file.
@@ -385,12 +396,21 @@ CREATE TABLE IF NOT EXISTS devices (
   PRIMARY KEY (vault_id, device_id)
 );
 
--- Single-use invites for adding a device without showing the root secret
--- again. sealed is the root sealed under an invite key the server never sees;
--- used is flipped in the same statement that reads the row, so a reply lost
--- on the wire still burns the invite. Expired rows are swept lazily whenever
--- an invite is added to the vault, and every row goes when the vault's secret
--- is rotated, because they seal the root that was just retired.
+-- Single-use invites for adding a device without showing the recovery key
+-- again. sealed is the vault's data key sealed under an invite key the server
+-- never sees; used is flipped in the same statement that reads the row and in
+-- the same transaction that writes the device row, so an invite is never spent
+-- without registering a device and no device is ever registered under an
+-- invite that is still live (RedeemInviteFor). Expired rows are swept lazily
+-- whenever an invite is added to the vault, and every row goes when the
+-- vault's secret is rotated: an invite is a device's authority to add a
+-- device, and a rotation exists to take a device's authority away.
+--
+-- Since protocol 4 the blob is the data key rather than the root. A device
+-- does not hold the root, so it has none to seal, and an invite that handed
+-- one over would give the new device the credential that registers devices
+-- and rewraps the vault: everything revoking a device is supposed to take
+-- back.
 CREATE TABLE IF NOT EXISTS invites (
   vault_id   TEXT    NOT NULL,
   invite     TEXT    NOT NULL,
@@ -1862,28 +1882,106 @@ func (s *Store) AddInvite(vaultID, invite, sealed string, expiresAt, now int64) 
 	})
 }
 
-// RedeemInvite marks an invite used and returns its sealed secret, or reports
-// ok false for one that is unknown, expired or already used, without saying
-// which. The read and the mark are one statement, so two devices redeeming at
-// once cannot both succeed, and a reply lost after this returns has still
-// burned the invite: one use means one, not one delivered.
-func (s *Store) RedeemInvite(vaultID, invite string, now int64) (sealed string, ok bool, err error) {
-	if !ValidInvite(invite) {
-		return "", false, nil
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	err = s.db.QueryRow(
+// spendInviteTx marks an invite used inside the caller's transaction and
+// returns what it sealed, or ErrNoInvite for one that is unknown, expired or
+// already used.
+//
+// The read and the mark are one statement, so two devices redeeming at once
+// cannot both succeed, and a reply lost after the transaction commits has
+// still burned the invite: one use means one, not one delivered.
+//
+// It takes a transaction rather than running on its own because spending an
+// invite is never the whole of what a redemption does. See RedeemInviteFor.
+func spendInviteTx(tx *sql.Tx, vaultID, invite string, now int64) (string, error) {
+	var sealed string
+	err := tx.QueryRow(
 		`UPDATE invites SET used = 1
 		  WHERE vault_id = ? AND invite = ? AND used = 0 AND expires_at >= ?
 		  RETURNING sealed`, vaultID, invite, now).Scan(&sealed)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
+		return "", fmt.Errorf("%w: vault %q", ErrNoInvite, vaultID)
 	}
 	if err != nil {
-		return "", false, err
+		return "", err
 	}
-	return sealed, true, nil
+	return sealed, nil
+}
+
+// betweenSpendAndRegister runs inside RedeemInviteFor's transaction, after the
+// invite is marked used and before the device row is inserted, and is nil in
+// every build but a test's. Returning an error from it stands in for the
+// process dying in that window.
+//
+// It exists because the whole claim RedeemInviteFor makes is that those two
+// writes are one commit, and the window between them is a few microseconds
+// wide: a test that tried to hit it by timing would be a test that passes when
+// the machine is busy. It is the same device the server package's beforeJoin
+// and beforeRegister hooks use, for the same reason.
+// TestACrashBetweenSpendingAnInviteAndRegisteringSpendsNeither.
+var betweenSpendAndRegister func() error
+
+// RedeemInviteFor spends an invite and registers the device it was redeemed
+// by, in one transaction, and returns what the invite sealed.
+//
+// An invite is already single use, server tracked and expiring, which is
+// exactly the authority to register exactly one device. That is why the two
+// halves are one call: under protocol 4 a device holds no root, so the device
+// that issues an invite cannot register a row for the device redeeming it, and
+// a redemption that did not register one would leave the newcomer holding a
+// data key and no way to connect.
+//
+// **Neither half survives the other failing.** An invite spent with no row
+// behind it is an invite somebody has to notice is gone and reissue; a row
+// under an invite that is still live is a device registered twice over. Both
+// writes are in one transaction, so a failure anywhere between them, the cap,
+// a duplicate id, or the process dying, rolls the spend back with it and the
+// string in somebody's hand still works. TestARedeemThatCannotRegisterLeaves
+// TheInviteUnspent and TestACrashBetweenSpendingAnInviteAndRegisteringSpends
+// Neither.
+//
+// The spend goes first so that a caller holding a bad invite learns nothing
+// about device ids: the refusal it gets is the invite's, before the row is
+// looked at.
+//
+// No vault hash here, and that is not an omission. RegisterDevice's insert is
+// conditional on the vault credential the caller authenticated under still
+// being the vault's, because rotation is what answers a leaked root and a
+// registration a millisecond late would outlive it. An invite is not
+// authorised by the root at all, and rotation deletes every invite on the
+// vault in its own transaction, so an invite issued before a rotation cannot
+// be redeemed after one. The guard is the same guard, one table over.
+// TestARedeemRacingARotationCannotWin.
+func (s *Store) RedeemInviteFor(vaultID, invite, deviceID, name, deviceHash string, max int, now int64) (string, error) {
+	if err := checkDeviceFields(deviceID, name, deviceHash); err != nil {
+		return "", err
+	}
+	if !ValidInvite(invite) {
+		// The same error an unknown one gets: see ErrNoInvite.
+		return "", fmt.Errorf("%w: vault %q", ErrNoInvite, vaultID)
+	}
+	if max <= 0 {
+		max = MaxDevices
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	var sealed string
+	err := s.inTx(func(tx *sql.Tx) error {
+		var err error
+		if sealed, err = spendInviteTx(tx, vaultID, invite, now); err != nil {
+			return err
+		}
+		if betweenSpendAndRegister != nil {
+			if err := betweenSpendAndRegister(); err != nil {
+				return err
+			}
+		}
+		return insertDeviceTx(tx, vaultID, deviceID, name, deviceHash, "", max, now)
+	})
+	if err != nil {
+		return "", err
+	}
+	return sealed, nil
 }
 
 // OutstandingInvites counts invites that could still be redeemed: unused and
@@ -2146,28 +2244,12 @@ type Device struct {
 // `internal`, which is retryable, so a device that retried after a lost reply
 // retried for ever.
 //
-// Every one of those conditions is in the one statement rather than read first
-// and acted on second, because the store is opened by more than one process
-// and a count read outside the insert is a count that was true a moment ago:
-// eight goroutines each seeing seven rows would each insert an eighth.
-// TestConcurrentRegistrationsCannotExceedTheCap is the one that fails against
-// a read-then-write version.
-//
-// Rule 4: the row count is checked rather than the absence of an error, because
-// an insert whose WHERE is false is a successful statement that wrote nothing.
-// Which of the four refusals it was is then read inside the same transaction,
-// so the answer describes the rows the insert was actually refused against,
-// the way RevokeDevice's does.
+// The insert itself is insertDeviceTx, shared with the other way a device
+// comes to exist: RedeemInviteFor, where the authority is an invite rather
+// than the vault's credential.
 func (s *Store) RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash string, max int, now int64) error {
-	if !validBase64URL(deviceID, MaxDeviceIDLen) {
-		return fmt.Errorf("%w: device id is %d bytes and must be base64url of at most %d",
-			ErrBadEntry, len(deviceID), MaxDeviceIDLen)
-	}
-	if err := CheckName("device", name, MaxDeviceLen); err != nil {
-		return fmt.Errorf("%w: %s", ErrBadEntry, err)
-	}
-	if !isHex64(deviceHash) {
-		return fmt.Errorf("%w: a device's auth hash is a 64 character hex digest", ErrBadEntry)
+	if err := checkDeviceFields(deviceID, name, deviceHash); err != nil {
+		return err
 	}
 	if !isHex64(vaultHash) {
 		// Not ErrUnknownVault: the caller offered no credential at all, which
@@ -2183,55 +2265,102 @@ func (s *Store) RegisterDevice(vaultID, deviceID, name, deviceHash, vaultHash st
 	defer s.writeMu.Unlock()
 
 	return s.inTx(func(tx *sql.Tx) error {
-		res, err := tx.Exec(
-			`INSERT INTO devices (vault_id, device_id, name, auth_hash, created_at, last_seen)
-			 SELECT ?, ?, ?, ?, ?, 0
-			  WHERE EXISTS (SELECT 1 FROM vaults WHERE vault_id = ? AND auth_hash = ?)
-			    AND (SELECT COUNT(*) FROM devices WHERE vault_id = ?) < ?
-			 ON CONFLICT(vault_id, device_id) DO NOTHING`,
-			vaultID, deviceID, name, deviceHash, now, vaultID, vaultHash, vaultID, max)
-		if err != nil {
-			return err
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if n == 1 {
-			return nil
-		}
-
-		var hash string
-		switch err := tx.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash); {
-		case errors.Is(err, sql.ErrNoRows):
-			return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
-		case err != nil:
-			return err
-		}
-		if hash == "" {
-			return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
-		}
-		if hash != vaultHash {
-			return fmt.Errorf("%w: vault %q was rotated, so the credential this registration "+
-				"was authorised by no longer opens it", ErrRotated, vaultID)
-		}
-		var exists int
-		switch err := tx.QueryRow(
-			`SELECT 1 FROM devices WHERE vault_id = ? AND device_id = ?`,
-			vaultID, deviceID).Scan(&exists); {
-		case err == nil:
-			return fmt.Errorf("%w: %q", ErrDeviceExists, deviceID)
-		case !errors.Is(err, sql.ErrNoRows):
-			return err
-		}
-		var count int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM devices WHERE vault_id = ?`, vaultID).Scan(&count); err != nil {
-			return err
-		}
-		return fmt.Errorf("%w: vault %q has %d of at most %d devices; revoke one you no longer use",
-			ErrDeviceLimit, vaultID, count, max)
+		return insertDeviceTx(tx, vaultID, deviceID, name, deviceHash, vaultHash, max, now)
 	})
+}
+
+// checkDeviceFields is the shape a device row has to have, wherever the
+// authority to write one came from.
+//
+// Two paths register a device: a registrar holding the vault's credential, and
+// an invite being redeemed. One copy of these three rules, because two copies
+// is how the two paths come to disagree about what a device id is, and the one
+// that disagreed would be the one nobody was looking at.
+func checkDeviceFields(deviceID, name, deviceHash string) error {
+	if !validBase64URL(deviceID, MaxDeviceIDLen) {
+		return fmt.Errorf("%w: device id is %d bytes and must be base64url of at most %d",
+			ErrBadEntry, len(deviceID), MaxDeviceIDLen)
+	}
+	if err := CheckName("device", name, MaxDeviceLen); err != nil {
+		return fmt.Errorf("%w: %s", ErrBadEntry, err)
+	}
+	if !isHex64(deviceHash) {
+		return fmt.Errorf("%w: a device's auth hash is a 64 character hex digest", ErrBadEntry)
+	}
+	return nil
+}
+
+// insertDeviceTx is the conditional insert both registration paths run, inside
+// the caller's transaction, and the diagnosis of which condition refused it.
+//
+// vaultHash is the vault credential the caller authenticated under, and empty
+// when the authority is an invite instead. Either way the vault must be
+// claimed: a vault with no root behind it has no data key for a device to be
+// handed, and an invite cannot exist on one because AddInvite refuses it.
+//
+// Every condition is in the one statement rather than read first and acted on
+// second, because the store is opened by more than one process and a count
+// read outside the insert is a count that was true a moment ago: eight
+// goroutines each seeing seven rows would each insert an eighth.
+// TestConcurrentRegistrationsCannotExceedTheCap is the one that fails against
+// a read-then-write version.
+//
+// Rule 4: the row count is checked rather than the absence of an error,
+// because an insert whose WHERE is false is a successful statement that wrote
+// nothing. Which of the refusals it was is then read inside the same
+// transaction, so the answer describes the rows the insert was actually
+// refused against, the way RevokeDevice's does.
+func insertDeviceTx(tx *sql.Tx, vaultID, deviceID, name, deviceHash, vaultHash string, max int, now int64) error {
+	res, err := tx.Exec(
+		`INSERT INTO devices (vault_id, device_id, name, auth_hash, created_at, last_seen)
+		 SELECT ?, ?, ?, ?, ?, 0
+		  WHERE EXISTS (SELECT 1 FROM vaults
+		                 WHERE vault_id = ? AND auth_hash != '' AND (? = '' OR auth_hash = ?))
+		    AND (SELECT COUNT(*) FROM devices WHERE vault_id = ?) < ?
+		 ON CONFLICT(vault_id, device_id) DO NOTHING`,
+		vaultID, deviceID, name, deviceHash, now,
+		vaultID, vaultHash, vaultHash, vaultID, max)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 1 {
+		return nil
+	}
+
+	var hash string
+	switch err := tx.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash); {
+	case errors.Is(err, sql.ErrNoRows):
+		return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
+	case err != nil:
+		return err
+	}
+	if hash == "" {
+		return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
+	}
+	if vaultHash != "" && hash != vaultHash {
+		return fmt.Errorf("%w: vault %q was rotated, so the credential this registration "+
+			"was authorised by no longer opens it", ErrRotated, vaultID)
+	}
+	var exists int
+	switch err := tx.QueryRow(
+		`SELECT 1 FROM devices WHERE vault_id = ? AND device_id = ?`,
+		vaultID, deviceID).Scan(&exists); {
+	case err == nil:
+		return fmt.Errorf("%w: %q", ErrDeviceExists, deviceID)
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+	var count int
+	if err := tx.QueryRow(
+		`SELECT COUNT(*) FROM devices WHERE vault_id = ?`, vaultID).Scan(&count); err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: vault %q has %d of at most %d devices; revoke one you no longer use",
+		ErrDeviceLimit, vaultID, count, max)
 }
 
 // Devices is every device registered to a vault, oldest first, for the list op

@@ -12,7 +12,6 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { Client } from "../core/client.ts";
-import { authToken, deriveRootKeys } from "../core/crypto.ts";
 import { testWrapped } from "../core/test-keys.ts";
 import { removeTree, TestServer } from "../core/test-server.ts";
 import { JsonIndexStore, NodeVault } from "../cli/vault.ts";
@@ -55,12 +54,8 @@ export async function reopen(
   const c = new Client({
     vault: new NodeVault(dir),
     store: new JsonIndexStore(join(dir, ".basalt", "index.json")),
-    secret: SUITE_SECRET,
     url: server.wsUrl,
-    ...server.credentials(
-      authToken(await deriveRootKeys(SUITE_SECRET)),
-      await testWrapped(SUITE_SECRET),
-    ),
+    ...(await server.deviceCredentials(SUITE_SECRET, await testWrapped(SUITE_SECRET), name)),
     vaultId: "default",
     device: name,
     timeoutMs: 120_000,

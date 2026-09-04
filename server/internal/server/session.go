@@ -780,32 +780,48 @@ func (s *Session) handleHello(m wire.In) error {
 			"a vault is claimed with a data key, and the wrapped key offered with this claim is %d bytes; "+
 				"it must be base64url of at most %d", len(m.Wrapped), store.MaxWrappedLen))
 	}
-	// An invite stands in for the token, so a hello carrying both is refused
-	// rather than resolved. The authenticator triggers on the invite alone, so
-	// a both-present hello used to get token authentication with the invite
-	// silently ignored: neither redeemed nor refused, and the device that was
-	// handed that invite would wait for a pairing that had already been used
-	// up by nothing. One credential per hello, and the refusal says which two
-	// were sent.
+	// An invite stands in for the vault's credential, so a hello carrying both
+	// is refused rather than resolved. The authenticator used to trigger on
+	// the invite alone, so a both-present hello got token authentication with
+	// the invite silently ignored: neither redeemed nor refused, and the
+	// device that was handed that invite would wait for a pairing that had
+	// already been used up by nothing. One credential per hello, and the
+	// refusal says which two were sent.
 	if m.Token != "" && m.Invite != "" {
 		return s.fatal(wire.CodeBadEntry, errors.New(
 			"this hello carries both a token and an invite, and an invite stands in for a token; send one"))
+	}
+	// A claim binds a vault that nothing has claimed yet, and an invite can
+	// only exist on one that has. Refused rather than resolved, for the same
+	// reason and with the same code.
+	if m.Claim != "" && m.Invite != "" {
+		return s.fatal(wire.CodeBadEntry, errors.New(
+			"this hello carries both a claim and an invite, which are how a vault is bound and how a "+
+				"device is added to one that already exists; send one"))
 	}
 
 	// The fork protocol 4 is about, and the whole of how the narrowing is
 	// enforced rather than remembered.
 	//
-	// A hello carrying a deviceId is a device connecting, and its token is
-	// that device's own auth key, checked against that device's row. A hello
-	// carrying none offers the vault's credential, which since protocol 4 may
-	// register a device and rewrap the data key and may not sync.
+	// Three ways in, and each one names its own credential. A hello carrying
+	// an invite is a device being added, and the invite is the authority. A
+	// hello carrying a deviceId is a device connecting, and its token is that
+	// device's own auth key, checked against that device's row. A hello
+	// carrying neither offers the vault's credential, which since protocol 4
+	// may register a device and rewrap the data key and may not sync.
 	//
 	// There is exactly one place a syncing session is built, helloAsDevice,
-	// and the only way into it is a device row whose hash matched. The
-	// pluggable Authenticator, which answers "does this token open this
-	// vault", is not consulted on that branch at all, so no authenticator and
-	// no later handler can hand the vault's credential the sync rights it lost.
-	// TestTheVaultCredentialCannotSync.
+	// and the only way into it is a device row whose hash matched. Redeeming
+	// an invite writes such a row and then closes, rather than becoming that
+	// session itself: a redeemer has proved it holds an invite and has not yet
+	// proved anybody holds the key just registered, and it has to write that
+	// key down before it can use it anyway. The pluggable Authenticator, which
+	// answers "does this token open this vault", is consulted on neither
+	// branch, so no authenticator and no later handler can hand the vault's
+	// credential the sync rights it lost. TestTheVaultCredentialCannotSync.
+	if m.Invite != "" {
+		return s.helloAsInvite(m)
+	}
 	if m.DeviceID != "" {
 		// Shape first, and as `badname` rather than `auth`, because it is a
 		// fact about the request rather than about the vault: refusing a
@@ -816,14 +832,13 @@ func (s *Session) handleHello(m wire.In) error {
 				"device id is %d bytes and must be base64url of at most %d",
 				len(m.DeviceID), store.MaxDeviceIDLen))
 		}
-		// A device connecting is not a vault being claimed and is not an
-		// invite being redeemed, and a server that picked one for the client
-		// would be choosing which credential it meant. The same rule, and the
-		// same code, as the token-and-invite refusal above.
-		if m.Claim != "" || m.Invite != "" {
+		// A device connecting is not a vault being claimed, and a server that
+		// picked one for the client would be choosing which credential it
+		// meant. The same rule, and the same code, as the refusals above.
+		if m.Claim != "" {
 			return s.fatal(wire.CodeBadEntry, errors.New(
 				"this hello carries a deviceId, which is a registered device connecting, "+
-					"as well as a claim or an invite, which are how a vault is bound and how a device is added; send one"))
+					"as well as a claim, which is how a vault is bound; send one"))
 		}
 		return s.helloAsDevice(m)
 	}
@@ -980,6 +995,99 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	return nil
 }
 
+// helloAsInvite finishes a hello that carried an invite: the one way a device
+// is added without the vault's own credential.
+//
+// The invite is the authority, and it is the authority to register exactly one
+// device. It is unguessable, single use, server tracked and expiring, which is
+// every property a registration credential needs and is why the spend and the
+// registration are one call into the store rather than two. Under protocol 4
+// they have to be: a device holds no root, so the device that issued this
+// invite could not have registered a row on the newcomer's behalf, and a
+// redemption that handed over a data key without a row would leave somebody
+// holding the vault's content key and no way to connect.
+//
+// No Authenticator on this branch, for the same reason there is none on
+// helloAsDevice: it answers whether a token opens a vault, and an invite is
+// not a token. A pluggable interface being handed the one credential whose
+// whole point is that it is checked inside the statement that consumes it is
+// how the check comes to happen twice, or not at all.
+//
+// What goes back is the sealed data key and the id of the row just written,
+// and then the session closes. It is not a device session: nothing here has
+// proved that anybody holds the key that was just registered, and the redeemer
+// has to write that key down before it can use it. Its next hello is the
+// proof, and helloAsDevice stays the only place a syncing session is built.
+//
+// Refusals. An invite that is unknown, expired, already used or malformed is
+// `auth` and says none of the four, exactly as a wrong token does. A device id
+// or an auth key the server will not write is the request's own fault and is
+// named: `badname` and `badentry`. A vault already at its device cap is
+// `full`, not `busy`, because waiting never makes it true. Every one of them
+// leaves the invite unspent, because the store rolls the spend back with the
+// registration; see store.RedeemInviteFor.
+func (s *Session) helloAsInvite(m wire.In) error {
+	// Shape before the invite is touched, so a malformed request cannot burn
+	// one. `badname` and `badentry` rather than `auth`, because these are
+	// facts about the frame and not about the vault: the same rule the device
+	// id shape check on an ordinary hello follows.
+	if !store.ValidDeviceID(m.DeviceID) {
+		return s.fatal(wire.CodeBadName, fmt.Errorf(
+			"redeeming an invite registers the device redeeming it, so this hello must carry the "+
+				"device id it is registering; this one is %d bytes and it must be base64url of at most %d",
+			len(m.DeviceID), store.MaxDeviceIDLen))
+	}
+	if len(m.Auth) < MinClaimLength {
+		return s.fatal(wire.CodeBadEntry, fmt.Errorf(
+			"redeeming an invite registers the device redeeming it, so this hello must carry the auth "+
+				"key that device will connect with; this one is %d characters, which is too few", len(m.Auth)))
+	}
+	// The name defaults to the one this hello already carries, the same rule
+	// `register` follows, so a device that says nothing about its name still
+	// arrives in the list as something a person recognises.
+	name := m.Name
+	if name == "" {
+		name = m.Device
+	}
+	if err := checkName("device", name, store.MaxDeviceLen); err != nil {
+		return s.fatal(wire.CodeBadName, err)
+	}
+
+	sum := sha256.Sum256([]byte(m.Auth))
+	sealed, err := s.srv.st.RedeemInviteFor(m.Vault, m.Invite, m.DeviceID, name,
+		hex.EncodeToString(sum[:]), store.MaxDevices, s.srv.now().UnixMilli())
+	switch {
+	case err == nil:
+	case errors.Is(err, store.ErrNoInvite), errors.Is(err, store.ErrUnknownVault):
+		// One answer for the two. An unclaimed vault has no invites, and
+		// saying so would tell somebody probing that this vault id is not one
+		// this server serves.
+		s.srv.log.Warn("invite refused", "remote", s.remote, "vault", m.Vault,
+			"deviceId", m.DeviceID, "err", err)
+		return s.fatal(wire.CodeAuth, errors.New("not authorised for this vault"))
+	case errors.Is(err, store.ErrDeviceLimit):
+		return s.fatal(wire.CodeFull, err)
+	case errors.Is(err, store.ErrDeviceExists):
+		return s.fatal(wire.CodeBadEntry, fmt.Errorf(
+			"this vault already has a device registered under id %q, so this invite was not spent; "+
+				"redeem it again with an id of this device's own", m.DeviceID))
+	case errors.Is(err, store.ErrBadEntry):
+		return s.fatal(wire.CodeBadEntry, err)
+	default:
+		s.srv.log.Error("redeem failed", "vault", m.Vault, "err", err)
+		return s.fatal(wire.CodeInternal, errors.New("the invite could not be redeemed: "+err.Error()))
+	}
+
+	s.srv.log.Info("invite redeemed", "remote", s.remote, "vault", m.Vault,
+		"device", m.Device, "deviceId", m.DeviceID, "name", name)
+	if err := s.writeJSON(wire.Redeemed{
+		Res: "redeemed", ID: s.reqID, Sealed: sealed, DeviceID: m.DeviceID,
+	}); err != nil {
+		return err
+	}
+	return errRedeemed
+}
+
 // helloAsRegistrar finishes a hello that offered the vault's credential.
 //
 // What comes back is a session that may register a device and rotate the
@@ -988,7 +1096,7 @@ func (s *Session) helloAsDevice(m wire.In) error {
 // `ready` promises the ceilings for a put and a backlog behind it and this
 // session will never get either.
 func (s *Session) helloAsRegistrar(m wire.In) error {
-	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped, Invite: m.Invite}
+	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped}
 	grant, err := s.srv.auth(creds)
 	if err != nil {
 		// Logged in full, reported as one word. Telling a caller whether the
@@ -1025,17 +1133,6 @@ func (s *Session) helloAsRegistrar(m wire.In) error {
 				"cannot serve: start a fresh data directory and pair the first device again", m.Vault, s.srv.version))
 	}
 
-	if grant.Redeemed {
-		// The invite is already marked used. Hand over the sealed secret and
-		// the wrapped key, then close: this connection proved nothing about
-		// holding the root and is not a device yet. It connects again with
-		// the derived key like any other.
-		s.srv.log.Info("invite redeemed", "remote", s.remote, "vault", m.Vault, "device", m.Device)
-		if err := s.writeJSON(wire.Redeemed{Res: "redeemed", ID: s.reqID, Sealed: grant.Sealed, Wrapped: wrapped}); err != nil {
-			return err
-		}
-		return errRedeemed
-	}
 	s.bootstrap = grant.Bootstrap
 	s.authHash = grant.AuthHash
 	s.wrapped = wrapped

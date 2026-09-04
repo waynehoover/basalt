@@ -147,10 +147,11 @@ describe("what a saved index must look like (C23)", () => {
     const engine = new Engine({
       vault: new MemoryVault(),
       store,
-      secret: new Uint8Array(32).fill(1),
+      dataKey: new Uint8Array(32).fill(1),
       transport,
       device: "d",
       vaultId: "v",
+      deviceId: "rig-device",
       token: "t",
     });
     await expect(engine.start()).rejects.toThrow(/cursor is -3/);
