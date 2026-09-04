@@ -42,6 +42,7 @@
  */
 
 import { looksLikeJson, looksLikeText, chunkBytes, chunkStream, sizesFor } from "./chunk.ts";
+import { drawingGate, looksLikeExcalidraw } from "./excalidraw.ts";
 import {
   deriveSchedule,
   entryIsOurs,
@@ -470,6 +471,38 @@ export interface SyncReport {
      */
     why?: string;
   }[];
+  /**
+   * The one list a person reads: every path waiting on somebody, and the
+   * sentence saying what to do about it.
+   *
+   * Rule 7 is about a status that cannot tell its cases apart, and the answer
+   * to it was four counters. Four is three distinctions to learn before the
+   * output can be read, and the distinctions are ours: `blocked`, `skipped`
+   * and `refusedInbound` all mean "this path is not syncing and waiting will
+   * not fix it", and each one's *reason* is the part that differs and the part
+   * that can be acted on. So the reasons are what is printed, in one list, and
+   * the categories stay where they belong, in the engine.
+   *
+   * The four maps are untouched and so are the counters above: each came from
+   * its own incident and they carry different exit-code semantics, which
+   * merging would throw away to save a noun. This is a projection of them for
+   * printing, and both shells render it rather than each inventing its own
+   * vocabulary for the same three counters.
+   *
+   * `ignored` is deliberately not in here (R2). A path another device syncs
+   * and this one is set to ignore is the configuration doing what it was
+   * asked; nobody needs to attend to it, which is the same reason it is not in
+   * the exit code. It keeps its counter and is still printed, because a number
+   * that quietly disappears is how somebody loses track of a folder they
+   * stopped syncing years ago.
+   *
+   * Bounded the way `inTheWay` and `skippedPaths` are, and bounded per source
+   * rather than over the whole list: one file where a folder belongs blocks a
+   * subtree, and a single list capped at the end would let that one cause hide
+   * every other. `blocked` is the count of the first kind and `skipped` of the
+   * second, so a renderer can always say how many are not shown.
+   */
+  needsAttention: { path: string; why: string }[];
   /** Chunk bodies actually sent, and their size. The measure that matters. */
   chunksSent: number;
   bytesSent: number;
@@ -517,6 +550,7 @@ function emptyReport(): SyncReport {
     ignored: 0,
     blocked: 0,
     inTheWay: [],
+    needsAttention: [],
     chunksSent: 0,
     bytesSent: 0,
   };
@@ -1178,7 +1212,54 @@ export class Engine {
     // durable here. Rule 3 in another form.
     await this.opts.vault.flush?.();
     await this.save();
+    report.needsAttention = this.attentionList(report);
     return report;
+  }
+
+  /**
+   * The four maps, rendered as the one list a person reads.
+   *
+   * Built here, at the end of a pass, because `inTheWay` is still being added
+   * to by `refuseAliases` and `applyDeletes` until then, and a list assembled
+   * halfway through would be missing whichever refusal came last.
+   *
+   * Every entry carries a whole sentence, including what to do, because a
+   * reason a person cannot act on is a category with extra words. The two
+   * blocked kinds ask for different things and say so: two spellings of one
+   * name are both on this device, so the rename is here, while a file here and
+   * a folder elsewhere is waiting on whichever device meant the other thing.
+   *
+   * Deduplicated by path, since a path can be blocked and written off at once,
+   * and blocked is the one that clears itself. Bounded per source, for the
+   * reason on the field.
+   */
+  private attentionList(report: SyncReport): { path: string; why: string }[] {
+    const out: { path: string; why: string }[] = [];
+    const said = new Set<string>();
+    const add = (path: string, why: string) => {
+      if (said.has(path)) return;
+      said.add(path);
+      out.push({ path, why });
+    };
+
+    for (const blocked of report.inTheWay) {
+      add(
+        blocked.path,
+        blocked.why === undefined
+          ? `"${blocked.blockedBy}" is a file here and a folder on another device. ` +
+              `Rename one of them, on whichever device meant the other thing.`
+          : `${blocked.why} Rename one of them here; nothing syncs under that name until you do.`,
+      );
+    }
+    for (const path of report.skippedPaths) {
+      // The reason is in whichever map wrote the path off. `refusedInbound` is
+      // counted as skipped in every report and has its own map, so both are
+      // asked; a path in neither is one a pass recorded and then cleared, and
+      // a bare path with no sentence is worse than no line.
+      const why = this.skipped.get(path)?.why ?? this.refusedInbound.get(path);
+      if (why !== undefined) add(path, why);
+    }
+    return out;
   }
 
   private entryFor(path: string): IndexEntry {
@@ -2449,7 +2530,23 @@ export class Engine {
     // A canvas that merged cleanly and no longer parses is a canvas
     // Obsidian refuses to open, and the four checks inside mergeText all
     // pass for it: nothing was lost and nothing collided.
-    const outcome = mergeText(base, mine, theirs, looksLikeJson(path) ? parsesAsJson : undefined);
+    //
+    // An Excalidraw drawing is the same failure under a `.md`, so it gets the
+    // same treatment through a predicate of its own. Its extension is `md`, so
+    // neither `looksLikeJson` nor anything else was ever asked about it, while
+    // its body is a JSON scene in a fenced block that a merge concatenates
+    // without a comma exactly as it does a canvas: 744 of 4,882 clean merges of
+    // an empty drawing two devices both drew on (core/excalidraw.ts, and the
+    // corpus in excalidraw.test.ts). The gate is built from all three versions
+    // rather than named by extension alone, because it has to abstain on a
+    // `.excalidraw.md` whose drawing it cannot read instead of turning every
+    // merge of it into a conflict copy; the reasoning is in that module.
+    const stillValid = looksLikeJson(path)
+      ? parsesAsJson
+      : looksLikeExcalidraw(path)
+        ? drawingGate(base, mine, theirs)
+        : undefined;
+    const outcome = mergeText(base, mine, theirs, stillValid);
     if (outcome.kind === "conflict") {
       this.log("merge refused", path, outcome.why);
       await this.conflict(path, entry, remote, report, outcome.why);
@@ -2779,6 +2876,7 @@ export function combinePasses(a: SyncReport, b: SyncReport): SyncReport {
     ignored: b.ignored,
     blocked: b.blocked,
     inTheWay: b.inTheWay,
+    needsAttention: b.needsAttention,
   };
 }
 

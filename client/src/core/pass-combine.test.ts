@@ -29,6 +29,7 @@ function report(over: Partial<SyncReport>): SyncReport {
     ignored: 0,
     blocked: 0,
     inTheWay: [],
+    needsAttention: [],
     chunksSent: 0,
     bytesSent: 0,
     ...over,

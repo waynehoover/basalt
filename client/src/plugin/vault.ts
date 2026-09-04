@@ -85,7 +85,15 @@ import {
   type JournalStamps,
   type JournalStoreOptions,
 } from "../core/index-journal-store.ts";
-import type { FileStat, IndexStamp, IndexStore, StoredState, Times, Vault } from "../core/vault.ts";
+import type {
+  Ambiguous,
+  FileStat,
+  IndexStamp,
+  IndexStore,
+  StoredState,
+  Times,
+  Vault,
+} from "../core/vault.ts";
 
 /**
  * A file's size and times, or undefined when the thing is a folder.
@@ -411,32 +419,60 @@ export class ObsidianVault implements Vault {
    * `stat`, rather than by `instanceof`. Class identity across a plugin
    * boundary is a thing that works until a build changes.
    *
-   * Two raw names that normalize to one path are refused, by name. The map
-   * used to let the second one win, so one of two real files was read and
-   * written under the other's name and recorded as synced, and the next scan
-   * called the loser deleted. Nothing syncs until somebody renames one,
-   * which is the only outcome that does not lose a note.
+   * Two raw names that normalize to one path are left out of the listing and
+   * reported through `ambiguous`, which blocks that one name and lets the rest
+   * of the vault sync.
+   *
+   * The map used to let the second one win, so one of two real files was read
+   * and written under the other's name and recorded as synced, and the next
+   * scan called the loser deleted. That was fixed by throwing, and throwing was
+   * the wrong half of the answer: it stopped the whole pass, so one ambiguous
+   * pair took every other note in the vault with it, including the one being
+   * written that minute. Fail loudly is rule 2 and naming the pair satisfies
+   * it; a vault that syncs nothing is the larger risk to the first rule.
+   *
+   * This is `NodeVault.list`'s behaviour, word for word, and that is the point:
+   * two adapters to one engine cannot disagree about what a vault contains.
+   * The divergence was unreachable, because Obsidian normalizes as it indexes,
+   * and it was still two shells answering one question two ways
+   * (plugin/vault.test.ts, "two names the plugin cannot hold apart (P20)").
+   *
+   * Grouped before anything is decided, because a clash cannot be seen one
+   * entry at a time and what is done about it applies to the whole group. The
+   * ignore filter runs first, as it does in the CLI: a name this device is not
+   * looking at is not a name it has an opinion about.
    */
   async list(): Promise<FileStat[]> {
-    const out: FileStat[] = [];
     this.actualName.clear();
-    const seen = new Map<string, string>();
+    this.ambiguousPaths = [];
     const items = this.vault.getAllLoadedFiles();
     await this.probeCase(items);
 
+    const byPath = new Map<string, { raw: string; item: TAbstractFile }[]>();
     for (const item of items) {
       const raw = trimLeadingSlash(item.path);
       if (raw === "" || raw === "/") continue; // the vault root itself
-      const path = this.register(raw);
-      const other = seen.get(path);
-      if (other !== undefined && other !== raw) {
-        throw new Error(
-          `two files in this vault are the same path once normalized, ${JSON.stringify(other)} and ` +
-            `${JSON.stringify(raw)}, and only one of them can sync. Rename one of them.`,
-        );
-      }
-      seen.set(path, raw);
+      const path = normalizePath(raw);
       if (this.ignored(path)) continue;
+      const group = byPath.get(path);
+      if (group) group.push({ raw, item });
+      else byPath.set(path, [{ raw, item }]);
+    }
+
+    const out: FileStat[] = [];
+    for (const [path, group] of byPath) {
+      const spellings = [...new Set(group.map((g) => g.raw))].sort();
+      if (spellings.length > 1) {
+        // Left out of the listing and reported separately, never silently
+        // dropped: a path that vanishes from a listing is a path the engine
+        // reports deleted. No `actualName` mapping either, or a write would
+        // pick one of the two and land on the note nobody meant.
+        this.ambiguousPaths.push({ path, spellings });
+        this.actualName.delete(path);
+        continue;
+      }
+      const { raw, item } = group[0]!;
+      if (path !== raw) this.actualName.set(path, raw);
 
       const stat = statOf(item);
       if (stat === undefined) {
@@ -458,11 +494,18 @@ export class ObsidianVault implements Vault {
     return out;
   }
 
-  /** Records the adapter's name for a path, and returns the normalized one. */
-  private register(raw: string): string {
-    const normalized = normalizePath(raw);
-    if (normalized !== raw) this.actualName.set(normalized, raw);
-    return normalized;
+  /** Paths the last `list` left out because two names in the index claim them. */
+  private ambiguousPaths: Ambiguous[] = [];
+
+  /**
+   * Which paths two names in Obsidian's index both claim, from the last `list`.
+   *
+   * The engine blocks these and everything under them rather than syncing
+   * either spelling, and names them so a person can rename one. Same contract
+   * as `NodeVault.ambiguous`, because it is the same engine reading it.
+   */
+  ambiguous(): readonly Ambiguous[] {
+    return this.ambiguousPaths;
   }
 
   /**

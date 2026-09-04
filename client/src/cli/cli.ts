@@ -28,8 +28,10 @@ import { deriveRootKeys, generateSecret, randomBytes } from "../core/crypto.ts";
 import {
   Client,
   Registrar,
+  attentionLines,
   convertToDevice,
   credentialsFor,
+  needsAttention,
   needsConversion,
   rebaseCursors,
   redeemInvite,
@@ -1195,7 +1197,7 @@ async function cmdRebase(args: Args, io: Console): Promise<number> {
     }
     io.out("");
     io.out("Rebased onto the server's history:");
-    report_(report, args, io, client.serverCursor);
+    renderReport(report, args, io, client.serverCursor);
     io.out(`Nothing was deleted. Where the two sides disagreed, both versions were kept.`);
     return exitCodeFor(report);
   } finally {
@@ -1210,7 +1212,7 @@ async function cmdSync(args: Args, io: Console): Promise<number> {
   const client = await open(config, args, io);
   try {
     const report = await client.settle();
-    report_(report, args, io, client.serverCursor);
+    renderReport(report, args, io, client.serverCursor);
     return exitCodeFor(report);
   } finally {
     await client.close();
@@ -1249,7 +1251,7 @@ async function watchForever(config: Config, args: Args, io: Console): Promise<nu
   let fatal: Error | undefined;
   await runForever(await clientOptions(config, args, io), {
     onSynced: (report, serverCursor) => {
-      report_(report, args, io, serverCursor);
+      renderReport(report, args, io, serverCursor);
       if (!args.json) io.err("Watching for changes. Ctrl-C to stop.");
     },
     onDisconnected: (cause, retryIn) => {
@@ -1671,7 +1673,7 @@ async function clientOptions(config: Config, args: Args, io?: Console): Promise<
   };
 }
 
-function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): void {
+export function renderReport(r: SyncReport, args: Args, io: Console, serverCursor: number): void {
   if (args.json) {
     io.out(JSON.stringify({ ok: true, ...r, serverCursor }));
     return;
@@ -1691,12 +1693,19 @@ function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): 
   say(r.foldersCreated, "folders created");
   say(r.waiting, "waiting for a write to settle");
   say(r.retrying, "failed, will try again");
-  say(r.skipped, "cannot sync and will not be retried");
+  // One line where there were three, and one list under it where there were
+  // two. `skipped`, `blocked` and the inbound refusals folded into `skipped`
+  // are three names for "this path is not syncing and waiting will not fix
+  // it", and a person had to learn all three before the output could be read
+  // (rule 7). What differs between them is the reason, which is the part
+  // somebody can act on, so the reasons are what is printed. The counters and
+  // the four maps behind them are untouched, and so is the exit code.
+  say(needsAttention(r), "need attention");
+  // Apart, and still printed, because this one is not a problem: it is the
+  // configuration doing what it was told, it is deliberately not in the exit
+  // code (R2), and a number that quietly disappears is how somebody loses
+  // track of a folder they stopped syncing years ago.
   say(r.ignored, "ignored here, and synced by another device");
-  // Not "a file here and a folder elsewhere" any more: two spellings of one
-  // name on a disk that keeps them apart is blocked for a different reason,
-  // and the lines below say which reason applies to which name.
-  say(r.blocked, "waiting on a name two things claim");
 
   if (lines.length === 0) {
     io.out("Nothing to do. Everything here matches the server.");
@@ -1704,36 +1713,14 @@ function report_(r: SyncReport, args: Args, io: Console, serverCursor: number): 
     for (const line of lines) io.out(line);
   }
 
-  // Named, because this is the one refusal that never clears itself. It waits
-  // for somebody to rename one of the two things that disagree, and a count on
-  // its own does not tell them which two.
-  if (r.inTheWay.length > 0) {
+  // Named, because a count is not something anybody can act on, and some of
+  // these never clear themselves: they wait for a person to rename one of two
+  // things that disagree, and they cannot do that without being told which
+  // two. The same renderer the panel uses, so the two surfaces cannot drift
+  // into describing one vault two ways again.
+  if (r.needsAttention.length > 0) {
     io.out("");
-    // `why` where the entry has one. Two names on disk that are one path once
-    // normalized are not a file here and a folder elsewhere, and printing that
-    // sentence over them would send somebody looking for the wrong thing.
-    const reasons = [
-      ...new Set(
-        r.inTheWay.map(
-          (b) => b.why ?? `"${b.blockedBy}" is a file here and a folder on another device.`,
-        ),
-      ),
-    ];
-    for (const reason of reasons) io.out(`  ${reason}`);
-    // Two lists, because the two refusals ask for different things. A name
-    // that is a file here and a folder elsewhere is waiting on a rename on
-    // whichever device meant the other thing; two spellings of one name are
-    // both here, and the rename is here too.
-    const waiting = r.inTheWay.filter((b) => b.why === undefined).map((b) => b.path);
-    if (waiting.length > 0) {
-      io.out(
-        `  Waiting to be written: ${waiting.join(", ")}${r.blocked > r.inTheWay.length ? ", …" : ""}`,
-      );
-      io.out("  Rename one of them, on whichever device meant the other thing.");
-    }
-    if (r.inTheWay.some((b) => b.why !== undefined)) {
-      io.out("  Rename one of them here. Nothing syncs under that name until you do.");
-    }
+    for (const line of attentionLines(r, "  ")) io.out(line);
   }
   if (r.chunksSent > 0)
     io.out(`${String(r.chunksSent).padStart(5)}  chunks sent, ${bytes(r.bytesSent)}`);

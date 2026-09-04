@@ -1558,10 +1558,69 @@ export function summarise(r: SyncReport): string {
   add(r.foldersCreated, "folders", "folder");
   add(r.waiting, "waiting");
   add(r.retrying, "retrying");
-  add(r.skipped, "stuck");
+  // One phrase where there were three. "stuck", "ignored" and "in the way"
+  // were three words for two ideas, and neither the CLI nor a person had the
+  // same three: see `needsAttention` on the report. `ignored` keeps its own
+  // phrase because it is not a problem, and it is the one that must not
+  // disappear.
+  add(needsAttention(r), "need attention", "needs attention");
   add(r.ignored, "ignored");
-  add(r.blocked, "in the way");
   return bits.length === 0 ? "up to date" : bits.join(", ");
+}
+
+/**
+ * How many paths are waiting on a person.
+ *
+ * `blocked` and `skipped` and nothing else, which is the same pair the exit
+ * code is built from and the same pair the panel's glyph turns on: a path this
+ * device is set to ignore is the configuration working (R2) and is counted and
+ * printed apart from these.
+ *
+ * The count rather than `needsAttention.length`, because that list is bounded
+ * and this is the truth: one file where a folder belongs blocks a subtree, and
+ * a headline that said five when four hundred are stuck would be rule 7 again
+ * one level down.
+ */
+export function needsAttention(r: SyncReport): number {
+  return r.skipped + r.blocked;
+}
+
+/**
+ * The needs-attention list as lines, for whichever surface is printing it.
+ *
+ * One renderer, because the CLI and the panel had grown separate vocabularies
+ * for the same counters: "cannot sync and will not be retried" against
+ * "stuck", "waiting on a name two things claim" against "in the way". Two
+ * shells of one engine describing one vault two ways is the same defect as two
+ * adapters answering one question two ways, and the fix is the same one.
+ *
+ * One line per reason with its paths in front, rather than a line per path.
+ * The reason is the actionable half and it is usually shared: one file where a
+ * folder belongs blocks every path beneath it, and four hundred copies of one
+ * sentence is a wall rather than a message.
+ *
+ * `indent` because the CLI prints into a column and a notice does not.
+ */
+export function attentionLines(r: SyncReport, indent = ""): string[] {
+  const listed = r.needsAttention ?? [];
+  const byReason = new Map<string, string[]>();
+  // `?? []` for the same reason the plugin's `announce` has one: the type
+  // promises the list and a report built by hand may not keep it, and this is
+  // on the path of the notice that says a file is stuck. Falling over while
+  // reporting a refusal loses the refusal (plugin/main.test.ts, "announces the
+  // count when a report names no paths").
+  for (const { path, why } of listed) {
+    const paths = byReason.get(why);
+    if (paths) paths.push(path);
+    else byReason.set(why, [path]);
+  }
+  const lines: string[] = [];
+  for (const [why, paths] of byReason) lines.push(`${indent}${paths.sort().join(", ")}: ${why}`);
+  // The list is bounded and the count is not, so the difference is said rather
+  // than left for somebody to notice that the numbers do not add up.
+  const rest = needsAttention(r) - listed.length;
+  if (rest > 0) lines.push(`${indent}and ${rest} more.`);
+  return lines;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

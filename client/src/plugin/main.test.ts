@@ -570,9 +570,12 @@ describe("when things go wrong", () => {
     );
     await plugin.syncNow();
     // And the refusal did not stop the file that was fine, and the status
-    // says the vault needs a person (P33).
-    expect(status(plugin)).toMatch(/stuck/);
-    expect(status(plugin)).toMatch(/attention/);
+    // says the vault needs a person (P33). One phrase, not three: "stuck",
+    // "ignored" and "in the way" were three words a person had to learn before
+    // the status could be read, and what differs between them is the reason,
+    // which the notice above carries.
+    expect(status(plugin)).toMatch(/need attention/);
+    expect(status(plugin)).toMatch(/files? need attention\./);
   }, 300_000);
 });
 
@@ -1541,9 +1544,7 @@ describe("what is announced, and how often (P5)", () => {
       bytesSent: 0,
     } as unknown as SyncReport;
     (plugin as unknown as { announce(report: SyncReport): void }).announce(report);
-    expect(notices.map((n) => n.message).join(" ")).toMatch(
-      /cannot sync 1 file\(s\) and has stopped trying\./,
-    );
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/cannot sync 1 file\(s\)\./);
   });
 });
 

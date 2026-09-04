@@ -43,8 +43,10 @@ import {
 import {
   Client,
   Registrar,
+  attentionLines,
   convertToDevice,
   isFatal,
+  needsAttention,
   needsConversion,
   rebaseCursors,
   redeemInvite,
@@ -165,7 +167,7 @@ export default class BasaltPlugin extends Plugin {
   /** The pairing in progress, so a second press cannot start another. */
   private pairing: Promise<unknown> | undefined;
   /** What the notices have already said, so they say it once. */
-  private announced = { skipped: "", inTheWay: "" };
+  private announced = { attention: "" };
   /** What `onunload` started and could not wait for, for anything that can. */
   closing: Promise<void> | undefined;
   /**
@@ -337,7 +339,7 @@ export default class BasaltPlugin extends Plugin {
     if (!config || this.running) return;
     this.running = true;
     this.everConnected = false;
-    this.announced = { skipped: "", inTheWay: "" };
+    this.announced = { attention: "" };
     // Every run is numbered, and only the newest one may speak. A single
     // boolean was not enough: unlinking cleared it, pairing again set it,
     // and the *previous* run woke from its backoff, read the new run's
@@ -555,7 +557,10 @@ export default class BasaltPlugin extends Plugin {
           kind: "synced",
           summary: summarise(report),
           at: Date.now(),
-          refused: report.skipped + report.blocked,
+          // The same pair the exit code is built from and the same pair the
+          // needs-attention list holds, through the one helper, so the glyph,
+          // the sentence and the notice cannot start counting different things.
+          refused: needsAttention(report),
         });
         this.announce(report);
       },
@@ -721,57 +726,32 @@ export default class BasaltPlugin extends Plugin {
         10_000,
       );
     }
-    // Keyed on which files, not how many (N2). One file fixed in the same
-    // pass as another starts failing leaves the count where it was, and the
-    // new failure went unannounced for as long as the numbers matched: the
-    // glyph said something was wrong and nothing ever said what.
+    // One notice where there were two, for the reason on the report's
+    // `needsAttention`: "written off" and "blocked by a name" are two of our
+    // categories and one of a person's, and it was the two notices that made
+    // somebody learn the difference before they could act. What differs is the
+    // reason, and the reason is now what the notice carries.
+    //
+    // Keyed on which files and which reasons, not how many (N2). One file
+    // fixed in the same pass as another starts failing leaves the count where
+    // it was, and the new failure went unannounced for as long as the numbers
+    // matched: the glyph said something was wrong and nothing ever said what.
+    //
     // `?? []` because the type promises the list and a hand-built report may
     // not keep it: announcing must never throw over the notice it owes.
-    const paths = report.skippedPaths ?? [];
-    const written = report.skipped === 0 ? "" : `${report.skipped}:${paths.join("\n")}`;
-    if (written !== this.announced.skipped) {
-      this.announced.skipped = written;
-      if (report.skipped > 0) {
-        // Named, because a count is not something anybody can act on. The
-        // list is capped, so it says when it is not the whole of it. An
-        // empty list still says the count rather than nothing.
-        const named = paths.map((p) => `"${p}"`).join(", ");
-        const rest = paths.length < report.skipped ? " and others" : "";
-        const detail = named === "" ? "" : `: ${named}${rest}`;
-        new Notice(
-          `Basalt cannot sync ${report.skipped} file(s) and has stopped trying${detail}.`,
-          10_000,
-        );
-      }
-    }
-    // Named, and left up longer, because this is the one refusal that waits on
-    // a person. Nothing clears it until one of the two names changes, and a
-    // notice saying only that something is in the way cannot be acted on.
-    //
-    // A blocked path carries its own sentence where "a file here and a folder
-    // elsewhere" is not what happened, which two spellings of one name on a
-    // disk that keeps them apart are not. Obsidian's vault does not produce
-    // that one, so the branch is here for the report shape rather than for
-    // this vault, and printing the wrong sentence over it would be worse than
-    // the extra line of code.
-    const clashes = report.inTheWay.filter((b) => b.why === undefined);
-    const names = [...new Set(clashes.map((b) => b.blockedBy))].sort();
-    const spelled = [...new Set(report.inTheWay.flatMap((b) => (b.why ? [b.why] : [])))].sort();
+    const attention = report.needsAttention ?? [];
+    const count = needsAttention(report);
     const key =
-      report.inTheWay.length === 0 ? "" : `${report.blocked}:${[...names, ...spelled].join("\n")}`;
-    if (key !== this.announced.inTheWay) {
-      this.announced.inTheWay = key;
-      if (key !== "") {
-        const said =
-          names.length === 0
-            ? ""
-            : `${names.map((n) => `"${n}"`).join(", ")} ` +
-              `${names.length === 1 ? "is a file" : "are files"} here and ` +
-              `${names.length === 1 ? "a folder" : "folders"} on another device. ` +
-              `Rename one, on whichever device meant the other thing.`;
+      count === 0 ? "" : `${count}:${attention.map((a) => `${a.path} ${a.why}`).join("\n")}`;
+    if (key !== this.announced.attention) {
+      this.announced.attention = key;
+      if (count > 0) {
+        // Named, because a count is not something anybody can act on. The
+        // list is bounded, so `attentionLines` says when it is not the whole
+        // of it. A report that named nothing still says the count.
+        const detail = attentionLines(report).join(" ");
         new Notice(
-          `Basalt cannot write ${report.blocked} file(s): ` +
-            [said, ...spelled].filter((s) => s !== "").join(" "),
+          `Basalt cannot sync ${count} file(s).${detail === "" ? "" : ` ${detail}`}`,
           20_000,
         );
       }

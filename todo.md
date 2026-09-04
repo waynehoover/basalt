@@ -224,59 +224,10 @@ Server (protocol 4, device registry, redeem-registers) plus client
 green: `go test -count=1 ./...` passes, `vitest run` passes 52 files /
 1110 tests. No code changed by this review. Findings, sharpest first:
 
-- [ ] **Docs overclaim: a device CAN add another device behind you.**
-  `[verified-by-reading]`. `docs/design.md` ("What a device cannot do is
-  add another one behind you") and `session.go`'s register refusal ("a
-  stolen laptop ... cannot add a ninth device to the vault behind you")
-  are both false via invites: any device session may `invite`, and redeeming
-  registers exactly one device, so a compromised laptop issues a string on
-  itself and redeems it on the attacker's machine. The *register* op is
-  registrar-gated, but the invite path reaches the same row. This is not a
-  regression (old invites carried the root, so old devices trivially could),
-  and the design requires device-issued invites (recovery key stays
-  offline), so the fix is honesty, not removal: state the real boundary
-  (register / rotate / the recovery key itself), and say what makes
-  invite-added rows survivable — they are visible in `basalt devices` with
-  `added <when>` / `last seen`, revokable by any device, and outstanding
-  (unredeemed) invites die on rotation and within the hour on expiry. Gap
-  inside the gap: there is no visibility into *outstanding* invites at all.
-  `devices` lists rows; an attacker-issued string sitting live for up to an
-  hour is invisible until redeemed. Consider listing live invites (ids and
-  expiry, never the blob) beside the device list, or record the decision
-  not to.
-- [ ] **Any device can revoke any device, including `--allow-last`.**
-  `[verified-by-reading]`. `handleRevoke` has no registrar gate and honours
-  `AllowLast` from a device session, so a compromised device can delete every
-  other row and leave the vault reachable only by the recovery key. Usability
-  demands device-may-revoke (the phone revoking the stolen laptop without
-  typing the recovery key is the whole point of revocation over rotation),
-  and it is recoverable (offline key re-registers), so this is almost
-  certainly accept-and-document rather than fix — but it is a cross-device
-  destructive power the docs never state. Record it next to the invite
-  finding above, and consider whether `--allow-last` specifically should
-  need the registrar: nothing about the common case needs it, and it is the
-  one revocation that cannot be undone without the recovery key.
-- [ ] **Lost redeem replies leave orphan rows against the 8-device cap.**
-  `[verified-by-reading]` (design choice, documented in `redeemInvite`'s
-  comment: save-nothing-first so a crash strands a server row, not a local
-  device). The row is visible (`last seen never`) and revokable, and the
-  alternative order strands the device instead, so the choice is right — but
-  eight crashes, or eight attacker-added rows, fill the vault and `register`
-  / redeem then refuse until a human revokes. Attack plus accident share one
-  cap with no reclamation and no prompt. Cheap mitigations: `devices` could
-  flag never-connected rows for cleanup, or invites could carry a
-  replace-an-orphan hint. At minimum the cap-full refusal should name
-  revocation of never-seen rows as the fix.
-- [ ] **The index journal is built, tested, and not wired in.**
-  `[verified-by-reading]`. `index-journal.ts` + `index-journal-store.ts` +
-  two test files exist and pass, but nothing outside their own tests imports
-  them; the engine still runs on the rewrite-the-JSON store. Until wiring
-  lands this is dead code with a passing suite — the exact shape rule 9
-  guards against drifting. Wiring wants three things the spec already names:
-  the engine actually using it, migration of existing `index-state.json`
-  (byte-identical-journal requirement is specified, good), and the
-  single-writer rule enforced rather than commented (two shells, one vault
-  dir, is the configuration that silently drops a journal of state).
+- [x] **Docs overclaim: a device CAN add another device behind you.** Done. Both sentences now state the real boundary (register, rotate, the key itself) and the honest defence, which is not that a compromised device cannot but that it cannot do so unseen. The visibility gap inside it is closed too: outstanding invites are listed.
+- [x] **Any device can revoke any device, including `--allow-last`.** Done. Ordinary revocation stays any device's; emptying the list is the recovery key's alone. That forced admitting the recovery key to the list and to pruning, since otherwise a vault of eight crashed pairings has no way back, and the widened power is written down rather than quietly taken.
+- [x] **Lost redeem replies leave orphan rows against the 8-device cap.** Done. Never-connected rows are flagged and counted in both surfaces, the full refusal names them as the fix, and the recovery key can prune. Nothing deletes a row on its own.
+- [x] **The index journal is built, tested, and not wired in.** Done. Both shells run on it. Wiring found three things reading had not: a snapshot with no sequence took another device's deltas by coincidence, two writers silently discarded each other's records, and replay was quadratic at 454 ms to start a client at ten thousand notes.
 - [x] **Protocol 3 dropped, both sides speak only 4.** Checked, no change.
   `MinProto = Proto = 4`, client refuses anything but 4, and `docs/server.md`
   already records that 3 lived one day with one user before replacement. An

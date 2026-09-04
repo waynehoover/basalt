@@ -2968,5 +2968,162 @@ describe("two notes that differ only by case, one written on each device", () =>
     // person renames one of them.
     expect(report.blocked).toBe(1);
     expect(report.inTheWay).toEqual([{ path: "Note.md", blockedBy: "note.md" }]);
+    // The four maps are untouched and the one list a person reads is built
+    // from them, with the sentence rather than the category. Both surfaces
+    // print this and neither invents its own words for it any more.
+    expect(report.needsAttention).toEqual([
+      {
+        path: "Note.md",
+        why:
+          '"note.md" is a file here and a folder on another device. ' +
+          "Rename one of them, on whichever device meant the other thing.",
+      },
+    ]);
+  }, 240_000);
+});
+
+/**
+ * The one list, built from the four maps, over a real server.
+ *
+ * `blocked`, `skipped` and the inbound refusals folded into `skipped` are three
+ * of our categories and one of a person's: every one of them means "this path
+ * is not syncing and waiting will not fix it", and what differs is the reason.
+ * Rule 7 asked for one list and the reasons are what it carries, so this checks
+ * that a path written off arrives in it with a sentence somebody can act on,
+ * not with a category name.
+ *
+ * The counters and the maps are asserted alongside, because the verdict on this
+ * was to simplify what is printed and leave the model alone: each of the four
+ * came from its own incident and they carry different exit-code semantics.
+ */
+describe("what needs attention, as one list with reasons", () => {
+  it("carries a sentence for a file the vault will never open", async () => {
+    await fresh();
+    const refusing = new RefusingVault();
+    const a = await device("a", undefined, refusing);
+    await a.vault.edit("fine.md", "fine\n");
+    await a.vault.edit("cursed.md", "nope\n");
+    refusing.refuse.add("cursed.md");
+
+    const report = await a.settle(4);
+
+    // The category is still there, with its counter and its exit-code meaning.
+    expect(report.skipped).toBeGreaterThan(0);
+    expect(report.skippedPaths).toContain("cursed.md");
+    // And so is the sentence, against the path, in the one list.
+    const said = report.needsAttention.find((n) => n.path === "cursed.md");
+    expect(said, `needsAttention: ${JSON.stringify(report.needsAttention)}`).toBeDefined();
+    expect(said!.why).toMatch(/cursed\.md/);
+    // A reason, not a category name: nothing in the list should read as one of
+    // the four buckets, because that is the distinction rule 7 says not to make
+    // a person learn.
+    expect(said!.why).not.toMatch(/^(skipped|blocked|ignored|refused)$/i);
+    // The file that was fine still synced. One refusal is not a stopped vault.
+    expect(report.needsAttention.some((n) => n.path === "fine.md")).toBe(false);
+  }, 240_000);
+});
+
+/**
+ * An Excalidraw drawing is `name.excalidraw.md`, so it merges as prose.
+ *
+ * The engine picks the `stillValid` predicate by path, and `looksLikeJson` was
+ * the whole of that decision: a `.canvas` was checked and a drawing was not,
+ * although a drawing's body is a JSON scene in a fenced block that breaks in
+ * exactly the same way. `core/excalidraw.ts` has the mechanism and
+ * `excalidraw.test.ts` has the corpus: 744 of 4,882 clean merges of an empty
+ * drawing two devices both drew on produce a scene the plugin refuses to open,
+ * with every other check reporting success.
+ *
+ * Here is the wiring, end to end, over a real server. Take the
+ * `looksLikeExcalidraw` branch out of `engine.ts` and this fails with a merged
+ * drawing that will not open, which is the branch the corpus cannot see.
+ */
+describe("an Excalidraw drawing two devices both drew on", () => {
+  /** A drawing as the plugin writes one: the scene tab-indented under a json fence. */
+  const drawing = (elements: unknown[]): string =>
+    [
+      "---",
+      "",
+      "excalidraw-plugin: parsed",
+      "tags: [excalidraw]",
+      "",
+      "---",
+      "# Excalidraw Data",
+      "",
+      "%%",
+      "## Drawing",
+      "```json",
+      JSON.stringify(
+        {
+          type: "excalidraw",
+          version: 2,
+          source: "basalt-test",
+          elements,
+          appState: {},
+          files: {},
+        },
+        null,
+        "\t",
+      ),
+      "```",
+      "%%",
+      "",
+    ].join("\n");
+
+  const shape = (id: string, x: number) => ({
+    id,
+    type: "rectangle",
+    x,
+    y: 40,
+    width: 180,
+    height: 90,
+    strokeColor: "#1e1e1e",
+    seed: 1,
+    version: 2,
+    isDeleted: false,
+  });
+
+  /** The plugin's own reader: find the scene, parse it, require an elements array. */
+  const opens = (text: string): boolean => {
+    const found = /\n##? Drawing\n[^`]*```json\n([\s\S]*?)```\n/.exec(text);
+    if (found === null) return false;
+    const scene = found[1]!;
+    try {
+      const parsed = JSON.parse(scene.substring(0, scene.lastIndexOf("}") + 1));
+      return Array.isArray((parsed as { elements?: unknown }).elements);
+    } catch {
+      return false;
+    }
+  };
+
+  it("keeps both drawings rather than merging one that will not open", async () => {
+    await fresh();
+    const a = await device("a");
+    const b = await device("b");
+
+    const path = "Drawings/Plan.excalidraw.md";
+    await a.vault.edit(path, drawing([]));
+    await convergeBoth(a, b);
+    expect(b.vault.text(path)).toBe(drawing([]));
+
+    // Each device draws its first shape, which is the edit that turns one line
+    // into many on both sides.
+    await a.vault.edit(path, drawing([shape("from-a", 10)]));
+    await a.settle();
+    await new Promise((r) => setTimeout(r, 200));
+    await b.vault.edit(path, drawing([shape("from-b", 500)]));
+
+    const report = await b.engine.sync();
+    expect(report.conflicted, `report: ${JSON.stringify(report)}`).toBe(1);
+    expect(report.merged).toBe(0);
+
+    // Rule 10: the property is not that the two devices agree, it is that
+    // neither drawing was lost and that everything b now holds opens.
+    const all = everywhere(b);
+    expect(all).toContain("from-a");
+    expect(all).toContain("from-b");
+    for (const [name, text] of Object.entries(b.vault.snapshot())) {
+      expect(opens(text), `${name} will not open:\n${text}`).toBe(true);
+    }
   }, 240_000);
 });

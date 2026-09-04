@@ -124,7 +124,9 @@
  *     nothing else. Disabling it leaves two tests in canvas.test.ts failing,
  *     and 193 of the 2,429 canvases that merge cleanly in that file's
  *     generated corpus are files Obsidian will not open: one in thirteen, and
- *     nothing else sees any of them.
+ *     nothing else sees any of them. `.svg`, `.xml` and `.csv` were measured
+ *     for the same failure and do not have it, which is why they are not on
+ *     the list: markup.test.ts, and `JSON_EXTENSIONS` in chunk.ts.
  *
  * The applied flags and insertion survival stay for the cost of a comparison
  * over data already at hand, and because the flags are the precise defect this

@@ -782,23 +782,79 @@ describe("creating a file only where nothing is (C17)", () => {
 });
 
 /**
- * P20 and review finding C16. Two raw names in Obsidian's index that normalize to
- * one path used to be one entry in the map, the second winning silently.
+ * P20 and review finding C16. Two raw names in Obsidian's index that normalize
+ * to one path used to be one entry in the map, the second winning silently.
+ *
+ * That was fixed by throwing out of `list`, and throwing was the wrong half of
+ * the answer, for the reason `cli/vault-spelling.test.ts` gives about the same
+ * bug on the other adapter: one ambiguous pair stopped the whole pass, so every
+ * other note in the vault went nowhere until somebody renamed one of two names
+ * that look identical. Naming the pair is what "fail loudly" asks for; stopping
+ * the vault is not.
+ *
+ * These now assert the CLI's behaviour, and they are deliberately the same
+ * assertions: the two adapters are one engine's two shells and they cannot
+ * answer this question differently. Unreachable through Obsidian, whose index
+ * is normalized before this code sees it, which is exactly why it had drifted.
  */
+/**
+ * The two ways one name can be spelled twice in an index, and both are ones
+ * `normalizePath` folds: a no-break space against a plain one, and a
+ * precomposed e-acute against e plus a combining acute. Written as escapes
+ * because the point of these names is that they look identical.
+ */
+const SPACE = "a b.md";
+const NBSP = "a\u00A0b.md";
+const NFC = "caf\u00E9.md";
+const NFD = "cafe\u0301.md";
+
 describe("two names the plugin cannot hold apart (P20)", () => {
-  it("refuses a listing where two raw names normalize to one path, and names both", async () => {
-    adapter.seed("a b.md", "nbsp");
-    adapter.seed("a b.md", "space");
+  it("names the pair rather than refusing the whole vault", async () => {
+    adapter.seed(NBSP, "nbsp");
+    adapter.seed(SPACE, "space");
     adapter.seed("fine.md", "x");
-    await expect(vault.list()).rejects.toThrow(/"a b\.md".*"a b\.md"|"a b\.md".*"a b\.md"/);
+    const listed = (await vault.list()).map((f) => f.path);
+    expect(listed, "the rest of the vault stopped as well").toEqual(["fine.md"]);
+    expect(vault.ambiguous()).toEqual([{ path: SPACE, spellings: [NBSP, SPACE].sort() }]);
   });
 
-  it("refuses NFC and NFD spellings of one name", async () => {
-    adapter.seed("café.md", "nfc");
-    adapter.seed("café.md", "nfd");
-    await expect(vault.list()).rejects.toThrow(/only one of them can sync/);
+  it("names NFC and NFD spellings of one name", async () => {
+    adapter.seed(NFC, "nfc");
+    adapter.seed(NFD, "nfd");
+    expect(await vault.list()).toEqual([]);
+    expect(vault.ambiguous()).toEqual([{ path: NFC, spellings: [NFC, NFD].sort() }]);
   });
 
+  it("names the pair with the folder it is in", async () => {
+    adapter.seed(`notes/${NFC}`, "nfc");
+    adapter.seed(`notes/${NFD}`, "nfd");
+    await vault.list();
+    expect(vault.ambiguous()).toEqual([
+      { path: `notes/${NFC}`, spellings: [`notes/${NFC}`, `notes/${NFD}`].sort() },
+    ]);
+  });
+
+  it("stops naming it the moment one of the two is gone", async () => {
+    adapter.seed(NFC, "nfc");
+    adapter.seed(NFD, "nfd");
+    await vault.list();
+    expect(vault.ambiguous()).toHaveLength(1);
+
+    await adapter.remove(NFD);
+    expect((await vault.list()).map((f) => f.path)).toEqual([NFC]);
+    expect(vault.ambiguous(), "the refusal outlived what caused it").toEqual([]);
+  });
+
+  /**
+   * A lone odd spelling still syncs, under the normal name, and is still
+   * readable. The clash path must not have taken the ordinary case with it.
+   */
+  it("still maps a lone odd spelling back to the name in the index", async () => {
+    adapter.seed(NFD, "nfd only");
+    expect((await vault.list()).map((f) => f.path)).toEqual([NFC]);
+    expect(vault.ambiguous()).toEqual([]);
+    expect(new TextDecoder().decode(await vault.read(NFC))).toBe("nfd only");
+  });
   it("folds normalization always, and case only where the adapter does", async () => {
     // Until asked, the safe answer: two spellings are one file.
     expect(vault.canonical("Note.md")).toBe(vault.canonical("note.md"));

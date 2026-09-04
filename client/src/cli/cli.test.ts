@@ -19,7 +19,8 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
 import { PAIRING_PREFIX, parseInvite } from "../core/pairing.ts";
 import { redeemInvite } from "../core/client.ts";
-import { run, normaliseUrl, parseArgs, type Console } from "./cli.ts";
+import type { SyncReport } from "../core/engine.ts";
+import { run, exitCodeFor, normaliseUrl, parseArgs, renderReport, type Console } from "./cli.ts";
 import { NodeVault } from "./vault.ts";
 
 beforeAll(async () => {
@@ -1699,6 +1700,7 @@ describe("what the CLI says about itself and the vault", () => {
       ignored: 0,
       blocked: 0,
       inTheWay: [],
+      needsAttention: [],
       chunksSent: 0,
       bytesSent: 0,
     };
@@ -1873,5 +1875,174 @@ describe("an argument the command does not take", () => {
     const dir = await vaultDir("a");
     const r = await cli("history", "note.md", "--dir", dir);
     expect(r.all).toMatch(/not paired/);
+  });
+});
+
+/**
+ * What the CLI actually prints when something needs a person, which nothing
+ * asserted.
+ *
+ * Two things are being pinned here and they arrived together. The first is the
+ * shape: one "need attention" list with a reason against each name, where
+ * there used to be three counters and two lists under them. The second is the
+ * content of the reason for the one refusal that had no test at all, two
+ * spellings that normalize to one name, whose sentence has to spell both names
+ * out because they are identical on a terminal. The whole reason `spellOut`
+ * exists is that "rename one of them" printed the same string twice and nobody
+ * could act on it.
+ *
+ * The two blocked kinds still ask for different things and still say so, which
+ * is what the one list must not lose: two spellings of one name are both on
+ * this device so the rename is here, while a file here and a folder elsewhere
+ * waits on whichever device meant the other thing. Rule 7 asked for one list,
+ * not for one sentence.
+ *
+ * A unit test on the renderer rather than a real sync, for the reason
+ * `vault-spelling.test.ts` gives about the mechanism underneath it: a disk that
+ * keeps NFC and NFD apart cannot be mounted on the machine this is written on,
+ * so an end-to-end version would self-skip locally and a green run that is not
+ * evidence is worse than no run (R9). The engine's side, including that it
+ * builds these sentences at all, is covered over a real server in
+ * `core/engine.test.ts`; this is the half that turns a report into lines, and
+ * it is exported for the same reason `exitCodeFor` is.
+ */
+describe("what needs attention looks like on the way out", () => {
+  const clean: SyncReport = {
+    uploaded: 0,
+    downloaded: 0,
+    merged: 0,
+    conflicted: 0,
+    deletedLocally: 0,
+    deletedRemotely: 0,
+    restored: 0,
+    foldersCreated: 0,
+    unchanged: 3,
+    waiting: 0,
+    retrying: 0,
+    skipped: 0,
+    skippedPaths: [],
+    ignored: 0,
+    blocked: 0,
+    inTheWay: [],
+    needsAttention: [],
+    chunksSent: 0,
+    bytesSent: 0,
+  };
+
+  /** What `renderReport` writes, given a report. */
+  const printed = (r: SyncReport, json = false): string => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const io: Console = { out: (l) => out.push(l), err: (l) => err.push(l) };
+    renderReport(r, { json } as Parameters<typeof renderReport>[1], io, 7);
+    return out.join("\n") + "\n" + err.join("\n");
+  };
+
+  /** The sentences the engine builds, as it builds them. */
+  const CLASH =
+    '"cafe\\u{301}.md" and "caf\\u{e9}.md" are one name here, and only one of them can sync. ' +
+    "Rename one of them here; nothing syncs under that name until you do.";
+  const FOLDER =
+    '"notes" is a file here and a folder on another device. ' +
+    "Rename one of them, on whichever device meant the other thing.";
+
+  it("spells both names out, and says the rename is here", () => {
+    const text = printed({
+      ...clean,
+      blocked: 1,
+      inTheWay: [{ path: "café.md", blockedBy: "café.md", why: CLASH }],
+      needsAttention: [{ path: "café.md", why: CLASH }],
+    });
+    expect(text).toMatch(/1 {2}need attention/);
+    // The two names are distinguishable on a terminal, which is the property.
+    expect(text).toContain("cafe\\u{301}.md");
+    expect(text).toContain("caf\\u{e9}.md");
+    expect(text).toMatch(/Rename one of them here/);
+    // And not the other refusal's advice, which would send somebody to the
+    // wrong device.
+    expect(text).not.toMatch(/whichever device meant the other thing/);
+  });
+
+  it("says the other thing for a file here and a folder elsewhere", () => {
+    const text = printed({
+      ...clean,
+      blocked: 1,
+      inTheWay: [{ path: "notes/a.md", blockedBy: "notes" }],
+      needsAttention: [{ path: "notes/a.md", why: FOLDER }],
+    });
+    expect(text).toMatch(/notes\/a\.md: "notes" is a file here and a folder on another device\./);
+    expect(text).toMatch(/whichever device meant the other thing/);
+    expect(text).not.toMatch(/Rename one of them here/);
+  });
+
+  it("keeps the two reasons apart in one list", () => {
+    // One list, and still two answers. Collapsing the sentences as well as the
+    // counters would tell somebody to do the wrong thing to half of it.
+    const text = printed({
+      ...clean,
+      blocked: 2,
+      inTheWay: [
+        { path: "notes/a.md", blockedBy: "notes" },
+        { path: "café.md", blockedBy: "café.md", why: CLASH },
+      ],
+      needsAttention: [
+        { path: "notes/a.md", why: FOLDER },
+        { path: "café.md", why: CLASH },
+      ],
+    });
+    expect(text).toMatch(/2 {2}need attention/);
+    expect(text).toMatch(/Rename one of them here/);
+    expect(text).toMatch(/whichever device meant the other thing/);
+  });
+
+  it("puts every path sharing one reason on one line", () => {
+    // One file where a folder belongs blocks a subtree, and four hundred
+    // copies of one sentence is a wall rather than a message.
+    const text = printed({
+      ...clean,
+      blocked: 3,
+      needsAttention: [
+        { path: "notes/b.md", why: FOLDER },
+        { path: "notes/a.md", why: FOLDER },
+        { path: "notes/c.md", why: FOLDER },
+      ],
+    });
+    expect(text).toContain("notes/a.md, notes/b.md, notes/c.md: ");
+    expect(text.match(/is a file here and a folder/g)).toHaveLength(1);
+  });
+
+  it("says how many are not shown, because the list is bounded and the count is not", () => {
+    const text = printed({
+      ...clean,
+      blocked: 40,
+      needsAttention: [{ path: "notes/a.md", why: FOLDER }],
+    });
+    expect(text).toMatch(/40 {2}need attention/);
+    expect(text).toMatch(/and 39 more\./);
+  });
+
+  it("keeps ignored out of it, and still prints it", () => {
+    // R2. A path this device is set to ignore is the configuration working, so
+    // it is not something to attend to and not in the exit code, and it still
+    // has to be visible or somebody loses track of a folder they stopped
+    // syncing years ago.
+    const text = printed({ ...clean, ignored: 4 });
+    expect(text).toMatch(/4 {2}ignored here, and synced by another device/);
+    expect(text).not.toMatch(/need attention/);
+    expect(exitCodeFor({ ...clean, ignored: 4 })).toBe(0);
+  });
+
+  it("says nothing about names when nothing needs a person", () => {
+    const text = printed({ ...clean, uploaded: 2 });
+    expect(text).not.toMatch(/need attention|Rename/i);
+  });
+
+  it("puts the whole report in --json, the reasons included", () => {
+    const text = printed(
+      { ...clean, blocked: 1, needsAttention: [{ path: "café.md", why: CLASH }] },
+      true,
+    );
+    const parsed = JSON.parse(text.trim()) as { needsAttention: { why: string }[] };
+    expect(parsed.needsAttention[0]!.why).toBe(CLASH);
   });
 });

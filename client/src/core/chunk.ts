@@ -534,6 +534,26 @@ export function looksLikeText(path: string): boolean {
  * application refuses to open. They are still merged as text, because a
  * line-wise merge of two edits to different parts of a document is usually
  * right; what changes is that the result is checked before it is accepted.
+ *
+ * The list stops here, and that was measured rather than assumed. `.svg`,
+ * `.xml`, `.csv` and the source extensions are all in `TEXT_EXTENSIONS` and
+ * merge with nothing looking at the result, which reads like the same hole
+ * the canvas corpus found. It is not, and the reason is one character.
+ *
+ * What breaks a canvas is the comma between two siblings: both devices turn
+ * `"edges":[]` into three lines, the merge concatenates two edge objects with
+ * nothing between them, and every other check passes. XML has no separator
+ * between siblings, so the same edit produces `<rect/><rect/>` and the file is
+ * as well formed as either side alone. One document tree, one set of
+ * mutations, four writers: as a canvas, 299 of 17,415 clean merges do not
+ * parse; as SVG, 0 of 18,229 one element per line, 0 of 19,333 the way
+ * Inkscape writes one, and 0 of 15,698 minified. `.csv` does go ragged, 600 of
+ * 16,793, and in every one of those every row is a row a device wrote, so
+ * nothing is lost and a conflict copy would be the worse record.
+ *
+ * So no gate for them, and no refusal to merge them either, which would have
+ * cost 53% of those merges to catch none. `core/markup.test.ts` holds the
+ * corpus, the control that keeps it honest, and the twelve adversarial pairs.
  */
 const JSON_EXTENSIONS = new Set(["canvas", "json"]);
 
