@@ -86,9 +86,15 @@ CREATE TABLE IF NOT EXISTS devices (
 
 Revoking is `DELETE`, not a `revoked_at` column. A tombstone invites the
 question "is this row still checked", and the answer must never be "it depends
-on a flag". Gone is gone. The audit trail already exists: `entries.device`
-records which device wrote every version, and that history is not touched by
-revoking.
+on a flag". Gone is gone.
+
+The audit trail survives a revoke, but it is weaker than it first looks and the
+first draft of this spec overstated it. `entries.device` holds the device's
+**name**, free text, not its `device_id`. Names are not unique, so after a
+revoke the history says "some device called laptop wrote this", which is a
+record of a kind and not an identification. Making it identify the writer means
+putting the `device_id` on the entry, which is a protocol 4 decision and is not
+in this plan. Raised by the step 1 implementation, which was right to.
 
 `vaults.auth_hash` stays, with its meaning narrowed to **may register a
 device, may not sync**. That is what lets the recovery key add the first device
@@ -112,6 +118,13 @@ person's problem to fix and not the server's to prevent.
 today. Then generate a device secret, register the first device row, and show
 the recovery key once. The device stores its device secret, the data key and
 the wrapped blob. It does not store the root.
+
+**Register twice.** A duplicate `device_id` is refused, and conversion below
+has to be able to run again after a crash, so the two rules pull against each
+other. The refusal is a distinct error the caller can match on, and the recipe
+is: read the row first, and treat a row whose hash is already this device's as
+the registration having happened. Without that spelled out, every crashed
+conversion becomes a device that retries for ever. Also raised by step 1.
 
 **Add a device (invite).** Unchanged from the outside: `basalt invite` on a
 paired device, paste into the new one. The invite carries the data key sealed
@@ -205,4 +218,23 @@ care it needs.
    registration only.
 3. The client's conversion, which is the part that can strand a device and so
    goes last and gets the most tests.
-4. `basalt devices` and the panel list.
+4. `basalt devices` and the panel list, **and the panel copy**. The honesty
+   requirement at the top of this spec is not mechanism and so has no natural
+   home in steps 1 to 3, which is exactly how a feature ends up shipping while
+   selling something it does not do. The panel must say that revoking stops a
+   device connecting and does not un-read what it already read, and that a
+   device which was stolen rather than lost still wants a rotation. If step 4
+   ships without that sentence, this feature is worse than not having it,
+   because it invites somebody to skip the rotation.
+
+## Left out of this plan on purpose
+
+- **A device id shape.** Bounded and base64url, with no minimum length. The
+  server cannot check that 16 bytes were random, and a minimum would admit a
+  string of A's anyway. What makes a collision safe is the primary key.
+- **The 8-device cap.** "A managed list rather than a cliff" implies the ninth
+  registration is refused, which needs a decision about a vault that somehow
+  already holds more, and the connection-count path still exists until hello
+  moves. It belongs with step 2.
+- **Renaming a device.** Promised above, five lines of `UPDATE`, wanted by
+  step 4 and not before.

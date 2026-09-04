@@ -84,6 +84,17 @@ const (
 	// anybody would type.
 	MaxDeviceLen = 64
 
+	// MaxDeviceIDLen bounds a device identifier, which is the primary key of a
+	// devices row and, unlike the name, the device's identity.
+	//
+	// A device chooses its own: 16 random bytes, 22 characters of base64url.
+	// The bound is generous for the same reason MaxInviteLen is, and costs the
+	// same. There is no lower bound, because the server cannot check that the
+	// bytes were random and pretending to would be a check that passes on
+	// "AAAAAAAAAAAAAAAAAAAAAA". What makes a collision safe is the primary key
+	// refusing the second registration, not the length.
+	MaxDeviceIDLen = 64
+
 	// MaxVaultLen bounds a vault id, for the same reason as MaxDeviceLen and
 	// one more: it lands in log lines on every refusal, and it was unbounded
 	// (S24). It is hashed before it touches the filesystem, so the bound is
@@ -167,6 +178,28 @@ var (
 	// root both rotated, the second overwrote the first, and the device the
 	// first was revoking owned the vault.
 	ErrRotated = errors.New("the vault was rotated by another device")
+
+	// ErrDeviceExists is a registration for a device id this vault already
+	// holds. It is its own error because the caller has to be able to tell it
+	// from a server fault: a fault is worth retrying and this never is, and
+	// because the conversion in step 3 of the per-device credentials work is
+	// meant to be idempotent. A device that crashed after registering and
+	// before writing its own config comes back and gets this; the recipe is to
+	// read DeviceByID and treat a row whose hash is already this device's as
+	// the registration having happened, rather than to retry for ever.
+	ErrDeviceExists = errors.New("this vault already has a device with that id")
+
+	// ErrUnknownDevice is an operation naming a device row that is not there,
+	// which after revocation is the ordinary state rather than a fault. It is
+	// distinct so that a session can tell "you were revoked while connected"
+	// from "the database is broken", and stop rather than retry.
+	ErrUnknownDevice = errors.New("no such device on this vault")
+
+	// ErrLastDevice is a revocation that would leave a vault with no devices
+	// at all. Reachable only by the recovery key after that, which is a real
+	// thing to want and not a thing to do by accident, so RevokeDevice refuses
+	// it unless the caller says the word. See its comment.
+	ErrLastDevice = errors.New("that is the vault's last device")
 )
 
 // Entry is one version of one file.
@@ -235,10 +268,26 @@ CREATE TABLE IF NOT EXISTS vaults (
   vault_id   TEXT    PRIMARY KEY,
   next_uid   INTEGER NOT NULL DEFAULT 1,
   created_at INTEGER NOT NULL,
-  -- Hex SHA-256 of the device auth key, or empty before a device has claimed
+  -- Hex SHA-256 of the vault's auth key, or empty before a device has claimed
   -- the vault. The key itself is never stored: a server holding one could
   -- write to the vault it is meant only to keep, and a stolen disk already
   -- yields every byte of ciphertext without also handing over the credential.
+  --
+  -- Its meaning is narrowing. Through protocol 3 this is the sync credential:
+  -- every device holds the root, derives the same auth key, and matching this
+  -- hash is what a hello proves. Per-device credentials make it the
+  -- registration credential and nothing else: may register a device, may not
+  -- sync. That is what lets the recovery key put the first device back after
+  -- every device is lost, and it is why revoking a device can mean something,
+  -- which under one shared credential it never could.
+  --
+  -- Step 1 (this change) adds the devices table and leaves the session alone,
+  -- so today this is still both. Step 2 takes the sync half away. The thing
+  -- step 2 must not do is keep accepting this hash as a sync credential while
+  -- devices exist: a vault whose devices can all be bypassed by the one
+  -- credential they were meant to replace has a device list and no
+  -- revocation, which is worse than not having the list, because it looks
+  -- like it works. The sync credential is devices.auth_hash, via DeviceByID.
   auth_hash  TEXT    NOT NULL DEFAULT '',
   -- The vault's data key, wrapped by the first device under a key derived
   -- from the root secret, and empty only before a device has claimed the
@@ -270,6 +319,32 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- the one with the history in it needs a number that says which side of a
   -- purge each was taken on, and this is that number; backup.json records it.
   purges     INTEGER NOT NULL DEFAULT 0
+);
+
+-- One row per device that may reach this vault. The device chooses its own
+-- device_id (16 random bytes, base64url) and its own auth key, and sends only
+-- the hash of the key, so the server can recognise a device and can never be
+-- one. name is a label a person reads; device_id is the identity.
+--
+-- Revoking is a DELETE and not a revoked_at flag. A tombstone invites the
+-- question "is this row still checked", and the answer must never be "it
+-- depends on a flag": the whole value of revocation is that it is obvious
+-- from the outside whether a device can still connect. Gone is gone. Nothing
+-- is lost by it either, because the audit trail is elsewhere and untouched:
+-- entries.device records which device wrote every version, and revoking does
+-- not rewrite history.
+--
+-- No foreign key to vaults, matching invites. The vault row is checked inside
+-- RegisterDevice's transaction instead, because the rule is not "a vault row
+-- exists" but "the vault is claimed", which no foreign key can express.
+CREATE TABLE IF NOT EXISTS devices (
+  vault_id   TEXT    NOT NULL,
+  device_id  TEXT    NOT NULL,   -- 16 random bytes, base64url, chosen by the device
+  name       TEXT    NOT NULL DEFAULT '',
+  auth_hash  TEXT    NOT NULL,   -- hex SHA-256 of this device's auth key
+  created_at INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (vault_id, device_id)
 );
 
 -- Single-use invites for adding a device without showing the root secret
@@ -1547,6 +1622,29 @@ func migrate(db *sql.DB) error {
 		}
 	}
 
+	// The devices table. Unlike a column, a new *table* does reach an older
+	// database on its own: CREATE TABLE IF NOT EXISTS in the schema above does
+	// nothing only to a table that is already there, and this one is not. So
+	// this statement is a second one saying the same thing, in the belt and
+	// braces style the index below is in, and it stays so that migrate reads
+	// as the complete list of what a database from an older build is missing.
+	// TestADatabaseFromAnOlderBuildGainsTheDevicesTable asserts the table is
+	// there and usable, not which statement made it.
+	// Character for character what the schema says, so that the definition
+	// SQLite records is the same one whichever statement created it.
+	if _, err := db.Exec(`
+CREATE TABLE IF NOT EXISTS devices (
+  vault_id   TEXT    NOT NULL,
+  device_id  TEXT    NOT NULL,   -- 16 random bytes, base64url, chosen by the device
+  name       TEXT    NOT NULL DEFAULT '',
+  auth_hash  TEXT    NOT NULL,   -- hex SHA-256 of this device's auth key
+  created_at INTEGER NOT NULL,
+  last_seen  INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (vault_id, device_id)
+)`); err != nil {
+		return err
+	}
+
 	// The index behind Deleted()'s rename suppression. Belt and braces: unlike
 	// CREATE TABLE IF NOT EXISTS, the CREATE INDEX IF NOT EXISTS in the schema
 	// does reach a table that already exists, so this is a second statement
@@ -1600,6 +1698,11 @@ func hasColumn(db *sql.DB, table, column string) (bool, error) {
 
 // AuthHash returns the hex SHA-256 of the vault's auth key, or empty when no
 // device has claimed it yet.
+//
+// This is the *vault* credential, whose meaning is narrowing to "may register
+// a device, may not sync"; see the column's comment in the schema. It is not
+// the credential a device syncs under from step 2 onwards, and code reaching
+// for "is this caller allowed to push" wants DeviceByID, not this.
 func (s *Store) AuthHash(vaultID string) (string, error) {
 	var hash string
 	err := s.db.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash)
@@ -1773,6 +1876,9 @@ func (s *Store) Wrapped(vaultID string) (string, error) {
 // times it has been rotated. Hash and blob are empty for a vault nothing has
 // claimed.
 //
+// The hash here is the vault credential, with the narrowed meaning in
+// AuthHash's comment: registration, not sync.
+//
 // One query for the three, because they are three columns of the same row and
 // a hello wants all of them. It does not read the row for the whole hello,
 // though: a first device's claim writes hash and blob while it authenticates,
@@ -1908,4 +2014,283 @@ func (s *Store) Rotate(vaultID, prevHash, hash, wrapped string) error {
 		_, err = tx.Exec(`DELETE FROM invites WHERE vault_id = ?`, vaultID)
 		return err
 	})
+}
+
+/* ---------------------------------------------------------------- *
+ * Devices
+ * ---------------------------------------------------------------- */
+
+// CheckName bounds a vault or device name and refuses control characters in it.
+//
+// Exported so that there is one of it. It was the session's, bounding the two
+// names a hello carries (S24, I6): a name lands in log lines and, for a
+// device, on every entry it writes, and a newline in a log line is a forged log
+// line. A device name is now also a column in the devices table, written by a
+// path that does not go through hello, and a second copy of a validation is how
+// the wire and the store come to disagree about what a name is. The session
+// still calls it under its own name, so every refusal a client can see is byte
+// for byte the one it was.
+//
+// The empty device name is allowed, because it always was and a device that
+// gives none is only harder to tell apart in a listing. An empty vault id is
+// refused before this is reached, as an auth failure, so that an attacker
+// probing the server learns nothing from the difference.
+func CheckName(what, name string, max int) error {
+	if len(name) > max {
+		return fmt.Errorf("%s name is %d bytes, limit is %d", what, len(name), max)
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c < 0x20 || c == 0x7f {
+			return fmt.Errorf("%s name contains a control character (byte %d at position %d)", what, c, i)
+		}
+	}
+	return nil
+}
+
+// Device is one registered device, in the shape a person reads it in a list.
+//
+// The hash of the device's auth key is deliberately not a field. This is what
+// a list op returns, and a credential hash that lives in the listing type is
+// one that reaches every device the first time somebody serialises it.
+// DeviceByID hands the hash back separately, to the one caller that has to
+// compare it.
+//
+// The JSON tags are here because this is what the list op sends in step 4, and
+// naming the fields once is cheaper than renaming them later.
+type Device struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt int64  `json:"createdAt"`
+	LastSeen  int64  `json:"lastSeen"` // 0 until the device has connected
+}
+
+// RegisterDevice adds a device to a claimed vault. created_at is now, in
+// milliseconds, and last_seen starts at zero, which reads as "has not connected
+// yet" rather than as "was here at the epoch".
+//
+// authHash is the hex SHA-256 of that device's own auth key, never the key: the
+// same rule as vaults.auth_hash and for the same reason, that a server holding
+// a key could be a device rather than merely recognise one.
+//
+// The vault must be claimed. Registration is the one power vaults.auth_hash
+// keeps once its meaning narrows (see the column's comment), so an unclaimed
+// vault has no credential that could have authorised this and the answer is
+// ErrUnknownVault. The check is inside the transaction with the insert, because
+// a claim read outside it is a claim that could have been rotated away before
+// the row landed.
+//
+// A device id this vault already holds is ErrDeviceExists, not a constraint
+// error. AddInvite's story is the precedent: a bare insert surfaced as
+// `internal`, which is retryable, so a device that retried after a lost reply
+// retried for ever. The insert is conditional in SQL rather than a read
+// followed by a write, so two devices offering one id cannot both be told they
+// registered it, whichever process they arrive through.
+//
+// Rule 4: the row count is checked rather than the absence of an error, because
+// ON CONFLICT DO NOTHING is a successful statement that wrote nothing.
+// TestRegisteringADeviceRefusesADuplicateID and
+// TestConcurrentRegistrationsOfOneIDProduceOneRow pin both halves.
+func (s *Store) RegisterDevice(vaultID, deviceID, name, authHash string, now int64) error {
+	if !validBase64URL(deviceID, MaxDeviceIDLen) {
+		return fmt.Errorf("%w: device id is %d bytes and must be base64url of at most %d",
+			ErrBadEntry, len(deviceID), MaxDeviceIDLen)
+	}
+	if err := CheckName("device", name, MaxDeviceLen); err != nil {
+		return fmt.Errorf("%w: %s", ErrBadEntry, err)
+	}
+	if !isHex64(authHash) {
+		return fmt.Errorf("%w: a device's auth hash is a 64 character hex digest", ErrBadEntry)
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	return s.inTx(func(tx *sql.Tx) error {
+		var hash string
+		err := tx.QueryRow(`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && hash == "") {
+			return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
+		}
+		if err != nil {
+			return err
+		}
+		res, err := tx.Exec(
+			`INSERT INTO devices (vault_id, device_id, name, auth_hash, created_at, last_seen)
+			 VALUES (?, ?, ?, ?, ?, 0)
+			 ON CONFLICT(vault_id, device_id) DO NOTHING`,
+			vaultID, deviceID, name, authHash, now)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n != 1 {
+			return fmt.Errorf("%w: %q", ErrDeviceExists, deviceID)
+		}
+		return nil
+	})
+}
+
+// Devices is every device registered to a vault, oldest first, for the list op
+// and for `basalt devices`. A vault with none, which is every protocol 3 vault,
+// is an empty slice and not an error.
+//
+// Ordered by created_at and then by device_id. created_at is a millisecond, so
+// two devices registered inside the same one need a tiebreak or the order
+// between them belongs to the query plan rather than to this function, and a
+// list that reshuffles between two calls is one a person cannot trust they read
+// the same way twice (rule 7).
+//
+// Honestly: no test can see the tiebreak today. The only scan available is the
+// primary key, which is already in device_id order, and SQLite's sort is
+// stable, so the order comes out right without it. Reverting the tiebreak
+// leaves TestDevicesListsInAStableOrderAndNeverReturnsNil passing, which was
+// checked rather than assumed. It stays because that is an accident of the
+// plan and this is the property, in the same belt and braces spirit as the
+// duplicated index statement in migrate.
+//
+// The slice is never nil, so it marshals to [] rather than to null, which is
+// the same rule Entry.Chunks has and for the same reason: a client that
+// iterates the result crashes on exactly the vault it is meant to handle, the
+// one with no devices.
+func (s *Store) Devices(vaultID string) ([]Device, error) {
+	rows, err := s.db.Query(
+		`SELECT device_id, name, created_at, last_seen FROM devices
+		  WHERE vault_id = ? ORDER BY created_at, device_id`, vaultID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Device{}
+	for rows.Next() {
+		var d Device
+		if err := rows.Scan(&d.ID, &d.Name, &d.CreatedAt, &d.LastSeen); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// DeviceByID is one device row and the hash of its auth key, which is the pair
+// the connect check needs: no row and a hash that does not match are the same
+// refusal to a client, and it has to be able to tell them apart internally to
+// produce that refusal at all.
+//
+// ok is false for a device that is not registered, including one revoked a
+// moment ago. That is not an error: a revoked device connecting is the system
+// working.
+//
+// The hash is returned beside the Device rather than inside it so that the
+// listing type cannot grow a credential field by accident; see Device. Callers
+// comparing it must do so in constant time over the hashes, as
+// server.DerivedAuth already does for the vault's.
+func (s *Store) DeviceByID(vaultID, deviceID string) (d Device, authHash string, ok bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT device_id, name, created_at, last_seen, auth_hash FROM devices
+		  WHERE vault_id = ? AND device_id = ?`, vaultID, deviceID).
+		Scan(&d.ID, &d.Name, &d.CreatedAt, &d.LastSeen, &authHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Device{}, "", false, nil
+	}
+	if err != nil {
+		return Device{}, "", false, err
+	}
+	return d, authHash, true, nil
+}
+
+// RevokeDevice deletes a device's row. That device cannot connect again, and no
+// other device is disturbed.
+//
+// It is a delete rather than a revoked_at flag, for the reason in the table's
+// comment: a flag makes "can this device connect" a question about how many
+// places remember to check it. What is not lost is the history, because
+// entries.device is a separate column on rows this never touches.
+//
+// allowLast is the caller saying, out loud, that it means to leave the vault
+// with no devices at all. Refused by default with ErrLastDevice: a vault whose
+// last device is gone is reachable only by the recovery key, which is a real
+// thing to want after a house fire and not a thing to discover you did by
+// clicking the wrong row. An unknown device is ErrUnknownDevice, and the two
+// are distinct because one is "try again with a different id" and the other is
+// "you already did this".
+//
+// The count and the delete are one statement, not a read followed by a write.
+// Two devices revoking each other at the same moment would both read two rows,
+// both decide they were not the last, and both delete: the vault ends with zero
+// devices and neither caller was told. Holding writeMu would close that inside
+// one process, and the store is opened by more than one (`basaltd backup` and
+// `basaltd purge` run against a live server's directory), so the guarantee has
+// to be in the SQL. TestConcurrentRevokesCannotEmptyTheVault is the test, and
+// it fails against the read-then-write version.
+func (s *Store) RevokeDevice(vaultID, deviceID string, allowLast bool) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	return s.inTx(func(tx *sql.Tx) error {
+		res, err := tx.Exec(
+			`DELETE FROM devices
+			  WHERE vault_id = ? AND device_id = ?
+			    AND (? = 1 OR (SELECT COUNT(*) FROM devices WHERE vault_id = ?) > 1)`,
+			vaultID, deviceID, boolToInt(allowLast), vaultID)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 1 {
+			return nil
+		}
+		// Which of the two it is, read inside the same transaction so the
+		// answer describes the rows the delete was refused against, the way
+		// Rotate's does.
+		var exists int
+		switch err := tx.QueryRow(
+			`SELECT 1 FROM devices WHERE vault_id = ? AND device_id = ?`,
+			vaultID, deviceID).Scan(&exists); {
+		case errors.Is(err, sql.ErrNoRows):
+			return fmt.Errorf("%w: %q on vault %q", ErrUnknownDevice, deviceID, vaultID)
+		case err != nil:
+			return err
+		}
+		return fmt.Errorf("%w: revoking %q would leave vault %q with no devices, "+
+			"reachable only by its recovery key; say so explicitly to do it anyway",
+			ErrLastDevice, deviceID, vaultID)
+	})
+}
+
+// SawDevice moves a device's last_seen to at, in milliseconds, and touches
+// nothing else. It is what a connect calls; the name, the id and the auth hash
+// are not its business, and a device that is not registered is ErrUnknownDevice
+// rather than a row this quietly creates. An upsert here would hand a revoked
+// device its row back, which is the one thing revocation has to mean.
+//
+// last_seen never moves backwards. The value is the server's clock, so it takes
+// an NTP step or two calls landing out of order to invert, and both happen; a
+// last_seen that goes backwards is a number a person reads as "that laptop has
+// not been here since Tuesday" when it was here a minute ago. Rule 8: the
+// numbers are what get believed, so they have to be true.
+// TestSawDeviceNeverMovesLastSeenBackwards.
+func (s *Store) SawDevice(vaultID, deviceID string, at int64) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	res, err := s.db.Exec(
+		`UPDATE devices SET last_seen = MAX(last_seen, ?) WHERE vault_id = ? AND device_id = ?`,
+		at, vaultID, deviceID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: %q on vault %q", ErrUnknownDevice, deviceID, vaultID)
+	}
+	return nil
 }

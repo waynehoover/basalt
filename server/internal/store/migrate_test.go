@@ -258,3 +258,56 @@ func schemaOf(t *testing.T, db *sql.DB) string {
 	}
 	return out
 }
+
+// The devices table, which a database written before per-device credentials has
+// no row of and no table for. A whole table, unlike a column, does reach an
+// older database through the schema's CREATE TABLE IF NOT EXISTS, and migrate
+// says it a second time so that it reads as the complete list of what an older
+// build is missing. This asserts the table is there and usable, not which
+// statement made it, and it fails against a build with neither.
+func TestADatabaseFromAnOlderBuildGainsTheDevicesTable(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "basalt.db")
+	writeOldDatabase(t, dbPath)
+
+	s, err := Open(dbPath, filepath.Join(dir, "chunks"))
+	if err != nil {
+		t.Fatalf("opening a database from an older build: %v", err)
+	}
+	defer s.Close()
+
+	var tables int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'devices'`).Scan(&tables); err != nil {
+		t.Fatalf("looking for the devices table: %v", err)
+	}
+	if tables != 1 {
+		t.Fatal("there is no devices table after migrating, so every query over it fails on somebody's notes")
+	}
+
+	// A protocol 3 vault has no device rows, and that is a vault with no
+	// devices rather than an error: it is the state every existing vault is
+	// in, and the one the conversion converts from.
+	ds, err := s.Devices("v1")
+	if err != nil {
+		t.Fatalf("devices of a migrated vault: %v", err)
+	}
+	if len(ds) != 0 {
+		t.Fatalf("a migrated vault came with %d devices", len(ds))
+	}
+
+	// And it is writable: the vault's own auth hash is the registration
+	// credential, so a migrated vault that has been claimed can register the
+	// first device without any other change.
+	if _, err := s.ClaimVault("v1", "0000000000000000000000000000000000000000000000000000000000000001",
+		"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 2000); err != nil {
+		t.Fatalf("claiming a migrated vault: %v", err)
+	}
+	if err := s.RegisterDevice("v1", "device-one", "laptop",
+		"1111111111111111111111111111111111111111111111111111111111111111", 3000); err != nil {
+		t.Fatalf("registering a device on a migrated vault: %v", err)
+	}
+	if got, err := s.Devices("v1"); err != nil || len(got) != 1 || got[0].ID != "device-one" {
+		t.Fatalf("devices after registering one: %+v %v", got, err)
+	}
+}

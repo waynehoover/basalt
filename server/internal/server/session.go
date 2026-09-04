@@ -850,21 +850,13 @@ var errRedeemed = errors.New("invite redeemed, closing")
 
 // checkName bounds a vault or device name and refuses control characters in it.
 //
-// The empty device name is allowed, because it always was and a device that
-// gives none is only harder to tell apart in a history listing. An empty vault
-// is refused before this is reached, as an auth failure, so that an attacker
-// probing the server learns nothing from the difference.
-func checkName(what, name string, max int) error {
-	if len(name) > max {
-		return fmt.Errorf("%s name is %d bytes, limit is %d", what, len(name), max)
-	}
-	for i := 0; i < len(name); i++ {
-		if c := name[i]; c < 0x20 || c == 0x7f {
-			return fmt.Errorf("%s name contains a control character (byte %d at position %d)", what, c, i)
-		}
-	}
-	return nil
-}
+// The rule itself moved to store.CheckName when device names became rows in the
+// devices table as well as fields on a hello: a name written by a path that
+// does not come through here has to be bounded the same way, and two copies of
+// a validation is how the two layers come to disagree about what a name is.
+// This stays as the name this file has always called it, so the refusals a
+// client sees are the same strings they were.
+func checkName(what, name string, max int) error { return store.CheckName(what, name, max) }
 
 // replay sends the backlog as batches and returns the cursor it reached.
 func (s *Session) replay(vaultID string, cursor int64) (int64, int, error) {
