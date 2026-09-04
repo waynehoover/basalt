@@ -198,6 +198,17 @@ refused-but-confusing > operational footguns > leaks/hardening.
   compare the two without opening SQLite, and the runbook now has an
   explicit verify-before-deleting step.
 
+## Known divergence between the two shells
+
+- [ ] **The plugin still throws on a name clash; the CLI blocks the pair.**
+  `list()` in `cli/vault.ts` leaves two names that normalise together out of
+  the listing and reports them through `ambiguous()`, so the rest of the vault
+  syncs. `plugin/vault.ts` still raises. Unreachable today, because Obsidian's
+  index is NFC before this code sees it, so it cannot hold both spellings. It
+  is still two shells behaving differently where they are meant to be one
+  engine with two adapters, and the CLI's rendering of the clash message has
+  no test.
+
 ## Test-coverage debts (not bugs, tracked here so they don't drift)
 
 - [x] Merge fuzz harness. Done, see above.
