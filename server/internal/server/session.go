@@ -67,8 +67,11 @@ type Session struct {
 	// registrar is true when this session authenticated with the *vault's*
 	// credential rather than a device's. Such a session may register a device
 	// and rewrap the data key, which are the two powers the root secret has,
-	// and may do nothing else: it holds no place in the fan-out, receives no
-	// entries and reads none.
+	// and may administer the device list: read it, and take a row off it,
+	// including the last row, which is the one revocation a device may not do.
+	// It may do nothing else, and in particular it holds no place in the
+	// fan-out, receives no entries and reads none. See dispatch for why the
+	// list is the recovery key's business as well as a device's.
 	//
 	// It is a property of how the session was opened, decided once in
 	// handleHello and read by dispatch, rather than a check each handler
@@ -635,10 +638,14 @@ func (s *Session) run() error {
 // while a genuinely unknown op is still an unknown op: a client waiting on a
 // reply that will never come looks the same either way, and the two are fixed
 // differently.
+//
+// Not here, and deliberately: `devices`, `revoke` and `uninvite`, which either
+// credential may send. They are the access list rather than the vault's
+// content, and the recovery key is the credential that administers access.
+// See dispatch.
 var deviceOps = map[string]bool{
 	"put": true, "putmany": true, "get": true, "fetch": true,
 	"history": true, "deleted": true, "invite": true,
-	"devices": true, "revoke": true,
 }
 
 // dispatch routes one request. frameLen is the encoded size of the frame it
@@ -658,6 +665,31 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 			return s.handleRegister(m)
 		case "rotate":
 			return s.handleRotate(m)
+		// The access list. The recovery key may read who may connect, take one
+		// of them away, and cancel an invite that would add one, and it may
+		// not read or write a note.
+		//
+		// It was register and rotate alone, and two things forced this open.
+		// Emptying the vault is the one revocation nothing on a device can
+		// undo, so it belongs to the credential that can undo it, and a
+		// refusal naming a credential that could not act would be worse than
+		// no gate at all. And a vault whose eight rows are all pairings that
+		// crashed refuses every registration with `full`, so if the recovery
+		// key could not prune the list there would be no way back into such a
+		// vault short of editing SQLite by hand. Both are in docs/design.md,
+		// "What a device can do to another device", with what it costs: a
+		// leaked root can now stop devices connecting, where before it could
+		// only read and add. Rotation is still what answers that: `revoke` is
+		// conditional on the vault hash this session authenticated under
+		// still being the vault's, exactly as `register` is, and a rotation
+		// deletes every outstanding invite, so a retired root reaches neither
+		// a device row nor an invite.
+		case "devices":
+			return s.handleDevices(m)
+		case "revoke":
+			return s.handleRevoke(m)
+		case "uninvite":
+			return s.handleUninvite(m)
 		case "ping":
 			// Allowed, and the one exception to "nothing else". A pong reads
 			// nothing, writes nothing and says nothing about the vault; it is
@@ -668,8 +700,9 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		}
 		if deviceOps[m.Op] {
 			return s.reject(wire.CodeAuth, fmt.Errorf(
-				"this session authenticated with the vault's credential, which may register a device "+
-					"and rotate the vault's secret and may not sync; %q needs a device's own credential", m.Op))
+				"this session authenticated with the vault's credential, which may register a device, "+
+					"rotate the vault's secret and administer the device list, and may not sync; "+
+					"%q needs a device's own credential", m.Op))
 		}
 		return s.reject(wire.CodeProtoState, fmt.Errorf("unknown op %q", m.Op))
 	}
@@ -691,14 +724,20 @@ func (s *Session) dispatch(m wire.In, frameLen int) error {
 		return s.handleDeleted(m)
 	case "invite":
 		return s.handleInvite(m)
+	case "uninvite":
+		return s.handleUninvite(m)
 	case "devices":
 		return s.handleDevices(m)
 	case "revoke":
 		return s.handleRevoke(m)
 	case "register":
-		// A device may not mint a credential. That is the whole point of a
-		// device not holding the root: a stolen laptop can read what it
-		// already had and cannot add a ninth device to the vault behind you.
+		// A device may not mint a credential from the root, because it does
+		// not hold one. That is the boundary and it is narrower than an
+		// earlier version of this comment claimed: a device can still add
+		// another device by issuing an invite, which is the design, since the
+		// recovery key stays offline and something has to admit the next
+		// device. What it cannot do is register without one, rotate, or
+		// produce the key itself. See docs/design.md, "Three credentials".
 		//
 		// A device session also has no vault credential to register under, so
 		// handleRegister would refuse it a second time if this were removed.
@@ -1090,11 +1129,12 @@ func (s *Session) helloAsInvite(m wire.In) error {
 
 // helloAsRegistrar finishes a hello that offered the vault's credential.
 //
-// What comes back is a session that may register a device and rotate the
-// vault's secret, and nothing else. It joins no vault's fan-out, so it is sent
-// no entry and occupies no device slot, and it is given no `ready`, because
-// `ready` promises the ceilings for a put and a backlog behind it and this
-// session will never get either.
+// What comes back is a session that may register a device, rotate the vault's
+// secret and administer the device list, and nothing else: no note is read or
+// written on one. It joins no vault's fan-out, so it is sent no entry and
+// occupies no device slot, and it is given no `ready`, because `ready` promises
+// the ceilings for a put and a backlog behind it and this session will never
+// get either.
 func (s *Session) helloAsRegistrar(m wire.In) error {
 	creds := Credentials{VaultID: m.Vault, Token: m.Token, Claim: m.Claim, Wrapped: m.Wrapped}
 	grant, err := s.srv.auth(creds)
@@ -2132,23 +2172,54 @@ func (s *Session) handleRegister(m wire.In) error {
 }
 
 // handleDevices answers with every device that may reach this vault: the only
-// way to answer "what is still connected to my notes". Device sessions only,
-// because the list is the vault's content in the sense that matters and a
-// registrar reads nothing.
+// way to answer "what is still connected to my notes".
+//
+// Either credential may ask. It is the access list rather than the vault's
+// content, it carries no key material, and the recovery key needs it to be
+// able to act: `revoke` takes an id, and a vault whose eight rows are all
+// crashed pairings has no device left to read the list from. See dispatch.
 func (s *Session) handleDevices(m wire.In) error {
 	ds, err := s.srv.st.Devices(s.vaultID)
 	if err != nil {
 		s.srv.log.Error("listing devices failed", "vault", s.vaultID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("the device list could not be read: "+err.Error()))
 	}
+	// The invites in the same reply, because they are the same question. A row
+	// is what has been added and an outstanding invite is what is about to be,
+	// and an invite was the one authority on a vault nothing could see: a
+	// string issued on a stolen laptop was invisible until somebody redeemed
+	// it, for up to an hour. Identifier and expiry only; the sealed blob is
+	// never in a listing type, see store.Invite.
+	invites, err := s.srv.st.Invites(s.vaultID, s.srv.now().UnixMilli())
+	if err != nil {
+		s.srv.log.Error("listing invites failed", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the invite list could not be read: "+err.Error()))
+	}
 	return s.writeJSON(wire.DeviceList{
-		Res: "devices", ID: s.reqID, Devices: ds, MaxDevices: store.MaxDevices,
+		Res: "devices", ID: s.reqID, Devices: ds, MaxDevices: store.MaxDevices, Invites: invites,
 	})
 }
 
 // handleRevoke deletes a device's row and closes every session that device has
 // open, in that order, so the reply means both. A device may revoke another and
 // may revoke itself, which is what unlinking is.
+//
+// **Except the last one.** `allowLast` is admitted from a registrar session and
+// refused from a device, and that is the only asymmetry between the two
+// credentials here. A phone revoking a stolen laptop without anybody finding
+// the recovery key is the entire point of having revocation rather than
+// rotation, so ordinary revocation stays with devices. Emptying the vault is
+// the other thing: nothing about the common case needs it, and it is the one
+// revocation a device cannot undo, because what it leaves is a vault only the
+// recovery key opens. A compromised device could otherwise delete every row
+// including the last and leave its owner holding devices that can no longer
+// reach their own notes, with the offline key the only way back. So the act
+// that can only be undone with the recovery key takes the recovery key.
+// TestADeviceMayNotEmptyTheVault.
+//
+// It costs nothing in the case it is aimed at. A device stolen when it was the
+// only one wants a rotation as well, and a rotation already needs the recovery
+// key, so the person doing this correctly is holding it either way.
 //
 // Deleting the row alone would be a revocation the revoked device does not
 // notice until it happens to reconnect: it holds an authenticated connection,
@@ -2167,17 +2238,61 @@ func (s *Session) handleRevoke(m wire.In) error {
 			"device id is %d bytes and must be base64url of at most %d",
 			len(m.DeviceID), store.MaxDeviceIDLen))
 	}
-	if err := s.srv.st.RevokeDevice(s.vaultID, m.DeviceID, m.AllowLast); err != nil {
+	if m.AllowLast && !s.registrar {
+		// `auth` rather than `badentry`, because this is about the credential
+		// the session holds and not about the frame: the same field from the
+		// recovery key is honoured. It names the credential and the way back,
+		// because a refusal a person cannot act on sends them looking for a
+		// worse route, and the worse route here is rotating and re-pairing
+		// every device.
+		return s.reject(wire.CodeAuth, errors.New(
+			"leaving this vault with no devices at all is the recovery key's to do, not a device's: "+
+				"it is the one revocation nothing on a device can undo, because what it leaves is a "+
+				"vault only the recovery key opens. Connect with the recovery key to revoke the last "+
+				"device, or revoke any other device from here"))
+	}
+	// The vault credential this session authenticated under, on a registrar,
+	// and empty on a device, which authenticated against its own row. It is
+	// what the delete is made conditional on; see store.RevokeDevice.
+	vaultHash := ""
+	if s.registrar {
+		if s.authHash == "" {
+			// No authenticator this build ships leaves it empty for a session
+			// that got this far, and a delete authorised by no credential at
+			// all is the hole this path exists to close, so it is refused
+			// rather than guessed, exactly as register and rotate do.
+			return s.reject(wire.CodeAuth, errors.New(
+				"this session has no vault credential to revoke a device under"))
+		}
+		vaultHash = s.authHash
+	}
+	if err := s.srv.st.RevokeDevice(s.vaultID, m.DeviceID, vaultHash, m.AllowLast); err != nil {
 		switch {
 		case errors.Is(err, store.ErrUnknownDevice):
 			return s.reject(wire.CodeNoDevice, err)
+		case errors.Is(err, store.ErrRotated):
+			// The vault was rotated between this session's hello and this
+			// revocation, so the recovery key it is holding is retired. Fatal,
+			// for the same reason a losing rotate and a late register are:
+			// retrying cannot succeed, and the point of the guard is that a
+			// retired root stops being able to touch the device list.
+			return s.fatal(wire.CodeRotated, errors.New(
+				"the vault was rotated by another device, so this revocation was refused; "+
+					"reconnect with the new recovery key and try again"))
 		case errors.Is(err, store.ErrLastDevice):
 			// badentry, the same code and the same shape as a hello carrying
 			// two credentials: a well-formed frame the server will not act on,
-			// which the caller fixes by sending a different one. The message
-			// says which field.
+			// which the caller fixes by sending a different one. Only a
+			// registrar reaches this, because a device sending allowLast was
+			// refused above and a device not sending it is being told what the
+			// field would cost.
+			if s.registrar {
+				return s.reject(wire.CodeBadEntry, fmt.Errorf(
+					"%s; resend with allowLast to do it anyway", err))
+			}
 			return s.reject(wire.CodeBadEntry, fmt.Errorf(
-				"%s; resend with allowLast to do it anyway", err))
+				"%s, so it takes the recovery key rather than a device; connect with the recovery "+
+					"key and revoke it there", err))
 		}
 		s.srv.log.Error("revoke failed", "vault", s.vaultID, "deviceId", m.DeviceID, "err", err)
 		return s.reject(wire.CodeInternal, errors.New("the device could not be revoked: "+err.Error()))
@@ -2266,4 +2381,43 @@ func (s *Session) handleInvite(m wire.In) error {
 	}
 	s.srv.log.Info("invite issued", "vault", s.vaultID, "device", s.device, "expiresAt", expiresAt)
 	return s.writeJSON(wire.Invited{Res: "invited", ID: s.reqID, ExpiresAt: expiresAt})
+}
+
+// handleUninvite cancels an invite that is still outstanding, so a string
+// somebody is holding stops working before it expires.
+//
+// The companion to being able to see them. An invite is a standing authority
+// to register one device, and until `devices` listed them the only way to
+// retire one was to wait out the hour or rotate the vault, which retires the
+// recovery key with it. Neither is an answer to "I issued that on the laptop I
+// have just lost".
+//
+// Either credential may send it, on the same reasoning as `revoke`: an invite
+// is part of who may connect rather than part of the vault's content. A device
+// cancels the invite it issued a moment ago, and the recovery key cancels one
+// on a vault whose devices are gone.
+//
+// `nodevice` would be the wrong code and there is deliberately no `noinvite`:
+// an unknown, expired, already redeemed or malformed identifier are one
+// refusal, `badentry`, saying which of the four it was to nobody. Saying more
+// would tell somebody guessing identifiers that they had found a real one, and
+// after a redemption it would confirm that this vault had an invite out a
+// moment ago. It is the same rule the redeem path follows, and the message
+// says what to do instead, which is to look at the device list.
+func (s *Session) handleUninvite(m wire.In) error {
+	if !store.ValidInvite(m.Invite) {
+		return s.reject(wire.CodeBadEntry, fmt.Errorf(
+			"the invite identifier is %d bytes and must be base64url of at most %d", len(m.Invite), store.MaxInviteLen))
+	}
+	if err := s.srv.st.CancelInvite(s.vaultID, m.Invite, s.srv.now().UnixMilli()); err != nil {
+		if errors.Is(err, store.ErrNoInvite) {
+			return s.reject(wire.CodeBadEntry, errors.New(
+				"this vault has no outstanding invite under that identifier: it may have expired, "+
+					"or been redeemed already, in which case it is a device row now; check the device list"))
+		}
+		s.srv.log.Error("uninvite failed", "vault", s.vaultID, "err", err)
+		return s.reject(wire.CodeInternal, errors.New("the invite could not be cancelled: "+err.Error()))
+	}
+	s.srv.log.Info("invite cancelled", "vault", s.vaultID, "device", s.device)
+	return s.writeJSON(wire.Uninvited{Res: "uninvited", ID: s.reqID, Invite: m.Invite})
 }

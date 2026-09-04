@@ -299,8 +299,8 @@ Two credentials, deliberately separated, and the separation is the point.
 
 | credential | held by | may |
 |---|---|---|
-| the vault's auth key, derived from the root secret | nobody, offline, written down as the recovery key | register a device, rotate the vault's secret |
-| a device's auth key | one device | connect and sync as that device |
+| the vault's auth key, derived from the root secret | nobody, offline, written down as the recovery key | register a device, rotate the vault's secret, administer the device list |
+| a device's auth key | one device | connect and sync as that device, and revoke any device but the last |
 
 The server stores only `sha256` of either key, unsalted. That is right for a
 random 256-bit key, where there is nothing to guess and nothing for a slow hash
@@ -317,9 +317,20 @@ list, because it looks like it works.
 
 It is enforced by there being one code path that builds a syncing session, and
 the only way into it is a `deviceId` whose stored hash matched the offered key.
-A registrar session is refused every op that touches the vault, is in no
+A registrar session is refused every op that reads or writes a note, is in no
 fan-out, and is not counted against the vault's connected-device limit, because
 it is not a device.
+
+What a registrar may also do is read the device list and take a row off it. The
+list is who may connect rather than what the vault holds, it carries no key
+material, and two things need the recovery key to reach it: emptying the vault
+is the recovery key's alone, below, and a vault whose every row is a pairing
+that crashed refuses each new registration with `full`, leaving no device to
+prune the list from. The cost is stated rather than hidden: a leaked root can
+stop devices connecting, where before it could only read and add. Rotation is
+what answers a leaked root, and every write a registrar makes, `revoke`
+included, is conditional on the credential it authenticated under still being
+the vault's.
 
 **Claiming.** A vault with no auth hash is opened only by the server's
 first-run token, in exchange for `claim`, the key it is to be bound to, and
@@ -341,11 +352,11 @@ identity; the name is never one, and two laptops may both be called laptop.
 -> {op:"register", id, deviceId, auth, name?}     registrar sessions only
 <- {res:"registered", id, deviceId, wrapped}
 
--> {op:"devices", id}                             device sessions only
-<- {res:"devices", id, devices, maxDevices}
+-> {op:"devices", id}                             either credential
+<- {res:"devices", id, devices, maxDevices, invites}
 
--> {op:"revoke", id, deviceId, allowLast?}        device sessions only
-<- {res:"revoked", id, deviceId, self}
+-> {op:"revoke", id, deviceId, allowLast?}        either credential
+<- {res:"revoked", id, deviceId, self}            allowLast: registrar only
 ```
 
 `auth` is the new device's auth key, not its hash, for the same reason `claim`
@@ -365,7 +376,8 @@ somebody else's device and is `badentry`, and nothing is overwritten.
 
 **A device may not register a device.** It holds no vault credential, so a
 stolen laptop can read what it already had and cannot add a device of its own.
-It may list and revoke, including revoking itself, which is what unlinking is.
+It may list, and revoke any device but the vault's last, including itself,
+which is what unlinking is.
 
 **Revoking closes the device's live sessions**, and the reply means both. The
 row alone would be a revocation the revoked device never notices: it holds an
@@ -377,11 +389,20 @@ then stamps its `lastSeen`. So either the delete is first and the stamp finds
 no row, and the connect is refused, or the join is first and the revoke finds
 the session. There is no interleaving that leaves a revoked device connected.
 
-Revoking the last device is refused without `allowLast`, because what it leaves
-is a vault only the recovery key can reach: a real thing to want after a house
-fire, and not a thing to discover you did by clicking the wrong row. Revoking
-an id the vault does not have is `nodevice`, which says the list you were
-reading is stale.
+**Emptying the vault takes the recovery key.** Ordinary revocation is any
+device's: a phone cutting off a stolen laptop without anybody digging out the
+recovery key is why there is revocation here rather than only rotation. The
+last row is the exception, and the only one. `allowLast` is honoured on a
+registrar session and refused with `auth` on a device's, because it is the one
+revocation nothing on a device can undo: what it leaves is a vault only the
+recovery key opens, so a compromised device could otherwise delete every row
+and the last one with it and leave its owner holding devices that cannot reach
+their own notes. It costs nothing in the case it is for, since a device stolen
+when it was the only one wants a rotation as well, and rotating already needs
+the key. A registrar still has to send `allowLast`, and without it gets
+`badentry`: the confirmation is still asked, now of the credential that can
+undo the answer. Revoking an id the vault does not have is `nodevice`, which
+says the list you were reading is stale.
 
 Revoking stops a device connecting. It does not un-read what that device
 already read: it still holds the data key and can decrypt every note it had
@@ -391,7 +412,19 @@ synced. A device that was stolen rather than merely lost wants a rotation too.
 client knows the cap before it registers rather than discovering it by being
 refused. The ninth registration is `full`, which is not `busy`: `busy` means
 come back later and this never becomes true by waiting, because somebody has to
-revoke a device. It is the same eight as the connected-device limit, and a test
+revoke a device.
+
+`full` names how many of the vault's rows have never connected, and both
+clients flag those rows in the list. They are the reclaimable ones, and they
+are what the redemption ordering costs: the row is written before the device
+redeeming it saves anything, so a pairing that reaches the server and then
+crashes strands a row rather than a device that believes it is paired. That is
+the right way round and does not change, but eight of them, or eight an
+attacker minted invites for, fill the cap. Nothing reclaims one on its own; a
+server deleting a device row because it looks unused is the failure the cap
+decision already refused. What the refusal can do is point at the rows worth
+looking at, so that "the vault is full" is an instruction rather than a choice
+between somebody's working devices. It is the same eight as the connected-device limit, and a test
 pins the two together, because a vault that could register more devices than it
 can connect would have one that registers and is then refused with `busy` for
 ever with nothing saying why. A vault that somehow already holds more keeps
@@ -436,15 +469,19 @@ What a rotation does close is every *other* registrar session on the vault,
 with an unsolicited `{res:"err", code:"auth"}`. Those are holding the root that
 was just retired.
 
-Both of a registrar's powers are conditional on the credential its session
-authenticated under still being the vault's, so a retired root can exercise
-neither. A second `rotate` is refused with `rotated`; a `register` is refused
-with `rotated` too. Closing a socket does not stop a request already in flight,
-so an unconditional swap let the loser overwrite the winner and the device the
-winner was revoking ended up owning the vault. Registration is the same race
-with a worse prize: a rotation deliberately leaves device rows alone, so a
+Every write a registrar makes is conditional on the credential its session
+authenticated under still being the vault's, so a retired root can make none of
+them. A second `rotate` is refused with `rotated`, and so are a `register` and
+a `revoke`. Closing a socket does not stop a request already in flight, so an
+unconditional swap let the loser overwrite the winner and the device the winner
+was revoking ended up owning the vault.
+
+The two device-list ops are the same race with worse prizes, and both turn on
+the one fact that a rotation deliberately leaves every device row alone. A
 device registered a millisecond too late by the leaked key would still be there
-afterwards.
+afterwards, which is permanent access outliving the rotation meant to end it. A
+row deleted a millisecond too late is the other direction: the retired root
+answers the rotation by locking every real device out of the vault.
 
 A client that has a rotation outstanding, sent with no reply, keeps both
 secrets and tries the new one first on its next connect, falling back to the
@@ -480,6 +517,28 @@ has none to seal, and an invite that carried one would hand the new device the
 credential that registers devices and rewraps the vault: everything revoking a
 device is meant to take back.
 
+An invite that has not been redeemed is visible, and can be cancelled:
+
+```
+-> {op:"uninvite", id, invite}                    either credential
+<- {res:"uninvited", id, invite}
+```
+
+Outstanding invites ride on the device list, in `invites`, as an identifier and
+an expiry each and never the sealed blob. They are the same question the rows
+answer: a row is a device that was added, an outstanding invite is one about to
+be. Before they were listed, an invite was the one authority on a vault that
+nothing could see, so a string issued on a stolen laptop stayed invisible until
+somebody redeemed it, for up to an hour. Seeing the identifier redeems nothing:
+that also takes the invite key, which never reaches the server and exists only
+in the string somebody is holding. What the identifier is for is `uninvite`,
+which deletes the row so the string stops working before it expires. Without
+it, the only ways to retire an invite were to wait out the hour or to rotate,
+which retires the recovery key with it. An identifier that is unknown, expired
+or already redeemed is one `badentry`, saying which of the three to nobody, for
+the reason every other invite refusal is one answer, and the message says to
+look at the device list, because a redeemed invite is a row there now.
+
 The new device redeems it at hello, in place of a token, and names the device
 row it is asking for:
 
@@ -514,7 +573,9 @@ characters, or with a name the server will not store, is `badname` or
 naming them cannot leak whether the invite exists. An id the vault already
 holds is `badentry`, and the invite stays unspent so the redeemer can pick
 another. A vault already at its device cap is `full`, not `busy`, because
-waiting never makes room; revoke a device and the same string works. A hello
+waiting never makes room; revoke a device and the same string works, and the
+refusal says how many rows have never connected, because those are the ones
+that cost nothing to revoke. A hello
 carrying both a token and an invite, or both a claim and an invite, is
 `badentry`, because an invite stands in for the one and excludes the other, and
 sending both leaves the server choosing which credential was meant. Issuing an
@@ -526,7 +587,8 @@ registration has: a rotation exists to end access somebody should not have, and
 an invite issued before one is a device somebody could still add after it.
 `invite` is refused with `auth` on a registrar session, which is what a session
 holding the vault credential or the bootstrap token gets: an invite seals the
-data key, which a registrar does not hold.
+data key, which a registrar does not hold. `uninvite` is not, because
+cancelling one needs nothing but the identifier.
 
 The recovery key is still a pairing string (`basalt3_`) and `pair` still
 accepts one, because a vault whose every device is lost has nothing else: it is
@@ -626,13 +688,13 @@ no longer agree how many frames are outstanding.
 | code | meaning | retryable | session |
 |---|---|---|---|
 | `proto` | unsupported `proto` or `crypto`, or a vault an older build claimed with no data key | no | ends; it is only sent at hello |
-| `auth` | bad token, vault or device, never saying which; or an op this session's credential may not send | no | ends at hello, continues when it refuses one op |
+| `auth` | bad token, vault or device, never saying which; or an op, or a field of one, this session's credential may not send | no | ends at hello, continues when it refuses one op |
 | `cursor` | the client is ahead of the server | no | ends |
-| `rotated` | a `rotate` or a `register` whose credential is no longer the vault's, because somebody rotated first | no | ends |
+| `rotated` | a `rotate`, `register` or `revoke` whose credential is no longer the vault's, because somebody rotated first | no | ends |
 | `busy` | the vault's device limit, or the server is shutting down | yes, with `retryAfterMs` | ends |
 | `protostate` | a message that does not belong in the current state | no | ends, except an unknown op or a negative `before` on a `history`, which reject that one request and continue |
 | `badchunk` | a body that does not hash to the name asked for, or a malformed chunk name | no | continues, except a bad body arriving mid-upload, which ends because the two ends no longer agree how many frames remain |
-| `badentry` | a structurally invalid put, or a well-formed request the vault's state refuses: a duplicate device id, revoking the last device without `allowLast` | no | continues, except a claim at hello carrying no valid `wrapped`, which ends |
+| `badentry` | a structurally invalid put, or a well-formed request the vault's state refuses: a duplicate device id, or the last device without `allowLast`. A device sending `allowLast` is `auth` instead, because that is about its credential | no | continues, except a claim at hello carrying no valid `wrapped`, which ends |
 | `badname` | a path the server cannot store, or a malformed device id | no | continues, except an over-long device name or a malformed device id at hello, which end |
 | `toolarge` | above an advertised ceiling, or more ciphertext than the size allows | no | continues, except uploads passing the declared size mid-put, which ends |
 | `nospace` | refused for want of disk | yes | ends; it can only arise mid-upload, where the frame count is no longer agreed |

@@ -230,7 +230,8 @@ var (
 	// ErrLastDevice is a revocation that would leave a vault with no devices
 	// at all. Reachable only by the recovery key after that, which is a real
 	// thing to want and not a thing to do by accident, so RevokeDevice refuses
-	// it unless the caller says the word. See its comment.
+	// it unless the caller says the word, and the session refuses the word
+	// itself to anything but the recovery key. See its comment.
 	ErrLastDevice = errors.New("that is the vault's last device")
 
 	// ErrNoInvite is a redemption naming an invite that is unknown, expired or
@@ -1984,6 +1985,106 @@ func (s *Store) RedeemInviteFor(vaultID, invite, deviceID, name, deviceHash stri
 	return sealed, nil
 }
 
+// Invite is one outstanding invite, as a device or the recovery key is shown
+// it: which invite, and when it stops working.
+//
+// The sealed blob is deliberately not a field, and neither is anything else
+// the table holds. This is what a list op returns, and an invite is a standing
+// authority to register a device: a listing type with the blob in it is one
+// that hands the blob to everything that ever serialises the list. The
+// identifier alone redeems nothing, because redeeming also takes the invite
+// key, which never reached the server and lives only in the string somebody is
+// holding. What the identifier is for is saying which invite to cancel.
+type Invite struct {
+	ID        string `json:"id"`
+	ExpiresAt int64  `json:"expiresAt"`
+}
+
+// Invites is every invite on a vault that could still be redeemed: unused and
+// not yet expired at now, soonest to expire first.
+//
+// It exists because an invite was the one authority on a vault nothing could
+// see. A string issued on a stolen laptop was invisible until somebody redeemed
+// it, for up to an hour, which made "every row is in the device list" a smaller
+// promise than it sounded: the row that has not appeared yet is the one worth
+// knowing about.
+//
+// Ordered by expiry and then by identifier, for the reason Devices is ordered:
+// two invites issued in the same millisecond need a tiebreak or the order
+// between them belongs to the query plan, and a list that reshuffles between
+// two reads is one nobody can trust they read the same way twice (rule 7).
+//
+// Never nil, so it marshals to [] rather than null.
+//
+// Unlimited, deliberately. What bounds it is the invites themselves: an invite
+// lives at most an hour and AddInvite sweeps the vault's expired ones every
+// time one is issued, so the list is however many a device chose to issue in
+// the last hour. A device that issues a hundred thousand of them is a device
+// already inside the trust boundary for content, and it has worse things
+// available to it than a long reply. A cap here would mean a list that says
+// less than it looks like it says, which is rule 7 and worse than a long one.
+func (s *Store) Invites(vaultID string, now int64) ([]Invite, error) {
+	rows, err := s.db.Query(
+		`SELECT invite, expires_at FROM invites
+		  WHERE vault_id = ? AND used = 0 AND expires_at >= ?
+		  ORDER BY expires_at, invite`, vaultID, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Invite{}
+	for rows.Next() {
+		var inv Invite
+		if err := rows.Scan(&inv.ID, &inv.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, inv)
+	}
+	return out, rows.Err()
+}
+
+// CancelInvite deletes an invite that is still outstanding, so a string somebody
+// is holding stops working before it expires.
+//
+// ErrNoInvite for one that is unknown, expired or already used, which is the
+// same one error those three share everywhere else and for the same reason: an
+// invite is unguessable, and saying which would tell somebody probing that they
+// had found a real one. Here it also means "there is nothing to cancel", which
+// after a redemption is the ordinary state rather than a fault.
+//
+// A delete rather than a used=1, because cancelled and spent are different
+// facts and the row is not evidence of either: `used` is what stops a redeem,
+// and a cancelled invite has not been used by anybody.
+//
+// The read and the delete are one statement, so a cancel racing a redemption
+// resolves one way or the other and never both: either the redeem marked it
+// used first and this is ErrNoInvite, or this removed the row first and the
+// redeem is refused. Nothing in between leaves a device registered under an
+// invite somebody was told had been cancelled.
+func (s *Store) CancelInvite(vaultID, invite string, now int64) error {
+	if !ValidInvite(invite) {
+		// The same error an unknown one gets: see ErrNoInvite.
+		return fmt.Errorf("%w: vault %q", ErrNoInvite, vaultID)
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	res, err := s.db.Exec(
+		`DELETE FROM invites WHERE vault_id = ? AND invite = ? AND used = 0 AND expires_at >= ?`,
+		vaultID, invite, now)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: vault %q", ErrNoInvite, vaultID)
+	}
+	return nil
+}
+
 // OutstandingInvites counts invites that could still be redeemed: unused and
 // not yet expired at now.
 func (s *Store) OutstandingInvites(vaultID string, now int64) (int, error) {
@@ -2354,10 +2455,28 @@ func insertDeviceTx(tx *sql.Tx, vaultID, deviceID, name, deviceHash, vaultHash s
 	case !errors.Is(err, sql.ErrNoRows):
 		return err
 	}
-	var count int
+	// The cap, and with it the count of rows nothing has ever connected under,
+	// because those are the ones a person can reclaim without losing anything.
+	//
+	// A redemption registers the row before the device redeeming it saves
+	// anything, deliberately: the alternative strands a device that believes
+	// it is paired. What that ordering costs is a row left behind whenever a
+	// pairing reaches the server and then crashes, and eight of those, or
+	// eight an attacker minted invites for, fill the cap and refuse every
+	// registration after them. Nothing here deletes one, for the reason in
+	// MaxDevices; what the refusal can do is name the rows worth looking at,
+	// rather than say the vault is full and leave somebody guessing which of
+	// their devices to cut off. TestTheCapRefusalNamesTheRowsThatNeverConnected.
+	var count, never int
 	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM devices WHERE vault_id = ?`, vaultID).Scan(&count); err != nil {
+		`SELECT COUNT(*), COALESCE(SUM(last_seen = 0), 0) FROM devices WHERE vault_id = ?`,
+		vaultID).Scan(&count, &never); err != nil {
 		return err
+	}
+	if never > 0 {
+		return fmt.Errorf("%w: vault %q has %d of at most %d devices, and %d of them have never "+
+			"connected, which is what a pairing that crashed leaves behind; revoke one of those, "+
+			"or one you no longer use", ErrDeviceLimit, vaultID, count, max, never)
 	}
 	return fmt.Errorf("%w: vault %q has %d of at most %d devices; revoke one you no longer use",
 		ErrDeviceLimit, vaultID, count, max)
@@ -2445,7 +2564,18 @@ func (s *Store) DeviceByID(vaultID, deviceID string) (d Device, authHash string,
 // thing to want after a house fire and not a thing to discover you did by
 // clicking the wrong row. An unknown device is ErrUnknownDevice, and the two
 // are distinct because one is "try again with a different id" and the other is
-// "you already did this".
+// "you already did this". Who may say allowLast is the session's business and
+// not this one's; see handleRevoke, which admits it only from the recovery key.
+//
+// vaultHash is the vault credential the caller authenticated under, and empty
+// when the caller is a device, which authenticated against its own row. When
+// it is given the delete happens only while it is still the vault's, and a
+// hash that has moved on is ErrRotated. That is the same guard, and the same
+// word, RegisterDevice uses, for the same incident: a rotation exists to end
+// access somebody should not have, closing a socket does not stop a request
+// already in flight, and a retired root that could still delete device rows
+// would be locking every real device out of the vault the rotation was meant
+// to keep. TestARevokeRacingARotationCannotWin.
 //
 // The count and the delete are one statement, not a read followed by a write.
 // Two devices revoking each other at the same moment would both read two rows,
@@ -2455,7 +2585,7 @@ func (s *Store) DeviceByID(vaultID, deviceID string) (d Device, authHash string,
 // `basaltd purge` run against a live server's directory), so the guarantee has
 // to be in the SQL. TestConcurrentRevokesCannotEmptyTheVault is the test, and
 // it fails against the read-then-write version.
-func (s *Store) RevokeDevice(vaultID, deviceID string, allowLast bool) error {
+func (s *Store) RevokeDevice(vaultID, deviceID, vaultHash string, allowLast bool) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
@@ -2463,8 +2593,11 @@ func (s *Store) RevokeDevice(vaultID, deviceID string, allowLast bool) error {
 		res, err := tx.Exec(
 			`DELETE FROM devices
 			  WHERE vault_id = ? AND device_id = ?
-			    AND (? = 1 OR (SELECT COUNT(*) FROM devices WHERE vault_id = ?) > 1)`,
-			vaultID, deviceID, boolToInt(allowLast), vaultID)
+			    AND (? = 1 OR (SELECT COUNT(*) FROM devices WHERE vault_id = ?) > 1)
+			    AND (? = '' OR EXISTS (SELECT 1 FROM vaults
+			                            WHERE vault_id = ? AND auth_hash = ?))`,
+			vaultID, deviceID, boolToInt(allowLast), vaultID,
+			vaultHash, vaultID, vaultHash)
 		if err != nil {
 			return err
 		}
@@ -2475,9 +2608,23 @@ func (s *Store) RevokeDevice(vaultID, deviceID string, allowLast bool) error {
 		if n == 1 {
 			return nil
 		}
-		// Which of the two it is, read inside the same transaction so the
+		// Which of the three it is, read inside the same transaction so the
 		// answer describes the rows the delete was refused against, the way
 		// Rotate's does.
+		if vaultHash != "" {
+			var hash string
+			switch err := tx.QueryRow(
+				`SELECT auth_hash FROM vaults WHERE vault_id = ?`, vaultID).Scan(&hash); {
+			case errors.Is(err, sql.ErrNoRows):
+				return fmt.Errorf("%w: %q is not a claimed vault", ErrUnknownVault, vaultID)
+			case err != nil:
+				return err
+			}
+			if hash != vaultHash {
+				return fmt.Errorf("%w: vault %q was rotated, so the credential this revocation "+
+					"was authorised by no longer opens it", ErrRotated, vaultID)
+			}
+		}
 		var exists int
 		switch err := tx.QueryRow(
 			`SELECT 1 FROM devices WHERE vault_id = ? AND device_id = ?`,
@@ -2488,7 +2635,7 @@ func (s *Store) RevokeDevice(vaultID, deviceID string, allowLast bool) error {
 			return err
 		}
 		return fmt.Errorf("%w: revoking %q would leave vault %q with no devices, "+
-			"reachable only by its recovery key; say so explicitly to do it anyway",
+			"reachable only by its recovery key",
 			ErrLastDevice, deviceID, vaultID)
 	})
 }

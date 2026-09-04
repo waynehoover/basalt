@@ -781,8 +781,12 @@ describe("the index is not rewritten when it has not changed", () => {
     expect(second.mtimeMs, "the index was rewritten with the same bytes").toBe(first.mtimeMs);
   });
 
-  it("writes when something did change", async () => {
+  it("writes what changed to the journal, and leaves the snapshot where it is", async () => {
+    // The whole point of the journal: an ordinary pass costs one record, not a
+    // rewrite of the index. The snapshot not moving is the property; the state
+    // coming back is what makes that safe rather than a silent loss.
     const file = join(root, ".basalt", "index2.json");
+    const log = join(root, ".basalt", "index2.log");
     const store = new JsonIndexStore(file);
     await store.save(state);
     const first = await stat(file);
@@ -791,8 +795,10 @@ describe("the index is not rewritten when it has not changed", () => {
     await store.save({ ...(state as object), cursor: 8 } as never);
     const second = await stat(file);
 
-    expect(second.mtimeMs).not.toBe(first.mtimeMs);
+    expect(second.mtimeMs, "an ordinary pass rewrote the whole index").toBe(first.mtimeMs);
+    expect((await stat(log)).size, "the change did not reach the journal").toBeGreaterThan(0);
     expect((await store.load())?.cursor).toBe(8);
+    expect((await new JsonIndexStore(file).load())?.cursor, "a restart lost the change").toBe(8);
   });
 
   /**

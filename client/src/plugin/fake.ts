@@ -119,6 +119,8 @@ export type FaultOp =
   | "readBinary"
   | "write"
   | "writeBinary"
+  | "append"
+  | "appendBinary"
   | "mkdir"
   | "remove"
   | "rename"
@@ -336,9 +338,24 @@ export class FakeAdapter implements DataAdapter {
     }
   }
 
+  /**
+   * Cut every append to this many bytes and report success anyway.
+   *
+   * Rule 4's own incident in miniature: `adb push` returned 0 after writing
+   * one file of four. A short append that throws is a failure anybody can see;
+   * a short append that returns is the one the caller has to check the file
+   * for, and there is no other way to produce one here.
+   */
+  shortAppendsSilently: number | undefined;
+
   async append(normalizedPath: string, data: string, options?: DataWriteOptions): Promise<void> {
-    const before = this.files.has(normalizedPath) ? await this.read(normalizedPath) : "";
-    await this.write(normalizedPath, before + data, options);
+    const short = this.check("append", normalizedPath);
+    const quiet = this.shortAppendsSilently;
+    if (short === undefined && quiet !== undefined) {
+      this.add(normalizedPath, new TextEncoder().encode(data).slice(0, quiet), options, undefined);
+      return;
+    }
+    this.add(normalizedPath, new TextEncoder().encode(data), options, short);
   }
 
   async appendBinary(
@@ -346,12 +363,39 @@ export class FakeAdapter implements DataAdapter {
     data: ArrayBuffer,
     options?: DataWriteOptions,
   ): Promise<void> {
-    const before = this.files.get(normalizedPath)?.binary ?? new Uint8Array(0);
-    const added = new Uint8Array(data);
+    const short = this.check("appendBinary", normalizedPath);
+    this.add(normalizedPath, new Uint8Array(data.slice(0)), options, short);
+  }
+
+  /**
+   * What the shipped adapters do, read out of `obsidian-1.13.7.asar`: desktop
+   * is `fs.promises.appendFile(path, data, "utf8")` and mobile is Capacitor's
+   * `appendFile`. Neither can shorten what is already there, so an injected
+   * short append lands its prefix on the end and fails, which is exactly the
+   * torn record a crash mid-append leaves and the one thing this file exists
+   * to let a test produce.
+   */
+  private add(
+    normalizedPath: string,
+    bytes: Uint8Array,
+    options: DataWriteOptions | undefined,
+    short: number | undefined,
+  ): void {
+    normalizedPath = this.real(normalizedPath);
+    const existing = this.files.get(normalizedPath);
+    const before = existing?.binary ?? new Uint8Array(0);
+    const added = short === undefined ? bytes : bytes.slice(0, short);
     const both = new Uint8Array(before.length + added.length);
     both.set(before, 0);
     both.set(added, before.length);
-    await this.writeBinary(normalizedPath, both.slice().buffer, options);
+    this.files.set(normalizedPath, {
+      binary: both,
+      ctime: options?.ctime ?? existing?.ctime ?? this.now,
+      mtime: options?.mtime ?? this.now,
+    });
+    if (short !== undefined) {
+      throw new Error(`ENOSPC: appended ${short} of ${bytes.length} bytes to '${normalizedPath}'`);
+    }
   }
 
   async process(

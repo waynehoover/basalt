@@ -429,17 +429,24 @@ type Registered struct {
 }
 
 // DeviceList answers a devices request with every device that may reach this
-// vault.
+// vault, and every invite that could still add one.
 //
-// Devices is never null, for the same reason Batch.Entries is not: a client
-// that iterates it would crash on exactly the vault it is meant to handle. It
-// carries no credential, and store.Device has no field that could; see its
-// comment there.
+// Neither slice is ever null, for the same reason Batch.Entries is not: a
+// client that iterates one would crash on exactly the vault it is meant to
+// handle. Neither carries a credential either: store.Device has no field that
+// could, and store.Invite carries the identifier and the expiry and never the
+// sealed blob; see the comments there.
+//
+// Invites ride on the device list rather than having an op of their own,
+// because they are one subject. "What can reach my notes" is answered by the
+// rows plus the strings that have not been redeemed yet, and a client that had
+// to ask twice would be a client that could show half the answer.
 type DeviceList struct {
 	Res        string         `json:"res"` // "devices"
 	ID         int64          `json:"id,omitempty"`
 	Devices    []store.Device `json:"devices"`
 	MaxDevices int            `json:"maxDevices"`
+	Invites    []store.Invite `json:"invites"`
 }
 
 // Revoked answers a revoke: the row is gone and every session that device had
@@ -567,6 +574,15 @@ type Redeemed struct {
 	ID       int64  `json:"id,omitempty"`
 	Sealed   string `json:"sealed"`
 	DeviceID string `json:"deviceId"`
+}
+
+// Uninvited answers an uninvite: that invite is gone and the string somebody is
+// holding no longer redeems. It names the invite so a client can tell which of
+// several it cancelled, the way Revoked names the device.
+type Uninvited struct {
+	Res    string `json:"res"` // "uninvited"
+	ID     int64  `json:"id,omitempty"`
+	Invite string `json:"invite"`
 }
 
 // Rotated answers a rotate: the vault's auth hash and wrapped data key were

@@ -17,7 +17,8 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { cleanupBinary, removeTree, serverBinary, TestServer } from "../core/test-server.ts";
-import { PAIRING_PREFIX } from "../core/pairing.ts";
+import { PAIRING_PREFIX, parseInvite } from "../core/pairing.ts";
+import { redeemInvite } from "../core/client.ts";
 import { run, normaliseUrl, parseArgs, type Console } from "./cli.ts";
 import { NodeVault } from "./vault.ts";
 
@@ -1253,22 +1254,198 @@ describe("the device list", () => {
     expect(missing.all).toMatch(/basalt devices again/);
   }, 60_000);
 
-  it("refuses to revoke the last device unless it is said out loud", async () => {
+  /**
+   * Emptying the vault is the recovery key's, and only that one revocation is.
+   *
+   * A device revoking another device is the whole reason revocation exists
+   * instead of rotation, and it stays a device's to do. The last row is the
+   * exception, because it is the only revocation nothing on a device can undo:
+   * what it leaves is a vault only the recovery key opens. It costs nothing in
+   * the case it is aimed at, since a device stolen when it was the only one
+   * wants a rotation as well and rotating already needs the key.
+   */
+  it("refuses to empty the vault from a device, and says whose job it is", async () => {
     await fresh();
-    const { dir: a } = await startedWithKey();
+    const { dir: a, recoveryKey } = await startedWithKey();
     const list = await cli("devices", "--dir", a, "--json");
     const only = (list.json()["devices"] as Record<string, unknown>[])[0]!["id"] as string;
 
+    // Without the flag: told what it would cost and who can.
     const refused = await cli("revoke", only, "--dir", a);
     expect(refused.code).toBe(1);
-    expect(refused.all).toMatch(/--allow-last/);
+    expect(refused.all).toMatch(/last device/);
+    expect(refused.all).toMatch(/--recovery-key/);
 
-    const done = await cli("revoke", only, "--dir", a, "--allow-last", "--json");
+    // With it and no key: refused before anything is sent, with the whole
+    // command to run rather than a hint.
+    const bare = await cli("revoke", only, "--dir", a, "--allow-last");
+    expect(bare.code).toBe(1);
+    expect(bare.all).toMatch(/--allow-last --recovery-key/);
+    // Still there, and still syncing.
+    expect((await cli("sync", "--dir", a)).code, (await cli("sync", "--dir", a)).all).toBe(0);
+
+    // The recovery key still has to say the word: the confirmation is asked
+    // of the credential that can undo the answer.
+    const unsaid = await cli("revoke", only, "--dir", a, "--recovery-key", recoveryKey);
+    expect(unsaid.code).toBe(1);
+    expect(unsaid.all).toMatch(/--allow-last/);
+
+    const done = await cli(
+      "revoke",
+      only,
+      "--dir",
+      a,
+      "--allow-last",
+      "--recovery-key",
+      recoveryKey,
+      "--json",
+    );
     expect(done.code, done.all).toBe(0);
-    expect(done.json()["self"]).toBe(true);
+    // Not self: the recovery key is not a device, so there is no row of its
+    // own for this to have been.
+    expect(done.json()["self"]).toBe(false);
     // And the vault is now reachable only by the recovery key, which is what
     // the confirmation was about.
     expect((await cli("sync", "--dir", a)).all).toMatch(/not authorised/);
+  }, 60_000);
+
+  /**
+   * An invite that has not been redeemed is visible beside the rows, and can
+   * be cancelled.
+   *
+   * It was the one authority on a vault that nothing could see: a string
+   * issued on a stolen laptop stayed invisible until somebody redeemed it, for
+   * up to an hour. What the list must never carry is anything that would let a
+   * reader redeem one, which the identifier alone is not: redeeming also takes
+   * the invite key, which never reaches the server and lives only in the
+   * string somebody is holding.
+   */
+  it("shows outstanding invites beside the devices, and cancels one", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+
+    const empty = await cli("devices", "--dir", a);
+    expect(empty.stdout).toMatch(/No outstanding invites/);
+
+    const issued = await cli("invite", "--dir", a, "--json");
+    expect(issued.code, issued.all).toBe(0);
+    const string = issued.json()["invite"] as string;
+
+    const listed = await cli("devices", "--dir", a, "--json");
+    const invites = listed.json()["invites"] as Record<string, unknown>[];
+    expect(invites).toHaveLength(1);
+    expect(invites[0]!["expiresAt"]).toBe(issued.json()["expiresAt"]);
+    // The identifier and the expiry, and nothing that redeems: the invite
+    // string itself is never on the server, so it cannot come back from it.
+    expect(Object.keys(invites[0]!).sort()).toEqual(["expiresAt", "id"]);
+    expect(listed.stdout).not.toContain(string);
+
+    const shown = await cli("devices", "--dir", a);
+    expect(shown.stdout).toMatch(/1 outstanding invite/);
+    expect(shown.stdout).toMatch(/basalt uninvite ID/);
+
+    // Cancelled, and the string stops working, which is the point of seeing
+    // it in the first place.
+    const id = invites[0]!["id"] as string;
+    const cancelled = await cli("uninvite", id, "--dir", a);
+    expect(cancelled.code, cancelled.all).toBe(0);
+    expect(cancelled.stdout).toMatch(/no longer adds a device/);
+
+    const c = await vaultDir("c");
+    const refused = await cli("pair", string, "--dir", c, "--device", "c");
+    expect(refused.code).toBe(1);
+    expect(refused.all).toMatch(/not authorised/);
+    expect((await cli("devices", "--dir", a, "--json")).json()["invites"]).toHaveLength(0);
+    expect((await cli("devices", "--dir", a, "--json")).json()["devices"]).toHaveLength(2);
+
+    // And cancelling it twice says there is nothing to cancel, in one answer
+    // that an unknown identifier also gets: telling them apart would tell
+    // somebody guessing that they had found a real one.
+    const again = await cli("uninvite", id, "--dir", a);
+    expect(again.code).toBe(1);
+    expect(again.all).toMatch(/no outstanding invite/);
+    expect(again.all).toMatch(/basalt devices/);
+  }, 60_000);
+
+  /**
+   * A row nothing has ever connected under is flagged, because it is the one
+   * that can be reclaimed.
+   *
+   * A redemption registers the row before the device redeeming it saves
+   * anything, so a crash in that window leaves a row on the server rather than
+   * a device that believes it is paired. That ordering is the right way round
+   * and does not change; what it costs is a row against the cap, and the list
+   * has to say which rows those are or the advice to revoke one is advice
+   * nobody can follow.
+   */
+  it("flags a row nothing has ever connected under", async () => {
+    await fresh();
+    const { a } = await twoDevices();
+
+    // A pairing that reached the server and then crashed: the invite is
+    // redeemed, the row is written, and nothing ever connects under it.
+    const issued = await cli("invite", "--dir", a, "--json");
+    expect(issued.code, issued.all).toBe(0);
+    await redeemInvite(parseInvite(issued.json()["invite"] as string), "the-one-that-crashed");
+
+    const listed = await cli("devices", "--dir", a);
+    expect(listed.code, listed.all).toBe(0);
+    expect(listed.stdout).toMatch(/never connected/);
+    expect(listed.stdout).toMatch(/1 of them has never connected/);
+    expect(listed.stdout).toMatch(/holds one of the 8 slots/);
+
+    // The two working devices are not flagged, which is the half that makes
+    // the flag worth reading.
+    const rows = (await cli("devices", "--dir", a, "--json")).json()["devices"] as Record<
+      string,
+      unknown
+    >[];
+    expect(rows.filter((d) => d["lastSeen"] === 0)).toHaveLength(1);
+    expect(rows.filter((d) => d["lastSeen"] !== 0)).toHaveLength(2);
+  }, 60_000);
+
+  it("refuses --recovery-key where it would have been ignored", async () => {
+    // A flag that is quietly ignored is how somebody comes to believe they ran
+    // a command as the recovery key when they ran it as this device.
+    await fresh();
+    const { dir: a, recoveryKey } = await startedWithKey();
+    const refused = await cli("sync", "--dir", a, "--recovery-key", recoveryKey);
+    // 1 rather than 2, the same as the refusal of a stray positional: the
+    // argument parsed, and it is the command that will not take it.
+    expect(refused.code).toBe(1);
+    expect(refused.all).toMatch(/does not take --recovery-key/);
+    expect(refused.all).toMatch(/basalt rotate takes the key as its argument/);
+  }, 60_000);
+
+  /**
+   * The way out of a vault whose eight rows are all pairings that crashed.
+   *
+   * A redemption saves nothing locally until the server has answered, so a
+   * crash in that window strands a server row rather than a device: the right
+   * way round, and it means the rows that fill the cap are the ones nothing
+   * ever connected under. Filling it refuses every registration, so the
+   * recovery key has to be able to read the list and prune it, or the only
+   * way back into such a vault would be editing the server's database.
+   */
+  it("lists and revokes with the recovery key, for a vault with no device to ask", async () => {
+    await fresh();
+    const { a, b, recoveryKey } = await twoDevices();
+    const mine = (await cli("devices", "--dir", b, "--json")).json()["thisDevice"] as string;
+
+    const listed = await cli("devices", "--recovery-key", recoveryKey, "--dir", a, "--json");
+    expect(listed.code, listed.all).toBe(0);
+    const rows = listed.json()["devices"] as Record<string, unknown>[];
+    expect(rows.map((d) => d["name"]).sort()).toEqual(["a", "b"]);
+    // No "(this device)" over the recovery key, because it is not one and a
+    // guess would put the mark against somebody else's row.
+    expect(listed.json()["thisDevice"]).toBeUndefined();
+
+    const gone = await cli("revoke", mine, "--recovery-key", recoveryKey, "--dir", a, "--json");
+    expect(gone.code, gone.all).toBe(0);
+    expect((await cli("sync", "--dir", b)).all).toMatch(/not authorised/);
+    // The other device is untouched, which is the guarantee a revocation
+    // makes whoever asked for it.
+    expect((await cli("sync", "--dir", a)).code).toBe(0);
   }, 60_000);
 });
 

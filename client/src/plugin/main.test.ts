@@ -33,6 +33,8 @@ import {
 import BasaltPlugin, { describeDeleted } from "./main.ts";
 import { describeRestore } from "./history.ts";
 import type { SyncReport } from "../core/engine.ts";
+import { redeemInvite } from "../core/client.ts";
+import { parseInvite } from "../core/pairing.ts";
 
 beforeAll(async () => {
   await serverBinary();
@@ -824,7 +826,11 @@ describe("the modal, which is not a settings tab", () => {
     await until("the list to arrive", () => built.some((s) => s.desc.includes("added ")));
     const listed = built.find((s) => s.name.startsWith("laptop"))!;
     expect(listed.name).toMatch(/\(this device\)/);
-    expect(listed.buttons[0]!.warning).toBe(true);
+    // No button on it, because it is the vault's only device and emptying the
+    // vault takes the recovery key. What the panel offers instead is in "the
+    // device list in the panel", below; the row with a Revoke button on it is
+    // there too.
+    expect(listed.buttons).toEqual([]);
   }, 300_000);
 
   it("shows what is happening once it is paired", async () => {
@@ -1556,7 +1562,7 @@ describe("a sync that fails (P7)", () => {
     // The index cannot be written: the pass throws on its way out.
     app.vault.adapter.seed("another.md", "y");
     app.vault.adapter.fault = (op, path) =>
-      op === "writeBinary" && path.includes("/plugins/basalt/")
+      (op === "writeBinary" || op === "append") && path.includes("/plugins/basalt/")
         ? new Error("EACCES: index")
         : undefined;
     notices.length = 0;
@@ -1834,7 +1840,7 @@ describe("a restore whose upload fails (P31)", () => {
 
     // The upload after the restore cannot save its index.
     app.vault.adapter.fault = (op, path) =>
-      op === "writeBinary" && path.includes("/plugins/basalt/")
+      (op === "writeBinary" || op === "append") && path.includes("/plugins/basalt/")
         ? new Error("EACCES: index")
         : undefined;
     const done = await plugin.recover(deletion);
@@ -1965,7 +1971,7 @@ describe("what History says after a restore (P-D1)", () => {
     // has to say so from this path too, which is what returning a path
     // rather than the outcome would have thrown away.
     app.vault.adapter.fault = (op, path) =>
-      op === "writeBinary" && path.includes("/plugins/basalt/")
+      (op === "writeBinary" || op === "append") && path.includes("/plugins/basalt/")
         ? new Error("EACCES: index")
         : undefined;
     const stuck = await restoreFromHistory(plugin);
@@ -2512,6 +2518,163 @@ describe("adding a device from the panel", () => {
     // long as this test has existed. This device has just uploaded and
     // caught up, so the server holds what it holds.
     expect(at.server, "the server cursor was stale").toBe(at.local);
+  }, 300_000);
+});
+
+/**
+ * The device list in the panel, which is the only device management a plugin
+ * device has.
+ */
+describe("the device list in the panel", () => {
+  /**
+   * Emptying the vault is the recovery key's, and no device holds one, so the
+   * panel does not offer a button that could only ever be refused.
+   *
+   * The last row is always this device: reading the list at all means this
+   * device connected. What it offers instead is the two things that do work,
+   * the command that would do it and the local unlink that leaves the row
+   * alone, because a refusal a person cannot act on sends them looking for a
+   * worse route, and the worse route here is replacing the vault's secret and
+   * pairing everything again.
+   */
+  it("offers no way to empty the vault, and says whose job that is", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
+
+    const row = built.find((s) => s.name.startsWith("laptop"))!;
+    expect(row, "the panel did not list this device").toBeDefined();
+    expect(
+      row.buttons.map((b) => b.label),
+      "the last row offered a button that cannot work",
+    ).toEqual([]);
+
+    const said = modals.at(-1)!.contentEl.allText();
+    expect(said).toMatch(/last device/);
+    expect(said).toMatch(/--allow-last --recovery-key/);
+    expect(said).toMatch(/Unlink this vault/);
+    // And the row is still there, because nothing was pressed and nothing was
+    // sent: a panel that said this while the vault emptied itself would be
+    // worse than one that said nothing.
+    expect((await plugin.devices()).devices).toHaveLength(1);
+  }, 300_000);
+
+  /**
+   * An invite that has not been redeemed is on screen beside the rows, and can
+   * be cancelled from there.
+   *
+   * It was the one authority on a vault nothing could see. What the panel must
+   * never show is the invite string itself, and it cannot: the server never
+   * had the invite key, so what comes back is an identifier that redeems
+   * nothing and says which invite to cancel.
+   */
+  it("shows outstanding invites beside the devices, and cancels one", async () => {
+    await fresh();
+    const first = await load();
+    await startVault(first.plugin, "laptop");
+    await synced(first.plugin);
+    const issued = await first.plugin.createInvite();
+
+    built.length = 0;
+    first.plugin.ribbonIcons[0]!.callback();
+    await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
+    await until("the list to arrive", () => built.some((s) => s.name === "Outstanding invite"));
+
+    const row = built.find((s) => s.name === "Outstanding invite")!;
+    expect(row.desc).toMatch(/adds one device/);
+    expect(row.desc).toMatch(/expires/);
+    // Never the string, which is the only thing that could redeem it.
+    expect(modals.at(-1)!.contentEl.allText()).not.toContain(issued.invite);
+    expect(modals.at(-1)!.contentEl.allText()).toMatch(/1 outstanding invite/);
+
+    await row.buttons.find((b) => b.label === "Cancel")!.click();
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/no longer adds a device/);
+    expect((await first.plugin.devices()).invites).toHaveLength(0);
+
+    // And the string it cancelled no longer pairs anything.
+    const second = await load();
+    await expect(second.plugin.pair(issued.invite, "phone")).rejects.toThrow(/auth/i);
+    expect(second.plugin.savedData, "a cancelled invite left a pairing on disk").toBe(null);
+  }, 300_000);
+
+  /**
+   * A row nothing ever connected under is flagged, because it is the
+   * reclaimable one.
+   *
+   * A redemption registers the row before the new device saves anything, so a
+   * crash in that window strands a row rather than a device that believes it
+   * is paired: the right way round, and the reason the rows that fill the cap
+   * are the ones nothing signed in under. The panel says so rather than
+   * leaving it to be inferred from a missing date.
+   */
+  it("flags a row nothing has ever connected under", async () => {
+    await fresh();
+    const first = await load();
+    await startVault(first.plugin, "laptop");
+    await synced(first.plugin);
+
+    // A pairing that reached the server and then crashed.
+    const issued = await first.plugin.createInvite();
+    await redeemInvite(parseInvite(issued.invite), "the-one-that-crashed");
+
+    built.length = 0;
+    first.plugin.ribbonIcons[0]!.callback();
+    await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
+    await until("the list to arrive", () => built.some((s) => s.desc.includes("added ")));
+
+    const stranded = built.find((s) => s.name === "the-one-that-crashed")!;
+    expect(stranded, "the panel did not list the stranded row").toBeDefined();
+    expect(stranded.desc).toMatch(/never connected/);
+    // And this device, which has connected, is not flagged: a marker on every
+    // row says nothing.
+    expect(built.find((s) => s.name.startsWith("laptop"))!.desc).toMatch(/last seen/);
+
+    const said = modals.at(-1)!.contentEl.allText();
+    expect(said).toMatch(/1 of these has never connected/);
+    expect(said).toMatch(/holds a slot/);
+  }, 300_000);
+
+  /**
+   * The ordinary case, which stays a device's to do: a phone cuts off a stolen
+   * laptop without anybody finding the recovery key. Two presses, and the
+   * second one means it.
+   */
+  it("revokes another device, behind a second press", async () => {
+    await fresh();
+    const first = await load();
+    await startVault(first.plugin, "laptop");
+    await synced(first.plugin);
+    const invite = (await first.plugin.createInvite()).invite;
+    const second = await load();
+    await second.plugin.pair(invite, "phone");
+    await synced(second.plugin);
+
+    built.length = 0;
+    first.plugin.ribbonIcons[0]!.callback();
+    await built.find((s) => s.name === "Devices")!.buttons[0]!.click();
+    const row = built.find((s) => s.name === "phone")!;
+    const button = row.buttons[0]!;
+    expect(button.label).toBe("Revoke");
+
+    // One press asks, and changes nothing.
+    await button.click();
+    expect(button.label).toBe("Yes, revoke");
+    expect((await first.plugin.devices()).devices).toHaveLength(2);
+    expect(modals.at(-1)!.contentEl.allText()).toMatch(/will stop syncing at once/);
+
+    // The second does it, and the revoked device finds out by being stopped.
+    await button.click();
+    expect((await first.plugin.devices()).devices.map((d) => d.name)).toEqual(["laptop"]);
+    expect(notices.map((n) => n.message).join(" ")).toMatch(/still holds the vault's key/);
+    await until(
+      "the revoked device to be stopped",
+      () => second.plugin.currentState.kind === "stopped",
+    );
   }, 300_000);
 });
 

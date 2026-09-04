@@ -189,6 +189,8 @@ device that has the vault, `basalt invite` or *Add another device* in the
 plugin, which works once and expires after ten minutes; the recovery key is
 never needed to add a device. The server stores an invite as an identifier and
 a blob it cannot open, and deletes every outstanding invite on `basalt rotate`.
+`basalt devices` lists the ones that have not been redeemed yet, and `basalt
+uninvite ID` cancels one without waiting out its hour.
 
 The token is one-time. The first device claims the vault with it and generates
 the root secret. From then on the server accepts only a key derived from that
@@ -562,16 +564,18 @@ detected by the protocol; it is detected by you, here.
 
 ## Rotating the vault secret
 
-Every device holds the same root secret, and that secret is also the
-credential. There is no per-device revocation. If a pairing string has been
-somewhere it should not have been, give the vault a new secret.
+If a recovery key has been somewhere it should not have been, give the vault a
+new secret. This is not how a lost device is answered: since protocol 4 each
+device connects with a credential of its own, so a device is revoked on its own
+with `basalt revoke ID`, and a rotation is for the root itself.
 
 Every vault has a data key wrapped under the root, so the root can change
 without the history changing. Either client can do it, from any device that
-still has the vault. On a machine with the headless client:
+still has the vault, and it takes the current recovery key on the command line
+because no device holds one:
 
 ```bash
-basalt rotate
+basalt rotate basalt3_...
 ```
 
 In Obsidian it is *Replace the vault's secret* in the panel, behind a warning
@@ -591,6 +595,11 @@ remove a device somebody else added: check `basalt devices` afterwards and
 `basalt revoke` anything you do not recognise. Outstanding invites go because
 an invite is a standing authority to add a device, which is the thing a
 rotation exists to take away.
+
+It does end what the old key could do to the device list. A revoke sent under a
+retired root is refused with `rotated`, the same as a registration, which is
+what stops whoever had the leaked key from answering the rotation by revoking
+every device you have.
 
 Nothing on the server is re-encrypted and no history is lost. It cannot unread
 what was already read. [design.md](design.md#a-lost-or-stolen-device) says more.

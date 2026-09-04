@@ -2,7 +2,7 @@
 
 Bugs and defects to fix, from reading the code and docs.
 
-Status as of 2026-09-03. Items marked done carry the test that failed first;
+Status as of 2026-09-04. Items marked done carry the test that failed first;
 items marked not reproduced were investigated and the concern did not survive
 contact with the code, which is recorded rather than deleted so nobody
 re-opens them from the same reading.
@@ -217,6 +217,95 @@ refused-but-confusing > operational footguns > leaks/hardening.
   already had needs `stillValid` to see the ancestor and both sides, which is a
   signature change. Pinned as a test with the reasoning.
 
+## Protocol 4 (per-device credentials): review of the uncommitted tree
+
+Server (protocol 4, device registry, redeem-registers) plus client
+(conversion, invites, device sessions) reviewed 2026-09-04 with all suites
+green: `go test -count=1 ./...` passes, `vitest run` passes 52 files /
+1110 tests. No code changed by this review. Findings, sharpest first:
+
+- [ ] **Docs overclaim: a device CAN add another device behind you.**
+  `[verified-by-reading]`. `docs/design.md` ("What a device cannot do is
+  add another one behind you") and `session.go`'s register refusal ("a
+  stolen laptop ... cannot add a ninth device to the vault behind you")
+  are both false via invites: any device session may `invite`, and redeeming
+  registers exactly one device, so a compromised laptop issues a string on
+  itself and redeems it on the attacker's machine. The *register* op is
+  registrar-gated, but the invite path reaches the same row. This is not a
+  regression (old invites carried the root, so old devices trivially could),
+  and the design requires device-issued invites (recovery key stays
+  offline), so the fix is honesty, not removal: state the real boundary
+  (register / rotate / the recovery key itself), and say what makes
+  invite-added rows survivable — they are visible in `basalt devices` with
+  `added <when>` / `last seen`, revokable by any device, and outstanding
+  (unredeemed) invites die on rotation and within the hour on expiry. Gap
+  inside the gap: there is no visibility into *outstanding* invites at all.
+  `devices` lists rows; an attacker-issued string sitting live for up to an
+  hour is invisible until redeemed. Consider listing live invites (ids and
+  expiry, never the blob) beside the device list, or record the decision
+  not to.
+- [ ] **Any device can revoke any device, including `--allow-last`.**
+  `[verified-by-reading]`. `handleRevoke` has no registrar gate and honours
+  `AllowLast` from a device session, so a compromised device can delete every
+  other row and leave the vault reachable only by the recovery key. Usability
+  demands device-may-revoke (the phone revoking the stolen laptop without
+  typing the recovery key is the whole point of revocation over rotation),
+  and it is recoverable (offline key re-registers), so this is almost
+  certainly accept-and-document rather than fix — but it is a cross-device
+  destructive power the docs never state. Record it next to the invite
+  finding above, and consider whether `--allow-last` specifically should
+  need the registrar: nothing about the common case needs it, and it is the
+  one revocation that cannot be undone without the recovery key.
+- [ ] **Lost redeem replies leave orphan rows against the 8-device cap.**
+  `[verified-by-reading]` (design choice, documented in `redeemInvite`'s
+  comment: save-nothing-first so a crash strands a server row, not a local
+  device). The row is visible (`last seen never`) and revokable, and the
+  alternative order strands the device instead, so the choice is right — but
+  eight crashes, or eight attacker-added rows, fill the vault and `register`
+  / redeem then refuse until a human revokes. Attack plus accident share one
+  cap with no reclamation and no prompt. Cheap mitigations: `devices` could
+  flag never-connected rows for cleanup, or invites could carry a
+  replace-an-orphan hint. At minimum the cap-full refusal should name
+  revocation of never-seen rows as the fix.
+- [ ] **The index journal is built, tested, and not wired in.**
+  `[verified-by-reading]`. `index-journal.ts` + `index-journal-store.ts` +
+  two test files exist and pass, but nothing outside their own tests imports
+  them; the engine still runs on the rewrite-the-JSON store. Until wiring
+  lands this is dead code with a passing suite — the exact shape rule 9
+  guards against drifting. Wiring wants three things the spec already names:
+  the engine actually using it, migration of existing `index-state.json`
+  (byte-identical-journal requirement is specified, good), and the
+  single-writer rule enforced rather than commented (two shells, one vault
+  dir, is the configuration that silently drops a journal of state).
+- [x] **Protocol 3 dropped, both sides speak only 4.** Checked, no change.
+  `MinProto = Proto = 4`, client refuses anything but 4, and `docs/server.md`
+  already records that 3 lived one day with one user before replacement. An
+  un-upgraded client gets a clean `proto` refusal naming the range, and
+  conversion needs only the old root from the local config, so the upgrade
+  order (server, then each client) still works. Nothing to fix; recorded so
+  nobody re-opens it.
+- [x] **Compose pin still current.** Checked, no change. Newest `server/v*`
+  tag is v0.3.2 and the pin is 0.3.2; the manifest's 0.3.4 is the plugin
+  moving on its own clock, which the CI check correctly ignores.
+
+Done well, noted so the pattern repeats:
+
+- `deviceAuth` gets its own HKDF string precisely so a device secret equal to
+  the root cannot derive the vault credential — the confusion made
+  unexpressible rather than unlikely, with the comment saying so.
+- `generateDeviceId` refuses ids starting with `-` (a CLI option word), with
+  the entropy cost stated (one char of 128 bits) and why it is affordable
+  (the primary key, not randomness, makes collisions safe).
+- `convertToDevice` carries six crash-point tests against the real server,
+  including the lost-`registered`-reply fault injected exactly after commit —
+  the window timing could never hit. Same device as the server's
+  `betweenSpendAndRegister` hook for the redeem transaction. This is the
+  rule-9 pattern at its best: the untestable window gets a hook, the hook
+  gets the test.
+- `RedeemInviteFor`'s comment states the rotation race explicitly (no vault
+  hash needed because rotation deletes invites in its own transaction) with
+  the test name attached. The claim is checkable, which is the point.
+
 ## Known divergence between the two shells
 
 - [ ] **The plugin still throws on a name clash; the CLI blocks the pair.**
@@ -227,6 +316,59 @@ refused-but-confusing > operational footguns > leaks/hardening.
   is still two shells behaving differently where they are meant to be one
   engine with two adapters, and the CLI's rendering of the clash message has
   no test.
+
+## Promoted out of improvements.md, with verdicts
+
+These sat in prose in sections 4, 5 and 7 and never reached that document's
+suggested order. Verdicts recorded so they are not re-argued from scratch.
+
+- [ ] **Purge tells you when it is worth running. Worth doing.** Unpurged
+  servers grow until `nospace` refuses uploads, and the documented answer is
+  the heaviest ceremony there is: stop, back up, purge, start. The server
+  already knows how many bytes are reclaimable, so say it in `stats` and in
+  the startup line. Then a purge happens because somebody was told, not
+  because the disk filled. Explicitly only the visibility half: an online
+  purge is more code in the most durability-critical layer, and purge is the
+  one command that destroys something no device holds. That stays a separate
+  decision.
+- [ ] **One "needs attention" list in the output, four maps underneath. Worth
+  doing, in part.** Rule 7 says four categories is three distinctions a person
+  must learn, and that is right about what is printed and wrong about the
+  model: `blocked`, `skipped`, `ignored` and `refusedInbound` each came from a
+  real incident and carry different exit-code semantics. Simplify the report,
+  leave the engine alone. Merging the maps would throw away four incidents'
+  worth of learning to save a noun.
+- [ ] **Rename resolution at scan time. Declined.** The proposal is to drop
+  the stateful `prev` chain and infer a rename by matching content hashes when
+  scanning. The heuristic is more ambiguous than the state it replaces:
+  identical files are ordinary in a vault (empty notes, templates), a rename
+  plus an edit changes the hash and stops looking like a rename, and a delete
+  then create of identical content becomes a false one. The current code also
+  deliberately matches Obsidian's own `previouspath` behaviour. Its bugs were
+  real and they were found, fixed and pinned. Rewriting scarred code in the
+  path that produced those incidents, to trade state for a guess, is the wrong
+  way round. Revisit if renames start producing new bugs.
+- [ ] **Server-side streaming import for a first sync. Declined for now, and
+  the source agrees.** improvements.md says "measure first; the current
+  numbers may already be good enough". The numbers exist: 54 s up and 22 s
+  down for a real 3,751-file vault. A first sync happens once per device.
+  A second path through the most durability-critical code is a poor trade for
+  that. Measure over real tailscale latency before reopening, not before
+  building.
+
+## Owed after protocol 4, before it can be called finished
+
+- [ ] **The docs describe a product that no longer exists.** Protocol 4
+  changed the key model, what a device stores, how a device is added, what
+  rotation does and what revocation means. `docs/design.md`'s keys section,
+  `docs/plugin.md`, `docs/server.md`'s runbooks, `client/README.md` and the
+  README's security graphic all need going through against the code rather
+  than patching the sentences that happen to be noticed. The security SVG in
+  particular draws the old three-key derivation and is now wrong as a picture.
+- [ ] **New screenshots.** The panel gained a device list and revocation, the
+  pairing flow changed, and the recovery-key copy was rewritten. The four in
+  the README are from the protocol 3 panel. Retake with the capturePage
+  recipe (Electron, background throttling off), which does not steal focus.
 
 ## Test-coverage debts (not bugs, tracked here so they don't drift)
 

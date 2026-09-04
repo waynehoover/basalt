@@ -31,6 +31,7 @@ import {
   ProtocolError,
   Transport,
   type DeviceRow,
+  type InviteRow,
   type RegistrarLimits,
   type ServerLimits,
   type SocketLike,
@@ -639,8 +640,30 @@ export class Client {
    * to answer "what is still connected to my notes", and a registrar reads
    * nothing.
    */
-  async devices(): Promise<{ devices: DeviceRow[]; maxDevices: number }> {
+  async devices(): Promise<{
+    devices: DeviceRow[];
+    maxDevices: number;
+    invites: InviteRow[];
+  }> {
     return this.serial(() => this.transport.devices());
+  }
+
+  /**
+   * Cancels an invite that is still outstanding, so the string somebody is
+   * holding stops working before it expires.
+   *
+   * The companion to being able to see one. An invite is a standing authority
+   * to register a device, and before this the only ways to retire one were to
+   * wait out the hour or to rotate the vault, which retires the recovery key
+   * with it: neither is an answer to "I issued that on the laptop I just
+   * lost".
+   *
+   * An identifier that is unknown, expired or already redeemed is one refusal,
+   * saying which of the three to nobody, because saying more would tell
+   * somebody guessing identifiers that they had found a real one.
+   */
+  async uninvite(invite: string): Promise<void> {
+    return this.serial(() => this.transport.uninvite(invite));
   }
 
   /**
@@ -953,11 +976,18 @@ export async function wrappedForClaim(keys: RootKeys): Promise<string> {
 /**
  * A connection holding the vault's own credential, which is the recovery key.
  *
- * It may register a device and rotate the vault's secret, and it may do
- * nothing else: no entries, no history, no device list, no catch-up. That is
- * the server's shape rather than a promise this class keeps, and it is the
- * whole of the privilege separation per-device credentials are made of. See
- * docs/protocol.md, "Authentication".
+ * It may register a device, rotate the vault's secret and administer the
+ * device list: read it, and take a row off it, including the last row. It may
+ * do nothing else: no entries, no history, no catch-up, and nothing that reads
+ * or writes a note. That is the server's shape rather than a promise this
+ * class keeps, and it is the whole of the privilege separation per-device
+ * credentials are made of. See docs/protocol.md, "Authentication".
+ *
+ * The device list is here because two things need it. Emptying the vault is
+ * the recovery key's alone, since it is the one revocation nothing on a device
+ * can undo, and a vault whose every row is a pairing that crashed refuses
+ * every registration until somebody prunes it, with no device left to prune
+ * it from.
  *
  * A separate class from `Client` on purpose. One object that was sometimes a
  * device and sometimes a registrar would have every caller asking which, and
@@ -1073,6 +1103,54 @@ export class Registrar {
     const rewrapped = await wrapDataKey(fresh.wrap, dataKey);
     await this.transport.rotate({ auth: authToken(fresh), wrapped: rewrapped });
     return { rewrapped };
+  }
+
+  /**
+   * Every device that may reach this vault, and the cap on how many there may
+   * be.
+   *
+   * The same op a device sends, and the same answer. It is the access list
+   * rather than the vault's content, it carries no key material, and the
+   * recovery key needs it to be able to act: revoking takes an id.
+   */
+  async devices(): Promise<{
+    devices: DeviceRow[];
+    maxDevices: number;
+    invites: InviteRow[];
+  }> {
+    return this.transport.devices();
+  }
+
+  /**
+   * Cancels an outstanding invite. The recovery key's, on the same reasoning
+   * as the device list: an invite is who may reach the vault, not what it
+   * holds, and on a vault whose devices are gone this is the only credential
+   * left to retire one with.
+   */
+  async uninvite(invite: string): Promise<void> {
+    return this.transport.uninvite(invite);
+  }
+
+  /**
+   * Removes a device's row and closes every session it has open.
+   *
+   * `allowLast` is why this is here. A device is refused it, because emptying
+   * the vault is the one revocation nothing on a device can undo: what it
+   * leaves is a vault only the recovery key opens, so it is the recovery key's
+   * to do. The server still asks for the word, which is the confirmation, now
+   * asked of the credential that can undo the answer.
+   *
+   * It does not un-read what that device already read, here any more than
+   * anywhere else, and a device that was stolen wants a rotation as well.
+   */
+  async revoke(
+    deviceId: string,
+    opts: { allowLast?: boolean } = {},
+  ): Promise<{ deviceId: string; self: boolean }> {
+    return this.transport.revoke({
+      deviceId,
+      ...(opts.allowLast !== undefined ? { allowLast: opts.allowLast } : {}),
+    });
   }
 
   close(): void {
@@ -1383,7 +1461,7 @@ export function credentialsFor(
 export { needsConversion };
 
 /** The shapes a shell needs to show a device list, re-exported for the same reason. */
-export type { DeviceRow, RegistrarLimits } from "./transport.ts";
+export type { DeviceRow, InviteRow, RegistrarLimits } from "./transport.ts";
 
 /**
  * Where this device and the server each are, for deciding whether a rebase is

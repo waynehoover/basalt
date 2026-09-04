@@ -147,6 +147,27 @@ and closes any connection it has open, in that order, so it stops at once
 rather than the next time it happens to reconnect. It can revoke this device
 too, which is what unlinking looks like from the server's side.
 
+The vault's **last** device has no button, and the panel says why where the
+button would have been. Taking the last row off the server leaves a vault only
+the recovery key opens, which is the one revocation no device can undo, so it
+takes the recovery key: `basalt revoke ID --allow-last --recovery-key` on a
+machine with the command line client. No device holds a recovery key, so a
+button here could only ever be refused. To stop syncing on this device and
+leave its row where it is, *Unlink this vault* is further down.
+
+A row that says *never connected* is one nothing has ever signed in under. That
+is what a pairing which reached the server and then crashed leaves behind, and
+it holds one of the eight slots until it is revoked.
+
+Under the rows are the invites nobody has redeemed yet, each with *Cancel*.
+They belong with the list because they are the same question: a row is a device
+that was added, an outstanding invite is one about to be. An invite issued on a
+device you have since lost is the one worth seeing, and cancelling it retires
+that string without waiting out its hour and without replacing the vault's
+secret, which would retire the recovery key with it. What is shown is the
+invite's identifier and when it expires, never the string itself: the server
+never had the part that opens it, so nothing on this screen can add a device.
+
 **Revoking stops a device connecting. It does not unread what that device
 already read.** It still holds the vault's key for every note it had synced,
 and nothing can take that back. A device that was stolen rather than merely

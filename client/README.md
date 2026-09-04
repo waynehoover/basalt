@@ -53,10 +53,11 @@ registers a second row for the same device.
 ```
 basalt init HOST:PORT#TOKEN               start a new vault, with the line the server printed
 basalt invite [--ttl 10m]                 print a single-use invite for another device
+basalt uninvite ID                        cancel an outstanding invite, from basalt devices
 basalt pair INVITE                        add this device to a vault, with an invite or its
                                           recovery key
 basalt devices                            every device that may reach this vault
-basalt revoke ID [--allow-last]           stop one device connecting, from basalt devices
+basalt revoke ID                          stop one device connecting, from basalt devices
 basalt rotate RECOVERY-KEY                give the vault a new secret, keeping its history
 basalt rebase --backup-taken              rejoin a server restored from an older backup
 basalt sync                               sync once and exit
@@ -81,7 +82,8 @@ basalt --version                          which release this is
 | `--uid N` | restore one exact version, from `basalt history` |
 | `--to PATH` | restore somewhere other than where it came from |
 | `--limit N` | how many versions `history` shows (default 20), or how many deletions `deleted` lists (default: all) |
-| `--allow-last` | revoke the last device, leaving the vault reachable only by its recovery key |
+| `--allow-last` | revoke the last device, leaving the vault reachable only by its recovery key. Needs `--recovery-key` |
+| `--recovery-key K` | run `devices`, `revoke` or `uninvite` with the vault's recovery key rather than this device's own credential. Any other command refuses it rather than ignoring it |
 | `--` | everything after it is a word rather than an option, for a device id that begins with `-` |
 | `-v`, `--verbose` | engine logging |
 
@@ -104,15 +106,46 @@ name, when it was added and when it was last seen. The name is not an identity
 and two laptops may both be called laptop; the id is, and it is what `basalt
 revoke` takes.
 
+A row whose last seen says **never connected** is one nothing has ever signed
+in under. A pairing that reached the server and then crashed leaves exactly
+that: the redemption registers the row before the new device saves anything, so
+a crash strands a row rather than a device that believes it is paired. Those
+rows still hold one of the eight slots, and revoking one is how the slot comes
+back.
+
 `basalt revoke ID` removes that device's row and closes any connection it has
 open, in that order, so it stops at once rather than the next time it happens
-to reconnect. A device may revoke itself. Revoking the last one is refused
-without `--allow-last`, because what it leaves is a vault only the recovery key
-can reach.
+to reconnect. Any device may revoke any other, and may revoke itself, which is
+the point: cutting off a stolen laptop should not need the recovery key out of
+its drawer.
+
+Revoking the vault's **last** device does need it:
+
+```bash
+basalt revoke ID --allow-last --recovery-key basalt3_...
+```
+
+That is the one revocation nothing on a device can undo, because what it leaves
+is a vault only the recovery key opens. It costs nothing in the case it is for:
+a device stolen when it was the only one wants `basalt rotate` as well, and
+that needs the key anyway. `--recovery-key` works on `basalt devices` and
+`basalt uninvite` too, and
+in a directory that was never paired, which is the way back into a vault whose
+eight rows are all pairings that crashed: nothing can register while it is
+full, so the ids have to come from somewhere.
 
 **Revoking stops a device connecting. It does not unread what that device
 already read**: it still holds the vault's key for every note it had synced. A
 device that was stolen rather than merely lost wants `basalt rotate` as well.
+
+`basalt devices` also lists the invites nobody has redeemed yet, by identifier
+and expiry, and `basalt uninvite ID` cancels one. They belong beside the rows
+because they are the same question: a row is a device that was added, an
+outstanding invite is one about to be. Until they were listed, an invite was
+the one authority on a vault nothing could see, and the only ways to retire one
+were to wait out its hour or to rotate, which retires the recovery key too. The
+identifier shown redeems nothing on its own: that also takes the invite key,
+which never reaches the server and exists only in the string that was printed.
 
 `basalt rotate RECOVERY-KEY` gives the vault a new root secret and prints the
 new one. It takes the old key on the command line because no device holds one:
@@ -142,8 +175,18 @@ to make a divergence visible.
 
 Everything lives in `.basalt/` inside the vault, which is never synced:
 `config.json` holds the pairing and the root secret, mode 0600, and
-`index.json` is what this device knows about every path. `unlink` removes both
-and touches no notes.
+`index.json` plus `index.log` are what this device knows about every path.
+The index is a snapshot and a journal of what has changed since, so an
+ordinary pass appends a few hundred bytes rather than rewriting the whole
+file; the log is folded back in when it has grown against the snapshot.
+Losing the tail of it loses no note, because notes are made durable before the
+index that names them and the engine simply redoes the pass. `unlink` removes
+all three files and touches no notes.
+
+One process at a time, and the lock in `.basalt/lock` enforces it for every
+command that writes. If something else writes the index anyway, the next save
+says so on stderr and replaces both files with a fresh snapshot rather than
+appending this device's changes onto somebody else's.
 
 ### Filenames
 

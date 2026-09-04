@@ -36,7 +36,13 @@ import {
   neverSync,
   splitName,
 } from "../core/paths.ts";
-import { LastIndexWrite } from "../core/vault.ts";
+import {
+  JournalIndexStore,
+  indexLogPath,
+  type JournalFiles,
+  type JournalStamps,
+  type JournalStoreOptions,
+} from "../core/index-journal-store.ts";
 import type {
   Ambiguous,
   FileStat,
@@ -1081,68 +1087,42 @@ export class NodeVault implements Vault {
 }
 
 /**
- * The index, in a JSON file beside the vault.
+ * The index, in a JSON snapshot and a journal beside the vault.
  *
  * Obsidian's headless client keeps its index in SQLite, with a JSON blob per
- * path. This keeps the JSON and drops the SQLite, for now: the whole index of a
- * four thousand note vault is a few hundred kilobytes, rewriting it costs
- * milliseconds, and a native dependency is a real cost for a client that
- * otherwise needs none. If a vault ever grows to where that stops being true,
- * the shape here is already the shape a table would hold.
+ * path. This keeps the JSON and drops the SQLite: the whole index of a four
+ * thousand note vault is a few hundred kilobytes, and a native dependency is a
+ * real cost for a client that otherwise needs none. What replaced rewriting
+ * the whole file on every change is a journal, not a database, because a
+ * journal is the only shape that is one implementation on both shells: Node
+ * has `appendFile` and Obsidian's `DataAdapter` has `append`. The reasoning
+ * and the crash semantics are in `core/index-journal-store.ts`, which is where
+ * both shells get them from; everything here is the five file operations it
+ * needs and nothing else.
  *
- * The write is atomic. An index truncated by a crash is worse than no index at
- * all: no index re-reads the vault and recovers, while a half-written one is
- * read as fact and quietly disagrees with the server about what has been synced.
+ * The snapshot write is atomic. An index truncated by a crash is worse than no
+ * index at all: no index re-reads the vault and recovers, while a half-written
+ * one is read as fact and quietly disagrees with the server about what has
+ * been synced. The log is different by construction, because a record that did
+ * not land whole is discarded on the next load and the records before it are
+ * not, and that is a device redoing a pass rather than a device believing
+ * something untrue.
  */
 export class JsonIndexStore implements IndexStore {
-  constructor(private readonly file: string) {}
+  private readonly store: JournalIndexStore;
 
-  /**
-   * What this session last wrote, and how it looked on disk (R3).
-   *
-   * The rule, and the reasoning behind it, is `LastIndexWrite` in core, shared
-   * with the plugin's store. It was not shared, and that is how this half of
-   * the client kept an existence check for a session after the other half
-   * learned that an index overwritten in place is still there.
-   */
-  private readonly last = new LastIndexWrite();
-
-  /** The index's size and modification time, or undefined if it is not a file. */
-  private async stamp(): Promise<IndexStamp | undefined> {
-    try {
-      const st = await stat(this.file);
-      return st.isFile() ? { size: st.size, mtime: st.mtimeMs } : undefined;
-    } catch {
-      // Not there, or not answerable. Either way this session cannot claim
-      // the file still holds its own bytes, so the next save writes.
-      return undefined;
-    }
+  constructor(file: string, opts: JournalStoreOptions = {}) {
+    this.store = new JournalIndexStore(new NodeJournalFiles(file), {
+      // Loud by default, and on stderr, because everything this reports is a
+      // thing the person running the client would want to know about their
+      // index. A caller with somewhere better to put it passes one in.
+      log: (message: string, ...rest: unknown[]) => console.warn(`basalt: ${message}`, ...rest),
+      ...opts,
+    });
   }
 
-  async load(): Promise<StoredState | undefined> {
-    let text: string;
-    try {
-      text = await readFile(this.file, "utf8");
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      // Rule 2 again, and this is the incident it came from: code that read
-      // a config file, fell back to an empty result on error and wrote that
-      // back disabled every plugin on a device. Unreadable must stop.
-      throw new Error(`cannot read the index at ${this.file}: ${(err as Error).message}`);
-    }
-    let state: StoredState;
-    try {
-      state = JSON.parse(text) as StoredState;
-    } catch (err) {
-      throw new Error(
-        `the index at ${this.file} is not valid JSON, so it cannot be trusted: ${(err as Error).message}`,
-      );
-    }
-    // What is on disk is what was last written, so the first pass of a vault
-    // with nothing to do writes nothing rather than serialising the whole
-    // index and fsyncing it twice to say so.
-    this.last.wrote(text, await this.stamp());
-    return state;
+  load(): Promise<StoredState | undefined> {
+    return this.store.load();
   }
 
   /**
@@ -1157,18 +1137,112 @@ export class JsonIndexStore implements IndexStore {
    * deleted it" and propagates the deletion to every other device.
    *
    * That is a note lost silently, by a machine losing power at the wrong
-   * moment, and it is the exact failure the first rule exists to refuse.
+   * moment, and it is the exact failure the first rule exists to refuse. It
+   * holds for a record as it did for a whole file: the append is fsynced
+   * before it is called done.
    */
-  async save(state: StoredState): Promise<void> {
-    const text = JSON.stringify(state);
-    if (this.last.matches(text, await this.stamp())) return;
+  save(state: StoredState): Promise<void> {
+    return this.store.save(state);
+  }
+}
+
+/** The snapshot, the log and the stats, on a real filesystem. */
+class NodeJournalFiles implements JournalFiles {
+  private readonly log: string;
+  /**
+   * Whether the log's own name has been made durable.
+   *
+   * The bytes of an append are fsynced every time. The directory entry only
+   * has to be, once, for a log that was not there before: a name that is not
+   * durable is a log a crash can lose whole, which is an older index and safe,
+   * but there is no reason to pay it more than once and no reason not to pay
+   * it at all.
+   */
+  private named = false;
+
+  constructor(private readonly file: string) {
+    this.log = indexLogPath(file);
+  }
+
+  async readSnapshot(): Promise<string | undefined> {
+    return read(this.file, `the index at ${this.file}`);
+  }
+
+  async writeSnapshot(text: string): Promise<void> {
     await mkdir(dirname(this.file), { recursive: true });
     await writeDurably(this.file, new TextEncoder().encode(text), true, {
       stageIn: join(dirname(this.file), "tmp"),
     });
-    // Only after it is durable. Recording it first would skip the write
-    // that a failed one still owes.
-    this.last.wrote(text, await this.stamp());
+  }
+
+  async readLog(): Promise<string | undefined> {
+    return read(this.log, `the index journal at ${this.log}`);
+  }
+
+  /**
+   * One record on the end, fsynced before it is called written.
+   *
+   * `a` rather than a seek, so the kernel places the bytes at the end of the
+   * file whatever else has happened to it, and `writeAll` because a short
+   * write reports itself and is otherwise ignored (rule 5). What a short write
+   * leaves behind is a torn record, which the next load discards along with
+   * nothing else; what the caller does about it is check the size afterwards.
+   */
+  async appendLog(line: string): Promise<void> {
+    await mkdir(dirname(this.log), { recursive: true });
+    const handle = await open(this.log, "a");
+    try {
+      await writeAll(handle, new TextEncoder().encode(line));
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (!this.named) {
+      await syncDirectory(dirname(this.log));
+      this.named = true;
+    }
+  }
+
+  /** Empty, and still there. A missing log and an empty one are different states. */
+  async truncateLog(): Promise<void> {
+    await mkdir(dirname(this.log), { recursive: true });
+    await writeDurably(this.log, new Uint8Array(0), true, {
+      stageIn: join(dirname(this.log), "tmp"),
+    });
+    this.named = true;
+  }
+
+  async stamps(): Promise<JournalStamps> {
+    const [snapshot, log] = await Promise.all([stampOf(this.file), stampOf(this.log)]);
+    return { ...(snapshot ? { snapshot } : {}), ...(log ? { log } : {}) };
+  }
+}
+
+/** A file's size and modification time, or undefined if it is not a file. */
+async function stampOf(path: string): Promise<IndexStamp | undefined> {
+  try {
+    const st = await stat(path);
+    return st.isFile() ? { size: st.size, mtime: st.mtimeMs } : undefined;
+  } catch {
+    // Not there, or not answerable. Either way this session cannot claim the
+    // file still holds its own bytes, so the next save writes.
+    return undefined;
+  }
+}
+
+/**
+ * A file's text, undefined when it is absent, and an error when it is neither.
+ *
+ * Rule 2, and this is the incident it came from: code that read a config file,
+ * fell back to an empty result on error and wrote that back disabled every
+ * plugin on a device. Unreadable must stop.
+ */
+async function read(path: string, what: string): Promise<string | undefined> {
+  try {
+    return await readFile(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error(`cannot read ${what}: ${(err as Error).message}`);
   }
 }
 

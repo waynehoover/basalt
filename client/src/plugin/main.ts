@@ -57,6 +57,7 @@ import {
   type ClientOptions,
   type DeletedList,
   type DeviceRow,
+  type InviteRow,
   type Version,
 } from "../core/client.ts";
 import { deriveRootKeys, generateSecret } from "../core/crypto.ts";
@@ -1110,14 +1111,24 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
-   * Every device that may reach this vault, and the cap on how many there may
-   * be.
+   * Every device that may reach this vault, the cap on how many there may be,
+   * and every invite that could still add one.
    *
    * Needs a connection, and says so rather than showing an empty list. "There
    * are no other devices" and "I could not ask" are different answers, and
    * this is the list somebody reads before deciding which one to cut off.
+   *
+   * The invites are part of the same answer. A row is a device that was added
+   * and an outstanding invite is one about to be, and until they were listed a
+   * string issued on a device somebody had just lost stayed invisible until
+   * somebody redeemed it, for up to an hour.
    */
-  async devices(): Promise<{ devices: DeviceRow[]; maxDevices: number; thisDevice: string }> {
+  async devices(): Promise<{
+    devices: DeviceRow[];
+    maxDevices: number;
+    invites: InviteRow[];
+    thisDevice: string;
+  }> {
     const client = this.client;
     if (!client) throw new Error(`${this.whyNoClient()} There is no way to ask what is paired.`);
     return { ...(await client.devices()), thisDevice: client.deviceId };
@@ -1142,6 +1153,21 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
+   * Cancels an outstanding invite, so the string stops working before it
+   * expires.
+   *
+   * The companion to being able to see one. Otherwise the only ways to retire
+   * an invite issued on a device that has just been lost are to wait out its
+   * hour or to replace the vault's secret, which retires the recovery key with
+   * it.
+   */
+  async uninvite(invite: string): Promise<void> {
+    const client = this.client;
+    if (!client) throw new Error(`${this.whyNoClient()} There is no way to cancel an invite.`);
+    return client.uninvite(invite);
+  }
+
+  /**
    * Stops one device connecting, and closes whatever it has open.
    *
    * Both, and the reply means both. What it does not do is un-read what that
@@ -1149,11 +1175,16 @@ export default class BasaltPlugin extends Plugin {
    * synced, so a device that was stolen rather than lost wants a new vault
    * secret as well. Every surface that offers this has to say so, and the
    * panel does.
+   *
+   * No `allowLast`, and it is not an omission. Emptying the vault takes the
+   * recovery key, no device holds one, and a plugin that offered the flag
+   * would be offering a request the server can only refuse. The panel says so
+   * where the button would have been.
    */
-  async revoke(deviceId: string, opts: { allowLast?: boolean } = {}): Promise<{ self: boolean }> {
+  async revoke(deviceId: string): Promise<{ self: boolean }> {
     const client = this.client;
     if (!client) throw new Error(`${this.whyNoClient()} There is no way to revoke a device.`);
-    const { self } = await client.revoke(deviceId, opts);
+    const { self } = await client.revoke(deviceId);
     if (self) {
       // Revoking this device is what unlinking is, from the server's side.
       // The connection is already closing behind the reply, so the run is
@@ -1835,23 +1866,37 @@ class BasaltModal extends Modal {
     const show = async () => {
       list.empty();
       said.setText("");
-      let answer: { devices: DeviceRow[]; maxDevices: number; thisDevice: string };
+      let answer: {
+        devices: DeviceRow[];
+        maxDevices: number;
+        invites: InviteRow[];
+        thisDevice: string;
+      };
       try {
         answer = await this.plugin.devices();
       } catch (err) {
         said.setText((err as Error).message);
         return;
       }
+      // The last row is the vault's last device, and it is always this one:
+      // reading the list at all means this device connected. Emptying the
+      // vault is the recovery key's to do, so there is no button for it here.
+      // A button that could only ever be refused is worse than none.
+      const last = answer.devices.length === 1;
       for (const device of answer.devices) {
         const mine = device.id === answer.thisDevice;
+        // Flagged rather than left as a blank, because a row nothing has ever
+        // connected under is the reclaimable one: a pairing that reached the
+        // server and then crashed leaves exactly that, and it holds a slot.
         const seen =
-          device.lastSeen === 0 ? "not connected yet" : `last seen ${when(device.lastSeen)}`;
+          device.lastSeen === 0 ? "never connected" : `last seen ${when(device.lastSeen)}`;
         const row = new Setting(list)
           .setName(`${device.name || "unnamed"}${mine ? " (this device)" : ""}`)
           // The id as well as the name, because the name is not an identity:
           // two laptops may both be called laptop, and the id is what says
           // which one this row would cut off.
           .setDesc(`${device.id} · added ${when(device.createdAt)} · ${seen}`);
+        if (last) continue;
         let confirmed = false;
         row.addButton((b) =>
           b
@@ -1865,16 +1910,13 @@ class BasaltModal extends Modal {
                   mine
                     ? "This device will stop syncing at once. Press again to revoke it."
                     : `"${device.name || device.id}" will stop syncing at once and cannot connect ` +
-                        `again until it is added with the vault's recovery key. Press again.`,
+                        `again until it is added with an invite from a device that still has the ` +
+                        `vault. Press again.`,
                 );
                 return;
               }
               try {
-                // The last device is refused unless it is said out loud, and
-                // the panel says it here rather than offering a checkbox
-                // nobody would read: the second press is already the
-                // confirmation, and this is the third.
-                await this.plugin.revoke(device.id, { allowLast: answer.devices.length === 1 });
+                await this.plugin.revoke(device.id);
                 new Notice(
                   "Revoked. It cannot connect again. It still holds the vault's key for every " +
                     "note it had already synced, so replace the vault's secret too if it was stolen.",
@@ -1887,11 +1929,59 @@ class BasaltModal extends Modal {
             }),
         );
       }
+      // The invites under the rows, because they are the same question: a row
+      // is a device that was added and an outstanding invite is one about to
+      // be. Identifier and expiry only. The string itself is not here and
+      // cannot be: the server never had the invite key, so nothing on this
+      // screen redeems anything, and what the identifier is for is saying
+      // which invite to cancel.
+      for (const invite of answer.invites) {
+        const row = new Setting(list)
+          .setName("Outstanding invite")
+          .setDesc(`${invite.id} · adds one device · expires ${when(invite.expiresAt)}`);
+        row.addButton((b) =>
+          b
+            .setButtonText("Cancel")
+            .setWarning()
+            .onClick(async () => {
+              try {
+                await this.plugin.uninvite(invite.id);
+                new Notice(
+                  "Cancelled. That string no longer adds a device. If somebody redeemed it " +
+                    "already, the device it added is a row above, and Revoke is what stops that.",
+                  10_000,
+                );
+                this.render();
+              } catch (err) {
+                said.setText((err as Error).message);
+              }
+            }),
+        );
+      }
+
+      const never = answer.devices.filter((d) => d.lastSeen === 0).length;
       said.setText(
         `${answer.devices.length} of at most ${answer.maxDevices} devices. Revoking stops a ` +
           `device connecting. It does not un-read what that device already read: it still holds ` +
           `the vault's key for every note it had synced. A device that was stolen rather than ` +
-          `lost wants the vault's secret replaced as well, below.`,
+          `lost wants the vault's secret replaced as well, below.` +
+          (never > 0
+            ? ` ${never} of these ${never === 1 ? "has" : "have"} never connected: a pairing that ` +
+              `reached the server and then crashed leaves a row like that, and it holds a slot ` +
+              `until it is revoked.`
+            : "") +
+          (answer.invites.length > 0
+            ? ` ${answer.invites.length} outstanding ${answer.invites.length === 1 ? "invite" : "invites"}: ` +
+              `each one adds one device and then stops working. Cancel one you did not mean to ` +
+              `issue, or that was issued on a device you have lost.`
+            : "") +
+          (last
+            ? ` This is the vault's last device, and taking its row off the server would leave a ` +
+              `vault only the recovery key opens, which is the one revocation no device can undo. ` +
+              `So there is no button for it here: it takes the recovery key, with basalt revoke ID ` +
+              `--allow-last --recovery-key on a machine that has the command line client. To stop ` +
+              `syncing here and leave the row where it is, use Unlink this vault below.`
+            : ""),
       );
     };
 
@@ -1899,7 +1989,8 @@ class BasaltModal extends Modal {
       .setName("Devices")
       .setDesc(
         `This device is "${this.plugin.deviceName}". Add another with an invite, above; each one ` +
-          `gets a credential of its own, which is what a row here can be revoked without touching.`,
+          `gets a credential of its own, which is what a row here can be revoked without touching. ` +
+          `Invites that have not been redeemed yet are listed here too.`,
       )
       .addButton((b) => b.setButtonText("Show devices").onClick(show));
   }

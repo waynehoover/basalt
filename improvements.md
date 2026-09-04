@@ -48,14 +48,28 @@ phone, a laptop, a work machine, and a NAS, and rotation means touching
 all four while the plugin (the thing on three of them) cannot rotate.
 The current answer to "stolen laptop" is: find a machine with the CLI,
 rotate, re-invite everything. For a notes app, that is a weekend. The
-rethink: **per-device credentials** (server stores a device list, each
+rethink was **per-device credentials** (server stores a device list, each
 device holds its own key derived from the root, revocation is deleting a
 row). It costs the "pairing string is one string" elegance and adds
 exactly one server-side concept (a device registry). It also fixes the
 8-device cap's cliff (refused with `busy`, which also means "server
 shutting down" — two unrelated conditions sharing one code and one
-retry hint). Worth pricing out; it is the single biggest gap between
-"one person's devices" as a scope decision and as a security story.
+retry hint). Taken, as protocol 4: the server stores a device list, each device
+holds its own secret plus the data key, revocation is deleting a row,
+rotation touches no row, and the root lives offline as the recovery key.
+It cost the one-string pairing (an invite string plus a device row
+instead) and one server-side concept (the registry), as predicted. What
+the review of that work found is that two sentences now overclaim the
+boundary. "A device cannot add another one behind you" is false via
+device-issued invites (any device may `invite`, and redeeming registers a
+row — necessarily so, since the recovery key stays offline), and any
+device can revoke any other device including `--allow-last`. Both are
+probably accept-and-document: the invite path is the design,
+revocation-by-phone is the point, rows are visible with creation times,
+and everything is recoverable via the offline key. But the philosophy doc
+should state the real boundary (register / rotate / the key itself)
+instead of the comforting one, and `todo.md` carries the two findings with
+the one genuine gap inside them: no visibility into outstanding invites.
 
 **"The server is an opaque blob store and stays one" — mostly true,
 two leaks to look at.** The server learns chunk equality (stated,
@@ -221,6 +235,13 @@ The engine is the best-tested part of the system and it shows: every
 major invariant has a comment citing the incident that produced it.
 Three structural observations:
 
+- **The journal is built and not wired in.** Since the measurement below,
+  the rethink grew a spec (`index-journal-spec.md`), an implementation
+  (`index-journal.ts`, `index-journal-store.ts`) and tests — and no caller:
+  nothing outside its own tests imports it. The remaining work is the
+  wiring, the migration of existing `index-state.json`, and enforcing the
+  single-writer rule. Until then it is dead code with a green suite.
+  `todo.md` tracks it.
 - **The whole index is stringified and rewritten on every change.**
   At 10,000 notes the index is 5.6 MiB; the `packed`/`unpacked`
   dance already exists because chunk names were stored 3x. This is a
@@ -344,7 +365,10 @@ fake API, asserting no-loss invariants rather than UI behavior.
 The protocol doc's six inversions of Obsidian Sync's defects are the
 clearest writing in the repo, and request ids + `retryable` + named
 outcomes (`have`/`want`/`ack`) are all load-bearing lessons. No
-direction change proposed. Edges worth smoothing in a protocol 4:
+direction change proposed. Protocol 4 has since happened — spent on
+per-device credentials, with protocols 1–3 removed rather than carried
+(the range stays in the handshake for next time). Edges worth smoothing
+in a protocol 5:
 
 - **`busy` means two things** (device limit vs. shutdown) with
   different retry hints (30s vs 5s). Split the code (`busy`/`full`?
@@ -432,12 +456,25 @@ Status as of 2026-09-03.
    vault, and `stats -json` reports the generation, so "which backup covers
    this uid" and "is the fresh one complete" are both answerable without
    opening SQLite.
-5. **Chunk identity and envelope design for protocol 4.** Not started. This is
-   a design decision, not a fix, and wants deciding before protocol 4 is
-   needed for something urgent.
-6. **Per-device credentials spike.** Not started. The biggest philosophy
-   decision in this document and the one least suited to being done quietly:
-   it trades the one-string pairing for a device registry on the server.
+5. **Chunk identity and envelope design.** Not started, and it is the only
+   substantive design item left here. It was written as "for protocol 4" and
+   protocol 4 has since been spent on per-device credentials, so it is
+   protocol 5 now. Still a decision rather than a fix, and still wanting to be
+   made before something urgent forces it. What has improved meanwhile is that
+   the compatibility story now has a worked example, protocol 3 dropped after
+   a day of single-user use, and a stated rule: the range stays in the
+   handshake, and next time compatibility gets written against a protocol that
+   has actually run.
+6. **Per-device credentials.** Done, as protocol 4. This was called the
+   biggest philosophy decision in this document and the one least suited to
+   being done quietly, and it was done loudly: a device registry, redemption
+   that registers in one transaction, silent self-conversion with a test per
+   crash point, and invites carrying the data key instead of the root. It cost
+   the one-string pairing and added exactly one server-side concept, as
+   predicted. The review pass found two sentences that overclaimed the
+   boundary and one visibility gap, all in `todo.md`. What it did not find is
+   a reason the trade was wrong: rotation without re-pairing every device is
+   the feature that justifies the registry.
 7. **Index storage measurement at 10k/50k notes.** Done, and it answers the
    SQLite question no. A full index rewrite costs 4 ms at ten thousand notes
    and 14 ms at fifty thousand, against passes measured in tens of

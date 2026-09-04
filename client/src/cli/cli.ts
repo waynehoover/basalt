@@ -37,6 +37,8 @@ import {
   runForever,
   wrappedForClaim,
   type ClientOptions,
+  type DeviceRow,
+  type InviteRow,
 } from "../core/client.ts";
 import { REJOIN_ADVICE, type SyncReport } from "../core/engine.ts";
 import {
@@ -88,6 +90,7 @@ export const USAGE = `basalt: self-hosted sync for Obsidian
 
   basalt init HOST:PORT#TOKEN               start a new vault, with the line the server printed
   basalt invite                             print a single-use invite for another device
+  basalt uninvite ID                        cancel an outstanding invite, from basalt devices
   basalt pair INVITE                        add this device to a vault, with an invite or its
                                             recovery key
   basalt sync                               sync once and exit
@@ -109,7 +112,10 @@ Options
   --vault-id ID    which vault on the server (default: default)
   --json           machine-readable output
   --timeout MS     how long to wait on the server (default: 30000)
-  --allow-last     revoke the last device, leaving the vault reachable only by its recovery key
+  --allow-last     revoke the last device, leaving the vault reachable only by its recovery key.
+                   Needs --recovery-key: it is the one revocation a device cannot undo
+  --recovery-key K run devices, revoke or uninvite with the vault's recovery key instead of this
+                   device's credential, for the last device and for a vault with no device to ask
   --ttl DURATION   how long an invite lasts, like 10m or 1h (default: 10m, at most 1h)
   --uid N          restore one exact version, from basalt history
   --to PATH        restore somewhere other than where it came from
@@ -140,6 +146,7 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
 
   try {
     refuseExtras(args);
+    refuseRecoveryKey(args);
     // Before anything else, and once per device in a vault's life: a config
     // that still holds the vault's root has not registered itself with the
     // server yet, and under protocol 4 there is nothing it can do until it
@@ -169,6 +176,8 @@ export async function run(argv: readonly string[], io: Console): Promise<number>
         return await cmdRotate(args, io);
       case "invite":
         return await cmdInvite(args, io);
+      case "uninvite":
+        return await cmdUninvite(args, io);
       case "recovery-key":
         throw new Error(NO_RECOVERY_KEY);
       case "rebase":
@@ -235,7 +244,28 @@ const POSITIONALS: Record<string, number> = {
   restore: 1,
   revoke: 1,
   rotate: 1,
+  uninvite: 1,
 };
+
+/**
+ * The three commands `--recovery-key` means something to.
+ *
+ * Everything else needs this device's own credential and would ignore the
+ * flag, and a flag that is quietly ignored is how somebody comes to believe
+ * they ran a command as the recovery key when they did not. The same reasoning
+ * as refuseExtras: a word that had no effect is worth an error.
+ */
+const TAKES_RECOVERY_KEY = new Set(["devices", "revoke", "uninvite"]);
+
+function refuseRecoveryKey(args: Args): void {
+  if (args.recoveryKey === undefined) return;
+  if (TAKES_RECOVERY_KEY.has(args.command ?? "")) return;
+  throw new Error(
+    `${args.command} does not take --recovery-key, so the key would have been ignored. ` +
+      `It is for ${[...TAKES_RECOVERY_KEY].join(", ")}; basalt rotate takes the key as its ` +
+      `argument instead.`,
+  );
+}
 
 function refuseExtras(args: Args): void {
   const takes = POSITIONALS[args.command ?? ""] ?? 0;
@@ -273,6 +303,7 @@ const CONVERTS_FIRST = new Set([
   "revoke",
   "rotate",
   "invite",
+  "uninvite",
 ]);
 
 /**
@@ -686,40 +717,228 @@ const NO_RECOVERY_KEY =
   "the old one, so there is nothing this can print.";
 
 /**
+ * Opens a session holding the vault's recovery key rather than this device's
+ * own credential.
+ *
+ * Two commands take one. Revoking the last device needs it, because that is
+ * the one revocation nothing on a device can undo. Listing accepts it for the
+ * vault that has no device left to ask: eight rows that never connected refuse
+ * every registration, and the ids to revoke off them have to come from
+ * somewhere.
+ *
+ * The key names its own server and vault, so this works in a directory that
+ * was never paired. When there is a config here it has to agree, or a key
+ * pasted from the wrong vault would act on that vault while the person read
+ * this one's name off the screen.
+ */
+async function asRecoveryKey(given: string, args: Args): Promise<Registrar> {
+  const key = parsePairing(given);
+  const config = await loadConfig(args.dir);
+  if (config && config.vaultId !== key.vaultId) {
+    throw new Error(
+      `that recovery key is for vault "${key.vaultId}" and this directory is paired with ` +
+        `"${config.vaultId}", so it would act on a vault this device is not on`,
+    );
+  }
+  return Registrar.open({
+    url: key.url,
+    vaultId: key.vaultId,
+    device: config?.device ?? "recovery-key",
+    secret: key.secret,
+    timeoutMs: args.timeout,
+  });
+}
+
+/**
  * Every device that may reach this vault.
  *
  * The only way to answer "what is still connected to my notes", which is the
  * question a device list exists for.
+ *
+ * A row that has never connected is flagged rather than left to be read out of
+ * a blank column, because those are the reclaimable ones. A redemption saves
+ * nothing on the new device until the server has answered, so a crash in that
+ * window strands a row on the server instead of a device that thinks it is
+ * paired: the right way round, and it means the rows that pile up against the
+ * cap are exactly the ones nothing has ever connected under.
  */
 async function cmdDevices(args: Args, io: Console): Promise<number> {
-  const config = await mustLoad(args.dir);
-  const client = await open(config, args, io, { waitForBacklog: false });
+  const { devices, maxDevices, invites, thisDevice, close } = await openDeviceList(args, io);
   try {
-    const { devices, maxDevices } = await client.devices();
     if (args.json) {
-      io.out(JSON.stringify({ ok: true, devices, maxDevices, thisDevice: client.deviceId }));
+      io.out(
+        JSON.stringify({
+          ok: true,
+          devices,
+          maxDevices,
+          invites,
+          ...(thisDevice !== undefined ? { thisDevice } : {}),
+        }),
+      );
       return 0;
     }
     for (const d of devices) {
-      const mine = d.id === client.deviceId ? "  (this device)" : "";
+      const mine = d.id === thisDevice ? "  (this device)" : "";
       // The id first, because it is what `basalt revoke` takes and the name
       // is not: two laptops may both be called laptop, and a list that put
       // the name where the identity goes would invite revoking the wrong one.
       io.out(
         `${d.id.padEnd(24)}  ${d.name.padEnd(16)}  added ${when(d.createdAt)}  ` +
-          `last seen ${d.lastSeen === 0 ? "never           " : when(d.lastSeen)}${mine}`,
+          `${d.lastSeen === 0 ? "never connected " : `last seen ${when(d.lastSeen)}`}${mine}`,
       );
     }
     io.out("");
     io.out(`${devices.length} of at most ${maxDevices} devices. basalt revoke ID stops one.`);
+    const stale = devices.filter((d) => d.lastSeen === 0);
+    if (stale.length > 0) {
+      io.out(
+        `${stale.length} of them ${stale.length === 1 ? "has" : "have"} never connected. A pairing ` +
+          `that reached the server and then crashed leaves a row like that, and it holds one of ` +
+          `the ${maxDevices} slots until somebody revokes it.`,
+      );
+    }
     io.out(
       "Revoking stops a device connecting. It does not un-read what that device already read:",
     );
     io.out("it still holds the vault's key for every note it had synced. A device that was stolen");
     io.out("rather than lost wants basalt rotate as well.");
+    // The invites, beside the rows, because they are the same question. A row
+    // is a device that was added and an outstanding invite is one about to be:
+    // a string issued on a device somebody has just lost is the thing worth
+    // seeing, and until this it was invisible until it was redeemed.
+    io.out("");
+    if (invites.length === 0) {
+      io.out("No outstanding invites.");
+    } else {
+      for (const inv of invites) {
+        io.out(`${inv.id.padEnd(24)}  invite, expires ${when(inv.expiresAt)}`);
+      }
+      io.out("");
+      io.out(
+        `${invites.length} outstanding ${invites.length === 1 ? "invite" : "invites"}. Each one ` +
+          `registers one device and then stops working. basalt uninvite ID cancels one you did ` +
+          `not mean to issue.`,
+      );
+    }
     return 0;
   } finally {
+    await close();
+  }
+}
+
+/**
+ * Cancels an outstanding invite.
+ *
+ * The companion to seeing them. An invite is a standing authority to register
+ * one device, and before it could be listed the only ways to retire one were
+ * to wait out its hour or to rotate the vault, which retires the recovery key
+ * with it. Neither is an answer to "I issued that on the laptop I have just
+ * lost".
+ */
+async function cmdUninvite(args: Args, io: Console): Promise<number> {
+  const invite = args.rest[0];
+  if (!invite) throw new Error("uninvite needs an invite id, from basalt devices");
+  const canceller = await openRevoker(args, io);
+  try {
+    await canceller.uninvite(invite);
+  } catch (err) {
+    if (err instanceof ProtocolError && err.code === "badentry") {
+      // One refusal for unknown, expired and already redeemed, because saying
+      // which would tell somebody guessing identifiers that they had found a
+      // real one. What it can say is where to look.
+      throw new Error(
+        `this vault has no outstanding invite ${invite}: it may have expired, or been redeemed, ` +
+          `in which case it is a device row now. basalt devices shows both.`,
+      );
+    }
+    throw err;
+  } finally {
+    await canceller.close();
+  }
+  if (args.json) {
+    io.out(JSON.stringify({ ok: true, cancelled: invite }));
+    return 0;
+  }
+  io.out(`Cancelled ${invite}. That string no longer adds a device.`);
+  io.out(
+    "It does not touch a device already added with it. If it was redeemed before this, the " +
+      "device it added is a row in basalt devices, and basalt revoke ID is what stops that.",
+  );
+  return 0;
+}
+
+/**
+ * Whoever is doing the revoking: this device, or the recovery key.
+ *
+ * The same two ways in as the list, and the same reason for the second one.
+ * Both objects answer `revoke` identically, because it is the same op on the
+ * wire; what differs is only whether the server will honour `allowLast`.
+ */
+async function openRevoker(
+  args: Args,
+  io: Console,
+): Promise<{
+  revoke: (id: string, opts: { allowLast?: boolean }) => Promise<{ self: boolean }>;
+  uninvite: (invite: string) => Promise<void>;
+  close: () => Promise<void>;
+}> {
+  if (args.recoveryKey !== undefined) {
+    const registrar = await asRecoveryKey(args.recoveryKey, args);
+    return {
+      revoke: (id, opts) => registrar.revoke(id, opts),
+      uninvite: (invite) => registrar.uninvite(invite),
+      close: async () => registrar.close(),
+    };
+  }
+  const config = await mustLoad(args.dir);
+  const client = await open(config, args, io, { waitForBacklog: false });
+  return {
+    revoke: (id, opts) => client.revoke(id, opts),
+    uninvite: (invite) => client.uninvite(invite),
+    close: () => client.close(),
+  };
+}
+
+/**
+ * The device list, from whichever credential was offered.
+ *
+ * Two ways in, one shape out. `thisDevice` is absent over the recovery key,
+ * because a registrar is not a device and there is no row for it to be: a
+ * list that guessed one would put "(this device)" against somebody else.
+ */
+async function openDeviceList(
+  args: Args,
+  io: Console,
+): Promise<{
+  devices: DeviceRow[];
+  maxDevices: number;
+  invites: InviteRow[];
+  thisDevice?: string;
+  close: () => Promise<void>;
+}> {
+  if (args.recoveryKey !== undefined) {
+    const registrar = await asRecoveryKey(args.recoveryKey, args);
+    try {
+      return {
+        ...(await registrar.devices()),
+        close: async () => registrar.close(),
+      };
+    } catch (err) {
+      registrar.close();
+      throw err;
+    }
+  }
+  const config = await mustLoad(args.dir);
+  const client = await open(config, args, io, { waitForBacklog: false });
+  try {
+    return {
+      ...(await client.devices()),
+      thisDevice: client.deviceId,
+      close: () => client.close(),
+    };
+  } catch (err) {
     await client.close();
+    throw err;
   }
 }
 
@@ -728,15 +947,30 @@ async function cmdDevices(args: Args, io: Console): Promise<number> {
  *
  * Both, and the reply means both: a row removed while the revoked device holds
  * an authenticated connection is a revocation it does not notice.
+ *
+ * Any device may do this to any other, which is the whole point of having
+ * revocation rather than rotation: a phone cuts off a stolen laptop without
+ * anybody digging the recovery key out of a drawer. The exception is
+ * `--allow-last`, which needs the recovery key, because emptying the vault is
+ * the one revocation nothing on a device can undo.
  */
 async function cmdRevoke(args: Args, io: Console): Promise<number> {
   const deviceId = args.rest[0];
   if (!deviceId) throw new Error("revoke needs a device id, from basalt devices");
-  const config = await mustLoad(args.dir);
-  const client = await open(config, args, io, { waitForBacklog: false });
+  // Refused here as well as at the server, so somebody who typed it gets the
+  // whole command back rather than a round trip and a refusal. The server's
+  // is the one that enforces it; this one is the one that helps.
+  if (args.allowLast && args.recoveryKey === undefined) {
+    throw new Error(
+      `--allow-last leaves a vault only its recovery key can reach, and it is the one revocation ` +
+        `no device can undo, so it takes that key: basalt revoke ${deviceId} --allow-last ` +
+        `--recovery-key basalt3_...`,
+    );
+  }
+  const revoker = await openRevoker(args, io);
   let self: boolean;
   try {
-    ({ self } = await client.revoke(deviceId, { allowLast: args.allowLast }));
+    ({ self } = await revoker.revoke(deviceId, { allowLast: args.allowLast }));
   } catch (err) {
     if (err instanceof ProtocolError && err.code === "nodevice") {
       throw new Error(
@@ -745,14 +979,21 @@ async function cmdRevoke(args: Args, io: Console): Promise<number> {
       );
     }
     if (err instanceof ProtocolError && err.code === "badentry" && !args.allowLast) {
+      // The last device. Over the recovery key that is the confirmation being
+      // asked for; from a device it is the credential as well, and saying so
+      // is the difference between an instruction and a dead end.
+      const said = err.message.replace(/; resend with allowLast.*$/, "");
       throw new Error(
-        `${err.message.replace(/; resend with allowLast.*$/, "")}. That would leave a vault only ` +
-          `its recovery key can reach, so say it out loud: basalt revoke ${deviceId} --allow-last.`,
+        args.recoveryKey !== undefined
+          ? `${said}. Say it out loud to do it anyway: basalt revoke ${deviceId} --allow-last ` +
+              `--recovery-key basalt3_...`
+          : `${said}. That is the recovery key's to do, not a device's: basalt revoke ${deviceId} ` +
+              `--allow-last --recovery-key basalt3_...`,
       );
     }
     throw err;
   } finally {
-    await client.close();
+    await revoker.close();
   }
   if (args.json) {
     io.out(JSON.stringify({ ok: true, revoked: deviceId, self }));
@@ -1533,6 +1774,16 @@ interface Args {
    * id off a list.
    */
   allowLast: boolean;
+  /**
+   * The vault's recovery key, for the two device-list commands that can be run
+   * with it instead of this device's own credential.
+   *
+   * Revoking the last device needs it, because that is the one revocation
+   * nothing on a device can undo. Listing takes it for the vault with no
+   * device left to ask: eight rows that never connected refuse every
+   * registration, and the ids to revoke have to come from somewhere.
+   */
+  recoveryKey?: string;
   /** How long an invite lasts, in milliseconds; undefined is the server's default. */
   ttlMs?: number;
   /** Whether rebase may remove the index, which the person confirms by typing it. */
@@ -1575,6 +1826,7 @@ export function parseArgs(argv: readonly string[]): Args {
     "--config-dir",
     "--ignore",
     "--ttl",
+    "--recovery-key",
   ]);
   let onlyPositional = false;
   for (let i = 0; i < argv.length; i++) {
@@ -1673,6 +1925,9 @@ export function parseArgs(argv: readonly string[]): Args {
         break;
       case "--allow-last":
         args.allowLast = true;
+        break;
+      case "--recovery-key":
+        args.recoveryKey = value!;
         break;
       case "--json":
         args.json = true;

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 )
@@ -160,6 +161,142 @@ func TestI23InvitesAreSingleUseAndExpire(t *testing.T) {
 	// on v2 either: a redemption is both halves or neither.
 	if ds, _ := h.Devices("v1"); len(ds) != 1 {
 		t.Fatalf("a refused redemption registered a device: %v", ds)
+	}
+	if n, _ := h.OutstandingInvites("v2", 1500); n != 1 {
+		t.Fatalf("%d outstanding invites on v2, want the one that was issued", n)
+	}
+}
+
+// Invites lists what could still be redeemed, in a stable order, and carries
+// nothing that would let a reader redeem one.
+//
+// The listing type has an identifier and an expiry and no sealed blob, which
+// is the property and not an accident of what this test asks for: an invite is
+// a standing authority to register a device, and a list type with the blob in
+// it hands the blob to everything that ever serialises it.
+func TestInvitesListsWhatCanStillBeRedeemed(t *testing.T) {
+	h := newTestStore(t)
+	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := h.Invites("v1", 1000); err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("a vault with no invites answered %#v, %v; never nil", got, err)
+	}
+	// Issued out of expiry order, so the ordering is the function's rather
+	// than the insertion's.
+	for _, c := range []struct {
+		id      string
+		expires int64
+	}{
+		{"CCCCCCCCCCCCCCCCCCCCCC", 9000},
+		{"AAAAAAAAAAAAAAAAAAAAAA", 3000},
+		{"BBBBBBBBBBBBBBBBBBBBBB", 6000},
+	} {
+		if err := h.AddInvite("v1", c.id, sealed1, c.expires, 1000); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := h.Invites("v1", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Invite{
+		{ID: "AAAAAAAAAAAAAAAAAAAAAA", ExpiresAt: 3000},
+		{ID: "BBBBBBBBBBBBBBBBBBBBBB", ExpiresAt: 6000},
+		{ID: "CCCCCCCCCCCCCCCCCCCCCC", ExpiresAt: 9000},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Invites = %+v, want %+v, soonest to expire first", got, want)
+	}
+
+	// Spent and expired are not outstanding: a list that showed either would
+	// be showing strings that no longer work.
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500); err != nil {
+		t.Fatalf("redeem: %v", err)
+	}
+	got, _ = h.Invites("v1", 6500)
+	if len(got) != 1 || got[0].ID != "CCCCCCCCCCCCCCCCCCCCCC" {
+		t.Fatalf("after a redemption and an expiry: %+v", got)
+	}
+	// Another vault's invites are not this one's.
+	if _, err := h.ClaimVault("v2", hash2, wrapped2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.AddInvite("v2", "DDDDDDDDDDDDDDDDDDDDDD", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := h.Invites("v1", 1000); len(got) != 2 {
+		t.Fatalf("v1 shows %+v, which includes another vault's", got)
+	}
+}
+
+// Cancelling an invite retires the string somebody is holding, before it
+// expires and without rotating the vault, which would retire the recovery key
+// with it.
+//
+// Unknown, expired, already redeemed and malformed are one error, the same
+// ErrNoInvite a redemption gets and for the same reason: saying which would
+// tell somebody guessing identifiers that they had found a real one.
+func TestCancellingAnInviteRetiresTheString(t *testing.T) {
+	h := newTestStore(t)
+	if _, err := h.ClaimVault("v1", hash1, wrapped1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.CancelInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", 1500); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	if got, _ := h.Invites("v1", 1500); len(got) != 0 {
+		t.Fatalf("a cancelled invite is still outstanding: %+v", got)
+	}
+	// The row is gone, not marked: cancelled and spent are different facts.
+	if n, _ := h.InviteRows("v1"); n != 0 {
+		t.Fatalf("%d invite rows after a cancel, want the row gone", n)
+	}
+	// And it no longer redeems, which is the whole point.
+	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "dev-one", "one", devHash1, 0, 1500); !errors.Is(err, ErrNoInvite) {
+		t.Fatalf("a cancelled invite redeemed: %v", err)
+	}
+	if ds, _ := h.Devices("v1"); len(ds) != 0 {
+		t.Fatalf("a cancelled invite registered a device: %v", ds)
+	}
+
+	// The four that are one refusal.
+	if err := h.AddInvite("v1", "BBBBBBBBBBBBBBBBBBBBBB", sealed1, 2000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.AddInvite("v1", "CCCCCCCCCCCCCCCCCCCCCC", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.RedeemInviteFor("v1", "CCCCCCCCCCCCCCCCCCCCCC", "dev-two", "two", devHash2, 0, 1500); err != nil {
+		t.Fatalf("redeem: %v", err)
+	}
+	for _, c := range []struct {
+		what, invite string
+		now          int64
+	}{
+		{"cancelled twice", "AAAAAAAAAAAAAAAAAAAAAA", 1500},
+		{"expired", "BBBBBBBBBBBBBBBBBBBBBB", 2001},
+		{"already redeemed", "CCCCCCCCCCCCCCCCCCCCCC", 1500},
+		{"unknown", "DDDDDDDDDDDDDDDDDDDDDD", 1500},
+		{"malformed", "not base64!", 1500},
+	} {
+		if err := h.CancelInvite("v1", c.invite, c.now); !errors.Is(err, ErrNoInvite) {
+			t.Fatalf("cancelling an %s invite answered %v, want ErrNoInvite", c.what, err)
+		}
+	}
+	// A cancel names its own vault: another vault's invite is not this one's
+	// to retire.
+	if _, err := h.ClaimVault("v2", hash2, wrapped2, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.AddInvite("v2", "EEEEEEEEEEEEEEEEEEEEEE", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.CancelInvite("v1", "EEEEEEEEEEEEEEEEEEEEEE", 1500); !errors.Is(err, ErrNoInvite) {
+		t.Fatalf("a vault cancelled another vault's invite: %v", err)
 	}
 	if n, _ := h.OutstandingInvites("v2", 1500); n != 1 {
 		t.Fatalf("%d outstanding invites on v2, want the one that was issued", n)
@@ -444,7 +581,7 @@ func TestARedeemRacingARevokeLeavesTheVaultConsistent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			revokeErr = two.RevokeDevice("v1", "alfa", false)
+			revokeErr = two.RevokeDevice("v1", "alfa", "", false)
 		}()
 		close(start)
 		wg.Wait()
@@ -565,7 +702,7 @@ func TestAnInviteCannotExceedTheDeviceCap(t *testing.T) {
 	}
 	// Refused, and so not spent: revoking something makes room and the same
 	// string works.
-	if err := h.RevokeDevice("v1", "seated-0", false); err != nil {
+	if err := h.RevokeDevice("v1", "seated-0", "", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := h.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "bravo", "phone", hashB, cap, 2001); err != nil {

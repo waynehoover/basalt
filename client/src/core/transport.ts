@@ -183,6 +183,20 @@ export interface RegistrarLimits {
   readonly maxDevices: number;
 }
 
+/**
+ * One outstanding invite, as the server hands it over.
+ *
+ * The identifier and the expiry, and deliberately nothing else. Redeeming an
+ * invite also takes the invite key, which never reached the server and lives
+ * only in the string somebody is holding, so a reader of this list cannot
+ * redeem one. What the identifier is for is saying which invite to cancel.
+ */
+export interface InviteRow {
+  readonly id: string;
+  /** When it stops working, in server milliseconds. */
+  readonly expiresAt: number;
+}
+
 /** One device's row in the vault's list, as the server hands it over. */
 export interface DeviceRow {
   /** The identity: chosen by that device, unique in the vault, never the name. */
@@ -1729,8 +1743,39 @@ export class Transport {
     return this.count(reply, "expiresAt", "invited");
   }
 
-  /** Every device that may reach this vault, and the cap on how many there may be. */
-  async devices(): Promise<{ devices: DeviceRow[]; maxDevices: number }> {
+  /**
+   * Cancels an outstanding invite, so the string somebody is holding stops
+   * working before it expires.
+   *
+   * Either credential may send it, the same as `revoke`: an invite is part of
+   * who may reach the vault rather than part of its content. An identifier
+   * that is unknown, expired or already redeemed is one refusal, `badentry`,
+   * saying which of the three to nobody.
+   */
+  async uninvite(invite: string): Promise<void> {
+    const reply = await this.request({ op: "uninvite", invite }, "uninvited");
+    if (reply["res"] !== "uninvited") {
+      throw new ProtocolError("protostate", `expected uninvited, got ${JSON.stringify(reply)}`);
+    }
+    if (reply["invite"] !== invite) {
+      throw this.malformed(
+        `an uninvited naming ${JSON.stringify(reply["invite"])}, which is not the ${JSON.stringify(invite)} that was cancelled`,
+      );
+    }
+  }
+
+  /**
+   * Every device that may reach this vault, the cap on how many there may be,
+   * and every invite that could still add one.
+   *
+   * The invites come with the devices because they are one answer: a row is
+   * what has been added and an outstanding invite is what is about to be.
+   */
+  async devices(): Promise<{
+    devices: DeviceRow[];
+    maxDevices: number;
+    invites: InviteRow[];
+  }> {
     const reply = await this.request({ op: "devices" }, "devices");
     if (reply["res"] !== "devices") {
       throw new ProtocolError("protostate", `expected devices, got ${JSON.stringify(reply)}`);
@@ -1739,10 +1784,36 @@ export class Transport {
     if (!Array.isArray(list)) {
       throw this.malformed("a devices reply with no list of devices");
     }
+    // A server that answers no `invites` at all is a malformed reply, the same
+    // as one with no `devices`: both are always sent, and reading a missing
+    // list as "none outstanding" would show an empty invite list with as much
+    // confidence as a true one. That is rule 7 in miniature.
+    const invites = reply["invites"];
+    if (!Array.isArray(invites)) {
+      throw this.malformed("a devices reply with no list of invites");
+    }
     return {
       devices: list.map((raw, i) => this.deviceRow(raw, i)),
       maxDevices: this.count(reply, "maxDevices", "devices"),
+      invites: invites.map((raw, i) => this.inviteRow(raw, i)),
     };
+  }
+
+  /** One invite, read as strictly as a device row and for the same reason. */
+  private inviteRow(raw: unknown, i: number): InviteRow {
+    const row = raw as Record<string, unknown>;
+    const id = row?.["id"];
+    if (typeof id !== "string" || id === "") {
+      throw this.malformed(`a devices reply whose invite ${i} has no id`);
+    }
+    const expiresAt = row["expiresAt"];
+    if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= 0) {
+      // An expiry is what says whether the string is still live, so a missing
+      // one cannot become zero: that reads as "expired in 1970" and would have
+      // a person ignore an invite that still works.
+      throw this.malformed(`a devices reply whose invite ${i} has no expiry`);
+    }
+    return { id, expiresAt };
   }
 
   /** One row, read strictly: a list somebody acts on is not a place to guess. */

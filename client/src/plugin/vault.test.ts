@@ -862,6 +862,7 @@ describe("a spelling check that cannot be made (P21)", () => {
 describe("the index, interrupted (P18)", () => {
   const INDEX = ".obsidian/plugins/basalt/index.json";
   const TEMP = ".obsidian/plugins/basalt/.basalt-tmp-index-index.json";
+  const LOG = ".obsidian/plugins/basalt/index.log";
   const state = (cursor: number) => ({
     cursor,
     entries: { "note.md": { path: "note.md", hash: `h${cursor}` } },
@@ -869,8 +870,19 @@ describe("the index, interrupted (P18)", () => {
     pending: [],
   });
 
+  /**
+   * Every save writes a whole snapshot, which is what these tests are about.
+   *
+   * With the ordinary policy the second save of a session appends one record
+   * and never touches the snapshot, so a fault injected into the snapshot
+   * write would never fire and every one of these would pass without testing
+   * anything. Forcing the snapshot keeps them aimed at the path they were
+   * written for.
+   */
+  const always = { policy: { fractionOfSnapshot: 0, maxRecords: 1, minBytes: 0 } };
+
   it("recovers from a live index cut short by reading the staged copy", async () => {
-    const store = new ObsidianIndexStore(adapter, INDEX);
+    const store = new ObsidianIndexStore(adapter, INDEX, always);
     await store.save(state(1));
     adapter.fault = (op, path) => (op === "write" && path === INDEX ? 5 : undefined);
     await expect(store.save(state(2))).rejects.toThrow(/wrote 5 of/);
@@ -881,7 +893,7 @@ describe("the index, interrupted (P18)", () => {
   });
 
   it("keeps the live index when the staging copy is what was cut short", async () => {
-    const store = new ObsidianIndexStore(adapter, INDEX);
+    const store = new ObsidianIndexStore(adapter, INDEX, always);
     await store.save(state(1));
     adapter.fault = (op, path) => (op === "writeBinary" && path === TEMP ? 3 : undefined);
     await expect(store.save(state(2))).rejects.toThrow(/wrote 3/);
@@ -890,7 +902,7 @@ describe("the index, interrupted (P18)", () => {
   });
 
   it("loads the live index and tidies a staged copy left behind after a complete save", async () => {
-    const store = new ObsidianIndexStore(adapter, INDEX);
+    const store = new ObsidianIndexStore(adapter, INDEX, always);
     await store.save(state(1));
     adapter.fault = (op, path) =>
       op === "remove" && path === TEMP ? new Error("EBUSY") : undefined;
@@ -915,13 +927,19 @@ describe("the index, interrupted (P18)", () => {
     await expect(new ObsidianIndexStore(adapter, INDEX).load()).rejects.toThrow(/not valid JSON/);
   });
 
-  it("removes both copies and proves it, for unlink", async () => {
+  it("removes every copy and proves it, for unlink", async () => {
+    // Three files, not two. A journal left behind is a delta against a
+    // snapshot that no longer exists, and the load after it refuses to start
+    // rather than guessing at a base.
     const store = new ObsidianIndexStore(adapter, INDEX);
     await store.save(state(1));
+    await store.save(state(2));
+    expect(await adapter.exists(LOG), "nothing was journalled to remove").toBe(true);
     await adapter.write(TEMP, JSON.stringify(state(2)));
     await store.remove();
     expect(await adapter.exists(INDEX)).toBe(false);
     expect(await adapter.exists(TEMP)).toBe(false);
+    expect(await adapter.exists(LOG), "the journal outlived the index").toBe(false);
     expect(await new ObsidianIndexStore(adapter, INDEX).load()).toBeUndefined();
 
     await store.save(state(3));

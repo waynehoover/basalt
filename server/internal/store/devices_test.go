@@ -319,7 +319,7 @@ func TestRevokingADeviceLeavesEveryOtherDeviceAlone(t *testing.T) {
 	if err := h.SawDevice("v1", "charlie", 5000); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.RevokeDevice("v1", "bravo", false); err != nil {
+	if err := h.RevokeDevice("v1", "bravo", "", false); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 
@@ -339,7 +339,7 @@ func TestRevokingADeviceLeavesEveryOtherDeviceAlone(t *testing.T) {
 	}
 	// And it is a delete, so revoking it again is unknown rather than a
 	// second success.
-	if err := h.RevokeDevice("v1", "bravo", false); !errors.Is(err, ErrUnknownDevice) {
+	if err := h.RevokeDevice("v1", "bravo", "", false); !errors.Is(err, ErrUnknownDevice) {
 		t.Fatalf("err = %v revoking an already revoked device, want ErrUnknownDevice", err)
 	}
 }
@@ -356,7 +356,7 @@ func TestRevokingADeviceDoesNotTouchTheHistoryItWrote(t *testing.T) {
 	if err := h.RegisterDevice("v1", "device-two", "phone", hashB, 1001); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.RevokeDevice("v1", "device-one", false); err != nil {
+	if err := h.RevokeDevice("v1", "device-one", "", false); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 	got, ok, err := h.EntryByUID("v1", e.UID)
@@ -380,24 +380,27 @@ func TestRevokingTheLastDeviceIsRefusedUnlessSaidSo(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two devices: not the last one.
-	if err := h.RevokeDevice("v1", "alfa", false); err != nil {
+	if err := h.RevokeDevice("v1", "alfa", "", false); err != nil {
 		t.Fatalf("revoking one of two: %v", err)
 	}
 	// One device: refused, and still there afterwards.
-	err := h.RevokeDevice("v1", "bravo", false)
+	err := h.RevokeDevice("v1", "bravo", "", false)
 	if !errors.Is(err, ErrLastDevice) {
 		t.Fatalf("err = %v revoking the last device, want ErrLastDevice", err)
 	}
 	if _, _, ok, _ := h.DeviceByID("v1", "bravo"); !ok {
 		t.Fatal("the refusal deleted the row anyway")
 	}
-	// The message has to tell a person what to do about it, because the
-	// refusal is the only place they learn there is a way through.
-	if !strings.Contains(err.Error(), "recovery key") || !strings.Contains(err.Error(), "explicitly") {
-		t.Fatalf("the refusal does not say what it costs or how to mean it: %v", err)
+	// The message has to say what it would cost, because the refusal is the
+	// only place a person learns what "the last device" means for the vault.
+	// What to do about it is the session's to add, since the answer depends on
+	// which credential is asking: a device is told to fetch the recovery key,
+	// and the recovery key is told to say the word. See handleRevoke.
+	if !strings.Contains(err.Error(), "recovery key") || !strings.Contains(err.Error(), "no devices") {
+		t.Fatalf("the refusal does not say what it costs: %v", err)
 	}
 	// Said explicitly: done.
-	if err := h.RevokeDevice("v1", "bravo", true); err != nil {
+	if err := h.RevokeDevice("v1", "bravo", "", true); err != nil {
 		t.Fatalf("revoking the last device on purpose: %v", err)
 	}
 	if n := len(ids(t, h, "v1")); n != 0 {
@@ -414,15 +417,15 @@ func TestRevokingAnUnknownDeviceIsNotTheSameAsTheLastOne(t *testing.T) {
 	if err := h.RegisterDevice("v1", "alfa", "laptop", hashA, 1000); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.RevokeDevice("v1", "typo", false); !errors.Is(err, ErrUnknownDevice) {
+	if err := h.RevokeDevice("v1", "typo", "", false); !errors.Is(err, ErrUnknownDevice) {
 		t.Fatalf("err = %v, want ErrUnknownDevice", err)
 	}
 	// Even with the confirmation, an unknown id is unknown rather than a
 	// quiet success.
-	if err := h.RevokeDevice("v1", "typo", true); !errors.Is(err, ErrUnknownDevice) {
+	if err := h.RevokeDevice("v1", "typo", "", true); !errors.Is(err, ErrUnknownDevice) {
 		t.Fatalf("err = %v with allowLast, want ErrUnknownDevice", err)
 	}
-	if err := h.RevokeDevice("nosuchvault", "alfa", true); !errors.Is(err, ErrUnknownDevice) {
+	if err := h.RevokeDevice("nosuchvault", "alfa", "", true); !errors.Is(err, ErrUnknownDevice) {
 		t.Fatalf("err = %v on an unknown vault, want ErrUnknownDevice", err)
 	}
 	if n := len(ids(t, h, "v1")); n != 1 {
@@ -500,7 +503,7 @@ func TestSawDeviceOnARevokedDeviceSaysSoAndDoesNotRecreateIt(t *testing.T) {
 	if err := h.RegisterDevice("v1", "bravo", "phone", hashB, 1001); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.RevokeDevice("v1", "bravo", false); err != nil {
+	if err := h.RevokeDevice("v1", "bravo", "", false); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.SawDevice("v1", "bravo", 7000); !errors.Is(err, ErrUnknownDevice) {
@@ -596,7 +599,7 @@ func TestConcurrentRevokesCannotEmptyTheVault(t *testing.T) {
 			go func(i int, h *harness, id string) {
 				defer wg.Done()
 				<-start
-				errs[i] = h.RevokeDevice("v1", id, false)
+				errs[i] = h.RevokeDevice("v1", id, "", false)
 			}(i, r.h, r.id)
 		}
 		close(start)
@@ -656,7 +659,7 @@ func TestRevokingRacesASessionsHeartbeatWithoutResurrectingIt(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		if err := h.RevokeDevice("v1", "bravo", false); err != nil {
+		if err := h.RevokeDevice("v1", "bravo", "", false); err != nil {
 			t.Errorf("revoke: %v", err)
 		}
 	}()
@@ -776,11 +779,62 @@ func TestTheNinthRegistrationIsRefused(t *testing.T) {
 
 	// Revoking one makes room, which is the whole of what "a managed list"
 	// means: the cap is cleared by a decision, not by waiting.
-	if err := h.RevokeDevice("v1", "device-0", false); err != nil {
+	if err := h.RevokeDevice("v1", "device-0", "", false); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 	if err := h.Store.RegisterDevice("v1", "one-too-many", "phone", hashB, hash1, MaxDevices, 2001); err != nil {
 		t.Fatalf("registering into the freed slot: %v", err)
+	}
+}
+
+// A full vault says how many of its rows nothing has ever connected under,
+// because those are the ones somebody can reclaim without losing a device.
+//
+// This is the cost of the ordering redemption deliberately has: the row is
+// written before the device redeeming it saves anything, so a pairing that
+// reaches the server and then crashes strands a row rather than a device that
+// believes it is paired. Eight of those, or eight an attacker minted invites
+// for, fill the cap. Nothing here deletes one, for the reason in MaxDevices,
+// so the refusal has to be the thing that points at them: "the vault is full"
+// on its own leaves a person choosing which of their working devices to cut
+// off.
+func TestTheCapRefusalNamesTheRowsThatNeverConnected(t *testing.T) {
+	h := claimedStore(t)
+	for i := 0; i < MaxDevices; i++ {
+		id := fmt.Sprintf("device-%d", i)
+		if err := h.Store.RegisterDevice("v1", id, id, hashA, hash1, MaxDevices, int64(1000+i)); err != nil {
+			t.Fatalf("device %d: %v", i, err)
+		}
+	}
+	// Five of the eight have connected; three are what a crashed pairing
+	// leaves.
+	for i := 0; i < 5; i++ {
+		if err := h.SawDevice("v1", fmt.Sprintf("device-%d", i), 5000); err != nil {
+			t.Fatalf("last seen on device %d: %v", i, err)
+		}
+	}
+	err := h.Store.RegisterDevice("v1", "one-too-many", "phone", hashB, hash1, MaxDevices, 2000)
+	if !errors.Is(err, ErrDeviceLimit) {
+		t.Fatalf("the ninth registration returned %v, want ErrDeviceLimit", err)
+	}
+	if !strings.Contains(err.Error(), "3 of them have never connected") {
+		t.Fatalf("the refusal does not count the rows worth reclaiming: %v", err)
+	}
+	if !strings.Contains(err.Error(), "revoke") {
+		t.Fatalf("the refusal does not say what to do about them: %v", err)
+	}
+
+	// And a full vault whose every row is in use does not invent them: a
+	// sentence about crashed pairings on a vault that has had none would send
+	// somebody looking for a row that is not there.
+	for i := 5; i < MaxDevices; i++ {
+		if err := h.SawDevice("v1", fmt.Sprintf("device-%d", i), 6000); err != nil {
+			t.Fatalf("last seen on device %d: %v", i, err)
+		}
+	}
+	err = h.Store.RegisterDevice("v1", "one-too-many", "phone", hashB, hash1, MaxDevices, 2001)
+	if !errors.Is(err, ErrDeviceLimit) || strings.Contains(err.Error(), "never connected") {
+		t.Fatalf("a vault with no stranded rows was told it had some: %v", err)
 	}
 }
 
@@ -936,6 +990,48 @@ func TestRegisteringUnderARetiredVaultCredentialIsRefused(t *testing.T) {
 	// The new credential registers.
 	if err := h.Store.RegisterDevice("v1", "after", "phone", hashB, hash2, MaxDevices, 3000); err != nil {
 		t.Fatalf("registering under the new credential: %v", err)
+	}
+}
+
+// Revoking under the vault's credential is conditional on that still being the
+// vault's credential, exactly as registering is.
+//
+// The same incident, and the prize is worse. A rotation deliberately leaves
+// every device row alone, so a retired root that could still delete rows would
+// answer the rotation meant to end its access by deleting every device the
+// vault has: the person who rotated keeps a vault only the recovery key opens,
+// and the leak-holder chose that for them. A device passes no hash and is
+// unaffected, because it authenticated against its own row and not the vault.
+func TestRevokingUnderARetiredVaultCredentialIsRefused(t *testing.T) {
+	h := claimedStore(t)
+	if err := h.RegisterDevice("v1", "alfa", "laptop", hashA, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RegisterDevice("v1", "bravo", "phone", hashB, 1001); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Rotate("v1", hash1, hash2, wrapped2); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+
+	err := h.RevokeDevice("v1", "alfa", hash1, false)
+	if !errors.Is(err, ErrRotated) {
+		t.Fatalf("a revoke under the retired credential returned %v, want ErrRotated", err)
+	}
+	if _, _, ok, _ := h.DeviceByID("v1", "alfa"); !ok {
+		t.Fatal("the retired credential revoked a device the rotation cannot put back")
+	}
+	// A device's revoke names no vault hash and is not touched by any of this:
+	// its authority is its own row, and a rotation does not move that.
+	if err := h.RevokeDevice("v1", "alfa", "", false); err != nil {
+		t.Fatalf("a device revoking after a rotation: %v", err)
+	}
+	// And the new credential revokes.
+	if err := h.RevokeDevice("v1", "bravo", hash2, true); err != nil {
+		t.Fatalf("revoking under the new credential: %v", err)
+	}
+	if n := len(ids(t, h, "v1")); n != 0 {
+		t.Fatalf("%d devices left", n)
 	}
 }
 

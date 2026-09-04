@@ -244,8 +244,51 @@ upload is one it will never accept, so a peer cannot write
 filesystem, so a symlink inside the vault cannot lead a write out; and a path
 from the wire cannot climb out with `..` or an absolute path.
 
-What a device cannot do is add another one behind you, or take the vault away
-from you, because it does not hold the root.
+What a device cannot do is `register` or `rotate`, or show you the recovery
+key, because it does not hold the root. The boundary stops there, and an
+earlier draft of this paragraph drew it in the wrong place.
+
+It cannot **empty the vault** either. Any device may revoke any other device,
+which is the whole reason revocation exists here rather than only rotation: a
+phone cuts off a stolen laptop without anybody finding the recovery key. The
+last row is the exception and the only one, because it is the one revocation
+nothing on a device can undo. What it leaves is a vault only the recovery key
+opens, so a compromised laptop could otherwise delete every row and the last
+one with it, and its owner would be left holding devices that can no longer
+reach their own notes. It costs nothing in the case it is aimed at: a device
+stolen when it was the only one wants a rotation as well, and rotating already
+needs the key.
+
+A device **can** add another device, because it can issue an invite and an
+invite registers exactly one row. That is not a leak, it is the design: the
+recovery key stays offline, so something a device holds has to be able to admit
+the next one. A compromised laptop can therefore issue a string and redeem it
+elsewhere, and the honest boundary is not that it cannot, but that it cannot do
+so unseen. Every row is in `basalt devices` with when it was added and when it
+was last seen, every outstanding invite is in that list too, any device can
+revoke any row but the last or cancel any invite, and an unredeemed invite dies
+on the next rotation or within the hour regardless.
+
+The other side of that boundary: the recovery key can now read the device list
+and take rows off it, where it used to be able only to register and rotate.
+Two things forced it. Emptying the vault has to be the recovery key's, and a
+refusal naming a credential the server would then also refuse is a dead end
+rather than an instruction. And a vault whose eight rows are all pairings that
+crashed refuses every registration until somebody prunes it, with no device
+left to prune it from. What it costs is that a leaked root can stop devices
+connecting, where before it could only read and add: worth saying, and smaller
+than it sounds, because a leaked root can already register itself and read
+everything, the answer to one is a rotation, and a rotation retires the leaked
+key's power to touch the list at all.
+
+That an invite is in the list at all is new, and it closes the gap this
+paragraph used to end on. An invite was the one authority on a vault that
+nothing could see, so a string issued on a stolen laptop stayed invisible until
+somebody redeemed it, for up to an hour. Both surfaces show every outstanding
+one now, by identifier and expiry and never the sealed blob, and offer to
+cancel it. Seeing an identifier redeems nothing, because redeeming also takes
+the invite key, which never reaches the server and exists only in the string
+somebody is holding.
 
 ## Three credentials, and who holds which
 
@@ -253,8 +296,8 @@ The separation is the point, so it is worth stating as three lines.
 
 | credential | held by | may |
 |---|---|---|
-| the root secret, which is the recovery key | nobody: written down, offline | register a device, rewrap the data key |
-| a device secret | one device | connect and sync as that device |
+| the root secret, which is the recovery key | nobody: written down, offline | register a device, rewrap the data key, read the device list, take a row off it, cancel an invite |
+| a device secret | one device | connect and sync as that device, issue and cancel invites, revoke any device but the last |
 | the data key | every paired device | read and write content |
 
 The root is used twice in a vault's life: when it is created, and when every
@@ -271,7 +314,14 @@ Revoke it. `basalt devices` lists every device that may reach the vault and
 `basalt revoke ID` deletes one's row and closes whatever it has open, and no
 other device is disturbed: each holds a credential of its own, so there is
 nothing shared to retire. That is the cheap, common case, and it is the one
-that used to cost a weekend of re-pairing everything.
+that used to cost a weekend of re-pairing everything. Any device can do it to
+any other, which is the point: the recovery key stays in its drawer.
+
+The exception is the vault's **last** device, which takes the recovery key:
+`basalt revoke ID --allow-last --recovery-key basalt3_...`. That one revocation
+cannot be undone without the key, since what it leaves is a vault only the key
+opens, so it is the one that asks for it. If the last device was stolen you
+want the rotation below as well, and that needs the key anyway.
 
 **Revoking does not un-read what that device already read.** It still holds the
 data key and can decrypt every note it had synced. Revocation stops future

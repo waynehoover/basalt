@@ -78,7 +78,13 @@ import {
   isNeverSynced,
   neverSync,
 } from "../core/paths.ts";
-import { LastIndexWrite } from "../core/vault.ts";
+import {
+  JournalIndexStore,
+  indexLogPath,
+  type JournalFiles,
+  type JournalStamps,
+  type JournalStoreOptions,
+} from "../core/index-journal-store.ts";
 import type { FileStat, IndexStamp, IndexStore, StoredState, Times, Vault } from "../core/vault.ts";
 
 /**
@@ -992,91 +998,131 @@ function flipCase(path: string): string {
  * Written through the adapter rather than the filesystem, because on mobile
  * there is no filesystem to write to.
  *
- * Written the way notes are, staged and read back, because the adapter's write
- * truncates first. An index cut short by a crash was not valid JSON, and an
- * index that is not valid JSON stops the plugin on every load (rule 2), so one
- * bad moment put a vault whose notes were all fine behind a plugin that would
- * not start. The staged copy is the way back: `load` reads it when the live
- * file cannot be read, because it is complete and describes a state at least as
- * new.
+ * Two files, a snapshot and a journal of what has changed since, with the
+ * reasoning and every crash case in `core/index-journal-store.ts` so that this
+ * shell and the headless one cannot answer them differently. What is here is
+ * the mapping onto the adapter, and it is the mapping that is awkward:
+ *
+ *   - the snapshot is written the way notes are, staged and read back, because
+ *     the adapter's write truncates first. An index cut short by a crash was
+ *     not valid JSON, and an index that is not valid JSON stops the plugin on
+ *     every load (rule 2), so one bad moment put a vault whose notes were all
+ *     fine behind a plugin that would not start. The staged copy is the way
+ *     back: it is read when the live file cannot be, because it is complete and
+ *     describes a state at least as new.
+ *   - the journal is appended with `DataAdapter.append`, which is
+ *     `fs.promises.appendFile(path, data, "utf8")` on desktop and Capacitor's
+ *     `appendFile` with a UTF-8 encoding on mobile. Both were read out of the
+ *     shipped bundle (`obsidian-1.13.7.asar`) rather than inferred from the
+ *     declarations, and `append` is public from 1.7.2, which is this plugin's
+ *     minimum. `appendBinary` is 1.12.3 and is not used for that reason.
+ *   - there is no staged copy of the journal and there does not need to be. A
+ *     record the adapter cut short is discarded by the next load and the
+ *     records before it are not, so the failure a staged copy exists to
+ *     prevent cannot happen here.
+ *
+ * What is still not offered is an fsync. The adapter has no way to ask for one,
+ * so a record is durable when the platform says it is, exactly as a note is.
+ * That is not a regression and it is not an improvement.
  */
 export class ObsidianIndexStore implements IndexStore {
+  private readonly files: ObsidianJournalFiles;
+  private readonly store: JournalIndexStore;
+
   constructor(
     private readonly adapter: DataAdapter,
-    private readonly path: string,
-  ) {}
+    path: string,
+    opts: JournalStoreOptions = {},
+  ) {
+    this.files = new ObsidianJournalFiles(adapter, normalizePath(path));
+    this.store = new JournalIndexStore(this.files, {
+      log: (message: string, ...rest: unknown[]) =>
+        console.warn(`Basalt Sync: ${message}`, ...rest),
+      ...opts,
+    });
+  }
 
-  private get live(): string {
-    return normalizePath(this.path);
+  load(): Promise<StoredState | undefined> {
+    return this.store.load();
+  }
+
+  save(state: StoredState): Promise<void> {
+    return this.store.save(state);
   }
 
   /**
-   * A fixed name, unlike a note's staging copy, because `load` has to find it
-   * after a restart. Inside the plugin's own folder, so nothing of the user's
-   * can be there under that name.
+   * Removes the index, every copy of it, and proves they are gone.
+   *
+   * What unlink needs. An index left behind is read by the next pairing as
+   * the truth about a server that has never seen this device, a staged copy
+   * left behind is read by `load` as the index, and a journal left behind is
+   * a delta against a snapshot that no longer exists.
+   */
+  async remove(): Promise<void> {
+    for (const path of this.files.everyFile()) {
+      if (await this.adapter.exists(path)) await this.adapter.remove(path);
+      if (await this.adapter.exists(path)) {
+        throw new Error(`${path} is still there after removing it`);
+      }
+    }
+  }
+}
+
+/** The snapshot, the journal and the stats, through Obsidian's adapter. */
+class ObsidianJournalFiles implements JournalFiles {
+  private readonly log: string;
+
+  constructor(
+    private readonly adapter: DataAdapter,
+    private readonly live: string,
+  ) {
+    this.log = indexLogPath(live);
+  }
+
+  /**
+   * A fixed name, unlike a note's staging copy, because `readSnapshot` has to
+   * find it after a restart. Inside the plugin's own folder, so nothing of the
+   * user's can be there under that name.
    */
   private get temp(): string {
     return stagingPath(this.live, "index");
   }
 
-  async load(): Promise<StoredState | undefined> {
-    const live = await this.readIndex(this.live);
-    if (live.state !== undefined) {
-      // A staging copy left behind means a save was interrupted after the
-      // live file was complete, or never got as far as touching it. The
-      // live file is complete and parses, so it is the state to start
-      // from; an older index is always safe, because notes are durable
-      // before the index that names them.
-      if (await this.adapter.exists(this.temp)) await this.adapter.remove(this.temp);
-      // What is on disk is what was last written, so a first pass that
-      // changes nothing writes nothing. Only from the live file: a state
-      // read out of the staging copy is not what the live file holds.
-      this.last.wrote(live.text!, await this.stamp());
-      return live.state;
-    }
-    const staged = await this.readIndex(this.temp);
-    if (staged.state !== undefined) return staged.state;
-    if (live.error !== undefined) {
-      // A read that fails is not an absent index. Rule 2, and the incident
-      // it came from: falling back to an empty result and writing it back
-      // disabled every plugin on a device.
-      throw new Error(`the index at ${this.path} is not valid JSON: ${live.error}`);
-    }
-    return undefined;
-  }
-
-  /** One index file: its state, or the reason it has none. */
-  private async readIndex(
-    path: string,
-  ): Promise<{ state?: StoredState; text?: string; error?: string; absent?: true }> {
-    if (!(await this.adapter.exists(path))) return { absent: true };
-    const text = await this.adapter.read(path);
-    try {
-      return { state: JSON.parse(text) as StoredState, text };
-    } catch (err) {
-      return { error: (err as Error).message };
-    }
+  /** Every path this store owns, for a removal that must leave nothing behind. */
+  everyFile(): string[] {
+    return [this.live, this.temp, this.log];
   }
 
   /**
-   * What this session last wrote, and how it looked on disk (R3).
+   * The live snapshot, or the staged copy when the live one cannot be read.
    *
-   * The rule, and the reasoning behind it, is `LastIndexWrite` in core, shared
-   * with the headless client's store so the two cannot drift apart again.
+   * Which of the two is returned changes nothing about the journal beside
+   * them. The staged copy is written first and holds the newer sequence, so a
+   * journal that continues the live file is already folded into it and every
+   * record is skipped; a journal that continues the staged copy is applied to
+   * the live one across the same gap. Either way no delta lands on a base it
+   * was not computed against.
    */
-  private readonly last = new LastIndexWrite();
-
-  /** The live index's size and modification time, or undefined if it is not a file. */
-  private async stamp(): Promise<IndexStamp | undefined> {
-    const stat = await this.adapter.stat(this.live);
-    if (stat === null || stat.type !== "file") return undefined;
-    return { size: stat.size, mtime: stat.mtime };
+  async readSnapshot(): Promise<string | undefined> {
+    const live = await this.readFile(this.live);
+    if (live.text !== undefined && parses(live.text)) {
+      // A staging copy left behind means a save was interrupted after the
+      // live file was complete, or never got as far as touching it. The live
+      // file is complete and parses, so it is the state to start from; an
+      // older index is always safe, because notes are durable before the
+      // index that names them.
+      if (await this.adapter.exists(this.temp)) await this.adapter.remove(this.temp);
+      return live.text;
+    }
+    const staged = await this.readFile(this.temp);
+    if (staged.text !== undefined && parses(staged.text)) return staged.text;
+    // Neither parses. The live file's text, if there is one, so the refusal
+    // above names what is wrong with the file somebody has to fix.
+    return live.text;
   }
 
-  async save(state: StoredState): Promise<void> {
-    const text = JSON.stringify(state);
+  async writeSnapshot(text: string): Promise<void> {
     const live = this.live;
-    if (this.last.matches(text, await this.stamp())) return;
     const parts = live.split("/");
     parts.pop();
     if (parts.length > 0) {
@@ -1095,36 +1141,75 @@ export class ObsidianIndexStore implements IndexStore {
         await this.adapter.remove(temp).catch(() => undefined);
         throw err;
       }
-    } else {
-      // In place, because rename refuses an occupied destination (see the
-      // header of this file). The staged copy stays until the live file has
-      // been read back, and stays for good if it never is: `load` finds it.
-      await this.adapter.write(live, text);
-      await verify(this.adapter, live, bytes);
-      // The live index is verified, so a staged copy that will not go is
-      // clutter and not a failure: raising here would have the next pass
-      // write the same index again and fail the same way, for ever. `load`
-      // removes it the next time the plugin starts.
-      await this.adapter.remove(temp).catch(() => undefined);
+      return;
     }
-    this.last.wrote(text, await this.stamp());
+    // In place, because rename refuses an occupied destination (see the header
+    // of this file). The staged copy stays until the live file has been read
+    // back, and stays for good if it never is: `readSnapshot` finds it.
+    await this.adapter.write(live, text);
+    await verify(this.adapter, live, bytes);
+    // The live index is verified, so a staged copy that will not go is clutter
+    // and not a failure: raising here would have the next pass write the same
+    // index again and fail the same way, for ever. `readSnapshot` removes it
+    // the next time the plugin starts.
+    await this.adapter.remove(temp).catch(() => undefined);
+  }
+
+  async readLog(): Promise<string | undefined> {
+    return (await this.readFile(this.log)).text;
+  }
+
+  async appendLog(line: string): Promise<void> {
+    await this.adapter.append(this.log, line);
   }
 
   /**
-   * Removes the index, both copies, and proves they are gone.
+   * Empty, and still there. A missing log and an empty one are different states.
    *
-   * What unlink needs. An index left behind is read by the next pairing as
-   * the truth about a server that has never seen this device, and a staged
-   * copy left behind is read by `load` as the index.
+   * `write` truncates first, which is the one place in this file where that is
+   * exactly what is wanted, and it is verified afterwards rather than trusted
+   * (rule 4). A truncate that silently did not happen would leave the records
+   * a fresh snapshot has already folded in, and the load after that skips them
+   * by sequence, so this is belt and braces rather than the only defence.
    */
-  async remove(): Promise<void> {
-    for (const path of [this.live, this.temp]) {
-      if (await this.adapter.exists(path)) await this.adapter.remove(path);
-      if (await this.adapter.exists(path)) {
-        throw new Error(`${path} is still there after removing it`);
-      }
+  async truncateLog(): Promise<void> {
+    await this.adapter.write(this.log, "");
+    const stat = await this.adapter.stat(this.log);
+    if (stat === null || stat.type !== "file" || stat.size !== 0) {
+      throw new Error(`the index journal at ${this.log} is not empty after truncating it`);
     }
-    this.last.forget();
+  }
+
+  async stamps(): Promise<JournalStamps> {
+    const [snapshot, log] = await Promise.all([this.stampOf(this.live), this.stampOf(this.log)]);
+    return { ...(snapshot ? { snapshot } : {}), ...(log ? { log } : {}) };
+  }
+
+  private async stampOf(path: string): Promise<IndexStamp | undefined> {
+    const stat = await this.adapter.stat(path);
+    if (stat === null || stat.type !== "file") return undefined;
+    return { size: stat.size, mtime: stat.mtime };
+  }
+
+  /**
+   * One file's text, or undefined when it is absent.
+   *
+   * A read that throws is not an absent file. Rule 2, and the incident it came
+   * from: falling back to an empty result and writing it back disabled every
+   * plugin on a device.
+   */
+  private async readFile(path: string): Promise<{ text?: string }> {
+    if (!(await this.adapter.exists(path))) return {};
+    return { text: await this.adapter.read(path) };
+  }
+}
+
+function parses(text: string): boolean {
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
   }
 }
 

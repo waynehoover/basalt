@@ -53,6 +53,227 @@ func issue(t *testing.T, a *client, invite string) {
 	a.recvInto("invited", &wire.Invited{})
 }
 
+/* ---------------------------------------------------------------- *
+ * Seeing an invite, and cancelling one
+ * ---------------------------------------------------------------- */
+
+// An outstanding invite is visible beside the device list, by identifier and
+// expiry and by nothing else.
+//
+// It was the one authority on a vault that nothing could see. A string issued
+// on a stolen laptop was invisible until somebody redeemed it, for up to an
+// hour, which made "every device is a row you can see" a smaller promise than
+// it sounded: the row that has not appeared yet is the one worth knowing about.
+//
+// What must never be here is the sealed blob, or anything else that would let
+// a reader of the list redeem the invite. The identifier alone redeems nothing:
+// that also takes the invite key, which never reached the server and exists
+// only in the string somebody is holding. The identifier is what says which
+// invite to cancel.
+func TestOutstandingInvitesAreVisibleAndCarryNothingThatRedeems(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+
+	a.sendJSON(wire.In{Op: "devices", ID: 1})
+	var empty wire.DeviceList
+	a.recvInto("devices", &empty)
+	if empty.Invites == nil {
+		t.Fatal("invites is null on a vault with none, so a client that iterates it crashes")
+	}
+	if len(empty.Invites) != 0 {
+		t.Fatalf("%d invites before any was issued", len(empty.Invites))
+	}
+
+	a.sendJSON(wire.In{Op: "invite", Invite: testInvite, Sealed: testSealed, TTLMs: 60_000})
+	var issued wire.Invited
+	a.recvInto("invited", &issued)
+
+	a.sendJSON(wire.In{Op: "devices", ID: 2})
+	raw := a.recv()
+	list, _ := raw["invites"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("the device list shows %v invites, want the one that was issued", raw["invites"])
+	}
+	row, _ := list[0].(map[string]any)
+	if row["id"] != testInvite || row["expiresAt"] != float64(issued.ExpiresAt) {
+		t.Fatalf("the invite row is %v, want the identifier and the expiry that was answered", row)
+	}
+	// By identifier and expiry and nothing else. Asserted over the raw frame
+	// rather than the struct, because a field added to store.Invite would
+	// unmarshal into a struct this test does not look at and reach every
+	// client that ever serialises the list.
+	if len(row) != 2 {
+		t.Fatalf("the invite row carries fields beyond the identifier and expiry: %v", row)
+	}
+	for key, value := range row {
+		if v, ok := value.(string); ok && v == testSealed {
+			t.Fatalf("the sealed data key is in the listing, under %q", key)
+		}
+	}
+
+	// A redeemed invite is not outstanding: it is a device row now, and the
+	// list would otherwise show a string that no longer works.
+	if f := redeem(t, r, testInvite, "phone"); f["res"] != "redeemed" {
+		t.Fatalf("redeem was answered %v", f)
+	}
+	a.sendJSON(wire.In{Op: "devices", ID: 3})
+	var after wire.DeviceList
+	a.recvInto("devices", &after)
+	if len(after.Invites) != 0 || len(after.Devices) != 2 {
+		t.Fatalf("after redeeming: %d invites and %d devices", len(after.Invites), len(after.Devices))
+	}
+}
+
+// An expired invite is not outstanding either, so the list shows what could
+// still be redeemed rather than what was ever issued.
+func TestAnExpiredInviteLeavesTheList(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+	a.sendJSON(wire.In{Op: "invite", Invite: testInvite, Sealed: testSealed, TTLMs: 60_000})
+	a.recvInto("invited", &wire.Invited{})
+
+	r.srv.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	a.sendJSON(wire.In{Op: "devices"})
+	var list wire.DeviceList
+	a.recvInto("devices", &list)
+	if len(list.Invites) != 0 {
+		t.Fatalf("an expired invite is still listed as outstanding: %+v", list.Invites)
+	}
+}
+
+// Cancelling one, which is what seeing them is for: an invite issued on a
+// device you have just lost is retired without waiting out the hour and
+// without rotating the vault, which would retire the recovery key with it.
+func TestAnOutstandingInviteCanBeCancelled(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+	issue(t, a, testInvite)
+
+	a.sendJSON(wire.In{Op: "uninvite", ID: 4, Invite: testInvite})
+	var done wire.Uninvited
+	a.recvInto("uninvited", &done)
+	if done.Invite != testInvite {
+		t.Fatalf("uninvited names %q, not the invite that was cancelled", done.Invite)
+	}
+	// Gone from the list, and gone from the server: the string somebody is
+	// holding stops working, which is the whole point.
+	a.sendJSON(wire.In{Op: "devices"})
+	var list wire.DeviceList
+	a.recvInto("devices", &list)
+	if len(list.Invites) != 0 {
+		t.Fatalf("a cancelled invite is still outstanding: %+v", list.Invites)
+	}
+	if f := redeem(t, r, testInvite, "phone"); f["code"] != wire.CodeAuth {
+		t.Fatalf("a cancelled invite still redeems: %v", f)
+	}
+	if n := len(mustDevices(t, r)); n != 1 {
+		t.Fatalf("%d devices after a cancelled invite was redeemed", n)
+	}
+
+	// Cancelling it again says there is nothing to cancel, and says it the
+	// same way an unknown identifier is answered: one refusal for the four,
+	// because telling them apart tells somebody guessing that they found one.
+	a.sendJSON(wire.In{Op: "uninvite", Invite: testInvite})
+	one := a.expectErr(wire.CodeBadEntry)
+	a.sendJSON(wire.In{Op: "uninvite", Invite: "BBBBBBBBBBBBBBBBBBBBBB"})
+	two := a.expectErr(wire.CodeBadEntry)
+	if one != two {
+		t.Fatalf("a spent invite and an unknown one are distinguishable:\n  %q\n  %q", one, two)
+	}
+	if !strings.Contains(one, "device list") {
+		t.Fatalf("the refusal does not say where to look instead: %q", one)
+	}
+	// The session survives, because nothing changed.
+	a.sendJSON(wire.In{Op: "ping"})
+	a.recvInto("pong", &wire.Pong{})
+}
+
+// The recovery key sees and cancels invites too, on the same reasoning as the
+// device list: an invite is part of who may reach the vault. It is also the
+// only credential left on a vault whose devices are all gone, which is exactly
+// where an invite somebody else issued would matter most.
+func TestTheRecoveryKeySeesAndCancelsInvites(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+	issue(t, a, testInvite)
+
+	reg := registrarWith(t, r, "recovery-key", longKey)
+	reg.sendJSON(wire.In{Op: "devices"})
+	var list wire.DeviceList
+	reg.recvInto("devices", &list)
+	if len(list.Invites) != 1 || list.Invites[0].ID != testInvite {
+		t.Fatalf("the recovery key was shown %+v", list.Invites)
+	}
+	reg.sendJSON(wire.In{Op: "uninvite", Invite: testInvite})
+	reg.recvInto("uninvited", &wire.Uninvited{})
+	if f := redeem(t, r, testInvite, "phone"); f["code"] != wire.CodeAuth {
+		t.Fatalf("a cancelled invite still redeems: %v", f)
+	}
+}
+
+// Eight pairings that crashed fill the vault, and the refusal points at them.
+//
+// A redemption deliberately saves nothing on the new device before the server
+// answers, so a crash in that window strands a server row rather than a device
+// that believes it is paired. That is the right way round and it must not
+// change; what it costs is this, and eight of them, or eight an attacker minted
+// invites for, refuse every registration and redemption afterwards.
+//
+// Nothing reclaims them on its own. A server deleting somebody's device row
+// because it looks unused is the failure the cap decision already refused, for
+// the reason in store.MaxDevices. What the refusal can do is say which rows are
+// worth looking at, so that "the vault is full" is an instruction rather than a
+// dead end, and `basalt devices` flags the same rows.
+func TestPairingsThatCrashFillTheVaultAndTheRefusalSaysSo(t *testing.T) {
+	r := newRigDerived(t)
+	a := claimed(t, r, "a")
+
+	// Seven redemptions that reached the server, each registering a row, none
+	// of which ever connects. This is the accident, played out over the wire.
+	for i := 0; i < store.MaxDevices-1; i++ {
+		invite := fmt.Sprintf("crashed-invite-%d", i)
+		issue(t, a, invite)
+		if f := redeem(t, r, invite, fmt.Sprintf("crashed-%d", i)); f["res"] != "redeemed" {
+			t.Fatalf("redemption %d was answered %v", i, f)
+		}
+	}
+	ds := mustDevices(t, r)
+	if len(ds) != store.MaxDevices {
+		t.Fatalf("%d rows after seven crashed pairings, want the cap %d", len(ds), store.MaxDevices)
+	}
+	never := 0
+	for _, d := range ds {
+		if d.LastSeen == 0 {
+			never++
+		}
+	}
+	if never != store.MaxDevices-1 {
+		t.Fatalf("%d rows nothing ever connected under, want %d", never, store.MaxDevices-1)
+	}
+
+	// The eighth is refused, and the refusal counts them.
+	issue(t, a, "the-real-one")
+	f := redeem(t, r, "the-real-one", "phone")
+	msg, _ := f["msg"].(string)
+	if f["code"] != wire.CodeFull {
+		t.Fatalf("redeeming onto a vault full of stranded rows was answered %v, want full", f)
+	}
+	if !strings.Contains(msg, "7 of them have never connected") {
+		t.Fatalf("the refusal does not count the rows worth reclaiming: %q", msg)
+	}
+	if !strings.Contains(msg, "revoke") {
+		t.Fatalf("the refusal does not say what to do about them: %q", msg)
+	}
+
+	// Acting on it works, which is what makes it an instruction: revoke one of
+	// the rows it named and the same string pairs.
+	a.sendJSON(wire.In{Op: "revoke", DeviceID: deviceID("crashed-0")})
+	a.recvInto("revoked", &wire.Revoked{})
+	if f := redeem(t, r, "the-real-one", "phone"); f["res"] != "redeemed" {
+		t.Fatalf("the invite did not redeem into the reclaimed slot: %v", f)
+	}
+}
+
 func TestI23AnInviteIsRedeemedExactlyOnce(t *testing.T) {
 	r := newRigDerived(t)
 	a := claimed(t, r, "a")
@@ -423,6 +644,11 @@ func TestARedeemThatCannotRegisterLeavesTheInviteUnspent(t *testing.T) {
 			// `full` and not `busy`: waiting never makes room, and `busy`
 			// means come back later.
 			t.Fatalf("redeeming onto a full vault was answered %v, want full", f)
+		}
+		// And it names the rows nothing has connected under, which the filler
+		// rows are: see TestPairingsThatCrashFillTheVaultAndTheRefusalSaysSo.
+		if msg, _ := f["msg"].(string); !strings.Contains(msg, "never connected") {
+			t.Fatalf("the refusal does not point at the reclaimable rows: %q", msg)
 		}
 		if n := len(mustDevices(t, r)); n != store.MaxDevices {
 			t.Fatalf("%d devices after a refused redemption, want the cap %d", n, store.MaxDevices)
