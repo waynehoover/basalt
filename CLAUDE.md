@@ -47,6 +47,18 @@ in ours inverts a specific defect in theirs, six of which fail silently.
 
 ## Testing
 
+**Run `scripts/check.sh` before pushing, and believe nothing else.** It runs
+every check CI runs and nothing less. Exit 0 means all of them passed here;
+exit 2 means some could not run, which is not the same thing and is not green.
+
+This exists because of a shipped regression. `bun run test` is one of nine
+checks, and the stress suite is a separate command in a separate job. A release
+went out on a green `bun run test` while `bun run stress` had been failing the
+whole time, on the same machine, catching precisely the bug that shipped. "The
+tests pass" was true and meant much less than it sounded. A guard inside the
+script fails when CI grows a step the script does not run, so the two cannot
+drift apart again.
+
 Unit tests are necessary and never sufficient here. Every real bug found in the
 predecessor was a *silent* failure that only appeared when the system ran. A fix
 without a test that failed before it is not finished: revert the fix, watch the
