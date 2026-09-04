@@ -59,7 +59,7 @@ Basalt is the narrow version. One backend, one transport, one person's devices. 
 ## Self-hosting
 
 > [!NOTE]
-> **Requirements:** any always-on machine that runs Docker or a single binary. Linux or macOS, amd64 or arm64. No database, no message broker, no accounts. The image is about 5 MB to pull and 12 MB on disk, and the data directory is one folder you can copy.
+> **Requirements:** any always-on machine that runs Docker or a single binary. Linux or macOS, amd64 or arm64. No database, no message broker, no accounts. The image is a few megabytes and the data directory is one folder you can copy; [docs/server.md](docs/server.md) has the exact figures and how to check them.
 
 **1. Run the server.**
 
@@ -121,7 +121,7 @@ basalt sync --watch
   <img src="docs/assets/wire.svg" alt="Editing one line of a 2 MiB note: whole-file sync sends 2.0 MiB, Basalt sends 21.7 KiB, of which 12.7 KiB is the chunk that changed and 9.0 KiB is the entry naming every chunk of the new version.">
 </picture>
 
-Notes are cut into content-defined chunks, so an edit sends the chunk that moved rather than the file. Chunks are compressed before they are encrypted, which takes a vault's text from 108% of plaintext on the wire down to about 60%, or nearer 69% once attachments are in the mix. Two thousand files reach a second device in tens of round trips rather than thousands, and a pass over a vault where nothing changed is too fast to measure. Every number here was measured, including a run against a real 3,751-file vault, and [docs/compared.md](docs/compared.md) shows them.
+Notes are cut into content-defined chunks, so an edit sends the chunk that moved rather than the file. Chunks are compressed before they are encrypted, and two thousand files reach a second device in tens of round trips rather than thousands. Every number here was measured, including a run against a real 3,751-file vault, and [docs/compared.md](docs/compared.md) shows them with the corpus each came from.
 
 ## Features and roadmap
 

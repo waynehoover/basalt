@@ -197,6 +197,26 @@ does to concurrent writers, not for its arithmetic.
   second code path through the most durability-critical part of the client.
 - **node-diff3** for the merge. It conflicted on five of eight cases that merge
   cleanly here, including two devices appending to a daily note.
+- **A SQLite index on the client**, to replace rewriting the whole index as
+  JSON on every change. The worry was a rewrite cliff on a large vault, so it
+  was measured before it was believed. Building a realistic index and timing
+  what the save path really does, `JSON.stringify` plus the durable write:
+
+  | notes | index | stringify | durable write | total |
+  |---|---|---|---|---|
+  | 1,000 | 0.6 MiB | 0.1 ms | 1.5 ms | 1.6 ms |
+  | 10,000 | 6.3 MiB | 1.9 ms | 2.1 ms | 4.0 ms |
+  | 50,000 | 31.6 MiB | 8.6 ms | 5.0 ms | 13.6 ms |
+
+  Four milliseconds at ten thousand notes, against passes measured in tens of
+  milliseconds, is not a cliff, and 50,000 notes is larger than the vault this
+  was built for by more than ten times. A local SQLite index would buy nothing
+  here and would cost a second storage path through the file whose corruption
+  the first rule exists to prevent, on a phone where SQLite is also the least
+  certain to be there. Two caveats kept with the numbers: this is an SSD on a
+  laptop, and one cold run wrote the 50,000 note index in 228 ms rather than
+  5 ms, so the fsync cost is real when nothing is cached. If a phone ever
+  shows the cliff these numbers do not, this decision is the one to revisit.
 
 ## What was borrowed
 

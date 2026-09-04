@@ -62,6 +62,55 @@ jobs:
           cat "$RUNNER_TEMP/basalt.service"
           systemd-analyze verify "$RUNNER_TEMP/basalt.service"
 
+  # The compose file is the example people copy, and its whole point is that
+  # a pull cannot move you to an image nobody tested. A pin two releases stale
+  # is that hazard wearing a seatbelt, and nothing noticed for two releases.
+  #
+  # Compared against the newest `server/v*` tag, not the plugin's manifest:
+  # the image is built on a server tag, so a client-only release moves the
+  # plugin while the server correctly stays put. Comparing against the
+  # manifest would fail every client-only release for no reason.
+  #
+  # Older-than fails; equal or newer passes, because the version bump commit
+  # lands before the tag that releases it.
+  compose-pin:
+    name: the compose pin is current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: the pinned image is not behind the newest server release
+        run: |
+          set -euo pipefail
+          pinned=$(sed -n 's|.*image: ghcr.io/waynehoover/basalt-sync:\([0-9][^@]*\)@sha256:.*|\1|p' compose.yaml)
+          if [ -z "$pinned" ]; then
+            echo "could not read a tag@digest pin out of compose.yaml"; exit 1
+          fi
+          newest=$(git tag --list 'server/v*' | sed 's|server/v||' | sort -V | tail -1)
+          if [ -z "$newest" ]; then
+            echo "no server/v* tag in the repository, nothing to compare against"; exit 0
+          fi
+          echo "compose pins $pinned, newest server release is $newest"
+          older=$(printf '%s\n%s\n' "$pinned" "$newest" | sort -V | head -1)
+          if [ "$pinned" != "$newest" ] && [ "$older" = "$pinned" ]; then
+            echo "compose.yaml pins $pinned but the newest server release is $newest."
+            echo "Update the tag and its digest together:"
+            echo "  docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:$newest"
+            exit 1
+          fi
+
+          # The runbooks are copied and pasted as readily as the compose file,
+          # and docs/server.md went stale in exactly the same way it did.
+          stale=$(grep -rn "basalt-sync:[0-9][^@ ]*" docs README.md \
+            | grep -v "basalt-sync:$pinned" || true)
+          if [ -n "$stale" ]; then
+            echo "these name an image tag that is not the pinned $pinned:"
+            echo "$stale"
+            exit 1
+          fi
+
   client:
     name: client
     runs-on: ubuntu-latest

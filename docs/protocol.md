@@ -53,10 +53,12 @@ for, so the upgrade order is the server first, then each client. Today that
 range is one version wide: protocol 3 is the only protocol that has ever been
 in the wild, since the two before it were withdrawn before anyone deployed
 them, and anything else, or a `crypto` the server does not implement, is
-refused with `{res:"err", code:"proto"}` naming both numbers and
-`serverVersion`. The range stays in the handshake because it is how the next
-version is introduced, and protocol 4's compatibility gets written then,
-against a protocol 3 that has actually run.
+refused with `{res:"err", code:"proto"}` naming both numbers. That refusal does
+not name the server's version: nothing has authenticated when it is sent, and
+`serverVersion` travels in `ready`, after a hello has succeeded. The range
+stays in the handshake because it is how the next version is introduced, and
+protocol 4's compatibility gets written then, against a protocol 3 that has
+actually run.
 
 `claim` and `wrapped` travel together, and a hello carrying a claim without a
 valid `wrapped` is refused with `badentry` and ends, whatever state the vault
@@ -475,3 +477,24 @@ no longer agree how many frames are outstanding.
 | `nocontent` | the entry is a folder or a deletion | no | continues |
 | `nochunk` | the server does not hold that chunk | no | continues; a body that fails its own hash is found before the header, quarantined, and refused with no bodies sent |
 | `internal` | a server-side fault; the put is not committed | yes | ends during handshake or catch-up, otherwise continues |
+
+### Why `busy` is not two codes
+
+`busy` covers the vault's device limit and a server shutting down, which are
+unrelated conditions, and splitting them has been proposed more than once. It
+is a protocol 4 change, not a free one, and the reason is in the client: a
+client decides whether to retry from an allowlist of codes it knows, so a code
+it has never seen is not retryable. Send a device at the connection limit a
+new `full` today and it stops for good, where `busy` has it come back. That is
+the failure the allowlist exists to prevent, aimed at the one case that most
+needs a retry.
+
+Nothing is currently lost by the sharing. Both conditions want the same thing
+from a client, come back later, and they already differ in the only two ways
+that carry: `retryAfterMs`, which says how much later, and the message, which
+says `this server is shutting down, reconnect in a moment` or
+`vault has 8 devices connected, limit is 8`. No client branches on the
+distinction and a person reading a log has the sentence, not just the number.
+
+If it is split, both ends move together: the client learns the new code first
+and only then may a server send it.

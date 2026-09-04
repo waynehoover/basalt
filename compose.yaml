@@ -16,9 +16,16 @@ services:
     # hello, naming both numbers, so a client upgraded first simply cannot
     # connect until the server catches up.
     #
+    # The tag is the newest *server* release, which is not the plugin's
+    # version: the image is built on a `server/v*` tag, and a client-only
+    # release moves the plugin without moving the server. Checked by
+    # .github/workflows/ci.yml, which reads the newest server tag rather
+    # than a manifest, because comparing against the plugin version would
+    # fail every client-only release for no reason.
+    #
     # The digest came from:
-    #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.3.0
-    image: ghcr.io/waynehoover/basalt-sync:0.3.0@sha256:f42385920a453a8d29461a565f57ac56649f3af3138e7d3853fbc78a3639ab01
+    #   docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:0.3.1
+    image: ghcr.io/waynehoover/basalt-sync:0.3.1@sha256:e9f6a780142e8d9b684f8b19f9b33ba09b4a523e40639fcba5af604d107b47a2
     container_name: basalt
     restart: unless-stopped
 
@@ -29,6 +36,15 @@ services:
 
     volumes:
       - basalt-data:/data
+
+    # The image's default is `serve -addr 0.0.0.0:3003`. Override it here to
+    # add a flag, which is the only place a flag can go under compose. The one
+    # that comes up is the file ceiling: `serve` refuses to start with a
+    # -max-file below a live file the vault already holds, and a vault that
+    # took a large attachment under a raised ceiling needs the same ceiling
+    # again. It is in bytes, with no suffixes.
+    #
+    # command: ["serve", "-addr", "0.0.0.0:3003", "-max-file", "134217728"]
 
     # The image already drops to 65532. These say the rest of it out loud, so a
     # compose file somebody copies keeps the properties the image was built for.
