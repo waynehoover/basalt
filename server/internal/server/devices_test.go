@@ -13,9 +13,8 @@ import (
 // devices and does nothing else, and revoking one device means something.
 //
 // docs/protocol.md, "Authentication" and "The device list". The property under
-// most of this is the one per-device-credentials-spec.md opens with: a device
-// list that can be bypassed by the credential it replaced is worse than no
-// list, because it looks like it works.
+// most of this: a device list that can be bypassed by a credential every
+// device shares is worse than no list, because it looks like it works.
 
 /* ---------------------------------------------------------------- *
  * The narrowing
