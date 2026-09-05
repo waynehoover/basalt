@@ -182,7 +182,7 @@ describe("replacing the vault's secret from the panel", () => {
     // The first is short enough for the row's one line. The other two followed the cut on
     // to the `?` beside the disclosure this row sits in, which is where the
     // panel keeps the detail a line cannot carry.
-    expect(row.desc).toMatch(/Paste the vault's current recovery key/);
+    expect(tooltips()).toMatch(/Paste the vault's current recovery key/);
     expect(tooltips()).toMatch(/keeps every device syncing/i);
     expect(tooltips()).toMatch(/cannot un-read/i);
     // The field, and the button that reads it, are separate rows.

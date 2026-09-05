@@ -64,6 +64,26 @@ export class FakeEl {
   }
 
   /**
+   * Obsidian's own `toggle`, which sets `hidden` rather than a class. Modelled
+   * because a badge that is only hidden when there is nothing to explain is a
+   * badge whose visibility is behaviour, and `allText` has to agree with what
+   * a person would see or an assertion about the panel's words is fiction.
+   */
+  hidden = false;
+
+  toggle(shown: boolean): void {
+    this.hidden = !shown;
+  }
+
+  hide(): void {
+    this.hidden = true;
+  }
+
+  show(): void {
+    this.hidden = false;
+  }
+
+  /**
    * Listeners are recorded rather than ignored, so a test can click what the
    * plugin drew. A modal whose buttons cannot be pressed is a modal whose
    * behaviour is untested no matter how much of its markup is asserted on.
@@ -114,6 +134,7 @@ export class FakeEl {
 
   /** Every string anywhere in the tree, for asserting on what was rendered. */
   allText(): string {
+    if (this.hidden) return "";
     return [this.text, ...this.children.map((c) => c.allText())].filter(Boolean).join("\n");
   }
 }
@@ -291,6 +312,7 @@ export class Plugin extends Component {
     { description: string; handler: (flags: Record<string, unknown>) => unknown }
   >();
   readonly registeredEvents: unknown[] = [];
+  readonly settingTabs: PluginSettingTab[] = [];
 
   constructor(
     public app: App,
@@ -303,6 +325,17 @@ export class Plugin extends Component {
     const el = new FakeEl("div", "status-bar-item");
     this.statusBarItems.push(el);
     return el;
+  }
+
+  /**
+   * Recorded rather than ignored, because whether a tab was registered is the
+   * whole of whether Settings shows this plugin at all. Obsidian draws the
+   * gear beside a community plugin only for a plugin that calls this, so a
+   * stub that shrugged would let the panel go missing from the one place
+   * people look for it and no test would notice.
+   */
+  addSettingTab(tab: PluginSettingTab): void {
+    this.settingTabs.push(tab);
   }
 
   addRibbonIcon(icon: string, title: string, callback: (evt: unknown) => void): FakeEl {
@@ -359,6 +392,27 @@ export class Plugin extends Component {
 /* ---------------------------------------------------------------- *
  * Modal and Setting
  * ---------------------------------------------------------------- */
+
+/**
+ * A plugin's tab in Obsidian's Settings dialog.
+ *
+ * Obsidian calls `display` each time the tab is opened and `hide` each time it
+ * is left, and hands the tab a `containerEl` it is expected to empty and
+ * refill. Both are modelled, because a tab that renders once and never tears
+ * down leaks its watcher, and that is a bug you only see the third time
+ * somebody opens Settings.
+ */
+export abstract class PluginSettingTab {
+  readonly containerEl = new FakeEl("div", "vertical-tab-content");
+
+  constructor(
+    public app: App,
+    public plugin: Plugin,
+  ) {}
+
+  abstract display(): void;
+  hide(): void {}
+}
 
 /** Every Modal built, newest last, so a test can read what it rendered. */
 export const modals: Modal[] = [];

@@ -133,6 +133,11 @@ const WIDTH = 92;
  * nothing else on the element says which picture it is.
  */
 export function outlineOf(root: FakeEl, rows = rowIndex(), depth = 0): string {
+  // What is on screen, which is what this artifact is for. An element that is
+  // hidden is not, and printing it would make the outline disagree with the
+  // screenshot beside it: the exact confusion somebody comes here to resolve.
+  // `allText` on the fake takes the same view.
+  if (root.hidden) return "";
   const pad = "  ".repeat(depth);
   const lines: string[] = [];
   const say = (label: string, value: string): void => {
@@ -166,7 +171,10 @@ export function outlineOf(root: FakeEl, rows = rowIndex(), depth = 0): string {
     }
   }
 
-  for (const child of root.children) lines.push(outlineOf(child, rows, depth + 1));
+  for (const child of root.children) {
+    const drawn = outlineOf(child, rows, depth + 1);
+    if (drawn !== "") lines.push(drawn);
+  }
   return lines.join("\n");
 }
 
@@ -372,8 +380,11 @@ export async function walkPanelStates(
   // server would be a second vault. It is the same `render()` either way: the
   // panel decides on the field and nothing else.
   openPanel(laptop);
-  (modals.at(-1) as unknown as { freshRecoveryKey?: string }).freshRecoveryKey = recoveryKey;
-  (modals.at(-1) as unknown as { render(): void }).render();
+  const shown = (
+    modals.at(-1) as unknown as { panel: { freshRecoveryKey?: string; render(): void } }
+  ).panel;
+  shown.freshRecoveryKey = recoveryKey;
+  shown.render();
   shots.push(
     shotOfOpenPanel(
       "fresh-recovery-key",

@@ -215,21 +215,75 @@ describe("the panel walk", () => {
   /**
    * The cut, measured rather than asserted about.
    *
-   * Sixteen descriptions carrying five hundred words is what this panel was,
-   * and a rule that is only in a commit message grows back. Every description
-   * on screen is a label and one line: fifteen words is the ceiling, and the
-   * device and invite rows, which are `id · added X · last seen Y`, are well
-   * under it.
+   * Sixteen descriptions carrying five hundred words is what this panel was.
+   * Trimming each to fifteen words made it shorter and no easier to scan,
+   * because the shape was still label-prose-label-prose all the way down. A
+   * row is a label, a `?` and a control now, and no description at all.
+   *
+   * The exception, and the only one: a description that *is* the row's
+   * content rather than an explanation of it. A device row is `id · added X ·
+   * last seen Y` and a deleted note is `Deleted X, last written on Y`; strip
+   * those and the list says nothing. They are recognised by shape rather than
+   * by an allowlist of rows, so a new list row is covered and a new sentence
+   * is not.
    */
-  it("keeps every description to one line", () => {
-    const long: string[] = [];
+  it("gives rows a label and a control, and prose only where it is the content", () => {
+    const isContent = (d: string): boolean =>
+      d.includes(" · ") || /^Deleted .*(last written on|nothing to restore)/.test(d);
+    const prosey: string[] = [];
     for (const shot of shots) {
       for (const desc of descriptions(shot.body)) {
-        const words = desc.split(" ").filter(Boolean).length;
-        if (words > 15) long.push(`${shot.name}: ${words} words · ${desc}`);
+        if (!isContent(desc)) prosey.push(`${shot.name}: ${desc}`);
       }
     }
-    expect(long, `these descriptions are more than a line:\n${long.join("\n")}`).toEqual([]);
+    expect(
+      prosey,
+      `these rows still carry a description; put it on the row's ?:\n${prosey.join("\n")}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * A paragraph waiting to be filled takes no room until it is.
+   *
+   * An empty `<p>` still occupies a line, and with a description under every
+   * row that went unnoticed. With rows that are a label and a control it is
+   * visible: the gap under "Add another device" was wider than every other
+   * gap, and it was two paragraphs holding space for an invite that did not
+   * exist yet. Caught in a screenshot, like the three layout faults before it.
+   */
+  it("reserves no space for a paragraph with nothing in it", () => {
+    const empty: string[] = [];
+    for (const shot of shots) {
+      const lines = shot.body.split("\n");
+      for (const [i, line] of lines.entries()) {
+        const tag = /^\s*<p(\.[\w.-]+)?>$/.exec(line);
+        if (!tag) continue;
+        // A paragraph is empty here if the next line is not deeper than it.
+        const indent = line.search(/\S/);
+        const next = lines[i + 1];
+        if (next === undefined || next.search(/\S/) <= indent) {
+          empty.push(`${shot.name}: ${line.trim()}`);
+        }
+      }
+    }
+    expect(
+      empty,
+      `these paragraphs are empty and still take a line; build them with later():\n${empty.join("\n")}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * And the prose did not simply vanish: it is on the badges.
+   *
+   * A cut that deleted the sentences instead of moving them would pass the
+   * test above and leave a panel that explains nothing, which is the failure
+   * this pairs with.
+   */
+  it("keeps the explanations, on the badges", () => {
+    const labels = of("paired")
+      .split("\n")
+      .filter((l) => l.includes("@aria-label"));
+    expect(labels.length, "the paired panel has no tooltips at all").toBeGreaterThan(4);
   });
 
   /**
@@ -246,10 +300,11 @@ describe("the panel walk", () => {
     expect(prose("paired")).toMatch(/An invite adds one device, works once, and expires/);
     expect(prose("devices-listed")).toMatch(/adds one device · expires/);
     // The recovery key is written down, and is not how a device is added.
-    expect(prose("paired")).toMatch(/Written down, not kept here\./);
-    expect(prose("paired")).toMatch(/An invite adds a device, not this\./);
+    expect(prose("paired")).toMatch(/Written down, not kept here/);
+    expect(prose("paired")).toMatch(/An invite adds a device/);
     // And what a hop with nothing in front of it costs.
-    expect(prose("paired")).toMatch(/no TLS in front: notes stay sealed/);
+    expect(prose("paired")).toMatch(/No TLS in front of this hop/);
+    expect(prose("paired")).toMatch(/credential and the note sizes are not/);
   });
 
   /**

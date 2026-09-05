@@ -30,7 +30,7 @@ import {
   notices,
   resetStub,
 } from "./stub.ts";
-import BasaltPlugin, { describeConnection, describeDeleted } from "./main.ts";
+import BasaltPlugin, { connectionDetail, describeConnection, describeDeleted } from "./main.ts";
 import { describeRestore } from "./history.ts";
 import type { SyncReport } from "../core/engine.ts";
 import { redeemInvite } from "../core/client.ts";
@@ -438,7 +438,7 @@ describe("pairing", () => {
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
     const row = built.find((s) => s.name === "Recovery key")!;
-    expect(row.desc).toMatch(/not kept here/);
+    expect(tooltips()).toMatch(/not kept here/);
     // And the reason, on the section's `?`, where the sentence went.
     expect(tooltips()).toMatch(/not on this device and cannot be shown again/);
     // And no button, because there is nothing for one to do.
@@ -784,7 +784,46 @@ describe("unlinking", () => {
   }, 300_000);
 });
 
-describe("the modal, which is not a settings tab", () => {
+describe("the panel, which is a modal and a settings tab", () => {
+  /**
+   * The panel has to be in Settings, and this is the test that says so.
+   *
+   * It was reachable from the ribbon, the status bar and the command palette,
+   * and nowhere else, because the plugin registered no settings tab. Obsidian
+   * draws a plugin's gear in Settings only for a plugin that calls
+   * `addSettingTab`, so Settings had no Basalt entry at all and somebody
+   * looking for the plugin's interface where every other plugin keeps it
+   * found nothing and concluded there was none. Reported by the one person
+   * running it, who could not find the settings screen.
+   *
+   * Registering it is the fix, and drawing the same panel is the point: no
+   * options were added to earn the place.
+   */
+  it("is in Obsidian's settings, drawing the same rows as the modal", async () => {
+    const { plugin } = await load();
+    expect(
+      plugin.settingTabs.length,
+      "the plugin registers no settings tab, so Settings shows no Basalt entry at all",
+    ).toBe(1);
+
+    const tab = plugin.settingTabs[0]!;
+    built.length = 0;
+    tab.display();
+    const inTab = built.map((s) => s.name);
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const inModal = built.map((s) => s.name);
+
+    expect(inTab, "the settings tab drew nothing").not.toEqual([]);
+    expect(inTab, "the tab and the modal are different panels").toEqual(inModal);
+
+    // And it tears down, because Obsidian calls hide on the way out and a tab
+    // that kept its state watcher would add one every time Settings opened.
+    tab.hide();
+    expect(tab.containerEl.children).toEqual([]);
+  }, 300_000);
+
   it("asks to be paired when it is not", async () => {
     const { plugin } = await load();
     plugin.ribbonIcons[0]!.callback();
@@ -838,14 +877,14 @@ describe("the modal, which is not a settings tab", () => {
     expect(adding.buttons.map((b) => b.label)).toContain("Create invite");
     // The sentence that keeps the recovery key written down and offline. If
     // the panel is silent about it, adding a device becomes fetching the key.
-    // It is short enough to stay on the row; what an invite carries instead of
-    // a root secret moved to the `?` under it.
-    expect(adding.desc).toMatch(/recovery key is not needed/i);
+    // On the row's `?` with everything else it has to say, because a row is a
+    // label and a control now and the prose is one hover away.
+    expect(tooltips()).toMatch(/recovery key is not needed/i);
     expect(tooltips()).toMatch(/no root secret/);
 
     const row = built.find((s) => s.name === "Devices")!;
     expect(row, "the panel has no device list").toBeDefined();
-    expect(row.desc).toMatch(/invite/);
+    expect(tooltips()).toMatch(/Add one with an invite/);
 
     built.length = 0;
     await row.buttons[0]!.click();
@@ -2688,7 +2727,7 @@ describe("adding a device from the panel", () => {
     // displayed once and this device kept its own credential instead. The row
     // says where the key is; the `?` beside the section says why it is there
     // and not here.
-    expect(setting.desc).toMatch(/not kept here/);
+    expect(tooltips()).toMatch(/not kept here/);
     expect(tooltips()).toMatch(/not on this device and cannot be shown again/);
     expect(tooltips()).toMatch(/register itself again after being revoked/);
     expect(setting.buttons, "the panel offers to show a key it does not have").toEqual([]);
@@ -2800,9 +2839,11 @@ describe("what the panel knows and used to keep to itself", () => {
     );
     expect(shown).toContain(`Protocol 4, basaltd ${to.server!.version}.`);
     expect(shown).not.toContain("Not connected");
-    // A test server has nothing in front of it, and the line says what that
-    // costs rather than only what it is.
-    expect(shown).toMatch(/no TLS in front: notes stay sealed/);
+    // A test server has nothing in front of it. What that costs is on the
+    // line's `?` rather than in the line, because it is the same two clauses
+    // on every open and the sentence is read on every open.
+    expect(tooltips()).toMatch(/No TLS in front of this hop/);
+    expect(tooltips()).toMatch(/credential and the note sizes are not/);
   }, 300_000);
 
   it("says the protocol and the build are unknown rather than leaving a gap", () => {
@@ -2811,18 +2852,19 @@ describe("what the panel knows and used to keep to itself", () => {
     // different states.
     const off = describeConnection({ url: "wss://homelab.tailnet.ts.net" });
     expect(off).toContain("Not connected to wss://homelab.tailnet.ts.net");
-    expect(off).toContain("neither is known yet");
     expect(off).not.toMatch(/basaltd/);
+    expect(off).not.toMatch(/Protocol/);
 
     const on = describeConnection({
       url: "wss://homelab.tailnet.ts.net",
       server: { proto: 4, version: "0.3.4" },
     });
-    expect(on).toContain("which has TLS in front");
     expect(on).toContain("Protocol 4, basaltd 0.3.4.");
     // The scheme is the whole of what is known about the hop, and wss is the
-    // only thing that says something terminated TLS in front.
-    expect(describeConnection({ url: "ws://192.168.1.20:3003" })).toContain("no TLS in front");
+    // only thing that says something terminated TLS in front. It is the `?`
+    // that says so now, because which server answered is what the line is for.
+    expect(connectionDetail({ url: "wss://homelab.tailnet.ts.net" })).toContain("TLS in front");
+    expect(connectionDetail({ url: "ws://192.168.1.20:3003" })).toContain("No TLS in front");
   });
 });
 
@@ -3091,7 +3133,7 @@ describe("rejoining a server that lost history (I10, plugin)", () => {
     first.plugin.ribbonIcons[0]!.callback();
     const row = built.find((s) => s.name === "Rejoin this server")!;
     expect(row, "the panel offered no way back").toBeDefined();
-    expect(row.desc).toMatch(/Nothing is deleted/);
+    expect(tooltips()).toMatch(/Nothing is deleted/);
     // On the panel itself, never behind the disclosure: a device the server
     // has refused has to say so, and offer the way out, on open.
     expect(

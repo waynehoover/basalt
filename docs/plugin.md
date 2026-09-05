@@ -135,11 +135,6 @@ is not, and [server.md](server.md) has the two ways to put TLS in front.
 The status bar icon shows the state. Obsidian mobile has no status bar, so the
 same sentence is the ribbon icon's tooltip.
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/status-states-dark.png">
-  <img src="assets/screenshots/status-states.png" alt="The six status bar icons: unpaired, connecting, syncing, synced, offline, stopped." width="420">
-</picture>
-
 | | |
 |---|---|
 | unpaired | open the panel to pair |
@@ -288,7 +283,10 @@ The server keeps every version of everything since the first sync. The history
 view lists them newest first, shows the text of the one you pick or its
 changes against what is on disk, and pages further back twenty at a time.
 
-<img src="assets/screenshots/history.png" alt="Version history: a sidebar of versions and the text of the selected one." width="800">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screenshots/changes-dark.png">
+  <img src="assets/screenshots/changes.png" alt="Version history for a note: a sidebar of versions, and what changed between two of them." width="800">
+</picture>
 
 **Restoring never overwrites.** If the path is occupied, the restored copy is
 written beside it as `Note (restored 42).md` and the notice says so. The
