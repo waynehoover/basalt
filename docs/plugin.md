@@ -6,6 +6,18 @@ Basalt Sync runs inside Obsidian on desktop and mobile. It needs Obsidian 1.7.2
 or newer. It has no settings tab: one panel, opened from the ribbon icon, that
 pairs a vault and says what is happening.
 
+Every row in that panel is a label and one line. Three of them are on screen
+when it opens, because they are what somebody opens it for: *Sync now*, *Add
+another device*, *Recover a deleted note*. The four that are rare and mostly
+irreversible are behind *Manage this vault*, one disclosure that starts closed:
+*Devices*, *Recovery key*, *Replace the vault's secret*, *Unlink this vault*.
+*Rejoin this server* appears on the panel itself, and only when a restored
+server has refused this device.
+
+Where a line cannot carry the whole answer there is a small **?** beside the
+section, which Obsidian shows on hover. The rest is this page, and the panel
+links to it.
+
 ## Install
 
 Not yet in the community directory. Put `main.js`, `manifest.json` and
@@ -52,9 +64,13 @@ That an invite carries the data key rather than the root is what makes revoking
 one device mean something; [design.md](design.md#a-lost-or-stolen-device) has
 the reasoning.
 
-*Recovery key* in a paired panel is a sentence rather than a button: the key
-was shown once, this device does not have it, and adding a device does not need
-it. *Pair* reaches the server before it says paired, so a mistyped string is
+*Recovery key* in a paired panel is a sentence rather than a button, under
+*Manage this vault*: "Written down, not kept here. An invite adds a device, not
+this." The key was shown once, this device does not have it, and a device that
+did could register itself again after being revoked, so revoking would stop
+nothing. That last part is on the **?** beside the disclosure.
+
+*Pair* reaches the server before it says paired, so a mistyped string is
 refused on the spot and nothing is left behind. An invite is spent by the
 exchange that registers the device, so nothing is written here until the server
 has answered, and the recovery key path is the same: it registers first and
@@ -106,6 +122,15 @@ build from `ready`. That is the first thing wanted when sync is not working,
 and none of it costs a request. A device that is not connected shows the
 address and says the protocol and the build are not known yet, because a build
 missing for want of a connection looks exactly like a server that did not say.
+
+A `wss://` address means something in front of the server terminated TLS. A
+`ws://` one means nothing did, and the panel says what that costs in a clause:
+"notes stay sealed, the credential and note sizes are not". In full: the
+notes themselves are encrypted on this device either way, so a network in
+between cannot read one, but it can see this device's credential go past and it
+can see the size and the timing of every note that moves. On a home LAN or a
+tailnet that is usually the trade somebody meant to make. Over anything else it
+is not, and [server.md](server.md) has the two ways to put TLS in front.
 
 The status bar icon shows the state. Obsidian mobile has no status bar, so the
 same sentence is the ribbon icon's tooltip.
@@ -160,8 +185,8 @@ two devices at once makes conflict copies instead of merging. Use Rejoin.
 
 ## Devices, and revoking one
 
-*Devices* asks the server who may reach this vault, on *Show devices*, and
-lists each one: its name, the id that identifies it, when it was added and when
+*Devices* is under *Manage this vault*. It asks the server who may reach this
+vault, on *Show devices*, and lists each one: its name, the id that identifies it, when it was added and when
 it was last seen. Nothing is fetched until you press it, because it is a
 request to the server rather than something this device already knows. The name
 is not an identity, and two laptops may both be called laptop; the id is.
@@ -195,11 +220,13 @@ invite's identifier and when it expires, never the string itself: the server
 never had the part that opens it, so nothing on this screen can add a device.
 
 **Revoking stops a device connecting. It does not unread what that device
-already read.** It still holds the vault's key for every note it had synced,
-and nothing can take that back. A device that was stolen rather than merely
-lost wants its secret replaced as well, below. A panel that let somebody read
-"revoked" as "the vault is safe again" would have them skip the one step that
-helps.
+already read.** The summary under the rows says exactly that, beside the
+buttons that do it, and it is the one sentence in the panel that was never a
+candidate for cutting: the revoked device still holds the vault's key for every
+note it had synced, and nothing can take that back. A device that was stolen
+rather than merely lost wants its secret replaced as well, below. A panel that
+let somebody read "revoked" as "the vault is safe again" would have them skip
+the one step that helps.
 
 Eight devices, and the ninth registration is refused rather than quietly
 allowed and then unable to connect.
@@ -210,11 +237,12 @@ For a recovery key that has been somewhere it should not have been, and for the
 second half of a stolen device: revoking it stops it connecting, and this stops
 the key it was holding opening the vault again.
 
-*Replace the vault's secret* asks for the vault's current recovery key, because
-no device holds one. That is the point of the change: a device that could
-replace the secret could also register itself again after being revoked. So
-somebody without the key cannot do it from here, and the row says so rather
-than letting them find out by pressing.
+*Replace the vault's secret*, under *Manage this vault*, asks for the vault's
+current recovery key, because no device holds one. That is the point of the
+change: a device that could replace the secret could also register itself again
+after being revoked. So somebody without the key cannot do it from here, and
+the row says so ("Paste the vault's current recovery key") rather than letting
+them find out by pressing.
 
 The vault keeps all of its history: its content is sealed under a data key that
 the root only wraps, so the wrapping changes and nothing is re-encrypted. **No
@@ -241,13 +269,14 @@ a rotation somebody else won says so and shows nothing to write down.
 | Show version history | for the open note |
 | Recover a deleted note | lists what the server has and this vault does not |
 
-The panel holds the rest: *Sync now*, *Add another device*, *Devices*, *Recover
-a deleted note*, *Recovery key*, *Replace the vault's secret*, *Unlink this
-vault*, and *Rejoin this server* when a restored server has refused this
-device. *Recovery key* is the one with no control at all: it says the key was
-shown once, that no device holds it, and that an invite is what adds a device.
-Revoking, replacing the secret and unlinking are behind warnings and
-confirmations; nothing there is a setting.
+The panel holds the rest, in two altitudes. On screen: *Sync now*, *Add
+another device*, *Recover a deleted note*, and *Rejoin this server* when a
+restored server has refused this device. Behind *Manage this vault*: *Devices*,
+*Recovery key*, *Replace the vault's secret*, *Unlink this vault*. *Recovery
+key* is the one with no control at all: it says the key was written down and is
+not kept here, and that an invite is what adds a device. Revoking, replacing
+the secret and unlinking are behind warnings and confirmations; nothing there
+is a setting.
 
 Version history is also on a note's right-click menu, where Obsidian Sync puts
 it. Both are registered on Obsidian's own command line as `basalt:history` and

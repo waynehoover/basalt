@@ -117,3 +117,31 @@
         transform: rotate(360deg);
     }
 }
+
+/* The panel's one disclosure. Everything rare and mostly irreversible lives
+ * behind it: devices, the recovery key, replacing the secret, unlinking. A
+ * <details> because it needs no code and no state to work; these rules only
+ * make the summary look like something to press. */
+.basalt-manage {
+    margin-top: 12px;
+    border-top: 1px solid var(--background-modifier-border);
+}
+
+.basalt-manage > summary {
+    cursor: pointer;
+    padding: 12px 0;
+    font-weight: var(--font-medium);
+    color: var(--text-muted);
+}
+
+/* The detail a one-line description cannot carry. Obsidian renders aria-label
+ * as its own tooltip, so the marker is the whole of the affordance. */
+.basalt-help {
+    cursor: help;
+    margin-left: 6px;
+    padding: 0 5px;
+    border-radius: 50%;
+    font-size: var(--font-ui-smaller);
+    color: var(--text-muted);
+    background: var(--background-modifier-border);
+}

@@ -1764,11 +1764,58 @@ function toneFor(state: State): string {
   }
 }
 
+/** The panel's own document, which is where the long form of all of this lives. */
+const DOCS = "https://github.com/waynehoover/basalt-sync/blob/main/docs/plugin.md";
+
+/**
+ * The detail a one-line description cannot carry, behind a hover.
+ *
+ * Obsidian renders `aria-label` as its own tooltip, which the ribbon icon and
+ * the status bar item already rely on, so this needs no component and no state.
+ *
+ * One of these per section and never one per row. The panel is readable now
+ * because the answer somebody needs every day fits on one line beside the
+ * control that answers it; a tooltip on every row would be the same wall of
+ * prose with a hover in front of it. A sentence or two, and anything longer
+ * belongs in `DOCS`.
+ */
+function help(el: HTMLElement, detail: string): void {
+  el.createSpan({ cls: "basalt-help", text: "?" }).setAttribute("aria-label", detail);
+}
+
+/** A link out to `DOCS`, which is the panel's answer to "but why". */
+function docsLink(el: HTMLElement, text: string): void {
+  el.createEl("a", { text }).setAttribute("href", DOCS);
+}
+
 /**
  * The whole interface: what is happening, and pairing when there is none.
  *
  * Deliberately not a settings tab. There are no options here, and there is not
  * going to be a place to put any.
+ *
+ * ## A label and one line
+ *
+ * Every description in here was justified on its own and together they buried
+ * the panel: sixteen of them, five hundred words, and the six rows that matter
+ * somewhere inside it. The rule now is a short label, one short line, and a `?`
+ * or `DOCS` for anybody who wants the rest. What could not be cut was compressed
+ * rather than deleted: revoking does not un-read, the recovery key is written
+ * down and is not how a device is added, an invite adds one device once, and a
+ * `ws://` hop has nothing in front of it. Each of those is still on screen.
+ *
+ * ## Two altitudes
+ *
+ * design.md: a thing that matters only when something specific happens appears
+ * in that moment. Syncing, adding a device and recovering a note are what a
+ * panel is opened for; devices, the recovery key, replacing the secret and
+ * unlinking are rare and three of the four are destructive. So the rare four
+ * sit inside one `<details>`, closed until it is wanted. A `<details>` and not
+ * a tab, a second modal or a toggle, because it is the only one of the four
+ * that needs no code, no state and no styling to work.
+ *
+ * What never hides: the status lines, and the rejoin row a refused device
+ * grows. A device the server has stopped talking to has to say so on open.
  */
 class BasaltModal extends Modal {
   private unwatch: (() => void) | undefined;
@@ -1837,34 +1884,28 @@ class BasaltModal extends Modal {
 
     new Setting(contentEl)
       .setName("Sync now")
-      .setDesc("Basalt syncs on its own. This is for when you want to be sure.")
+      .setDesc("Basalt syncs on its own. This is for being sure.")
       .addButton((b) =>
         b.setButtonText("Sync").onClick(async () => {
           await this.plugin.syncNow();
         }),
       );
 
-    // Only while it is the answer to something. The panel is the whole
-    // interface and every row in it is a row somebody has to read past; a
-    // recovery for a state this vault is not in is noise, and a destructive
-    // button on the path people take every day is a bug waiting to be
-    // pressed. design.md: a thing that matters only when something specific
-    // happens appears in that moment.
+    // Only while it is the answer to something, and never inside the
+    // disclosure below: a device the server has refused has to say so, and
+    // offer the way out, without anybody opening anything first.
     if (drewRejoin) this.renderRejoin(contentEl);
 
     if (this.freshRecoveryKey !== undefined)
       this.renderRecoveryKey(contentEl, this.freshRecoveryKey);
 
-    // Adding a device, and then the list of them. In that order because they
-    // are one subject: the invite is how a row appears here, and the list is
-    // the answer to "what is still connected to my notes", which is the
-    // question somebody opens this panel with after losing a phone.
+    // Adding a device and recovering a note: the two things somebody comes
+    // here to do that are not "is it working".
     this.renderInvite(contentEl);
-    this.renderDevices(contentEl);
 
     new Setting(contentEl)
       .setName("Recover a deleted note")
-      .setDesc("The server keeps every version of everything, including what you have deleted.")
+      .setDesc("The server keeps every version, including of notes you have deleted.")
       .addButton((b) =>
         b.setButtonText("Browse deleted").onClick(() => {
           this.close();
@@ -1872,29 +1913,34 @@ class BasaltModal extends Modal {
         }),
       );
 
-    // Said, not shown, because there is nothing to show. This device holds a
-    // credential for one row and not the vault's root, which is what makes
-    // the row above able to cut a device off. The key was displayed once, when
-    // the vault was started, and no device can print it again.
-    //
-    // And it says what it is for, because that is the sentence that keeps the
-    // recovery key written down and offline: adding a device is the invite
-    // above, and this is the day every device is gone.
-    new Setting(contentEl)
+    // Everything rare, behind one press. Named for what is inside rather than
+    // "Advanced", which says nothing and reads as a dare.
+    const manage = contentEl.createEl("details", { cls: "basalt-manage" });
+    const summary = manage.createEl("summary", { text: "Manage this vault" });
+    help(
+      summary,
+      "The recovery key is not on this device and cannot be shown again: a device that held it " +
+        "could register itself again after being revoked, so revoking would stop nothing. " +
+        "Replacing the vault's secret keeps every device syncing and cannot un-read what was " +
+        "already read.",
+    );
+
+    this.renderDevices(manage);
+
+    // Said, not shown, because there is nothing to show: this device holds a
+    // credential for one row and not the vault's root, which is what makes the
+    // rows above revocable. Why that is, and why no device can print the key
+    // again, is on the `?` beside the summary.
+    new Setting(manage)
       .setName("Recovery key")
-      .setDesc(
-        "The vault's root secret, shown once when the vault was started. It is for writing down " +
-          "in case every device is lost, not for adding one: use an invite for that. It is not " +
-          "on this device and cannot be shown again, because a device that held it could " +
-          "register itself again after being revoked, so revoking would stop nothing.",
-      );
+      .setDesc("Written down, not kept here. An invite adds a device, not this.");
 
     // Beside the recovery key, because it is the same secret and the same
     // warning, and behind two presses, because it is the one action here that
-    // disconnects every other device.
-    this.renderRotate(contentEl);
+    // retires the key somebody wrote down.
+    this.renderRotate(manage);
 
-    new Setting(contentEl)
+    new Setting(manage)
       .setName("Unlink this vault")
       .setDesc("Stops syncing. Every note stays where it is, here and on the server.")
       .addButton((b) =>
@@ -1910,6 +1956,8 @@ class BasaltModal extends Modal {
             this.render();
           }),
       );
+
+    docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "How all of this works");
   }
 
   /**
@@ -1919,12 +1967,14 @@ class BasaltModal extends Modal {
    * a panel that made one every time it was drawn would make one every time
    * somebody looked at the sync status.
    *
-   * The honesty paragraph is not decoration and it is not optional. Revoking
-   * stops a device connecting and does not un-read what it already read: the
-   * revoked device still holds the vault's key for every note it had synced.
-   * A panel that let somebody believe otherwise would have them skip the
-   * rotation, which is the one thing that actually helps after a theft, and
-   * this feature would be worse than not having it.
+   * The honesty line is not decoration and it is not optional. Revoking stops
+   * a device connecting and does not un-read what it already read: the revoked
+   * device still holds the vault's key for every note it had synced. A panel
+   * that let somebody believe otherwise would have them skip the rotation,
+   * which is the one thing that actually helps after a theft, and this feature
+   * would be worse than not having it. It was a paragraph and is now a
+   * sentence, and it stays here, beside the buttons it is about, rather than
+   * moving to a tooltip or the docs.
    */
   private renderDevices(contentEl: HTMLElement): void {
     // Declared here and created below the setting that fills them, for the
@@ -1981,8 +2031,7 @@ class BasaltModal extends Modal {
                   mine
                     ? "This device will stop syncing at once. Press again to revoke it."
                     : `"${device.name || device.id}" will stop syncing at once and cannot connect ` +
-                        `again until it is added with an invite from a device that still has the ` +
-                        `vault. Press again.`,
+                        `again until it is added with an invite. Press again.`,
                 );
                 return;
               }
@@ -2033,36 +2082,28 @@ class BasaltModal extends Modal {
       const never = answer.devices.filter((d) => d.lastSeen === 0).length;
       said.setText(
         `${answer.devices.length} of at most ${answer.maxDevices} devices. Revoking stops a ` +
-          `device connecting. It does not un-read what that device already read: it still holds ` +
-          `the vault's key for every note it had synced. A device that was stolen rather than ` +
-          `lost wants the vault's secret replaced as well, below.` +
+          `device connecting. It does not un-read what that device already read, so replace the ` +
+          `vault's secret too if it was stolen.` +
           (never > 0
-            ? ` ${never} of these ${never === 1 ? "has" : "have"} never connected: a pairing that ` +
-              `reached the server and then crashed leaves a row like that, and it holds a slot ` +
-              `until it is revoked.`
+            ? ` ${never} ${never === 1 ? "has" : "have"} never connected and still ` +
+              `${never === 1 ? "holds" : "hold"} a slot.`
             : "") +
           (answer.invites.length > 0
-            ? ` ${answer.invites.length} outstanding ${answer.invites.length === 1 ? "invite" : "invites"}: ` +
-              `each one adds one device and then stops working. Cancel one you did not mean to ` +
-              `issue, or that was issued on a device you have lost.`
+            ? ` ${answer.invites.length} outstanding ` +
+              (answer.invites.length === 1
+                ? `invite, which adds one device.`
+                : `invites, each adding one device.`)
             : "") +
           (last
-            ? ` This is the vault's last device, and taking its row off the server would leave a ` +
-              `vault only the recovery key opens, which is the one revocation no device can undo. ` +
-              `So there is no button for it here: it takes the recovery key, with basalt revoke ID ` +
-              `--allow-last --recovery-key on a machine that has the command line client. To stop ` +
-              `syncing here and leave the row where it is, use Unlink this vault below.`
+            ? ` The vault's last device: removing its row takes basalt revoke ID --allow-last ` +
+              `--recovery-key. To stop syncing here, use Unlink this vault below.`
             : ""),
       );
     };
 
     new Setting(contentEl)
       .setName("Devices")
-      .setDesc(
-        `This device is "${this.plugin.deviceName}". Add another with an invite, above; each one ` +
-          `gets a credential of its own, which is what a row here can be revoked without touching. ` +
-          `Invites that have not been redeemed yet are listed here too.`,
-      )
+      .setDesc("Who else can reach this vault. Add one with an invite, above.")
       .addButton((b) => b.setButtonText("Show devices").onClick(show));
 
     list = contentEl.createEl("div");
@@ -2080,13 +2121,10 @@ class BasaltModal extends Modal {
    */
   private renderInvite(contentEl: HTMLElement): void {
     let currentInvite = "";
-    new Setting(contentEl)
+    const adding = new Setting(contentEl)
       .setName("Add another device")
       .setDesc(
-        `This device is "${this.plugin.deviceName}". An invite works once, for ten minutes, and ` +
-          "carries no root secret: it hands the new device the vault's key and registers a " +
-          "credential of its own for it, which is what lets you revoke that device later. The " +
-          "recovery key is not needed for this and should stay written down.",
+        "An invite adds one device, works once, and expires. The recovery key is not needed.",
       )
       .addButton((b) =>
         b.setButtonText("Create invite").onClick(async () => {
@@ -2118,6 +2156,20 @@ class BasaltModal extends Modal {
 
     const shown = contentEl.createEl("p", { cls: "basalt-pairing" });
     const expiry = contentEl.createEl("p", { cls: "basalt-advice" });
+    // What the one-line description had to drop: what an invite carries, and
+    // why that is what makes a row revocable at all. Its own element, because
+    // `expiry` is filled with `setText`, which in a real DOM would take this
+    // out with it.
+    // On the row's own name, the way the disclosure's marker sits on its
+    // summary. In its own paragraph it rendered as a lone question mark in
+    // empty space, belonging to nothing: the third layout fault a screenshot
+    // has caught here and no test has.
+    help(
+      adding.nameEl,
+      "An invite carries the vault's data key and no root secret. It registers a credential of " +
+        "its own for the new device, which is what lets you revoke that device later without " +
+        "touching any other.",
+    );
   }
 
   /**
@@ -2135,10 +2187,7 @@ class BasaltModal extends Modal {
     new Setting(contentEl)
       .setName("Rejoin this server")
       .setDesc(
-        "The server has lost history this device already has, which is what restoring it from an " +
-          "older backup looks like. Rejoining forgets what this device believed it had synced and " +
-          "starts again from the server's version, sending what only this device holds as new " +
-          "versions. Nothing is deleted, here or on the server. Back the server up first.",
+        "The server lost history this device has. Nothing is deleted; back the server up first.",
       )
       .addButton((b) =>
         b
@@ -2185,7 +2234,9 @@ class BasaltModal extends Modal {
    * the whole point of the change: a device that could rotate could also
    * register itself again after being revoked. So this is a field rather than
    * a button, and somebody who has not got the key cannot do it from here,
-   * which is correct and is said in the description rather than discovered.
+   * which is correct and is what the one-line description says: paste the
+   * vault's current recovery key. Why no device has one is on the `?` beside
+   * the disclosure this row sits in.
    *
    * Two presses, because it retires the old key the moment it commits, and the
    * new key goes on screen before the second press: the server commits, closes
@@ -2197,14 +2248,7 @@ class BasaltModal extends Modal {
     let keyField: TextComponent | undefined;
     new Setting(contentEl)
       .setName("Replace the vault's secret")
-      .setDesc(
-        "For a recovery key that has been somewhere it should not have been, or a device that " +
-          "was stolen rather than lost. Paste the vault's current recovery key: no device holds " +
-          "one, which is what makes revoking a device above mean anything. The vault gets a new " +
-          "root secret and keeps all of its history, and every device including this one keeps " +
-          "syncing: no device row is touched. It cannot un-read what was already read, so revoke " +
-          "the lost device as well.",
-      )
+      .setDesc("For a leaked key or a stolen device. Paste the vault's current recovery key.")
       .addText((t) => {
         t.setPlaceholder("basalt3_...");
         keyField = t;
@@ -2254,18 +2298,20 @@ class BasaltModal extends Modal {
     contentEl.createEl("p", { text: `Basalt has stopped: ${problem}` });
     contentEl.createEl("p", {
       text:
-        `The saved settings are in ${this.plugin.dataPath}. Pairing again would replace the ` +
-        `credential they hold, so nothing here will do that. Fix or move the file, then reload the plugin.`,
+        `Pairing again would replace the credential in ${this.plugin.dataPath}, so nothing here ` +
+        `offers to. Fix or move that file, then reload the plugin.`,
     });
   }
 
   private renderPairing(contentEl: HTMLElement): void {
-    contentEl.createEl("p", {
-      text:
-        "This vault is not paired yet. If another device already has the vault, create an invite " +
-        "there and paste it here. The vault's recovery key works too, and is what to use when no " +
-        "device is left to make an invite.",
+    const intro = contentEl.createEl("p", {
+      text: "Not paired. Paste an invite from another device, or the vault's recovery key. ",
     });
+    help(
+      intro,
+      "An invite is made on a device that already has the vault, under Add another device, and " +
+        "works once. The recovery key is for the day no device is left to make one.",
+    );
 
     // The fields are read when a button is pressed rather than tracked
     // through input events. One less thing between what was typed and what
@@ -2280,10 +2326,7 @@ class BasaltModal extends Modal {
     // itself. What is offered is what will be used, and it can be typed over.
     new Setting(contentEl)
       .setName("Device name")
-      .setDesc(
-        "How this device shows in the device list, in version history and in conflict copy " +
-          "names. Type over it with whatever you call this machine.",
-      )
+      .setDesc("Shown in the device list, in history and on conflict copies. Type over it.")
       .addText((t) => {
         t.setPlaceholder("laptop");
         t.setValue(suggestedDeviceName());
@@ -2292,11 +2335,7 @@ class BasaltModal extends Modal {
 
     new Setting(contentEl)
       .setName("Invite or recovery key")
-      .setDesc(
-        "An invite from Basalt on a device that already has this vault, or the vault's recovery " +
-          "key. Either way this device ends up with a credential of its own, and keeps neither " +
-          "the invite nor the key.",
-      )
+      .setDesc("An invite works once. Either way this device keeps a credential of its own.")
       .addText((t) => {
         t.setPlaceholder("basalt3i_...");
         pairingField = t;
@@ -2320,14 +2359,12 @@ class BasaltModal extends Modal {
     );
 
     contentEl.createEl("h3", { text: "Or start a new vault" });
-    contentEl.createEl("p", {
-      text: "Only for the first device. Paste the line the server printed when it first started.",
-    });
+    contentEl.createEl("p", { text: "Only for the first device." });
 
     let setupField: TextComponent | undefined;
     new Setting(contentEl)
       .setName("Setup string")
-      .setDesc("Looks like homelab:3003#TOKEN. Behind TLS, use that hostname in front of the #.")
+      .setDesc("The line the server printed on first run. Behind TLS, use that hostname.")
       .addText((t) => {
         t.setPlaceholder("homelab:3003#K7M2PQR4-...");
         setupField = t;
@@ -2349,6 +2386,8 @@ class BasaltModal extends Modal {
         }
       }),
     );
+
+    docsLink(contentEl.createEl("p", { cls: "basalt-advice" }), "How pairing works");
   }
 
   /** The recovery key of a vault this panel just started, shown once. */
@@ -2356,14 +2395,16 @@ class BasaltModal extends Modal {
 
   private renderRecoveryKey(contentEl: HTMLElement, key: string): void {
     contentEl.createEl("h3", { text: "Write this down" });
-    contentEl.createEl("p", {
+    const said = contentEl.createEl("p", {
       text:
-        "This is the vault's recovery key. It is shown here once and no device keeps it: what is " +
-        "stored here is this device's own credential, which can be revoked on its own. Adding a " +
-        "device does not need it, an invite does that; this replaces the vault's secret and is " +
-        "the only way back if every device is lost. Anyone who has it has the vault. Keep it " +
-        "offline.",
+        "Shown once; no device keeps it. Write it down and keep it offline: anyone who has it " +
+        "has the vault. ",
     });
+    help(
+      said,
+      "An invite adds a device, not this. The recovery key replaces the vault's secret and is " +
+        "the only way back if every device is lost.",
+    );
     contentEl.createEl("p", { cls: "basalt-pairing", text: key });
     new Setting(contentEl).addButton((b) =>
       b.setButtonText("I have written it down").onClick(() => {
@@ -2540,13 +2581,13 @@ export interface Connection {
  * server.md describes, and `ws://` means nothing did. The second is not a
  * warning that the vault is exposed, because it is not: the notes are sealed
  * on this device either way. What it does cost is named exactly, because the
- * only wrong thing to say here is the vague thing.
+ * only wrong thing to say here is the vague thing. Which of the two is exposed
+ * is what fits on the line; which network can see it is in docs/plugin.md.
  */
 export function describeConnection(at: Connection): string {
   const hop = at.url.startsWith("wss://")
     ? "which has TLS in front"
-    : "which has no TLS in front: notes stay sealed, and a network in between can see this " +
-      "device's credential, and the size and timing of every note";
+    : "which has no TLS in front: notes stay sealed, the credential and note sizes are not";
   return at.server === undefined
     ? `Not connected to ${at.url}, ${hop}. Its protocol and build are said at hello, so neither is known yet.`
     : `Connected to ${at.url}, ${hop}. Protocol ${at.server.proto}, basaltd ${at.server.version}.`;

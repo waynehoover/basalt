@@ -465,8 +465,20 @@ export class Setting {
   readonly texts: TextComponent[] = [];
   readonly buttons: ButtonComponent[] = [];
   readonly settingEl = new FakeEl("div", "setting-item");
+  /**
+   * The two children the real `Setting` exposes and this used to leave out.
+   *
+   * Obsidian's own type has `settingEl`, `infoEl` and `nameEl` since 0.9.7,
+   * and code that hangs a hover marker on the row's name reaches for
+   * `nameEl`. Without them here that code threw only in a real vault, which
+   * is the whole failure mode this fake exists to prevent.
+   */
+  readonly infoEl = new FakeEl("div", "setting-item-info");
+  readonly nameEl = new FakeEl("div", "setting-item-name");
 
   constructor(containerEl: FakeEl) {
+    this.settingEl.children.push(this.infoEl);
+    this.infoEl.children.push(this.nameEl);
     containerEl.children.push(this.settingEl);
     built.push(this);
   }

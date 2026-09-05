@@ -147,6 +147,27 @@ const synced = (p: Testable) =>
  */
 const status = (p: Testable) => p.statusBarItems[0]?.attributes.get("aria-label") ?? "";
 
+/**
+ * Every `?` tooltip in the panel that is open, joined.
+ *
+ * Each description in the panel is one line now, and the detail that used to
+ * be inside them is on an `aria-label` beside the section it belongs to, which
+ * is what Obsidian draws as a hover tooltip. The assertions that used to read
+ * a `desc` and now read this did not go anywhere: they followed their sentence.
+ * Deleting them instead would have made the cut unfalsifiable.
+ */
+const tooltips = (): string => {
+  const found: string[] = [];
+  const walk = (el: FakeEl): void => {
+    const label = el.attributes.get("aria-label");
+    if (label !== undefined) found.push(label);
+    for (const child of el.children) walk(child);
+  };
+  const modal = modals.at(-1);
+  if (modal) walk(modal.contentEl);
+  return found.join("\n");
+};
+
 /** Which glyph it chose, which is the other half of what it says. */
 const statusIcon = (p: Testable) =>
   p.statusBarItems[0]?.children
@@ -419,7 +440,9 @@ describe("pairing", () => {
     built.length = 0;
     plugin.ribbonIcons[0]!.callback();
     const row = built.find((s) => s.name === "Recovery key")!;
-    expect(row.desc).toMatch(/not on this device and cannot be shown again/);
+    expect(row.desc).toMatch(/not kept here/);
+    // And the reason, on the section's `?`, where the sentence went.
+    expect(tooltips()).toMatch(/not on this device and cannot be shown again/);
     // And no button, because there is nothing for one to do.
     expect(row.buttons, "the panel offers to show a key it does not have").toEqual([]);
   }, 300_000);
@@ -817,8 +840,10 @@ describe("the modal, which is not a settings tab", () => {
     expect(adding.buttons.map((b) => b.label)).toContain("Create invite");
     // The sentence that keeps the recovery key written down and offline. If
     // the panel is silent about it, adding a device becomes fetching the key.
+    // It is short enough to stay on the row; what an invite carries instead of
+    // a root secret moved to the `?` under it.
     expect(adding.desc).toMatch(/recovery key is not needed/i);
-    expect(adding.desc).toMatch(/no root secret/);
+    expect(tooltips()).toMatch(/no root secret/);
 
     const row = built.find((s) => s.name === "Devices")!;
     expect(row, "the panel has no device list").toBeDefined();
@@ -849,6 +874,52 @@ describe("the modal, which is not a settings tab", () => {
     expect(names).toContain("Devices");
     expect(names).toContain("Recovery key");
     expect(names).toContain("Unlink this vault");
+  }, 300_000);
+
+  /**
+   * The rare rows behind one press, and the everyday ones not.
+   *
+   * design.md: a thing that matters only when something specific happens
+   * appears in that moment. Devices, the recovery key, replacing the secret
+   * and unlinking are rare and three of the four cannot be undone, so they are
+   * inside one `<details>`. A `<details>` and not a tab or a second modal
+   * because it needs no code and holds no state, which is the whole reason the
+   * panel can be the whole interface.
+   */
+  it("puts the rare rows behind one disclosure and leaves the everyday ones out", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const manage = modals.at(-1)!.contentEl.children.find((el) => el.tag === "details")!;
+    expect(manage, "the panel has no disclosure").toBeDefined();
+    expect(manage.children[0]!.tag).toBe("summary");
+    expect(manage.children[0]!.text).toBe("Manage this vault");
+
+    const inside = (name: string): boolean =>
+      manage.children.includes(built.find((s) => s.name === name)!.settingEl);
+    for (const row of [
+      "Devices",
+      "Recovery key",
+      "Replace the vault's secret",
+      "Unlink this vault",
+    ])
+      expect(inside(row), `"${row}" is on the everyday panel`).toBe(true);
+    for (const row of ["Sync now", "Add another device", "Recover a deleted note"])
+      expect(inside(row), `"${row}" is behind the disclosure`).toBe(false);
+
+    // And the way out of the panel for anybody who wants the rest of it, which
+    // is where the four hundred words that used to be on screen went.
+    const links = modals
+      .at(-1)!
+      .contentEl.children.flatMap((el) => el.children)
+      .filter((el) => el.tag === "a");
+    expect(links.map((el) => el.attributes.get("href"))).toContain(
+      "https://github.com/waynehoover/basalt-sync/blob/main/docs/plugin.md",
+    );
   }, 300_000);
 
   it("says what went wrong rather than failing quietly", async () => {
@@ -2564,7 +2635,11 @@ describe("adding a device from the panel", () => {
 
     const shown = modals.at(-1)!.contentEl.allText();
     expect(shown).toMatch(/Write this down/);
-    expect(shown).toMatch(/only way back/);
+    // What it is for, on the `?` beside the key: the screen itself says the
+    // two things somebody has to act on now, which is write it down and keep
+    // it offline.
+    expect(shown).toMatch(/keep it offline/);
+    expect(tooltips()).toMatch(/only way back/);
     // The key itself, taken off the screen, because this is the one moment it
     // exists anywhere: no device keeps it and nothing reprints it.
     const key = shown.split(/\s+/).find((w) => w.startsWith("basalt3_"))!;
@@ -2595,9 +2670,12 @@ describe("adding a device from the panel", () => {
     expect(modals.at(-1)!.contentEl.allText(), "the key was on screen unasked").not.toContain(key);
     const setting = built.find((s) => s.name === "Recovery key")!;
     // Said, not shown, because there is nothing to show: the key was
-    // displayed once and this device kept its own credential instead.
-    expect(setting.desc).toMatch(/not on this device and cannot be shown again/);
-    expect(setting.desc).toMatch(/register itself again after being revoked/);
+    // displayed once and this device kept its own credential instead. The row
+    // says where the key is; the `?` beside the section says why it is there
+    // and not here.
+    expect(setting.desc).toMatch(/not kept here/);
+    expect(tooltips()).toMatch(/not on this device and cannot be shown again/);
+    expect(tooltips()).toMatch(/register itself again after being revoked/);
     expect(setting.buttons, "the panel offers to show a key it does not have").toEqual([]);
     expect(modals.at(-1)!.contentEl.allText()).not.toContain(key);
   }, 300_000);
@@ -2803,8 +2881,11 @@ describe("the device list in the panel", () => {
 
     // The stub does not render a setting's name into the DOM, so position is
     // the thing to assert: the container the rows are built into must come
-    // after the row that offers them.
-    const kids = modals.at(-1)!.contentEl.children;
+    // after the row that offers them. Both are inside the one disclosure the
+    // panel has now, so the children to look at are its children.
+    const manage = modals.at(-1)!.contentEl.children.find((el) => el.tag === "details");
+    expect(manage, "the panel has no disclosure to manage the vault from").toBeDefined();
+    const kids = manage!.children;
     const row = built.find((b) => b.name.includes("laptop"))!;
     const at = kids.indexOf(heading.settingEl);
     const listAt = kids.findIndex((el) => el.children.includes(row.settingEl));
@@ -2875,7 +2956,7 @@ describe("the device list in the panel", () => {
     expect(built.find((s) => s.name.startsWith("laptop"))!.desc).toMatch(/last seen/);
 
     const said = modals.at(-1)!.contentEl.allText();
-    expect(said).toMatch(/1 of these has never connected/);
+    expect(said).toMatch(/1 has never connected/);
     expect(said).toMatch(/holds a slot/);
   }, 300_000);
 
@@ -2996,6 +3077,12 @@ describe("rejoining a server that lost history (I10, plugin)", () => {
     const row = built.find((s) => s.name === "Rejoin this server")!;
     expect(row, "the panel offered no way back").toBeDefined();
     expect(row.desc).toMatch(/Nothing is deleted/);
+    // On the panel itself, never behind the disclosure: a device the server
+    // has refused has to say so, and offer the way out, on open.
+    expect(
+      modals.at(-1)!.contentEl.children,
+      "the way back off a refused device is behind a disclosure",
+    ).toContain(row.settingEl);
     const button = row.buttons[0]!;
     expect(button.warning, "a destructive action with no warning on it").toBe(true);
     await button.click();

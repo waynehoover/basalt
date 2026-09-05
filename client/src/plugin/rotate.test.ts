@@ -26,7 +26,15 @@ import type { App as ObsidianApp, PluginManifest } from "obsidian";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TestServer, cleanupBinary, serverBinary } from "../core/test-server.ts";
-import { App, Plugin as StubPlugin, built, modals, notices, resetStub } from "./stub.ts";
+import {
+  App,
+  type FakeEl,
+  Plugin as StubPlugin,
+  built,
+  modals,
+  notices,
+  resetStub,
+} from "./stub.ts";
 import BasaltPlugin from "./main.ts";
 
 /**
@@ -137,6 +145,25 @@ async function started(): Promise<{ plugin: Testable; app: App; key: string }> {
   return { plugin, app, key };
 }
 
+/**
+ * Every `?` tooltip in the panel that is open, joined.
+ *
+ * The panel's descriptions are one line each, and the detail they used to
+ * carry is on an `aria-label` beside the section it belongs to, which is what
+ * Obsidian draws as a hover tooltip.
+ */
+const tooltips = (): string => {
+  const found: string[] = [];
+  const walk = (el: FakeEl): void => {
+    const label = el.attributes.get("aria-label");
+    if (label !== undefined) found.push(label);
+    for (const child of el.children) walk(child);
+  };
+  const modal = modals.at(-1);
+  if (modal) walk(modal.contentEl as unknown as FakeEl);
+  return found.join("\n");
+};
+
 /** What `data.json` says, which is the only thing a restart is worth. */
 const saved = (p: Testable) => p.savedData as Record<string, string> | null;
 
@@ -151,10 +178,13 @@ describe("replacing the vault's secret from the panel", () => {
     expect(row, "the panel offers no way to retire a leaked secret").toBeDefined();
     // The copy has to say the two things a person would otherwise get wrong:
     // that this needs the key they wrote down, and that every device keeps
-    // syncing, which is the opposite of what protocol 3 did.
+    // syncing, which is the opposite of what protocol 3 did. The first is
+    // short enough for the row's one line. The other two followed the cut on
+    // to the `?` beside the disclosure this row sits in, which is where the
+    // panel keeps the detail a line cannot carry.
     expect(row.desc).toMatch(/Paste the vault's current recovery key/);
-    expect(row.desc).toMatch(/every device including this one keeps/i);
-    expect(row.desc).toMatch(/cannot un-read/i);
+    expect(tooltips()).toMatch(/keeps every device syncing/i);
+    expect(tooltips()).toMatch(/cannot un-read/i);
     // The field, and the button that reads it, are separate rows.
     const field = row.texts[0]!;
     const button = built.find((s) => s.buttons.some((b) => b.label === "Replace the secret"))!

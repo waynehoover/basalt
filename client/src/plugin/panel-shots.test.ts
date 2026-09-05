@@ -89,6 +89,33 @@ const EXPECTED = [
   "status-bar-stopped",
 ];
 
+/**
+ * Every row description in a capture, unwrapped.
+ *
+ * The outline puts a field on one line and continues it under the label's own
+ * width, so a description is `desc` plus every line indented exactly eight
+ * further columns. Read by that indent rather than by a regex over the whole
+ * dump, because the dump's other lines are indented too and a greedy match
+ * would swallow the next element and call the description long.
+ */
+function descriptions(body: string): string[] {
+  const lines = body.split("\n");
+  const out: string[] = [];
+  for (const [i, line] of lines.entries()) {
+    const head = /^( *)desc {4}(.*)$/.exec(line);
+    if (!head) continue;
+    const indent = " ".repeat(head[1]!.length + 8);
+    let text = head[2]!;
+    for (let j = i + 1; j < lines.length; j++) {
+      const next = lines[j]!;
+      if (!next.startsWith(indent) || next[indent.length] === " ") break;
+      text += ` ${next.slice(indent.length)}`;
+    }
+    out.push(text.replace(/\s+/g, " ").trim());
+  }
+  return out;
+}
+
 describe("the panel walk", () => {
   const of = (name: string): string => {
     const shot = shots.find((s) => s.name === name);
@@ -132,20 +159,97 @@ describe("the panel walk", () => {
   it("draws the paired panel's rows, in the order somebody reads them", () => {
     const body = of("paired");
     const rows = [
+      // What a panel is opened for, always on screen.
       "Sync now",
       "Add another device",
-      "Devices",
       "Recover a deleted note",
+      // And what is rare, inside the one disclosure, in the order the
+      // paragraphs above the code describe: the list, then the two things
+      // that touch the vault's secret, then leaving.
+      "Devices",
       "Recovery key",
+      "Replace the vault's secret",
       "Unlink this vault",
     ];
     const at = rows.map((row) => body.indexOf(`name    ${row}`));
     for (const [i, row] of rows.entries()) {
       expect(at[i], `the paired panel has no "${row}" row`).toBeGreaterThan(-1);
     }
-    // Adding a device and then the list of them, because they are one
-    // subject, and the destructive rows last.
     expect(at, `the rows are out of order:\n${body}`).toEqual([...at].sort((x, y) => x - y));
+  });
+
+  /**
+   * The altitude split, pinned against the same text a reviewer reads.
+   *
+   * design.md: a thing that matters only when something specific happens
+   * appears in that moment. Four of the seven rows are rare and three of those
+   * four are destructive, so they are inside one `<details>` and the everyday
+   * three are not. This is a layout claim, which is exactly the kind this
+   * artifact can hold on its own.
+   */
+  it("keeps the everyday rows out of the disclosure and the rare ones in", () => {
+    const body = of("paired");
+    const disclosure = body.indexOf("<details.basalt-manage>");
+    expect(disclosure, "the panel has no disclosure at all").toBeGreaterThan(-1);
+    expect(body).toContain("Manage this vault");
+
+    for (const row of ["Sync now", "Add another device", "Recover a deleted note"]) {
+      expect(
+        body.indexOf(`name    ${row}`),
+        `"${row}" is behind the disclosure, and it is an everyday row`,
+      ).toBeLessThan(disclosure);
+    }
+    for (const row of [
+      "Devices",
+      "Recovery key",
+      "Replace the vault's secret",
+      "Unlink this vault",
+    ]) {
+      expect(
+        body.indexOf(`name    ${row}`),
+        `"${row}" is on the everyday panel, and it is rare or destructive`,
+      ).toBeGreaterThan(disclosure);
+    }
+  });
+
+  /**
+   * The cut, measured rather than asserted about.
+   *
+   * Sixteen descriptions carrying five hundred words is what this panel was,
+   * and a rule that is only in a commit message grows back. Every description
+   * on screen is a label and one line: fifteen words is the ceiling, and the
+   * device and invite rows, which are `id · added X · last seen Y`, are well
+   * under it.
+   */
+  it("keeps every description to one line", () => {
+    const long: string[] = [];
+    for (const shot of shots) {
+      for (const desc of descriptions(shot.body)) {
+        const words = desc.split(" ").filter(Boolean).length;
+        if (words > 15) long.push(`${shot.name}: ${words} words · ${desc}`);
+      }
+    }
+    expect(long, `these descriptions are more than a line:\n${long.join("\n")}`).toEqual([]);
+  });
+
+  /**
+   * The four things the cut was not allowed to take, each still on screen.
+   *
+   * Every one of them was a paragraph somebody argued for, and each is now a
+   * clause. Compressed is fine; gone is not, and this is the difference.
+   */
+  it("still says the four things that were paid for in incidents", () => {
+    // Revoking, beside the buttons that do it.
+    expect(prose("devices-listed")).toMatch(/does not un-read what that device already read/);
+    expect(prose("devices-listed")).toMatch(/replace the vault's secret too if it was stolen/);
+    // An invite: one device, once, and it expires.
+    expect(prose("paired")).toMatch(/An invite adds one device, works once, and expires/);
+    expect(prose("devices-listed")).toMatch(/adds one device · expires/);
+    // The recovery key is written down, and is not how a device is added.
+    expect(prose("paired")).toMatch(/Written down, not kept here\./);
+    expect(prose("paired")).toMatch(/An invite adds a device, not this\./);
+    // And what a hop with nothing in front of it costs.
+    expect(prose("paired")).toMatch(/no TLS in front: notes stay sealed/);
   });
 
   /**
