@@ -28,8 +28,8 @@ once produced a successful backup of nothing.
 ### Docker
 
 The image is the binary on an empty filesystem: no shell, no package manager,
-nothing to update. For 0.3.1 on linux/amd64 that is 5.2 MB of compressed layers
-to pull and a 12.0 MB binary on disk, checkable for any release with
+nothing to update. For 0.4.0 on linux/amd64 that is 5.3 MB of compressed layers
+to pull and a 12.1 MB binary on disk, checkable for any release with
 `docker buildx imagetools inspect ghcr.io/waynehoover/basalt-sync:<tag> --raw`.
 `latest` is for trying it out; pin the tag and its digest for a server you keep,
 the way `compose.yaml` does, so a pull cannot move you to an image nobody
@@ -554,7 +554,7 @@ back rather than promising space the purge then spares.
 are an array:
 
 ```json
-{ "version": "0.3.1", "bodies": 21117, "graceMs": 3600000,
+{ "version": "0.4.0", "bodies": 21117, "graceMs": 3600000,
   "vaults": [ { "vault": "default", "claimed": true, "files": 1834,
                 "folders": 212, "bytes": 64193000, "deleted": 17,
                 "recoverable": 17, "purged": 0, "versions": 9120,
@@ -597,7 +597,7 @@ The startup line is the other thing to grep for after a restart, with the same
 made-up numbers as the example above:
 
 ```
-msg=starting version=0.3.1 vault=default latest=9120 claimed=true reclaimable="14.8 MiB"
+msg=starting version=0.4.0 vault=default latest=9120 claimed=true reclaimable="14.8 MiB"
 ```
 
 `latest` is the uid every device compares itself against. If a device says it

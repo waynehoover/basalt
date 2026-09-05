@@ -2304,8 +2304,13 @@ class BasaltModal extends Modal {
   }
 
   private renderPairing(contentEl: HTMLElement): void {
+    // Short enough that the `?` stays on the line with it. At the width the
+    // panel actually renders, "from another device" pushed the badge onto a
+    // line of its own, where it read as a stray glyph belonging to nothing:
+    // the same fault twice fixed elsewhere in this file, found the same way,
+    // by looking at a screenshot. Where an invite comes from is on the badge.
     const intro = contentEl.createEl("p", {
-      text: "Not paired. Paste an invite from another device, or the vault's recovery key. ",
+      text: "Not paired. Paste an invite, or the vault's recovery key. ",
     });
     help(
       intro,
@@ -2593,6 +2598,11 @@ export function describeConnection(at: Connection): string {
     : `Connected to ${at.url}, ${hop}. Protocol ${at.server.proto}, basaltd ${at.server.version}.`;
 }
 
+/** A fragment placed where a sentence starts. A leading digit is left alone. */
+function opens(fragment: string): string {
+  return fragment.charAt(0).toUpperCase() + fragment.slice(1);
+}
+
 function longStatus(state: State): string {
   switch (state.kind) {
     case "unpaired":
@@ -2601,10 +2611,15 @@ function longStatus(state: State): string {
       return "Connecting.";
     case "syncing":
       return `Working on ${state.path}.`;
-    case "synced":
+    case "synced": {
+      // `summarise` returns a fragment because three of its four callers put
+      // it after a colon. This is the fourth, and it opens a sentence: the
+      // tooltip, and the panel's first line above two proper ones.
+      const done = opens(state.summary);
       return state.refused > 0
-        ? `${state.summary}, as of ${clock(state.at)}. ${state.refused} ${state.refused === 1 ? "file needs" : "files need"} attention.`
-        : `${state.summary}, as of ${clock(state.at)}.`;
+        ? `${done}, as of ${clock(state.at)}. ${state.refused} ${state.refused === 1 ? "file needs" : "files need"} attention.`
+        : `${done}, as of ${clock(state.at)}.`;
+    }
     case "failed":
       return `Last sync failed at ${clock(state.at)}: ${state.why}. It will try again.`;
     case "offline":

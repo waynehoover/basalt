@@ -2444,6 +2444,23 @@ describe("what the status bar shows", () => {
     // Not all the same glyph, or the bar would say nothing by changing.
     expect(seen.size).toBeGreaterThan(2);
   });
+
+  /**
+   * `summarise` returns a fragment, because three of its four callers put it
+   * after a colon. The fourth starts a sentence with it, in the tooltip and on
+   * the panel's first line, and it read "up to date, as of 9:41 PM." under a
+   * heading and above two proper sentences. Every other state here already
+   * capitalises; only the settled one, the one seen most, did not. Found in a
+   * screenshot, like the last three layout faults, and not by any of these.
+   */
+  it("starts every state's sentence the way a sentence starts", async () => {
+    const { plugin } = await load();
+    for (const state of states) {
+      (plugin as unknown as { setState(s: unknown): void }).setState(state);
+      const sentence = status(plugin).replace(/^Basalt Sync: /, "");
+      expect(sentence, `${state.kind} opens mid-sentence`).toMatch(/^[A-Z0-9]/);
+    }
+  });
 });
 
 /**

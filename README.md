@@ -26,7 +26,7 @@ Basalt is the narrow version. One backend, one transport, one person's devices. 
     <td align="center">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/panel-dark.png">
-        <img src="docs/assets/screenshots/panel.png" alt="The Basalt panel: up to date, sync now, add another device, recover a deleted note, unlink.">
+        <img src="docs/assets/screenshots/panel.png" alt="The Basalt panel: up to date, sync now, add another device, recover a deleted note, and everything rarer behind Manage this vault.">
       </picture>
     </td>
     <td align="center">
