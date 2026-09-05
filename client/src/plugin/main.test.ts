@@ -30,7 +30,7 @@ import {
   notices,
   resetStub,
 } from "./stub.ts";
-import BasaltPlugin, { describeDeleted } from "./main.ts";
+import BasaltPlugin, { describeConnection, describeDeleted } from "./main.ts";
 import { describeRestore } from "./history.ts";
 import type { SyncReport } from "../core/engine.ts";
 import { redeemInvite } from "../core/client.ts";
@@ -1369,7 +1369,17 @@ describe("a vault that was started and never joined (P16)", () => {
       }
       return realSave(data);
     };
-    await expect(startVault(plugin, "laptop")).rejects.toThrow(/could not register itself/);
+    const failed = await startVault(plugin, "laptop").then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(failed?.message, "starting the vault succeeded").toMatch(/could not register itself/);
+    // The row the registration may already have committed, named. A phone
+    // told only to pair again registers a second row and spends another of
+    // the vault's eight slots, and nothing ever says the first one is there.
+    expect(failed?.message).toMatch(/device row was registered/);
+    expect(failed?.message).toMatch(/never connected/);
+    expect(failed?.message).toMatch(/Write the recovery key shown in the Basalt panel down/);
 
     // On disk and in memory, the root is still there: the claim may have
     // committed, and throwing it away is a vault nothing will ever open.
@@ -1392,6 +1402,87 @@ describe("a vault that was started and never joined (P16)", () => {
     const after = rejoined.plugin.savedData as Record<string, unknown>;
     expect(after["secret"], "pairing with the recovery key kept it").toBeUndefined();
     expect(after["deviceId"]).toBeDefined();
+  }, 300_000);
+
+  /**
+   * The panel's pairing form, at the same moment: the registration commits and
+   * the credential does not reach data.json.
+   *
+   * A row exists on the vault that nothing holds the key to, and the advice
+   * has to name it. Pairing again registers a second one, so a phone that is
+   * only told to try again spends one of the vault's eight slots per attempt
+   * and nothing ever says so. The words come from `adviseAfterRegistering`,
+   * which the CLI's `init` and `pair` also take theirs from.
+   */
+  it("names the row the panel's pairing left when the credential could not be saved", async () => {
+    await fresh();
+    const first = await load();
+    const key = await startVault(first.plugin, "laptop");
+    await synced(first.plugin);
+
+    const second = await load();
+    const realSave = second.plugin.saveData.bind(second.plugin);
+    second.plugin.saveData = async (data: unknown) => {
+      const record = data as Record<string, unknown> | null;
+      if (record !== null && record["deviceId"] !== undefined) throw new Error("EIO: data.json");
+      return realSave(data);
+    };
+    const failed = await second.plugin.pair(key, "desktop").then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(failed?.message, "the pairing succeeded").toMatch(/EIO/);
+    expect(failed?.message).toMatch(/device row was registered/);
+    expect(failed?.message).toMatch(/never connected/);
+    expect(failed?.message).toMatch(/device slots/);
+    // Nothing here claims to be paired, because nothing here can connect.
+    expect(second.plugin.savedData).toBe(null);
+
+    // And the row it names is really there, and really goes.
+    const rows = (await first.plugin.devices()).devices;
+    const orphan = rows.find((d) => d.lastSeen === 0);
+    expect(orphan, JSON.stringify(rows)).toBeDefined();
+    await first.plugin.revoke(orphan!.id);
+    expect((await first.plugin.devices()).devices).toHaveLength(1);
+  }, 300_000);
+
+  /**
+   * The mirror image, and why the advice is read off the disk in four states.
+   *
+   * A data.json that writes and will not read back holds a credential for a
+   * live row, and "that row is one nothing can connect as, revoke it" would
+   * destroy the row this phone could have used. Rule 2: absent and unreadable
+   * are different states, here with different consequences.
+   */
+  it("will not name a row for revoking when data.json refuses to read back", async () => {
+    await fresh();
+    const first = await load();
+    const key = await startVault(first.plugin, "laptop");
+    await synced(first.plugin);
+
+    const second = await load();
+    let breaking = false;
+    const realLoad = second.plugin.loadData.bind(second.plugin);
+    const realSave = second.plugin.saveData.bind(second.plugin);
+    second.plugin.saveData = async (data: unknown) => {
+      const record = data as Record<string, unknown> | null;
+      if (record !== null && record["deviceId"] !== undefined) breaking = true;
+      return realSave(data);
+    };
+    second.plugin.loadData = async () => {
+      if (breaking) throw new Error("EIO: data.json");
+      return realLoad();
+    };
+    const failed = await second.plugin.pair(key, "desktop").then(
+      () => undefined,
+      (err: Error) => err,
+    );
+    expect(failed?.message, "the pairing succeeded").toMatch(/could not be read/);
+    expect(failed?.message).toMatch(/not known/);
+    expect(failed?.message).not.toMatch(/never connected/);
+    // The credential really was written, and it is the row's only key.
+    expect((second.plugin.savedData as Record<string, unknown>)["deviceId"]).toBeDefined();
+    expect((await first.plugin.devices()).devices).toHaveLength(2);
   }, 300_000);
 });
 
@@ -2533,6 +2624,116 @@ describe("adding a device from the panel", () => {
 });
 
 /**
+ * The pairing form's device name, and the connection line under the status.
+ *
+ * Both are the same complaint from the same evening: the panel is the whole
+ * interface, and it was not saying two things it already knew. It knew what
+ * kind of machine it was running on and offered nothing, so every device was
+ * called after the app. It knew the address, the protocol and the server's
+ * build, and said "up to date, cursor 66".
+ */
+describe("what the panel knows and used to keep to itself", () => {
+  /** The pairing form's name field, from the last render. */
+  const nameField = () => built.find((s) => s.name === "Device name")!.texts[0]!;
+
+  it("suggests a name for this device, and pairs under it", async () => {
+    await fresh();
+    const { plugin } = await load();
+    Platform.isMacOS = true;
+    try {
+      plugin.ribbonIcons[0]!.callback();
+      // In the field, not behind it as a placeholder. A placeholder is not a
+      // value: the field was empty and so was what got used.
+      const suggested = nameField().getValue();
+      expect(suggested).toMatch(/^mac-[0-9a-f]{4}$/);
+
+      built.find((s) => s.name === "Setup string")!.texts[0]!.type(server.setup);
+      await built
+        .find((s) => s.buttons.some((b) => b.label === "Start a new vault"))!
+        .buttons[0]!.click();
+      await synced(plugin);
+
+      // Used, and used where it is read: the row in the device list, which is
+      // what somebody looks at before revoking one.
+      expect(plugin.deviceName).toBe(suggested);
+      const { devices } = await plugin.devices();
+      expect(devices.map((d) => d.name)).toEqual([suggested]);
+    } finally {
+      Platform.isMacOS = false;
+    }
+  }, 300_000);
+
+  it("does not call an iPad a Mac", async () => {
+    await fresh();
+    const { plugin } = await load();
+    // obsidian.d.ts: isMacOS is true on "a device that pretends to be one
+    // (like iPhones and iPads)". Checked in the wrong order, every iPad in
+    // the device list is a Mac.
+    Platform.isIosApp = true;
+    Platform.isTablet = true;
+    Platform.isMacOS = true;
+    try {
+      plugin.ribbonIcons[0]!.callback();
+      expect(nameField().getValue()).toMatch(/^ipad-[0-9a-f]{4}$/);
+    } finally {
+      Platform.isIosApp = false;
+      Platform.isTablet = false;
+      Platform.isMacOS = false;
+    }
+  }, 300_000);
+
+  it("says what it is connected to, with the protocol and the server's build", async () => {
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+
+    plugin.ribbonIcons[0]!.callback();
+    const shown = modals.at(-1)!.contentEl.allText();
+    const to = plugin.connection()!;
+    // The address this device actually holds, rather than the one this test
+    // knows: a panel that agreed with the test and not with the config would
+    // be the bug.
+    expect(to.url).toBe(server.wsUrl);
+    expect(shown).toContain(`Connected to ${server.wsUrl}`);
+    // From `ready` and nowhere else, and both of them present: an absent
+    // build is what a server that never answered looks like.
+    expect(to.server!.proto).toBe(4);
+    // Not "unknown", which is what `readReady` puts there when the server did
+    // not say. A panel showing the fallback as a build is the failure this
+    // line exists for, and it reads exactly like a build.
+    expect(to.server!.version, "the build is the fallback, not what ready said").not.toBe(
+      "unknown",
+    );
+    expect(shown).toContain(`Protocol 4, basaltd ${to.server!.version}.`);
+    expect(shown).not.toContain("Not connected");
+    // A test server has nothing in front of it, and the line says what that
+    // costs rather than only what it is.
+    expect(shown).toMatch(/no TLS in front: notes stay sealed/);
+  }, 300_000);
+
+  it("says the protocol and the build are unknown rather than leaving a gap", () => {
+    // Rule 2 at the width of a sentence: a build missing because nothing is
+    // connected reads exactly like a server that did not say, and they are
+    // different states.
+    const off = describeConnection({ url: "wss://homelab.tailnet.ts.net" });
+    expect(off).toContain("Not connected to wss://homelab.tailnet.ts.net");
+    expect(off).toContain("neither is known yet");
+    expect(off).not.toMatch(/basaltd/);
+
+    const on = describeConnection({
+      url: "wss://homelab.tailnet.ts.net",
+      server: { proto: 4, version: "0.3.4" },
+    });
+    expect(on).toContain("which has TLS in front");
+    expect(on).toContain("Protocol 4, basaltd 0.3.4.");
+    // The scheme is the whole of what is known about the hop, and wss is the
+    // only thing that says something terminated TLS in front.
+    expect(describeConnection({ url: "ws://192.168.1.20:3003" })).toContain("no TLS in front");
+  });
+});
+
+/**
  * The device list in the panel, which is the only device management a plugin
  * device has.
  */
@@ -2606,7 +2807,7 @@ describe("the device list in the panel", () => {
     const kids = modals.at(-1)!.contentEl.children;
     const row = built.find((b) => b.name.includes("laptop"))!;
     const at = kids.indexOf(heading.settingEl);
-    const listAt = kids.findIndex((el) => el === row.settingEl.parent || el.children.includes(row.settingEl));
+    const listAt = kids.findIndex((el) => el.children.includes(row.settingEl));
     expect(at, "the Devices row is not in the panel").toBeGreaterThanOrEqual(0);
     expect(listAt, "no container held the device rows").toBeGreaterThanOrEqual(0);
     expect(listAt, "the device rows rendered above the row that lists them").toBeGreaterThan(at);

@@ -94,7 +94,13 @@ func TestRestoreRehearsal(t *testing.T) {
 	if !strings.Contains(out, "0 faults") {
 		t.Fatalf("the restored backup does not verify:\n%s", out)
 	}
-	if strings.Contains(out, "0 references") {
+	// Not a vacuous pass. This guard used to look for "0 references", which the
+	// line has never said, so a restore of an empty directory would have read
+	// exactly like a restore of this one: the guard could not fail. Both counts
+	// now, because a copy that carried the entries and lost the device rows
+	// verifies deeply and leaves every device locked out (rule 8).
+	if strings.Contains(out, "checked 0 chunk references") ||
+		strings.Contains(out, "0 registry rows") {
 		t.Fatalf("verify found nothing to check, so it proved nothing:\n%s", out)
 	}
 

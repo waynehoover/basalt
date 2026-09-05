@@ -687,7 +687,8 @@ func TestVerifyIsCleanAfterPurge(t *testing.T) {
 		t.Fatalf("purge: %v", err)
 	}
 
-	faults, checked, err := h.Verify(true)
+	faultsRep, err := h.Verify(true)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -812,7 +813,8 @@ func TestPushesCompleteWhileAPurgeIsRunning(t *testing.T) {
 		t.Fatalf("%d of %d pushes committed, %d lost a body to the sweep",
 			committed.Load(), writers*each, raced.Load())
 	}
-	faults, checked, err := h.Verify(true)
+	faultsRep, err := h.Verify(true)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -900,7 +902,8 @@ func TestAnEntryIsNeverCommittedWhileItsChunkIsBeingSwept(t *testing.T) {
 	close(stop)
 	purger.Wait()
 
-	faults, _, err := h.Verify(true)
+	faultsRep, err := h.Verify(true)
+	faults := faultsRep.Faults
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -930,7 +933,8 @@ func TestVerifyFindsAMissingChunk(t *testing.T) {
 		t.Fatalf("remove: %v", err)
 	}
 
-	faults, checked, err := h.Verify(false)
+	faultsRep, err := h.Verify(false)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -958,7 +962,8 @@ func TestDeepVerifyFindsACorruptChunk(t *testing.T) {
 	}
 
 	// A shallow verify only asks whether the file is there, and it is.
-	shallow, _, err := h.Verify(false)
+	shallowRep, err := h.Verify(false)
+	shallow := shallowRep.Faults
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -966,7 +971,8 @@ func TestDeepVerifyFindsACorruptChunk(t *testing.T) {
 		t.Fatalf("shallow verify reported %v; it checks presence only", shallow)
 	}
 
-	deep, _, err := h.Verify(true)
+	deepRep, err := h.Verify(true)
+	deep := deepRep.Faults
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -1052,7 +1058,8 @@ func TestEntriesAndChunksSurviveAReopen(t *testing.T) {
 	if err != nil || string(body) != "head" {
 		t.Fatalf("chunk body after reopen = %q, err %v", body, err)
 	}
-	faults, checked, err := again.Verify(true)
+	faultsRep, err := again.Verify(true)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil || len(faults) != 0 || checked != 2 {
 		t.Fatalf("verify after reopen: faults=%v checked=%d err=%v", faults, checked, err)
 	}
@@ -1223,7 +1230,8 @@ func TestVerifyNoticesAnEntryWhoseChunksAreGone(t *testing.T) {
 		t.Fatalf("detach chunks: %v", err)
 	}
 
-	faults, _, err := h.Verify(false)
+	faultsRep, err := h.Verify(false)
+	faults := faultsRep.Faults
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -1251,7 +1259,8 @@ func TestVerifyNoticesChunksOnSomethingThatShouldHaveNone(t *testing.T) {
 		t.Fatalf("attach chunk to folder: %v", err)
 	}
 
-	faults, _, err := h.Verify(false)
+	faultsRep, err := h.Verify(false)
+	faults := faultsRep.Faults
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -1279,7 +1288,8 @@ func TestVerifyIsQuietOnAHealthyVault(t *testing.T) {
 		t.Fatalf("seed folder: %v", err)
 	}
 
-	faults, checked, err := h.Verify(true)
+	faultsRep, err := h.Verify(true)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}

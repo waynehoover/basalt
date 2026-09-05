@@ -12,6 +12,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"github.com/waynehoover/basalt-sync/server/internal/chunks"
 	"github.com/waynehoover/basalt-sync/server/internal/server"
 	"github.com/waynehoover/basalt-sync/server/internal/store"
+	"github.com/waynehoover/basalt-sync/server/internal/wire"
 )
 
 // A mac of the right shape, standing in for a real writer's. The server holds no
@@ -144,6 +146,82 @@ func TestVerifyFindsAMissingBody(t *testing.T) {
 	}
 	if !strings.Contains(out, "missing") {
 		t.Fatalf("verify said:\n%s", out)
+	}
+}
+
+// I2. `verify -deep` opens the registry too, and says how much of it it opened.
+//
+// A device row whose auth hash has rotted is one device refused with "not
+// authorised", which is what the server says to a stranger, and until this
+// nothing on the machine ever said the registry was the reason. It is not
+// reachable from the entries walk, because it is not an entry.
+func TestVerifyDeepChecksTheRegistryAndSaysWhatItChecked(t *testing.T) {
+	dir := seeded(t)
+	registryOn(t, dir)
+
+	out := mustRun(t, "verify", "-data", dir, "-deep")
+	// Rule 8: the count, not only the pass. A registry that was never walked
+	// and a registry with nothing wrong with it read identically otherwise.
+	if !strings.Contains(out, "2 registry rows") || !strings.Contains(out, "0 faults") {
+		t.Fatalf("verify -deep said:\n%s", out)
+	}
+	// The shallow pass does not open them, so it must not mention them: "0
+	// registry rows" would read as a registry looked at and found empty.
+	if shallow := mustRun(t, "verify", "-data", dir); strings.Contains(shallow, "registry") {
+		t.Fatalf("a shallow verify claims to have read the registry:\n%s", shallow)
+	}
+
+	// Now rot the one field a device is recognised by.
+	execSQL(t, dir, `UPDATE devices SET auth_hash = 'nonsense'`)
+	if shallow := mustRun(t, "verify", "-data", dir); !strings.Contains(shallow, "0 faults") {
+		t.Fatalf("a shallow verify read the registry after all:\n%s", shallow)
+	}
+	out, err := basalt(t, "verify", "-data", dir, "-deep")
+	if err == nil {
+		t.Fatalf("a deep verify passed over a device nothing can authenticate:\n%s", out)
+	}
+	for _, want := range []string{"baddevice", `device "alfa"`, "not authorised"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("the fault does not mention %q:\n%s", want, out)
+		}
+	}
+}
+
+// registryOn claims the seeded vault and puts a device and an outstanding
+// invite on it, which is what a vault anybody is using has.
+func registryOn(t *testing.T, dir string) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(dir, "basalt.db"), filepath.Join(dir, "chunks"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	vaultHash := strings.Repeat("a", 64)
+	if _, err := st.ClaimVault("default", vaultHash, testWrapped, 1000); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := st.RegisterDevice("default", "alfa", "laptop", strings.Repeat("b", 64),
+		vaultHash, 8, 1000); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := st.AddInvite("default", "AAAAAAAAAAAAAAAAAAAAAA", testWrapped,
+		time.Now().Add(time.Hour).UnixMilli(), time.Now().UnixMilli()); err != nil {
+		t.Fatalf("invite: %v", err)
+	}
+}
+
+// execSQL damages the database the third way a data directory can be damaged,
+// after a missing body and a rotted one: a row that no longer decodes. There is
+// no store call that writes one, which is the point.
+func execSQL(t *testing.T, dir, query string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "basalt.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(query); err != nil {
+		t.Fatalf("%s: %v", query, err)
 	}
 }
 
@@ -1109,6 +1187,61 @@ func TestAClaimedVaultPrintsNoToken(t *testing.T) {
 	// device rather than on this server.
 	if !strings.Contains(got, "basalt invite") {
 		t.Errorf("a claimed vault did not say how to add a device:\n%s", got)
+	}
+}
+
+// A claimed vault refuses the next claim, and says so.
+//
+// The printed token is what stops somebody who can reach the port from
+// claiming an empty vault, and what makes it safe to print in a log is that
+// spending it is final: the vault is bound to the first device's key, and a
+// second device offering the same token with a key of its own is refused
+// rather than quietly rebound to. Dropping the token on a loopback bind was
+// considered and refused (docs/design.md, "Why a loopback bind is not the
+// token"), so this property has to hold for every bind there is, which is why
+// it is checked here against the running binary rather than only against the
+// authenticator.
+//
+// There is a test for this at the authenticator already, in
+// internal/server/auth_test.go, and it is a function call rather than a door.
+// This one is the door: the shipped binary, a websocket, and the frame a
+// second claimant is actually sent.
+func TestAClaimedVaultRefusesTheNextClaim(t *testing.T) {
+	dir := t.TempDir()
+	addr := fmt.Sprintf("127.0.0.1:%d", freeTestPort(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := &safeBuffer{}
+	go func() { _ = run(ctx, []string{"serve", "-data", dir, "-addr", addr}, out) }()
+	waitForServer(t, addr, out)
+
+	token := bootstrapToken(t, out.String())
+	dialFirstDevice(t, "ws://"+addr, token)
+
+	// The same token, a key of its own, and nothing else different.
+	stranger := dialWS(t, "ws://"+addr)
+	stranger.write(wire.In{
+		Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
+		Token: token, Claim: strings.Repeat("s", len(vaultKey)), Wrapped: testWrapped,
+		Device: "stranger",
+	})
+	res := stranger.readJSON()
+	if res["res"] != "err" || res["code"] != wire.CodeAuth {
+		t.Fatalf("a claimed vault answered a second claim with %v", res)
+	}
+	if retryable, _ := res["retryable"].(bool); retryable {
+		t.Errorf("a refused claim was marked retryable, so a stranger is invited to keep trying: %v", res)
+	}
+
+	// And the vault is still the first device's: the refusal above is only
+	// worth anything if the claim it refused changed nothing.
+	back := dialWS(t, "ws://"+addr)
+	back.write(wire.In{
+		Op: "hello", ID: 1, Proto: wire.Proto, Crypto: wire.Crypto, Vault: "default",
+		Token: firstDevKey, DeviceID: firstDevID, Device: "test-device",
+	})
+	if res := back.readJSON(); res["res"] != "ready" {
+		t.Fatalf("the device that claimed the vault was locked out by the claim that failed: %v", res)
 	}
 }
 

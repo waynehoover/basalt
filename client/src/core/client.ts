@@ -208,6 +208,19 @@ export class Client {
     return Math.max(this.limits?.cursor ?? 0, this.transport.appliedCursor);
   }
 
+  /**
+   * What the server said about itself at hello, or undefined before one.
+   *
+   * The caps in here are the engine's business and it takes them directly.
+   * What a caller wants this for is the two facts nothing else carries: which
+   * protocol this connection settled on, and which build is on the other end.
+   * The panel shows both, because "up to date, cursor 66" says nothing about
+   * what it is up to date with.
+   */
+  get serverLimits(): ServerLimits | undefined {
+    return this.limits;
+  }
+
   /** The keys in use, which are the data key's and are known from `ready` onwards. */
   get keys(): Schedule {
     return this.engine.vaultKeys;
@@ -1267,6 +1280,136 @@ export async function registerAsDevice(
   return device;
 }
 
+/**
+ * What is on the disk where a device's credential should be, after a
+ * registration that did not finish.
+ *
+ * Four states and not two, because rule 2 is what reading it is for: an
+ * unreadable config is not an absent one. A config that was written and cannot
+ * be read back holds a credential that may be the only copy of a live row's
+ * key, and calling that nothing is how advice comes to destroy a row this
+ * device could have used.
+ */
+export type PairingRemains =
+  /** A credential for a row: this device is finished bar the confirmation. */
+  | { readonly kind: "credential"; readonly config: DeviceConfig }
+  /** The vault's root and no credential: a vault started here and not joined. */
+  | { readonly kind: "root"; readonly config: DeviceConfig }
+  /** Nothing at all, which is also what an unpaired vault looks like. */
+  | { readonly kind: "nothing" }
+  /** Something is there and will not read, so nothing here is known. */
+  | { readonly kind: "unreadable"; readonly why: string };
+
+/**
+ * Reads what is left, keeping absent and unreadable apart (rule 2).
+ *
+ * `read` is the surface's own reader: `loadConfig` in the CLI, `readConfig` in
+ * the plugin. Both return undefined for a config that is not there and throw
+ * for one that is there and will not decode, which is the distinction this
+ * turns into a state instead of the `.catch(() => undefined)` that flattened
+ * the two.
+ */
+export async function whatTheDiskHolds(
+  read: () => Promise<DeviceConfig | undefined>,
+): Promise<PairingRemains> {
+  let held: DeviceConfig | undefined;
+  try {
+    held = await read();
+  } catch (err) {
+    return { kind: "unreadable", why: (err as Error).message };
+  }
+  if (held?.deviceId !== undefined) return { kind: "credential", config: held };
+  // Anything else that decoded holds the root and nothing else: `decodeConfig`
+  // refuses a config with neither, so there is no third shape to be in. The
+  // config comes back with the state because the caller that has to keep it,
+  // the panel, would otherwise read the same file a second time to get it.
+  if (held !== undefined) return { kind: "root", config: held };
+  return { kind: "nothing" };
+}
+
+/**
+ * What to do next when registering this device did not finish: one counsellor
+ * for `basalt init`, `basalt pair` and both of the panel's pairing paths.
+ *
+ * It answers from what the disk says rather than from which step threw (rule
+ * 4), because that is the only thing that tells the states apart, and it is
+ * one function because four copies of these words is how three of them come to
+ * be missing a sentence. `init`'s copy was: it printed the recovery key and
+ * said "unlink here, and pair with that key", which is right and incomplete.
+ * A registration may already have committed, so pairing again registers a
+ * *second* row, and each retry silently spends one of the vault's eight device
+ * slots. `pair`'s copy said so; `init`'s did not.
+ *
+ * What each state is owed:
+ *
+ *  - **credential**: the row is real and this is the only copy of its key, so
+ *    what was written stays and syncing finishes it.
+ *  - **root** and **nothing**: no credential here, so a row on the server may
+ *    be one nothing can connect as. Naming it is the whole point.
+ *  - **unreadable**: nothing is known, so nothing is advised. A `saveConfig`
+ *    that succeeded with a read-back that then failed lands here holding a
+ *    perfectly good credential, and "revoke the row and pair again" would
+ *    throw away a row this device could have used. It takes a disk that writes
+ *    and will not read back, which is exactly the disk that makes the advice
+ *    wrong, so the refusal says what is unknown instead of guessing.
+ *
+ * Whether a row exists cannot be read off a config, and saying so is the
+ * honest part. `registered` is one way only: true means the server was seen to
+ * accept the registration, false means it may still have committed with the
+ * reply lost. So a row "was" or "may have been" registered, and never was not.
+ *
+ * The way back is pair-again-then-revoke rather than revoke-then-pair-again,
+ * because the stranded row is often the vault's only one, and revoking the
+ * last row takes `--allow-last` and the recovery key. Pairing first makes it
+ * an ordinary revocation from an ordinary device.
+ *
+ * cli/state.test.ts walks these against a real server, and plugin/main.test.ts
+ * walks the panel's two paths.
+ */
+export function adviseAfterRegistering(what: {
+  readonly remains: PairingRemains;
+  /** Whether the server was seen to accept the registration. */
+  readonly registered: boolean;
+  /** Which shell is speaking, so it names commands that exist there. */
+  readonly surface: "cli" | "panel";
+  /** Where the config lives, in that shell's words. */
+  readonly where: string;
+}): string {
+  const { remains, registered, surface, where } = what;
+  const cli = surface === "cli";
+  switch (remains.kind) {
+    case "credential":
+      return cli
+        ? `This device is registered with the vault and ${where} holds its credential; ` +
+            `run basalt sync here to finish, or basalt unlink to start again.`
+        : `This device is registered with the vault; Basalt will connect as it on the next attempt.`;
+    case "unreadable":
+      return (
+        `${where} could not be read (${remains.why}), so what this device holds is not known and ` +
+        `nothing should be revoked on the strength of it: a credential that was written and ` +
+        `cannot be read back is still the only copy of its row's key. Fix that first, ` +
+        (cli
+          ? `then basalt status here says whether this device has one.`
+          : `then reload the plugin, which says whether this device has one.`)
+      );
+    default: {
+      const wayBack =
+        remains.kind !== "root"
+          ? "Pair again"
+          : cli
+            ? "Run basalt unlink here and basalt pair with the recovery key"
+            : "Unlink this vault and pair again with the recovery key on the panel";
+      return (
+        `A device row ${registered ? "was" : "may have been"} registered with the vault and its ` +
+        `credential is not here, so it is a row nothing can connect as, and it holds one of the ` +
+        `vault's device slots until somebody takes it off. ${wayBack}, then ` +
+        (cli
+          ? `basalt devices lists that row as never connected and basalt revoke ID removes it.`
+          : `the device list shows that row as never connected, with Revoke beside it.`)
+      );
+    }
+  }
+}
 /**
  * One hello as the device, and nothing after it.
  *

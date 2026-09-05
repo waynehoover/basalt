@@ -158,6 +158,12 @@ are bounded and the pre-auth limits in the reference table exist.
 For trying it on one machine, `basaltd serve -localhost` binds to loopback and
 prints a `ws://` address that needs no TLS.
 
+The first-device token below is required on every bind, loopback included. A
+loopback bind is exactly what both arrangements above proxy to, so it says
+nothing about who is on the other end of a connection;
+[design.md](design.md#why-a-loopback-bind-is-not-the-token) has the reasoning
+and what the token is really proving.
+
 ## The first device
 
 On first run the server generates a bootstrap token, stores it in
@@ -291,7 +297,9 @@ What a server backup is for:
 | Every device is lost or wiped | Backup plus pairing string is the only way back. |
 
 Run it nightly from a timer, ideally to two places. Add `-deep` monthly: it
-re-reads every body already in the destination to catch bit rot.
+re-reads every body already in the destination to catch bit rot, and decodes
+the device rows and invites, which nothing else ever opens until a device
+cannot connect.
 
 ### Nightly, then off the machine
 
@@ -384,10 +392,15 @@ puts the copy at the address every paired device already points at.
 Step 2 is the one that pays for itself here. A body that rotted in the offsite
 copy is still there, still the right length, and a shallow verify walks
 straight past it; `-deep` re-reads every body and checks it against its name,
-which for a content-addressed store is complete for the bytes. What it cannot
-tell you is that the vault serves: a restore with a hole in it starts, verifies
-and passes every check before the read-back, which is the clause rule 11 turns
-on.
+which for a content-addressed store is complete for the bytes. It also decodes
+the device rows and the invites, and says how many of each it opened, because a
+copy that carried every note and rotted one device's credential verifies
+clean by every other measure and leaves that device refused with `not
+authorised`. What it cannot tell you is that the vault serves: a restore with a
+hole in it starts, verifies and passes every check before the read-back, which
+is the clause rule 11 turns on. Nor can it tell you a credential is the *right*
+one: the server holds digests of keys it has never seen, so a hash of the right
+shape is all there is to check.
 
 For the real thing, the steps are the same with the live directory as the
 destination:
@@ -439,7 +452,8 @@ old directory goes, in this order:
    `purges` must equal the live store's and its `latestUid` must be at least
    the live store's newest uid.
 2. `basaltd verify -deep -data /srv/basalt-backup-new`, and it must say
-   `0 faults` over a non-zero number of references.
+   `0 faults` over a non-zero number of chunk references and, on a vault
+   anybody has paired with, a non-zero number of registry rows.
 3. Only then delete the old directory whole. A script deciding this compares
    the two `backup.json` files and never has to open a database.
 
@@ -794,7 +808,7 @@ next to their reasoning in the source; these are the numbers.
 | flag | on | |
 |---|---|---|
 | `-to DIR` | backup | destination, required |
-| `-deep` | backup, verify | re-read every body and check it against its name |
+| `-deep` | backup, verify | re-read every body against its name, and decode every device row and invite |
 | `-vault` | purge | which vault (default `default`) |
 | `-confirm VAULT` | purge | the vault's name again, exactly; required |
 | `-backup DIR` | purge | a backup that must hold the vault up to its newest uid; required unless the check is waived |

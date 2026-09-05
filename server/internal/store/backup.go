@@ -451,16 +451,20 @@ func (s *Store) Backup(destDir string, deep bool) (BackupReport, error) {
 	// the failure this whole function exists to prevent, and publishing an
 	// unverified snapshot over the last good one would be that failure with the
 	// safety net cut.
-	faults, verified, err := dest.Verify(deep)
+	checked, err := dest.Verify(deep)
 	if err != nil {
 		dest.Close()
 		return rep, err
 	}
-	rep.Verified = verified
-	if len(faults) > 0 {
+	rep.Verified = checked.Chunks
+	if len(checked.Faults) > 0 {
 		dest.Close()
-		return rep, fmt.Errorf("the backup is missing %d of %d chunk references, first: %s",
-			len(faults), verified, faults[0])
+		// Not "missing chunk references": a deep pass also decodes the device
+		// rows and the invites, and a backup that published with a rotted
+		// registry would restore into a vault whose devices are locked out.
+		return rep, fmt.Errorf("the backup has %d faults over %d chunk references and %d "+
+			"registry rows, first: %s",
+			len(checked.Faults), checked.Chunks, checked.Rows, checked.Faults[0])
 	}
 	// What the snapshot covers, read from the snapshot itself so backup.json
 	// describes the file beside it and not the live store, which may have

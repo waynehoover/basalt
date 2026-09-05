@@ -753,3 +753,102 @@ func TestARedemptionOntoAnExistingIdChangesNothing(t *testing.T) {
 		t.Fatalf("%d outstanding invites after a refused redemption, want 1", n)
 	}
 }
+
+// Eight devices redeeming one invite at the same moment, which is the claim
+// the whole design of an invite rests on.
+//
+// Single use is proven sequentially by TestI23InvitesAreSingleUseAndExpire and
+// at the wire by TestI23AnInviteIsRedeemedExactlyOnce, and both redeem one
+// after the other: what they see is a second attempt meeting used = 1. The
+// property neither can see is the one the comment on spendInviteTx claims,
+// that the read and the mark are one statement, so eight callers cannot all
+// find a live invite and all spend it. An invite is the authority to register
+// exactly one device, and two of them getting through is a device the vault's
+// owner never admitted.
+//
+// Through eight Store handles on one directory rather than one, for the reason
+// TestConcurrentRevokesCannotEmptyTheVault gives: writeMu makes a read then a
+// write atomic within one process, so a single-handle version of this passes
+// against an implementation that reads the invite and then marks it. The store
+// is opened by more than one process in earnest anyway, since `basaltd backup`
+// and `basaltd purge` run against a live server's directory.
+//
+// Checked to fail rather than assumed to: with spendInviteTx's UPDATE ...
+// RETURNING split into a SELECT and an UPDATE, the racers no longer agree and
+// this reports it on the first attempt.
+func TestConcurrentRedemptionsOfOneInviteRegisterExactlyOneDevice(t *testing.T) {
+	const racers = 8
+	for attempt := 0; attempt < 20; attempt++ {
+		dir := t.TempDir()
+		one := openAt(t, dir)
+		if _, err := one.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
+			t.Fatal(err)
+		}
+		if err := one.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+			t.Fatal(err)
+		}
+		hands := make([]*harness, racers)
+		for i := range hands {
+			hands[i] = openAt(t, dir)
+		}
+
+		sealed := make([]string, racers)
+		errs := make([]error, racers)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < racers; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				id := fmt.Sprintf("racer-%d", i)
+				<-start
+				sealed[i], errs[i] = hands[i].RedeemInviteFor(
+					"v1", "AAAAAAAAAAAAAAAAAAAAAA", id, id, fmt.Sprintf("%064x", i), 0, 2000)
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		won, winner := 0, -1
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				won++
+				winner = i
+			case errors.Is(err, ErrNoInvite):
+			default:
+				t.Fatalf("attempt %d: racer %d got %v, want nil or ErrNoInvite", attempt, i, err)
+			}
+		}
+		if won != 1 {
+			t.Fatalf("attempt %d: %d of %d racers redeemed one invite, want exactly 1 (%v)",
+				attempt, won, racers, errs)
+		}
+		if sealed[winner] != sealed1 {
+			t.Fatalf("attempt %d: the winner was handed %q", attempt, sealed[winner])
+		}
+		// One row, and it is the winner's. A redemption is both halves or
+		// neither, so a loser must not have left a device behind either.
+		got := ids(t, one, "v1")
+		if len(got) != 1 || got[0] != fmt.Sprintf("racer-%d", winner) {
+			t.Fatalf("attempt %d: devices %v after racer %d won", attempt, got, winner)
+		}
+		if _, hash, ok, err := one.DeviceByID("v1", got[0]); err != nil || !ok ||
+			hash != fmt.Sprintf("%064x", winner) {
+			t.Fatalf("attempt %d: the row holds hash %q, not the winner's", attempt, hash)
+		}
+		// Spent, and spent once: nothing may redeem it afterwards either.
+		if n, err := one.OutstandingInvites("v1", 2000); err != nil || n != 0 {
+			t.Fatalf("attempt %d: %d invites still outstanding (%v)", attempt, n, err)
+		}
+		if _, err := one.RedeemInviteFor("v1", "AAAAAAAAAAAAAAAAAAAAAA", "latecomer", "late",
+			devHash1, 0, 2001); !errors.Is(err, ErrNoInvite) {
+			t.Fatalf("attempt %d: the invite redeemed again afterwards: %v", attempt, err)
+		}
+
+		one.Close()
+		for _, h := range hands {
+			h.Close()
+		}
+	}
+}

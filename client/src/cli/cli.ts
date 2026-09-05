@@ -28,6 +28,7 @@ import { generateSecret, randomBytes } from "../core/crypto.ts";
 import {
   Client,
   Registrar,
+  adviseAfterRegistering,
   attentionLines,
   credentialsFor,
   needsAttention,
@@ -36,6 +37,7 @@ import {
   refuseUnlessAhead,
   registerAsDevice,
   runForever,
+  whatTheDiskHolds,
   type ClientOptions,
   type DeviceRow,
   type InviteRow,
@@ -334,24 +336,30 @@ async function cmdInit(args: Args, io: Console): Promise<number> {
   // vault that nothing will ever open again: the secret in it is the only copy
   // on this machine. Every command from here on refuses it and prints the key
   // back out, which is what "pair again with it" needs to be possible.
+  let registered = false;
   try {
-    await joinVault({ url, vaultId: args.vaultId, device, secret, bootstrap: token }, args, io);
+    await joinVault(
+      { url, vaultId: args.vaultId, device, secret, bootstrap: token },
+      args,
+      io,
+      () => {
+        registered = true;
+      },
+    );
   } catch (err) {
     // What to do next is read off the disk rather than off which step threw
-    // (rule 4). A config that has a credential is a device that registered and
-    // whose confirming connection did not happen, and syncing finishes that.
-    // One that still holds the root has nothing here to connect with, whether
-    // or not a row was registered, and the way back is the key printed above.
-    const held = await loadConfig(args.dir).catch(() => undefined);
+    // (rule 4), by the same counsellor `pair` and the panel use, so the four
+    // states get the same four answers wherever a registration stops. This one
+    // used to say only "unlink here, and pair with that key", which left out
+    // the row the registration may already have committed: pairing again
+    // registers a second one, and each retry spends a slot nothing accounts
+    // for. state.test.ts, "names the row a failed init left".
+    const remains = await whatTheDiskHolds(() => loadConfig(args.dir));
     io.err("basalt: the vault was started but this device could not register itself with it:");
     io.err(`  ${(err as Error).message}`);
     io.err("Write this recovery key down now, before anything else:");
     io.err(`  ${recoveryKey}`);
-    io.err(
-      held?.deviceId !== undefined
-        ? "This device is registered with the vault; run basalt sync here to finish."
-        : "Then run basalt unlink here, and basalt pair with that key.",
-    );
+    io.err(adviseAfterRegistering({ remains, registered, surface: "cli", where: args.dir }));
     return 1;
   }
 
@@ -458,6 +466,10 @@ async function refuseIfPaired(dir: string): Promise<void> {
  * unpaired as it found it (C39). A crash between the registration and the save
  * leaves the same orphan row the invite path leaves, and the same way to see
  * and remove it. See `registerAsDevice`.
+ *
+ * What a failure after the registration is told to do comes from
+ * `adviseAfterRegistering`, which `init` and both of the panel's pairing paths
+ * also take their words from.
  */
 async function cmdPair(args: Args, io: Console): Promise<number> {
   const given = args.rest[0];
@@ -480,24 +492,16 @@ async function cmdPair(args: Args, io: Console): Promise<number> {
     });
   } catch (err) {
     if (!registered) throw err;
-    // Registered, and then two different states, told apart by what reached
-    // the disk rather than by which step threw (rule 4).
-    const held = await loadConfig(args.dir).catch(() => undefined);
-    if (held?.deviceId !== undefined) {
-      // The row is real and this device holds the only copy of its
-      // credential, so what was written stays and syncing finishes it.
-      throw new Error(
-        `${(err as Error).message}. This device is registered with the vault and ${args.dir} ` +
-          `holds its credential; run basalt sync here to finish, or basalt unlink to start again.`,
-      );
-    }
-    // The row is real and nothing holds the key to it, which is the same
-    // orphan an invite leaves when its reply is lost, and goes the same way.
+    // Registered, and then what the disk says rather than which step threw
+    // (rule 4). The `.catch(() => undefined)` this used to read it with is
+    // what the counsellor exists to replace: it made an unreadable config look
+    // like an absent one, so a save that succeeded with a read-back that then
+    // failed was told to revoke a row it was itself holding the key to.
+    // state.test.ts, "will not send somebody revoking a row".
+    const remains = await whatTheDiskHolds(() => loadConfig(args.dir));
     throw new Error(
-      `${(err as Error).message}. A device row was registered with the vault and its credential ` +
-        `could not be written down here, so the row is one nothing can connect as: basalt ` +
-        `devices on another device shows it as never connected, and basalt revoke removes it. ` +
-        `Then pair again.`,
+      `${(err as Error).message}. ` +
+        adviseAfterRegistering({ remains, registered, surface: "cli", where: args.dir }),
     );
   }
 

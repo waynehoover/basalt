@@ -717,7 +717,8 @@ func (r *rig) mustStats() store.Stats {
 
 func (r *rig) mustVerify() int {
 	r.t.Helper()
-	faults, checked, err := r.st.Verify(true)
+	faultsRep, err := r.st.Verify(true)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil {
 		r.t.Fatalf("verify: %v", err)
 	}

@@ -558,6 +558,100 @@ func TestConcurrentRegistrationsOfOneIDProduceOneRow(t *testing.T) {
 	}
 }
 
+// Two devices registering the same id under *different* keys at the same
+// moment, which is the other half of the race above.
+//
+// TestConcurrentRegistrationsOfOneIDProduceOneRow races eight registrations of
+// one id under one key. That is the crash-and-retry case, and it cannot see a
+// flip: every racer wants the same row, so a row that changed hands would look
+// exactly like a row that did not. This is the case where the two callers want
+// different rows under one name. The loser must change nothing, because a
+// registration that overwrote auth_hash would hand somebody else's device this
+// id and this credential, and both callers would be told they had succeeded.
+//
+// Two handles on one directory, or writeMu would be what makes it true rather
+// than the insert's ON CONFLICT DO NOTHING; see
+// TestConcurrentRevokesCannotEmptyTheVault.
+//
+// The loser's ErrDeviceExists is what a session answers `badentry` to, and it
+// is deliberately not the same answer as re-registering under the *same* key,
+// which is the lost-reply retry and succeeds:
+// TestRegisteringTheSameDeviceTwiceIsIdempotent, in the server package, pins
+// both mappings and the sequential case of this.
+//
+// Checked to fail rather than assumed to: with the insert's ON CONFLICT clause
+// changed to DO UPDATE SET auth_hash = excluded.auth_hash, both racers win and
+// this reports it on the first attempt.
+func TestConcurrentRegistrationsOfOneIDUnderTwoKeysCannotFlipTheRow(t *testing.T) {
+	hashes := [2]string{hashA, hashB}
+	names := [2]string{"laptop", "somebody-elses"}
+	for attempt := 0; attempt < 20; attempt++ {
+		dir := t.TempDir()
+		one := openAt(t, dir)
+		if err := one.EnsureVault("v1", 1000); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := one.ClaimVault("v1", hash1, wrapped1, 1000); err != nil {
+			t.Fatal(err)
+		}
+		two := openAt(t, dir)
+
+		var errs [2]error
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i, h := range [2]*harness{one, two} {
+			wg.Add(1)
+			go func(i int, h *harness) {
+				defer wg.Done()
+				<-start
+				errs[i] = h.Store.RegisterDevice(
+					"v1", "contested", names[i], hashes[i], hash1, 1000, int64(1000+i))
+			}(i, h)
+		}
+		close(start)
+		wg.Wait()
+
+		won, winner := 0, -1
+		for i, err := range errs {
+			switch {
+			case err == nil:
+				won++
+				winner = i
+			case errors.Is(err, ErrDeviceExists):
+			default:
+				t.Fatalf("attempt %d: racer %d got %v, want nil or ErrDeviceExists", attempt, i, err)
+			}
+		}
+		if won != 1 {
+			t.Fatalf("attempt %d: %d of 2 registrations of one id succeeded, want exactly 1 (%v)",
+				attempt, won, errs)
+		}
+		if got := ids(t, one, "v1"); len(got) != 1 || got[0] != "contested" {
+			t.Fatalf("attempt %d: devices = %v, want the one contested row", attempt, got)
+		}
+		// The credential, which is the whole of what a flip would take: the
+		// loser's key on the winner's row is the loser holding this device.
+		_, hash, ok, err := one.DeviceByID("v1", "contested")
+		if err != nil || !ok {
+			t.Fatalf("attempt %d: reading the row back: ok=%v err=%v", attempt, ok, err)
+		}
+		if hash != hashes[winner] {
+			t.Fatalf("attempt %d: racer %d won and the row holds %q, which is the loser's key",
+				attempt, winner, hash)
+		}
+		ds, err := one.Devices("v1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ds[0].Name != names[winner] {
+			t.Fatalf("attempt %d: the refused registration renamed the row to %q", attempt, ds[0].Name)
+		}
+
+		one.Close()
+		two.Close()
+	}
+}
+
 // The one that a read followed by a write gets wrong. Two devices revoking each
 // other at the same moment both see two rows, both decide they are not the
 // last, and both delete: the vault ends with no devices and neither caller was
@@ -1047,5 +1141,146 @@ func TestRegisteringNamesTheCredentialItIsAuthorisedBy(t *testing.T) {
 	}
 	if n := len(ids(t, h, "v1")); n != 0 {
 		t.Fatalf("%d devices after registrations that named no credential", n)
+	}
+}
+
+// I2. A rotted registry row is one device locked out with "not authorised" and
+// nothing anywhere that ever says the registry is unsound.
+//
+// `verify -deep` re-read every chunk body against its name and walked past the
+// devices and invites tables entirely, so a vault whose device row had lost a
+// character from its auth hash verified clean, deeply, right up until somebody
+// tried to connect. These are the same predicates the writes use, so a row
+// that would be refused today is a fault however it came to be there.
+func TestDeepVerifyDecodesTheRegistry(t *testing.T) {
+	h := claimedStore(t)
+	h.file(t, "note.md", "content")
+	if err := h.RegisterDevice("v1", "sound", "laptop", hashA, 1000); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.AddInvite("v1", "AAAAAAAAAAAAAAAAAAAAAA", sealed1, 9000, 1000); err != nil {
+		t.Fatal(err)
+	}
+
+	// Clean, and the numbers say what was opened rather than only that nothing
+	// was wrong with it (rule 8): one chunk reference, one device, one invite.
+	sound, err := h.Verify(true)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if len(sound.Faults) != 0 {
+		t.Fatalf("a sound vault reported %v", sound.Faults)
+	}
+	if sound.Chunks != 1 || sound.Rows != 2 {
+		t.Fatalf("checked %d chunk references and %d registry rows, want 1 and 2",
+			sound.Chunks, sound.Rows)
+	}
+	// A shallow pass does not open them, and must not report that it did.
+	shallow, err := h.Verify(false)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if shallow.Rows != 0 {
+		t.Fatalf("a shallow pass claims %d registry rows checked", shallow.Rows)
+	}
+
+	exec := func(t *testing.T, query string) {
+		t.Helper()
+		if _, err := h.db.Exec(query); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+	}
+	for _, c := range []struct{ what, rot, undo, reason, row, detail string }{
+		{
+			"a device whose auth hash lost most of itself",
+			`UPDATE devices SET auth_hash = '0123' WHERE device_id = 'sound'`,
+			`UPDATE devices SET auth_hash = '` + hashA + `' WHERE device_id = 'sound'`,
+			"baddevice", `device "sound"`, "not authorised",
+		},
+		{
+			"a device id that is not base64url",
+			`UPDATE devices SET device_id = 'not base64!' WHERE device_id = 'sound'`,
+			`UPDATE devices SET device_id = 'sound' WHERE device_id = 'not base64!'`,
+			"baddevice", `device "not base64!"`, "base64url",
+		},
+		{
+			"a device made at the epoch",
+			`UPDATE devices SET created_at = 0 WHERE device_id = 'sound'`,
+			`UPDATE devices SET created_at = 1000 WHERE device_id = 'sound'`,
+			"baddevice", `device "sound"`, "not a time",
+		},
+		{
+			"a device name with a control character in it",
+			`UPDATE devices SET name = 'lap` + "\x07" + `top' WHERE device_id = 'sound'`,
+			`UPDATE devices SET name = 'laptop' WHERE device_id = 'sound'`,
+			"baddevice", `device "sound"`, "control character",
+		},
+		{
+			"a device row on a vault this database does not hold",
+			`INSERT INTO devices (vault_id, device_id, name, auth_hash, created_at, last_seen)
+			 VALUES ('ghost', 'stray', 'phone', '` + hashB + `', 1000, 0)`,
+			`DELETE FROM devices WHERE vault_id = 'ghost'`,
+			"novault", `device "stray"`, "not a vault a device row can be registered onto",
+		},
+		{
+			"an invite whose sealed data key is gone",
+			`UPDATE invites SET sealed = '' WHERE invite = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+			`UPDATE invites SET sealed = '` + sealed1 + `' WHERE invite = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+			"badinvite", `invite "AAAAAAAAAAAAAAAAAAAAAA"`, "hand a device nothing",
+		},
+		{
+			"an invite that expires at a time nothing could have issued it with",
+			`UPDATE invites SET expires_at = 0 WHERE invite = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+			`UPDATE invites SET expires_at = 9000 WHERE invite = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+			"badinvite", `invite "AAAAAAAAAAAAAAAAAAAAAA"`, "not a time",
+		},
+		{
+			"an invite that is neither spent nor unspent",
+			`UPDATE invites SET used = 7 WHERE invite = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+			`UPDATE invites SET used = 0 WHERE invite = 'AAAAAAAAAAAAAAAAAAAAAA'`,
+			"badinvite", `invite "AAAAAAAAAAAAAAAAAAAAAA"`, "spent or it is not",
+		},
+	} {
+		t.Run(c.what, func(t *testing.T) {
+			exec(t, c.rot)
+			defer exec(t, c.undo)
+
+			rotted, err := h.Verify(true)
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+			if len(rotted.Faults) != 1 {
+				t.Fatalf("verify -deep found %d faults, want 1: %v", len(rotted.Faults), rotted.Faults)
+			}
+			f := rotted.Faults[0]
+			if f.Reason != c.reason || f.Row != c.row || !strings.Contains(f.Detail, c.detail) {
+				t.Fatalf("the fault is %+v, want reason %q on %s mentioning %q",
+					f, c.reason, c.row, c.detail)
+			}
+			// It names the row, and it names it in words: a fault printed as
+			// uid 0 would send somebody looking for an entry.
+			if !strings.Contains(f.String(), c.row) {
+				t.Fatalf("printed as %q, which does not name the row", f.String())
+			}
+			// And a shallow pass still reports nothing, so this is what -deep
+			// buys rather than something the cheap pass was doing all along.
+			shallow, err := h.Verify(false)
+			if err != nil {
+				t.Fatalf("verify: %v", err)
+			}
+			if len(shallow.Faults) != 0 {
+				t.Fatalf("a shallow pass reported %v", shallow.Faults)
+			}
+		})
+	}
+
+	// Undone, and clean again: every case above put the row back.
+	after, err := h.Verify(true)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if len(after.Faults) != 0 || after.Rows != 2 {
+		t.Fatalf("after putting every row back: %d faults over %d rows (%v)",
+			len(after.Faults), after.Rows, after.Faults)
 	}
 }

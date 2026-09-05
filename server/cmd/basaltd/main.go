@@ -836,18 +836,27 @@ func cmdVerify(args []string, out io.Writer) error {
 	}
 	defer st.Close()
 
-	faults, checked, err := st.Verify(*deep)
+	checked, err := st.Verify(*deep)
 	if err != nil {
 		return err
 	}
-	// Both numbers, always. Zero faults out of zero checks is not a healthy
-	// vault, and reporting only the faults makes those two look identical.
-	fmt.Fprintf(out, "checked %d chunk references, %d faults\n", checked, len(faults))
-	for _, f := range faults {
+	// Every number, always. Zero faults out of zero checks is not a healthy
+	// vault, and reporting only the faults makes those two look identical. The
+	// registry rows appear only under -deep, because that is the only pass
+	// that opens them and a "0 registry rows" on a shallow one would read as a
+	// registry that was looked at and found empty (rule 7).
+	if *deep {
+		fmt.Fprintf(out, "checked %d chunk references and %d registry rows, %d faults\n",
+			checked.Chunks, checked.Rows, len(checked.Faults))
+	} else {
+		fmt.Fprintf(out, "checked %d chunk references, %d faults\n",
+			checked.Chunks, len(checked.Faults))
+	}
+	for _, f := range checked.Faults {
 		fmt.Fprintln(out, " ", f)
 	}
-	if len(faults) > 0 {
-		return fmt.Errorf("%d entries cannot be served", len(faults))
+	if len(checked.Faults) > 0 {
+		return fmt.Errorf("%d entries and registry rows cannot be served", len(checked.Faults))
 	}
 	return nil
 }
@@ -1018,17 +1027,18 @@ func cmdPurge(args []string, out io.Writer) error {
 
 	// Purging is the one operation that deletes data, so it verifies what it
 	// left behind rather than reporting success on the strength of no error.
-	faults, checked, err := st.Verify(false)
+	checked, err := st.Verify(false)
 	if err != nil {
 		return err
 	}
-	if len(faults) > 0 {
-		for _, f := range faults {
+	if len(checked.Faults) > 0 {
+		for _, f := range checked.Faults {
 			fmt.Fprintln(out, " ", f)
 		}
-		return fmt.Errorf("purge left %d unserveable entries out of %d references", len(faults), checked)
+		return fmt.Errorf("purge left %d unserveable entries out of %d references",
+			len(checked.Faults), checked.Chunks)
 	}
-	fmt.Fprintf(out, "verified %d chunk references, all present\n", checked)
+	fmt.Fprintf(out, "verified %d chunk references, all present\n", checked.Chunks)
 	// Purge is the one command that destroys something no device holds a copy
 	// of: old versions, and the deletion records that make a deleted note
 	// recoverable. The last line says so, and says where the only copy is, or

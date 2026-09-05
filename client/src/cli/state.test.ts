@@ -20,10 +20,18 @@ import { configPath, indexPath, loadConfig, saveConfig } from "./config.ts";
 import { alive, lockPath, lockVault } from "./lock.ts";
 
 /**
- * `saveConfig`, failing when a test says so. The CLI imports the same module,
- * so a failure injected here is a failure it meets exactly where it would.
+ * `saveConfig` and `loadConfig`, failing when a test says so. The CLI imports
+ * the same module, so a failure injected here is a failure it meets exactly
+ * where it would.
+ *
+ * The second one is a disk that writes and will not read back, which is a
+ * stranger failure than a full disk and the one that decides whether the
+ * advice after a half-finished pairing is safe. `breakLoadsAfterSaves` is set
+ * to the save count at the start of a test, so reads before the write go
+ * through and every read after it fails.
  */
 let failSavesAfter = Infinity;
+let breakLoadsAfterSaves = Infinity;
 let saves = 0;
 vi.mock("./config.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./config.ts")>();
@@ -33,6 +41,10 @@ vi.mock("./config.ts", async (importOriginal) => {
       saves++;
       if (saves > failSavesAfter) throw new Error("the disk is full, as it were");
       return actual.saveConfig(vault, config);
+    },
+    loadConfig: async (vault: string) => {
+      if (saves > breakLoadsAfterSaves) throw new Error("the disk will not read, as it were");
+      return actual.loadConfig(vault);
     },
   };
 });
@@ -69,6 +81,7 @@ const children: ChildProcess[] = [];
 
 afterEach(async () => {
   failSavesAfter = Infinity;
+  breakLoadsAfterSaves = Infinity;
   saves = 0;
   for (const c of children.splice(0)) {
     // A child killed by a signal has no exit code, only a signal.
@@ -390,6 +403,99 @@ describe("a vault that was started and never joined (C15)", () => {
     const orphan = rows.find((d) => d.lastSeen === 0);
     expect(orphan, listed.all).toBeDefined();
     expect((await cli("revoke", orphan!.id, "--dir", dir)).code).toBe(0);
+  }, 180_000);
+
+  /**
+   * The init half of the same failure, and the sentence it was missing.
+   *
+   * `init` claims the vault, registers this device's row and then saves the
+   * credential. When that save fails it printed the recovery key, which is
+   * right, and said "unlink here, and pair with that key", which is right and
+   * incomplete: the row is already on the server and nothing holds its key, so
+   * pairing again registers a *second* row and each retry silently spends one
+   * of the vault's eight slots. `pair` said so and `init` did not, which is
+   * what one shared counsellor is for; see `adviseAfterRegistering`.
+   *
+   * Walked to the end rather than asserted as a sentence (rule 11): the row is
+   * really there, it has really never connected, and the order the words give
+   * really takes it off.
+   */
+  it("names the row a failed init left, and the way back it names works", async () => {
+    server = new TestServer();
+    await server.start();
+    const dir = await vaultDir("initorphan");
+    // The root is saved, the claim and the registration commit, and the save
+    // that would record this device's credential fails.
+    failSavesAfter = 1;
+    const init = await cli("init", server.setup, "--dir", dir, "--device", "first");
+    expect(init.code, init.all).toBe(1);
+    expect(init.all).toMatch(/Write this recovery key down now/);
+    const printed = init.err.join("\n").match(/(basalt3_[A-Za-z0-9_-]+)/)![1]!;
+    expect(init.all).toMatch(/device row was registered/);
+    expect(init.all).toMatch(/never connected/);
+    expect(init.all).toMatch(/basalt revoke/);
+    failSavesAfter = Infinity;
+
+    // The row is really there, and has really never connected. Only the
+    // recovery key can ask: the vault has no device that can.
+    const look = await vaultDir("look");
+    const listed = await cli("devices", "--recovery-key", printed, "--dir", look, "--json");
+    expect(listed.code, listed.all).toBe(0);
+    const stranded = listed.json()["devices"] as { id: string; lastSeen: number }[];
+    expect(
+      stranded.map((d) => d.lastSeen),
+      listed.all,
+    ).toEqual([0]);
+
+    // And the way back, in the order the message gives it: pair again, then
+    // revoke the row that never connected. That order and not the other one,
+    // because the stranded row is this vault's only row and revoking the last
+    // one takes --allow-last and the recovery key.
+    expect((await cli("unlink", "--dir", dir)).code).toBe(0);
+    const again = await cli("pair", printed, "--dir", dir, "--device", "second", "--json");
+    expect(again.code, again.all).toBe(0);
+    const now = await cli("devices", "--dir", dir, "--json");
+    const mine = now.json()["thisDevice"] as string;
+    const rows = now.json()["devices"] as { id: string; lastSeen: number }[];
+    const orphan = rows.find((d) => d.id !== mine);
+    expect(orphan?.lastSeen, now.all).toBe(0);
+    expect((await cli("revoke", orphan!.id, "--dir", dir)).code).toBe(0);
+    const left = await cli("devices", "--dir", dir, "--json");
+    expect((left.json()["devices"] as unknown[]).length, left.all).toBe(1);
+    expect((await cli("sync", "--dir", dir)).code).toBe(0);
+  }, 180_000);
+
+  /**
+   * The mirror image of the orphan above, and the reason the advice is read
+   * off the disk in four states rather than two.
+   *
+   * A disk that writes and will not read back saves the credential, fails the
+   * read-back, and then fails the read the catch does as well. Both reads
+   * being gone is what makes it dangerous: the row is live and its only key is
+   * on this disk, so "that row is one nothing can connect as, revoke it" would
+   * destroy a row this device could have used. Rule 2, in the place where
+   * absent and unreadable have different consequences.
+   */
+  it("will not send somebody revoking a row when the disk refuses to say what is here", async () => {
+    const { dir, recoveryKey } = await pairedWithKey("writeonly");
+    expect(dir).toBeDefined();
+    const second = await vaultDir("writeonly-2");
+
+    breakLoadsAfterSaves = saves;
+    const attempt = await cli("pair", recoveryKey, "--dir", second, "--device", "two");
+    expect(attempt.code, attempt.all).toBe(1);
+    expect(attempt.all).toMatch(/could not be read/);
+    expect(attempt.all).toMatch(/not known/);
+    // The row must not be named for revoking, because it is this device's.
+    expect(attempt.all).not.toMatch(/basalt revoke/);
+    expect(attempt.all).not.toMatch(/never connected/);
+
+    // And the credential really was written: with the disk reading again this
+    // device connects as the row the advice would have told somebody to take
+    // away.
+    breakLoadsAfterSaves = Infinity;
+    expect((await loadConfig(second))!.deviceId).toBeDefined();
+    expect((await cli("sync", "--dir", second)).code).toBe(0);
   }, 180_000);
 
   it("says the same thing to status, without blaming the server", async () => {

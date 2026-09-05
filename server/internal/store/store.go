@@ -1556,23 +1556,49 @@ func liveChunks(tx *sql.Tx, vaultID string) (map[string]struct{}, error) {
 	return live, rows.Err()
 }
 
-// Fault is a stored entry whose bodies do not back it up.
+// Fault is something stored that will not do what it is stored for: an entry
+// whose bodies do not back it up, or a registry row nothing could ever
+// authenticate against.
 type Fault struct {
 	VaultID string
 	UID     int64
 	Path    string
 	// Chunk is empty for a fault about the entry itself rather than a body.
-	Chunk  string
-	Reason string // "missing", "corrupt", "nochunks" or "straychunks"
+	Chunk string
+	// Row names a registry row instead of an entry: `device "alfa"`, `invite
+	// "AAAA"`. Empty for an entry fault, which UID and Path name. The two
+	// cannot both be set, and String prints whichever there is: a fault about
+	// a device row has no uid to print, and printing uid 0 for it would send
+	// somebody looking for an entry.
+	Row    string
+	Reason string // "missing", "corrupt", "nochunks", "straychunks", "baddevice", "badinvite" or "novault"
 	Detail string
 }
 
 func (f Fault) String() string {
-	if f.Chunk == "" {
+	switch {
+	case f.Row != "":
+		return fmt.Sprintf("vault %s %s: %s (%s)", f.VaultID, f.Row, f.Reason, f.Detail)
+	case f.Chunk == "":
 		return fmt.Sprintf("vault %s uid %d: %s (%s)", f.VaultID, f.UID, f.Reason, f.Detail)
+	default:
+		return fmt.Sprintf("vault %s uid %d chunk %s: %s (%s)",
+			f.VaultID, f.UID, f.Chunk, f.Reason, f.Detail)
 	}
-	return fmt.Sprintf("vault %s uid %d chunk %s: %s (%s)",
-		f.VaultID, f.UID, f.Chunk, f.Reason, f.Detail)
+}
+
+// Verification is what a pass looked at and what it found.
+//
+// Two counts rather than one, and both are printed, because rule 8 says to
+// trust the numbers rather than the pass: zero faults over zero checks is not
+// a healthy vault, and a registry that was never walked is not a sound one.
+type Verification struct {
+	Faults []Fault
+	// Chunks is chunk references checked, repeats included.
+	Chunks int
+	// Rows is device and invite rows decoded, and zero unless deep, because a
+	// shallow pass does not look at them and must not report that it did.
+	Rows int
 }
 
 // Verify walks every live entry and checks that its chunks exist. With deep, it
@@ -1587,47 +1613,203 @@ func (f Fault) String() string {
 // it never sees plaintext. That is a deliberate consequence of the server
 // holding no key, not an omission here.
 //
-// Returns the faults found and the number of chunk references checked. Both
-// matter: zero faults out of zero checks is not a healthy vault, and rule 8 says
-// to trust the numbers rather than the pass.
-func (s *Store) Verify(deep bool) ([]Fault, int, error) {
+// Deep also decodes the registry: see verifyRegistry.
+//
+// Returns what was checked as well as what was found. Both matter: zero faults
+// out of zero checks is not a healthy vault, and rule 8 says to trust the
+// numbers rather than the pass.
+func (s *Store) Verify(deep bool) (Verification, error) {
+	var v Verification
 	rows, err := s.db.Query(
 		`SELECT e.vault_id, e.uid, e.path, c.name
 		   FROM entries e JOIN entry_chunks c
 		     ON c.vault_id = e.vault_id AND c.uid = e.uid
 		  ORDER BY e.vault_id, e.uid, c.ord`)
 	if err != nil {
-		return nil, 0, err
+		return v, err
 	}
 	defer rows.Close()
 
-	var faults []Fault
-	checked := 0
 	for rows.Next() {
 		var f Fault
 		if err := rows.Scan(&f.VaultID, &f.UID, &f.Path, &f.Chunk); err != nil {
-			return faults, checked, err
+			return v, err
 		}
-		checked++
+		v.Chunks++
 		if !s.chunks.Has(f.VaultID, f.Chunk) {
 			f.Reason = "missing"
-			faults = append(faults, f)
+			v.Faults = append(v.Faults, f)
 			continue
 		}
 		if deep {
 			if err := s.chunks.Check(f.VaultID, f.Chunk); err != nil {
 				f.Reason = "corrupt"
 				f.Detail = err.Error()
-				faults = append(faults, f)
+				v.Faults = append(v.Faults, f)
 			}
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return faults, checked, err
+		return v, err
 	}
 
 	entryFaults, err := s.verifyEntries()
-	return append(faults, entryFaults...), checked, err
+	v.Faults = append(v.Faults, entryFaults...)
+	if err != nil || !deep {
+		return v, err
+	}
+
+	registryFaults, rowsChecked, err := s.verifyRegistry()
+	v.Faults = append(v.Faults, registryFaults...)
+	v.Rows = rowsChecked
+	return v, err
+}
+
+// verifyRegistry decodes every device row and every invite, which nothing else
+// does until the moment one of them is needed.
+//
+// A rotted body is a note that will not open and says so. A rotted registry
+// row is quieter: a device whose auth_hash has lost a character can never
+// match a credential again, so that device is refused with "not authorised",
+// which is the same thing the server says to a stranger, and no check anywhere
+// ever said the registry was unsound. An invite whose sealed blob is gone
+// redeems into a device holding no data key. Neither is reachable from the
+// entries walk above, because neither is an entry.
+//
+// What it checks is what the writes check, by calling the same predicates
+// rather than restating them: a row that would be refused today is a fault
+// however it came to be there. Lengths and shapes for the identifiers, the
+// hash digest, and the sealed blob; the two flags an invite carries; and that
+// the vault each row names is a vault this database holds and something has
+// claimed, since a device row can only be inserted onto a claimed one.
+//
+// Deep only, and the count comes back so `verify` can print it. A shallow pass
+// leaves Rows at zero and says nothing about the registry rather than
+// reporting a clean one it never opened (rule 7).
+//
+// What it deliberately cannot check:
+//
+//   - **Whether a credential is the right one.** The server holds digests of
+//     keys it has never seen. A hash of the correct shape that is not the
+//     hash of any key anybody holds is indistinguishable from one that is,
+//     from here and from anywhere else on this machine.
+//   - **Whether the sealed blob opens.** It is sealed under an invite key that
+//     never reached the server, so its shape is the whole of what can be said
+//     about it.
+//   - **Timestamps against each other.** created_at and last_seen come from
+//     the server's clock, and a clock that went backwards would make an
+//     ordering check fire on a vault that is perfectly sound. Only the
+//     impossible values are refused: a row made at or before the epoch, and a
+//     last_seen before it.
+//   - **Rows that are missing.** Nothing here can tell a device that was
+//     revoked from one that was lost, because a revocation is a delete and
+//     leaves nothing behind. Rule 6 is about entries and does not reach the
+//     registry; what answers a lost row is `basaltd backup`.
+//
+// TestDeepVerifyDecodesTheRegistry.
+func (s *Store) verifyRegistry() ([]Fault, int, error) {
+	var faults []Fault
+	checked := 0
+
+	rows, err := s.db.Query(
+		`SELECT d.vault_id, d.device_id, d.name, d.auth_hash, d.created_at, d.last_seen,
+		        (SELECT COUNT(*) FROM vaults v WHERE v.vault_id = d.vault_id AND v.auth_hash != '')
+		   FROM devices d
+		  ORDER BY d.vault_id, d.device_id`)
+	if err != nil {
+		return nil, checked, err
+	}
+	for rows.Next() {
+		var vaultID, deviceID, name, authHash string
+		var createdAt, lastSeen int64
+		var claimed int
+		if err := rows.Scan(&vaultID, &deviceID, &name, &authHash, &createdAt, &lastSeen, &claimed); err != nil {
+			rows.Close()
+			return faults, checked, err
+		}
+		checked++
+		fault := func(reason, detail string) {
+			faults = append(faults, Fault{
+				VaultID: vaultID,
+				Row:     fmt.Sprintf("device %q", deviceID),
+				Reason:  reason,
+				Detail:  detail,
+			})
+		}
+		switch {
+		case !ValidDeviceID(deviceID):
+			fault("baddevice", fmt.Sprintf(
+				"device id is %d bytes and must be base64url of at most %d",
+				len(deviceID), MaxDeviceIDLen))
+		case !isHex64(authHash):
+			fault("baddevice", fmt.Sprintf(
+				"auth hash is %q, not a 64 character hex digest, so nothing this device sends "+
+					"can ever match it and it is locked out with \"not authorised\"", authHash))
+		case createdAt <= 0:
+			fault("baddevice", fmt.Sprintf("was created at %d, which is not a time", createdAt))
+		case lastSeen < 0:
+			fault("baddevice", fmt.Sprintf("was last seen at %d, which is not a time", lastSeen))
+		case claimed == 0:
+			fault("novault", "names a vault this database does not hold as a claimed vault, "+
+				"which is not a vault a device row can be registered onto")
+		default:
+			if err := CheckName("device", name, MaxDeviceLen); err != nil {
+				fault("baddevice", err.Error())
+			}
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return faults, checked, err
+	}
+
+	rows, err = s.db.Query(
+		`SELECT i.vault_id, i.invite, i.sealed, i.expires_at, i.used,
+		        (SELECT COUNT(*) FROM vaults v WHERE v.vault_id = i.vault_id AND v.auth_hash != '')
+		   FROM invites i
+		  ORDER BY i.vault_id, i.invite`)
+	if err != nil {
+		return faults, checked, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var vaultID, invite, sealed string
+		var expiresAt int64
+		var used, claimed int
+		if err := rows.Scan(&vaultID, &invite, &sealed, &expiresAt, &used, &claimed); err != nil {
+			return faults, checked, err
+		}
+		checked++
+		fault := func(reason, detail string) {
+			faults = append(faults, Fault{
+				VaultID: vaultID,
+				Row:     fmt.Sprintf("invite %q", invite),
+				Reason:  reason,
+				Detail:  detail,
+			})
+		}
+		switch {
+		case !ValidInvite(invite):
+			fault("badinvite", fmt.Sprintf(
+				"invite identifier is %d bytes and must be base64url of at most %d",
+				len(invite), MaxInviteLen))
+		case !ValidSealed(sealed):
+			fault("badinvite", fmt.Sprintf(
+				"the sealed data key is %d bytes and must be base64url of at most %d, so "+
+					"redeeming this would hand a device nothing to open the vault with",
+				len(sealed), MaxSealedLen))
+		case expiresAt <= 0:
+			fault("badinvite", fmt.Sprintf(
+				"expires at %d, which is not a time an invite was ever issued with", expiresAt))
+		case used != 0 && used != 1:
+			fault("badinvite", fmt.Sprintf(
+				"used is %d, and an invite is spent or it is not", used))
+		case claimed == 0:
+			fault("novault", "names a vault this database does not hold as a claimed vault, "+
+				"which is not a vault an invite can be issued on")
+		}
+	}
+	return faults, checked, rows.Err()
 }
 
 // verifyEntries checks the entries themselves, rather than the bodies they name.

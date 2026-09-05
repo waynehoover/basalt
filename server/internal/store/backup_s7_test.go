@@ -41,7 +41,8 @@ func TestS7AFailedSecondBackupLeavesTheFirstRestorable(t *testing.T) {
 
 	// The first backup still opens, still verifies, and still holds the note.
 	restored := openBackup(t, dir)
-	faults, checked, err := restored.Verify(true)
+	faultsRep, err := restored.Verify(true)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil {
 		t.Fatalf("verifying the first backup after a failed second: %v", err)
 	}

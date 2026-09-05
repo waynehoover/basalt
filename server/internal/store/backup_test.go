@@ -194,7 +194,8 @@ func TestABackupNeverHoldsAnEntryWithoutItsBodies(t *testing.T) {
 
 	// The backup is self-consistent: everything its database claims, it holds.
 	restored := openBackup(t, dir)
-	faults, checked, err := restored.Verify(true)
+	faultsRep, err := restored.Verify(true)
+	faults, checked := faultsRep.Faults, faultsRep.Chunks
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}

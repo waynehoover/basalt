@@ -111,7 +111,8 @@ func TestS16ATerminatedServerEndsAnUploadAsAnAckOrACleanRetry(t *testing.T) {
 			if !tc.finish && stats.Versions != 0 {
 				t.Fatalf("no ack was given but the store holds %d versions", stats.Versions)
 			}
-			faults, _, err := st.Verify(true)
+			faultsRep, err := st.Verify(true)
+			faults := faultsRep.Faults
 			if err != nil || len(faults) != 0 {
 				t.Fatalf("the data directory does not verify after the shutdown: %v %v", err, faults)
 			}

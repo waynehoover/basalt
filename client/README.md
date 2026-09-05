@@ -110,10 +110,13 @@ revoke` takes.
 
 A row whose last seen says **never connected** is one nothing has ever signed
 in under. A pairing that reached the server and then crashed leaves exactly
-that: the redemption registers the row before the new device saves anything, so
-a crash strands a row rather than a device that believes it is paired. Those
-rows still hold one of the eight slots, and revoking one is how the slot comes
-back.
+that: the registration commits before the new device saves anything, so a crash
+strands a row rather than a device that believes it is paired. `basalt init`
+can leave one too, when the claim goes through and the credential does not
+reach the disk. Those rows still hold one of the eight slots, and revoking one
+is how the slot comes back, so a failed pairing says so and names the row
+rather than sending you straight back to pairing, which would register a
+second.
 
 `basalt revoke ID` removes that device's row and closes any connection it has
 open, in that order, so it stops at once rather than the next time it happens

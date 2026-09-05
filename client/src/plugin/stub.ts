@@ -132,6 +132,13 @@ export const Platform = {
   isMobileApp: false,
   isIosApp: false,
   isAndroidApp: false,
+  isTablet: false,
+  // Which operating system, which is what the suggested device name is made
+  // of. All false by default, which no real host is: that is the fallback
+  // word, and leaving it reachable is what tests it.
+  isMacOS: false,
+  isWin: false,
+  isLinux: false,
 };
 
 /* ---------------------------------------------------------------- *

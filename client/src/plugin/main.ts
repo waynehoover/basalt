@@ -43,12 +43,14 @@ import {
 import {
   Client,
   Registrar,
+  adviseAfterRegistering,
   attentionLines,
   needsAttention,
   rebaseCursors,
   redeemInvite,
-  registerAsDevice,
   refuseUnlessAhead,
+  registerAsDevice,
+  whatTheDiskHolds,
   runForever,
   summarise,
   credentialsFor,
@@ -811,26 +813,28 @@ export default class BasaltPlugin extends Plugin {
         );
       } catch (err) {
         if (!registered) throw err;
-        // Registered, and then two different states, told apart by what
-        // reached the disk rather than by which step threw (rule 4).
-        this.config = await this.readConfig().catch(() => undefined);
-        if (this.config) {
+        // Registered, and then what the disk says rather than which step threw
+        // (rule 4), through the counsellor the CLI's `init` and `pair` use.
+        // The `.catch(() => undefined)` this read it with is what that
+        // replaces: it made an unreadable data.json look like an absent one,
+        // so a save that succeeded with a read-back that then failed was told
+        // to revoke a row it was itself holding the key to.
+        const remains = await whatTheDiskHolds(() => this.readConfig());
+        if (remains.kind === "credential") {
           // The row is real and this phone holds the only copy of its
           // credential, so what was written stays and the panel says as much
           // rather than looking unpaired.
+          this.config = remains.config;
           this.start();
-          throw new Error(
-            `${(err as Error).message}. This device is registered with the vault; ` +
-              `Basalt will connect as it on the next attempt.`,
-          );
         }
-        // The row is real and nothing holds the key to it, which is the same
-        // orphan a lost invite reply leaves, and goes the same way.
         throw new Error(
-          `${(err as Error).message}. A device row was registered with the vault and its ` +
-            `credential could not be saved here, so the row is one nothing can connect as: ` +
-            `it shows in the device list as never connected, and can be revoked there. ` +
-            `Then pair again.`,
+          `${(err as Error).message}. ` +
+            adviseAfterRegistering({
+              remains,
+              registered,
+              surface: "panel",
+              where: this.dataPath,
+            }),
         );
       }
       this.config = paired;
@@ -901,11 +905,17 @@ export default class BasaltPlugin extends Plugin {
       const recoveryKey = formatPairing({ url, vaultId: "default", secret });
 
       const mine = this.generation;
+      let registered = false;
       try {
         this.config = await registerAsDevice(
           { url, vaultId: "default", device: name, secret, bootstrap: token },
           (next) => this.saveDuringRun(mine, next),
-          { log: (message, ...rest) => console.info("Basalt:", message, ...rest) },
+          {
+            onRegistered: () => {
+              registered = true;
+            },
+            log: (message, ...rest) => console.info("Basalt:", message, ...rest),
+          },
         );
       } catch (err) {
         // The config stays, whatever it now holds. If it is still the root,
@@ -915,12 +925,28 @@ export default class BasaltPlugin extends Plugin {
         // read from rather than a notice that goes. If the registration got as
         // far as saving a credential, that is what is on disk and `start`
         // connects with it. Read back rather than assumed (rule 4).
-        this.config = (await this.readConfig().catch(() => undefined)) ?? starting;
+        const remains = await whatTheDiskHolds(() => this.readConfig());
+        this.config = "config" in remains ? remains.config : starting;
         this.start();
+        // The recovery key only when the root is still what is held: a
+        // credential that landed has replaced it, and there is then nothing on
+        // the panel to write down. The row this may have left is named by the
+        // same counsellor the pairing form above uses, because a phone sent
+        // straight back to pairing registers a second row and spends another
+        // of the vault's eight slots.
+        const writeItDown =
+          remains.kind === "credential"
+            ? ""
+            : "Write the recovery key shown in the Basalt panel down now. ";
         throw new Error(
           `the vault was started but this device could not register itself with it: ` +
-            `${(err as Error).message}. Write the recovery key shown in the Basalt panel down ` +
-            `now, then unlink this vault and pair again with it.`,
+            `${(err as Error).message}. ${writeItDown}` +
+            adviseAfterRegistering({
+              remains,
+              registered,
+              surface: "panel",
+              where: this.dataPath,
+            }),
         );
       }
       this.start();
@@ -1431,6 +1457,28 @@ export default class BasaltPlugin extends Plugin {
   }
 
   /**
+   * What this device is talking to, as far as it knows.
+   *
+   * Two halves with two lifetimes, which is why they come back together. The
+   * address is the pairing's and is known whether or not anything is
+   * connected; the protocol and the build are the server's own account of
+   * itself, arrive in `ready`, and are gone again the moment the connection
+   * is. Nothing here is asked for specially: it is what the client already
+   * holds.
+   */
+  connection(): Connection | undefined {
+    const url = this.config?.url;
+    if (url === undefined) return undefined;
+    const limits = this.client?.serverLimits;
+    return {
+      url,
+      ...(limits !== undefined
+        ? { server: { proto: limits.proto, version: limits.serverVersion } }
+        : {}),
+    };
+  }
+
+  /**
    * Forgets the pairing. Every note stays where it is, on both ends.
    *
    * The index goes with it, and that is not tidiness. It records what this
@@ -1554,20 +1602,62 @@ function recoveryFor(cause: Error): "rejoin" | undefined {
 }
 
 /**
- * The name this device goes by, from what was typed or from nothing.
+ * The name this device goes by, from what was typed or from the suggestion.
  *
  * Two devices left blank used to both be "obsidian", and their conflict
  * copies were told apart only by the number `firstFreeName` appended. The
  * copies were never lost, but a name that says which device wrote it is the
- * point of having one in the filename, so a blank gets a short random tail.
- * Shown in the panel, editable nowhere, because there is no settings screen.
+ * point of having one in the filename, so a blank gets a suggestion. Shown in
+ * the panel, editable nowhere afterwards, because there is no settings screen.
  */
 function deviceName(typed: string): string {
   const name = typed.trim();
-  if (name !== "") return name;
+  return name === "" ? suggestedDeviceName() : name;
+}
+
+/**
+ * A name to offer for this device: what kind of machine it is, and a short
+ * random tail.
+ *
+ * The pairing form has always had a name field and never had anything in it,
+ * so the honest thing to do with an empty field was leave it empty, and an
+ * empty one became `obsidian-3f2a`. A device list read from inside Obsidian,
+ * every row of which says Obsidian, identifies nothing. The CLI has had the
+ * better answer since it existed, the hostname and a tail (`deviceNameFor` in
+ * cli/cli.ts), and this is as near as a plugin gets: a phone has no hostname
+ * and the mobile bundle has no `os` module, but `Platform` says what kind of
+ * machine this is.
+ *
+ * The tail is the CLI's own two random bytes, and it is there whatever the
+ * platform word is, because two Macs are both "mac" and the name is what tells
+ * two conflict copies apart and what somebody reads in the device list before
+ * revoking a row. Typing a name replaces the whole suggestion, tail included,
+ * exactly as `--device` does.
+ */
+function suggestedDeviceName(): string {
   const bytes = new Uint8Array(2);
   crypto.getRandomValues(bytes);
-  return `obsidian-${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+  const tail = [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+  return `${platformWord()}-${tail}`;
+}
+
+/**
+ * One word for the machine, out of `Platform`.
+ *
+ * The mobile flags come first, and that ordering is the whole of what is
+ * subtle here: `obsidian.d.ts` says `isMacOS` is true on "a device that
+ * pretends to be one (like iPhones and iPads)", so an iPad checked in the
+ * other order would call itself a Mac. The last word is a fallback that a
+ * real Obsidian never reaches, since every host it runs on claims one of the
+ * five above.
+ */
+function platformWord(): string {
+  if (Platform.isAndroidApp) return "android";
+  if (Platform.isIosApp) return Platform.isTablet ? "ipad" : "iphone";
+  if (Platform.isMacOS) return "mac";
+  if (Platform.isWin) return "windows";
+  if (Platform.isLinux) return "linux";
+  return "obsidian";
 }
 
 /**
@@ -1715,6 +1805,12 @@ class BasaltModal extends Modal {
 
     const status = contentEl.createEl("p");
     const cursors = contentEl.createEl("p", { cls: "basalt-advice" });
+    // What it is talking to, under what it is doing. The panel said "up to
+    // date, cursor 66" and nothing at all about the other end, which is the
+    // first thing wanted when it is not working: whether this device is
+    // pointed where it should be, whether the hop is protected, and which
+    // build is answering.
+    const connection = contentEl.createEl("p", { cls: "basalt-advice" });
     const advice = contentEl.createEl("p", { cls: "basalt-advice" });
     // Which rows this pass drew, so that a panel left open when the state
     // changes under it grows the recovery it now needs. Everything else here
@@ -1734,6 +1830,8 @@ class BasaltModal extends Modal {
       cursors.setText(
         at === undefined ? "" : `Local cursor ${at.local}, server cursor ${at.server}.`,
       );
+      const to = this.plugin.connection();
+      connection.setText(to === undefined ? "" : describeConnection(to));
       advice.setText(originAdvice(state));
     });
 
@@ -2176,11 +2274,19 @@ class BasaltModal extends Modal {
     let pairingField: TextComponent | undefined;
     const device = () => deviceField?.getValue() ?? "";
 
+    // A suggestion in the field, not a placeholder behind it. A placeholder is
+    // not a value, so the honest thing to do with the field was leave it
+    // alone, and every device ended up named after the app rather than after
+    // itself. What is offered is what will be used, and it can be typed over.
     new Setting(contentEl)
       .setName("Device name")
-      .setDesc("Appears in version history and conflict copy names. Left blank, one is made up.")
+      .setDesc(
+        "How this device shows in the device list, in version history and in conflict copy " +
+          "names. Type over it with whatever you call this machine.",
+      )
       .addText((t) => {
         t.setPlaceholder("laptop");
+        t.setValue(suggestedDeviceName());
         deviceField = t;
       });
 
@@ -2402,6 +2508,48 @@ function origin(): string {
  */
 function clock(ms: number): string {
   return new Date(ms).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+/**
+ * What this device syncs with: the address, the protocol and the build.
+ *
+ * @see BasaltPlugin.connection
+ */
+export interface Connection {
+  /** Where this device pairs to, from the saved config. */
+  readonly url: string;
+  /** What the server said at hello. Absent until there has been one. */
+  readonly server?: { readonly proto: number; readonly version: string } | undefined;
+}
+
+/**
+ * One line for what the panel is talking to.
+ *
+ * Four facts and no more, because each is one somebody is missing when sync is
+ * not working and none of them costs a request: the address this device
+ * actually holds, whether that hop has TLS in front of it, the protocol the
+ * two ends settled on, and the build on the other end. The last two come from
+ * `ready` and are absent until there has been one, and the line says so rather
+ * than leaving a gap: a build that is missing because nothing is connected
+ * reads exactly like a server that did not say, and they are different states
+ * (rule 2, at the width of a sentence).
+ *
+ * The scheme is the whole of what is known about the hop, and it is a complete
+ * test because `normaliseUrl` stores one of exactly two. `wss://` means
+ * something in front of the server terminated TLS, which is the arrangement
+ * server.md describes, and `ws://` means nothing did. The second is not a
+ * warning that the vault is exposed, because it is not: the notes are sealed
+ * on this device either way. What it does cost is named exactly, because the
+ * only wrong thing to say here is the vague thing.
+ */
+export function describeConnection(at: Connection): string {
+  const hop = at.url.startsWith("wss://")
+    ? "which has TLS in front"
+    : "which has no TLS in front: notes stay sealed, and a network in between can see this " +
+      "device's credential, and the size and timing of every note";
+  return at.server === undefined
+    ? `Not connected to ${at.url}, ${hop}. Its protocol and build are said at hello, so neither is known yet.`
+    : `Connected to ${at.url}, ${hop}. Protocol ${at.server.proto}, basaltd ${at.server.version}.`;
 }
 
 function longStatus(state: State): string {
