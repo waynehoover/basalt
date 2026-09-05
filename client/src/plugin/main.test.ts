@@ -2584,6 +2584,34 @@ describe("the device list in the panel", () => {
    * had the invite key, so what comes back is an identifier that redeems
    * nothing and says which invite to cancel.
    */
+  it("puts the device rows under the Devices row, not above it", async () => {
+    // Twice now the panel has grown a list that rendered above the setting
+    // that fills it, so the rows read as belonging to whatever sat above.
+    // Both times a screenshot found it and no test did, which is why this
+    // one exists.
+    await fresh();
+    const { plugin } = await load();
+    await startVault(plugin, "laptop");
+    await synced(plugin);
+
+    built.length = 0;
+    plugin.ribbonIcons[0]!.callback();
+    const heading = built.find((s) => s.name === "Devices")!;
+    await heading.buttons[0]!.click();
+    await until("the list to arrive", () => built.some((s) => s.name.includes("laptop")));
+
+    // The stub does not render a setting's name into the DOM, so position is
+    // the thing to assert: the container the rows are built into must come
+    // after the row that offers them.
+    const kids = modals.at(-1)!.contentEl.children;
+    const row = built.find((b) => b.name.includes("laptop"))!;
+    const at = kids.indexOf(heading.settingEl);
+    const listAt = kids.findIndex((el) => el === row.settingEl.parent || el.children.includes(row.settingEl));
+    expect(at, "the Devices row is not in the panel").toBeGreaterThanOrEqual(0);
+    expect(listAt, "no container held the device rows").toBeGreaterThanOrEqual(0);
+    expect(listAt, "the device rows rendered above the row that lists them").toBeGreaterThan(at);
+  }, 300_000);
+
   it("shows outstanding invites beside the devices, and cancels one", async () => {
     await fresh();
     const first = await load();

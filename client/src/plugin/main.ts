@@ -1829,8 +1829,13 @@ class BasaltModal extends Modal {
    * this feature would be worse than not having it.
    */
   private renderDevices(contentEl: HTMLElement): void {
-    const list = contentEl.createEl("div");
-    const said = contentEl.createEl("p", { cls: "basalt-advice" });
+    // Declared here and created below the setting that fills them, for the
+    // same reason renderInvite does it: created first, the rows rendered
+    // above the "Devices" row and the list appeared to belong to whatever
+    // sat above it. Found by taking a screenshot of the panel, twice now,
+    // which is a better reviewer of layout than a test.
+    let list!: HTMLElement;
+    let said!: HTMLElement;
     const show = async () => {
       list.empty();
       said.setText("");
@@ -1961,6 +1966,9 @@ class BasaltModal extends Modal {
           `Invites that have not been redeemed yet are listed here too.`,
       )
       .addButton((b) => b.setButtonText("Show devices").onClick(show));
+
+    list = contentEl.createEl("div");
+    said = contentEl.createEl("p", { cls: "basalt-advice" });
   }
 
   /**
