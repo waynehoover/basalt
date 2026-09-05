@@ -285,9 +285,9 @@ func TestADatabaseFromAnOlderBuildGainsTheDevicesTable(t *testing.T) {
 		t.Fatal("there is no devices table after migrating, so every query over it fails on somebody's notes")
 	}
 
-	// A protocol 3 vault has no device rows, and that is a vault with no
-	// devices rather than an error: it is the state every existing vault is
-	// in, and the one the conversion converts from.
+	// A vault with no device rows is a vault with no devices rather than an
+	// error: it is where an unclaimed vault starts, and a migration that
+	// turned it into a failure would break the empty case first.
 	ds, err := s.Devices("v1")
 	if err != nil {
 		t.Fatalf("devices of a migrated vault: %v", err)

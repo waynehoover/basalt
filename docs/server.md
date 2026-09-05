@@ -102,18 +102,10 @@ with both numbers: read that as "upgrade the server". The refusal names no
 release, because nothing has authenticated when it is sent; `basaltd version`
 on the server does.
 
-Today that range is one version wide. Protocol 4 is the only protocol: the
-three before it were removed rather than carried, because a compatibility path
-is a second set of code paths through the part of the system that must not be
-wrong, and 3 had been in use by one person for one day when 4 replaced it. The
-range stays in the handshake for the next version, whose compatibility gets
-written against a protocol 4 that has actually run.
-
-| Release | Protocol | Notes |
-|---|---|---|
-| plugin, `basalt` and `basaltd` 0.1.x and 0.2.x | 1 and 2 | withdrawn before deployment; a data directory from one of these cannot be served |
-| 0.3.x | 3 | request ids, retryable errors, the data key, invites |
-| current | 4 | per-device credentials: a hello names a device and carries that device's own key, and an invite registers the device that redeems it |
+That range is one version wide. Protocol 4 is the only protocol: a hello names
+a device and carries that device's own key, and an invite registers the device
+that redeems it. Nothing older is carried, because a compatibility path is a
+second set of code paths through the part of the system that must not be wrong.
 
 The protocol version is what decides whether two releases can talk. Every
 plugin release needs Obsidian 1.7.2 or newer (`versions.json`). `basaltd
@@ -667,14 +659,6 @@ which case keep both and run it again with whichever the server accepts.
 If two devices rotate at once the loser is refused with `rotated`, nothing of
 its rotation committed, and it is told to cross out the key it printed. No
 device has to pair again either way.
-
-## A data directory from before protocol 3
-
-The 0.1 and 0.2 releases spoke protocols 1 and 2 and were withdrawn before
-anyone deployed them. A vault claimed by one of those builds has no data key,
-so this server refuses every session on it at hello, naming the reason. Start a
-fresh data directory and pair the first device again. Your notes are on your
-devices in plaintext; what does not carry over is the server's history of them.
 
 ## Phones
 

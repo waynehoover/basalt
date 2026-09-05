@@ -823,7 +823,7 @@ describe("refusals that the session survives", () => {
       expect(typeof put["id"]).toBe("number");
       expect(want["id"]).toBe(put["id"]);
       expect(ack["id"]).toBe(put["id"]);
-      // And the two protocol 3 caps travel on ready.
+      // And the caps travel on ready.
       expect(ready["maxBatchBytes"]).toBe(16 * 1024 * 1024);
     } finally {
       t.close();
@@ -832,10 +832,10 @@ describe("refusals that the session survives", () => {
 
   /**
    * The other side of the version check: this client says `proto: 4`, and a
-   * hello in any other version is refused rather than answered. Protocol 3 is
-   * the one somebody might still be running, and a server still answering it
-   * would hand a connection the vault's own credential as a sync credential,
-   * which is exactly the thing per-device credentials took away.
+   * hello in any other version is refused rather than answered. A server that
+   * answered an older one would hand a connection the vault's own credential
+   * as a sync credential, which is exactly what per-device credentials took
+   * away.
    */
   it("refuses a hello in any protocol but this one", async () => {
     const creds = server.credentials(
@@ -869,7 +869,7 @@ describe("refusals that the session survives", () => {
     expect(refusal["res"]).toBe("err");
     expect(refusal["code"]).toBe("proto");
     // Both numbers named, because that is how somebody works out which end to
-    // upgrade, and this is the refusal a protocol 3 device actually gets.
+    // upgrade. 3 stands in for any version outside the range.
     expect(String(refusal["msg"])).toMatch(/protocol 3 not supported/);
     expect(String(refusal["msg"])).toMatch(/4 to 4/);
   });

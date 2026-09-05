@@ -248,9 +248,9 @@ describe("what a rotation leaves on a device", () => {
 
     expect((await cli("rotate", key, "--dir", dir)).code).toBe(0);
 
-    // Under protocol 3 this device would have been evicted by the rotation and
-    // would have had to be paired again from the new string, which for a
-    // laptop, a phone, a desktop and a NAS is a weekend.
+    // A rotation that evicted this device would mean pairing it again from the
+    // new string, and doing that for a laptop, a phone, a desktop and a NAS is
+    // a weekend.
     await writeFile(join(second, "still.md"), "still here\n");
     const sync = await cli("sync", "--dir", second, "--json");
     expect(sync.code, sync.all).toBe(0);

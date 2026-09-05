@@ -88,27 +88,6 @@ describe("round tripping", () => {
  * and decrypt nothing anyone else wrote. The vault would appear to be syncing.
  */
 describe("refusing a string it cannot read completely", () => {
-  /**
-   * Versions 1 and 2 went with the protocols that made them, and neither can
-   * be read into a vault this client can talk to. Somebody may still have one
-   * written down from testing, so each is named and told what to do instead
-   * rather than lumped in with rubbish.
-   */
-  it("names a string from before protocol 3 and says to start a fresh vault", () => {
-    for (const [prefix, version] of [
-      ["basalt1_", 1],
-      ["basalt2_", 2],
-    ] as const) {
-      expect(() => parsePairing(`${prefix}AAAAAAAA`)).toThrow(
-        new RegExp(`version ${version} pairing string, from before protocol 3`),
-      );
-      expect(() => parsePairing(`${prefix}AAAAAAAA`)).toThrow(/start a fresh vault/);
-      // And the same string offered as a setup line, which is the other
-      // place somebody pastes one.
-      expect(() => parseSetup(`${prefix}AAAAAAAA`)).toThrow(/from before protocol 3/);
-    }
-  });
-
   it("refuses something that is not a pairing string at all", () => {
     expect(() => parsePairing("hello")).toThrow(/should start with basalt3_/);
     expect(() => parsePairing("")).toThrow(/should start with basalt3_/);

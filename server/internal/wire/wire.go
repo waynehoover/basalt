@@ -15,22 +15,15 @@ package wire
 import "github.com/waynehoover/basalt-sync/server/internal/store"
 
 // Proto is the newest protocol version this server implements, and MinProto the
-// oldest it still answers. A version outside that range is refused, not
-// negotiated: interoperating with a version we have not seen is how a silent
-// incompatibility gets shipped.
+// oldest it still answers. A version outside that range is refused at hello
+// naming both numbers, not negotiated: interoperating with a version we have
+// not seen is how a silent incompatibility gets shipped, and the one it would
+// ship here is a device that connects and syncs under a credential nobody can
+// revoke.
 //
-// Both are 4, and 4 is not compatible with 3. Hello gained a `deviceId`, the
-// credential it carries is a device's rather than the vault's, and the vault's
-// own auth key stopped being a sync credential at all: there is nothing in a
-// protocol 3 hello that a protocol 4 server could serve, and a shim that
-// guessed would be handing a device the sync rights per-device credentials
-// exist to take away. Protocol 3 was in use by one person for a day.
-//
-// A protocol 3 client is therefore refused at hello, naming its number and the
-// server's range, which is what the range check has been kept for since
-// protocols 1 and 2 were withdrawn. That refusal is the whole of the
-// compatibility story and it is deliberate: the alternative is a device that
-// connects and silently syncs under a credential nobody can revoke.
+// Both are 4, so the range is one version wide and nothing older is carried.
+// The range stays in the handshake because the next version needs somewhere to
+// say so.
 const (
 	Proto    = 4
 	MinProto = 4

@@ -940,10 +940,9 @@ func (s *Session) helloAsDevice(m wire.In) error {
 	}
 	// No rotation check on this path, and that is the point of the feature. A
 	// rotation replaces the root and rewraps the same data key; it touches no
-	// device row, so every device goes on syncing across one. Under protocol 3
-	// the vault's hash *was* the device's credential, so a rotation had to
-	// evict everybody; a device refused here for somebody else's rotation
-	// would be the weekend of re-pairing this exists to abolish.
+	// device row, so every device goes on syncing across one. A device refused
+	// here for somebody else's rotation would be a weekend of re-pairing, which
+	// is how a leaked key goes unrotated.
 	// TestRotationLeavesEveryDeviceRowAndEverySessionAlone.
 
 	s.vaultID = m.Vault
@@ -2112,8 +2111,6 @@ func (s *Session) handleRotate(m wire.In) error {
 	// Committed. Every device row is untouched and every device goes on
 	// syncing, which is what per-device credentials bought: rotation replaces
 	// the root and rewraps the same data key, and no device holds either.
-	// Under protocol 3 this evicted the whole vault and told every device to
-	// pair again, because the vault's hash *was* their credential.
 	//
 	// What is still closed is any *other* registrar session on this vault.
 	// Those are holding the root that was just retired, and the one thing a

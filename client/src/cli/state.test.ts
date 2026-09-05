@@ -316,10 +316,10 @@ describe("an index that is valid JSON and wrong (C23)", () => {
  * A vault is claimed by the hello that starts it, and the config holding the
  * root is written and read back before that hello goes out for exactly this
  * reason: the claim commits, its reply is lost, and the only copy of the
- * vault's recovery key is the one on this disk. Protocol 3 answered that by
- * resuming from the config, retrying the spent token and falling back to the
- * key the root derives. Nothing resumes now, and the answer is simpler and has
- * to be just as complete: every command refuses such a config, prints the
+ * vault's recovery key is the one on this disk. Nothing resumes from the
+ * config, retries the spent token or falls back to the key the root derives,
+ * so the answer has to be complete without any of that: every command refuses
+ * such a config, prints the
  * recovery key back out of it, and pairing again with that key joins the vault
  * that was claimed, with every note still on it.
  *

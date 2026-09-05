@@ -60,9 +60,8 @@ export const SEAL_OVERHEAD = NONCE_LENGTH + TAG_BITS / 8 + 1;
 /**
  * Root secret length in bytes. Thirty-two, and only thirty-two.
  *
- * It was twenty before protocol 3, which is enough through HKDF-SHA256 and
- * unusual enough that everyone reading it asked whether it was a truncation
- * bug. Nothing produces or accepts one now: a pairing string carries this
+ * Twenty would be enough through HKDF-SHA256 and unusual enough that every
+ * reader asks whether it is a truncation bug. A pairing string carries this
  * length or it is refused.
  */
 export const SECRET_LENGTH = 32;

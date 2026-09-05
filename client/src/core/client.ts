@@ -167,10 +167,10 @@ export class Client {
   /**
    * One operation at a time on the wire.
    *
-   * Not because replies could be confused with one another: protocol 3 gives
-   * every request an id and the transport keeps a map of what is outstanding,
-   * so two questions in flight resolve into their own slots. That was the
-   * original reason and it is gone, and the queue is still needed.
+   * Not because replies could be confused with one another: every request
+   * carries an id and the transport keeps a map of what is outstanding, so two
+   * questions in flight resolve into their own slots. That was the original
+   * reason, it no longer applies, and the queue is still needed.
    *
    * What it protects is the state either side of the wire. A pass reads the
    * vault, decides, writes and saves an index; a restore fetches a version
@@ -1086,8 +1086,8 @@ export class Registrar {
    * wrapped again under the new one, and the server swaps the auth hash and
    * the blob together. **No device row is touched and every device goes on
    * syncing across a rotation**, which is the expensive half of what per-device
-   * credentials removed. Under protocol 3 the vault's hash was the credential
-   * every device held, so a rotation evicted the lot.
+   * credentials removed: a rotation that evicted every device is how a leaked
+   * key goes unrotated.
    *
    * The data key comes from the caller rather than from a wrapping, because a
    * registrar is handed no wrapping at hello and the caller has the key
@@ -1532,8 +1532,8 @@ export async function redeemInvite(
  * once, from the same stored config, and the two copies were the
  * highest-consequence drift point in the client.
  *
- * It refuses a config that holds no credential, rather than falling back to
- * the root: falling back is what protocol 3 did, and what protocol 4 exists to
+ * It refuses a config that holds no credential rather than falling back to the
+ * root. A device that can fall back to the root is a device revoking cannot
  * stop. `deviceCredential` is where the refusal is worded.
  */
 export function credentialsFor(

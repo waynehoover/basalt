@@ -366,11 +366,10 @@ export default class BasaltPlugin extends Plugin {
   /**
    * Checks there is something to connect with, then runs the loop.
    *
-   * There is one credential and no list of candidates to try. Protocol 3 kept
-   * one here, because a device might have been holding a spent bootstrap, a
-   * rotation whose reply was lost, or the vault's root, and the connection was
-   * where it found out which. A paired device holds one credential for one row
-   * and either it opens the vault or nothing on this phone does.
+   * There is one credential and no list of candidates to try. A paired device
+   * holds one credential for one row, and either it opens the vault or nothing
+   * on this phone does. Trying a second would mean a device with a way in that
+   * revoking the first cannot close.
    *
    * So the check in front of the loop is not a step that can be resumed, it is
    * a refusal. A config that holds no credential is one a pairing left behind
@@ -1287,9 +1286,8 @@ export default class BasaltPlugin extends Plugin {
    *
    * **Every device keeps syncing across this, including this one.** A rotation
    * replaces the vault's secret and its wrapping of the data key, and touches
-   * no device row. Under protocol 3 the vault's hash was the credential every
-   * device held, so a rotation evicted the lot and each one had to be paired
-   * again from the new string, which on a phone means typing it.
+   * no device row. A rotation that evicted every device would mean typing the
+   * new string into a phone, which is how a leaked key goes unrotated.
    *
    * The data key is this device's own, which is the vault's: a rotation
    * replaces the wrapping and never the key, so the copy a paired device holds

@@ -217,9 +217,9 @@ func TestRegisteringADeviceRefusesAMalformedIDOrHash(t *testing.T) {
 func TestDevicesListsInAStableOrderAndNeverReturnsNil(t *testing.T) {
 	h := claimedStore(t)
 
-	// A vault with no devices, which is every protocol 3 vault, is an empty
-	// list and not an error, and not nil either: nil marshals to JSON null and
-	// a client that iterates it crashes on exactly the vault it has to handle.
+	// A vault with no devices is an empty list and not an error, and not nil
+	// either: nil marshals to JSON null and a client that iterates it crashes
+	// on exactly the vault it has to handle.
 	empty, err := h.Devices("v1")
 	if err != nil {
 		t.Fatalf("devices of a vault with none: %v", err)

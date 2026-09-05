@@ -52,10 +52,10 @@ import {
 /**
  * Marks the string as ours, and says which layout follows.
  *
- * Since protocol 3 this string is the vault's recovery key: shown once to the
- * person who starts the vault, to write down, and reprinted only on request.
- * Adding a device goes through a single-use invite instead, below, so the
- * root secret no longer has to be pasted anywhere to add a phone.
+ * This string is the vault's recovery key: shown once to the person who starts
+ * the vault, to write down, and reprinted only on request. Adding a device goes
+ * through a single-use invite instead, below, so the root secret never has to
+ * be pasted anywhere to add a phone.
  */
 export const PAIRING_PREFIX = "basalt3_";
 
@@ -189,7 +189,6 @@ function fields(body: Uint8Array, at: number, what: string, names: readonly stri
  */
 export function parsePairing(input: string): Pairing {
   const text = input.trim();
-  if (isPreProtocol3(text)) throw preProtocol3Error(text);
   if (text.startsWith(INVITE_PREFIX)) {
     throw new Error(
       "this is an invite, not a recovery key. It adds a device: give it to basalt pair, or to the Basalt panel on the new device.",
@@ -213,27 +212,6 @@ export function parsePairing(input: string): Pairing {
   if (url === "" || vaultId === "") throw new Error("this pairing string has an empty field");
 
   return { url: normaliseUrl(url), secret, vaultId };
-}
-
-/** Whether this is a string from before protocol 3, which nothing here reads. */
-function isPreProtocol3(text: string): boolean {
-  return text.startsWith("basalt1_") || text.startsWith("basalt2_");
-}
-
-/**
- * Names an old string rather than lumping it in with rubbish.
- *
- * Somebody may still have one written down from testing, and "not a pairing
- * string" would send them looking for a typo. There is nothing to migrate:
- * the vault it belongs to was claimed under a protocol this client no longer
- * speaks and the server no longer serves, so the answer is a new vault.
- */
-function preProtocol3Error(text: string): Error {
-  const version = text.startsWith("basalt1_") ? 1 : 2;
-  return new Error(
-    `this is a version ${version} pairing string, from before protocol 3. Nothing reads it any more: ` +
-      "start a fresh vault with basalt init, or the Basalt panel, and pair this device to that.",
-  );
 }
 
 /** Whether a string is an invite rather than a recovery key, by its prefix. */
@@ -664,7 +642,6 @@ function asciiHost(url: string): string {
  */
 export function parseSetup(input: string): { url: string; token: string } {
   const text = input.trim();
-  if (isPreProtocol3(text)) throw preProtocol3Error(text);
   if (text.startsWith(PAIRING_PREFIX)) {
     throw new Error(
       "that is a recovery key from another device. It joins an existing vault; " +

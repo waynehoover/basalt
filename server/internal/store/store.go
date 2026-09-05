@@ -317,13 +317,10 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- write to the vault it is meant only to keep, and a stolen disk already
   -- yields every byte of ciphertext without also handing over the credential.
   --
-  -- Through protocol 3 this was the sync credential: every device held the
-  -- root, derived the same auth key, and matching this hash was what a hello
-  -- proved. Protocol 4 narrowed it to the registration credential and nothing
-  -- else: may register a device, may not sync. That is what lets the recovery
-  -- key put the first device back after every device is lost, and it is why
-  -- revoking a device means something, which under one shared credential it
-  -- never could.
+  -- It is the registration credential and nothing else: may register a device,
+  -- may not sync. That is what lets the recovery key put the first device back
+  -- after every device is lost, and it is why revoking a device means
+  -- something, which under one credential every device shared it never could.
   --
   -- The narrowing is structural rather than remembered. A session that offers
   -- this credential is a registrar and the code that serves entries is not
@@ -346,19 +343,12 @@ CREATE TABLE IF NOT EXISTS vaults (
   -- rotation transaction, so it moves at exactly the moment the credential
   -- and the blob do.
   --
-  -- It existed because authenticating, reading the blob, joining the fan-out
-  -- and rotating were four steps under protocol 3, where the vault's hash was
-  -- the credential every device connected with: a device that passed auth
-  -- under the old root and paused before joining would join after the
-  -- rotation had swept the hub, and go on writing under a credential the
-  -- vault no longer knew.
-  --
-  -- Protocol 4 removed that window rather than watching it. A rotation does
-  -- not touch a device row, so a device session is not affected by one at
-  -- all, and the only session that can be is a registrar's, whose two powers
-  -- are each conditional on this row's auth_hash inside the statement that
-  -- exercises them. What the number is still for is the record: it is the
-  -- only evidence a vault's secret has ever been replaced.
+  -- A rotation does not touch a device row, so a device session is not
+  -- affected by one at all, and the only session that can be is a
+  -- registrar's, whose two powers are each conditional on this row's
+  -- auth_hash inside the statement that exercises them. So the number is not
+  -- a guard against a half-rotated session; it is the record, and the only
+  -- evidence a vault's secret has ever been replaced.
   rotations  INTEGER NOT NULL DEFAULT 0,
   -- How many purges have dropped history from this vault. Bumped inside the
   -- purge transaction, and only when the purge removed something, so it moves
@@ -2420,10 +2410,8 @@ func (s *Store) VaultKeys(vaultID string) (hash, wrapped string, rotations int64
 // secret has been replaced. Zero for a vault with no row, which is also where a
 // vault starts.
 //
-// It was a session's re-read after joining the fan-out, under protocol 3, where
-// a rotation retired the credential every device was connected with. Nothing
-// reads it that way now, because a rotation leaves device sessions alone; it is
-// kept because it is the only record that a vault's secret has ever been
+// No session re-reads it, because a rotation leaves device sessions alone. It
+// is kept because it is the only record that a vault's secret has ever been
 // replaced, and a rotation that left no trace is one nobody can confirm
 // happened.
 func (s *Store) Rotations(vaultID string) (int64, error) {
@@ -2756,8 +2744,8 @@ func insertDeviceTx(tx *sql.Tx, vaultID, deviceID, name, deviceHash, vaultHash s
 }
 
 // Devices is every device registered to a vault, oldest first, for the list op
-// and for `basalt devices`. A vault with none, which is every protocol 3 vault,
-// is an empty slice and not an error.
+// and for `basalt devices`. A vault with none is an empty slice, not an error:
+// an unclaimed vault has no devices and that is not a fault.
 //
 // Ordered by created_at and then by device_id. created_at is a millisecond, so
 // two devices registered inside the same one need a tiebreak or the order

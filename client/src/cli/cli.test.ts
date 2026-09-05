@@ -1494,8 +1494,7 @@ describe("the device list", () => {
  * A vault's content is sealed under a data key the root only wraps, so the root
  * can be replaced without the history going with it. What is new is that no
  * device row is touched either, so every device keeps syncing across a
- * rotation: under protocol 3 the vault's hash was the credential every device
- * held, and a rotation evicted the lot.
+ * rotation. A rotation that evicted every device is one nobody runs.
  */
 describe("rotating the secret (I5)", () => {
   it("keeps the history and every device, and retires the old key", async () => {

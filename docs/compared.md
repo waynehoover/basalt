@@ -101,14 +101,13 @@ a few large, half the large ones incompressible, prose that does not repeat.
 Latency is injected by a proxy; 400 ms at 2.6 MiB/s is Sync Engine's published
 environment.
 
-**A whole vault.** 200 files, 17.8 MiB, Apple M4 Pro, under protocol 3. 200
-arrived, 0 wrong, on every row.
+**A whole vault.** 200 files, 17.8 MiB, Apple M4 Pro. 200 arrived, 0 wrong, on
+every row.
 
-The protocol 3 label is when the run happened, and does not date the figures.
-Protocol 4 changed the handshake, the device list and what an invite carries;
-`put`, `putmany`, `get`, `fetch`, the chunker and the content key schedule are
-untouched, and the golden vectors pinning sealed bytes still pass, so a chunk
-has the same name and length it had here. Protocol 4 would move the cost of
+The figures predate the current handshake and still stand: `put`, `putmany`,
+`get`, `fetch`, the chunker and the content key schedule have not been touched
+since, and the golden vectors pinning sealed bytes still pass, so a chunk has
+the same name and length it had here. What has changed is the cost of
 connecting, which no row here measures.
 
 | Round trip | Up | Down | 20 notes up | 20 notes down | Nothing changed |
@@ -130,11 +129,11 @@ figure was measured against a link that was not really throttling, and should
 not be compared with this one.
 
 The upload cost is `fsync`, and macOS pays four to six times more of it than
-Linux because Go issues `F_FULLFSYNC` there. Measured under an earlier protocol,
+Linux because Go issues `F_FULLFSYNC` there. Measured earlier,
 the same 200 files uploaded in 2.8 s on Linux against 12.2 s here, and the
 400 ms upload was close to link-bound, so there is no large win left in the
-server for a vault of notes. Not repeated under protocol 3, and quoted as the
-earlier measurement it is.
+server for a vault of notes. Not repeated since, and quoted as the earlier
+measurement it is.
 
 **Scale.** Ten thousand notes of distinct prose, 21.1 MiB.
 

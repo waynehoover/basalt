@@ -25,9 +25,8 @@ import (
 // that touches the vault is refused, there is no `ready` and no catch-up, and
 // the session is in no fan-out, so nothing reaches it either.
 //
-// This is the whole of step 2. Under protocol 3 this same credential was what
-// every device connected with, so a device list would have been a list of rows
-// nothing consulted.
+// A credential every device connects with makes a device list a list of rows
+// nothing consults, which is why the narrowing comes before the list.
 func TestTheVaultCredentialCannotSync(t *testing.T) {
 	r := newRigDerived(t)
 	device := claimed(t, r, "a")

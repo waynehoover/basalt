@@ -118,7 +118,7 @@ func TestI1UnsolicitedFramesCarryNoId(t *testing.T) {
 
 // A request with no id, or one out of range, cannot be answered in a
 // way the client could match, so the session ends with a reason.
-func TestI1AProto3RequestWithoutAnIdEndsTheSession(t *testing.T) {
+func TestI1ARequestWithoutAnIdEndsTheSession(t *testing.T) {
 	for _, tc := range []struct {
 		why string
 		id  int64
@@ -504,9 +504,8 @@ func TestI5AVaultClaimedWithNoDataKeyIsRefusedAtHello(t *testing.T) {
 // Three steps and two connections, because there are two credentials now. The
 // first hello claims the vault with the root-derived key and gets a registrar
 // session; that session registers a device row; the device connects with its
-// own key. Under protocol 3 the first hello was all of it, and the credential
-// that claimed the vault was the credential everything synced under, which is
-// exactly what made revoking a device impossible.
+// own key. Three steps rather than one, because a credential that both claims
+// the vault and syncs is a credential revoking a device cannot take away.
 func claimed(t *testing.T, r *rig, name string) *client {
 	t.Helper()
 	first := r.dial("claimer")
@@ -609,10 +608,9 @@ func TestI5RotateReplacesTheSecretAndClosesOtherRegistrars(t *testing.T) {
 // untouched and every device goes on syncing, mid-session, without pairing
 // again.
 //
-// Under protocol 3 the vault's hash was the credential every device held, so a
-// rotation had to evict the lot and each one had to be paired again from the
-// new string. For a notes app with a laptop, a phone, a desktop and a NAS that
-// is a weekend, and it is the reason a leaked pairing string went unrotated.
+// A rotation that evicted every device would mean pairing a laptop, a phone, a
+// desktop and a NAS again from the new string. For a notes app that is a
+// weekend, and it is how a leaked pairing string goes unrotated.
 func TestRotationLeavesEveryDeviceRowAndEverySessionAlone(t *testing.T) {
 	r := newRigDerived(t)
 	a := claimed(t, r, "a")
@@ -829,13 +827,13 @@ func TestADeviceIDIsBoundedAndBase64URL(t *testing.T) {
  * I9: version negotiation
  * ---------------------------------------------------------------- */
 
-// Protocol 3 is the only protocol. A client asking for 2 is refused at hello
+// 4 is the only protocol. A client asking for anything else is refused at hello
 // with both numbers in the message, which is the whole of what the negotiation
-// machinery is kept for: when protocol 4 lands, this is how an old client
-// learns which end to upgrade. The server's version used to be in this message
-// too and is not any more, because nothing has authenticated when it is sent;
-// see disclosure_test.go.
-func TestI9AProto2HelloIsRefusedNamingBothNumbers(t *testing.T) {
+// machinery is kept for: when the next version lands, this is how a client on
+// the wrong one learns which end to upgrade. The server's version is not in
+// this message, because nothing has authenticated when it is sent; see
+// disclosure_test.go.
+func TestAHelloOutsideTheRangeIsRefusedNamingBothNumbers(t *testing.T) {
 	r := newRig(t)
 	r.srv.SetVersion("4.5.6")
 	cl := r.dial("old-phone")

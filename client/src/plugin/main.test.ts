@@ -406,8 +406,6 @@ describe("pairing", () => {
 
   it("refuses a pairing string that was mangled", async () => {
     const { plugin } = await load();
-    await expect(plugin.pair("basalt1_notreally", "d")).rejects.toThrow(/before protocol 3/);
-    await expect(plugin.pair("basalt2_notreally", "d")).rejects.toThrow(/before protocol 3/);
     await expect(plugin.pair("hello", "d")).rejects.toThrow(/basalt3_/);
     expect(plugin.paired).toBe(false);
     expect(plugin.savedData).toBe(null);
@@ -1386,9 +1384,9 @@ describe("unlink, in order and all the way (P15)", () => {
  * claim goes out, because the claim binds the server to that secret for good
  * and a secret that never reached the disk is a vault nobody can open. If the
  * registration after it fails, that is what is left: a root, no row, and a
- * phone. Protocol 3 resumed from it and retried the spent token. Nothing
- * resumes now, so the whole of the answer has to be in what the phone shows,
- * and it is tested for the key itself rather than for advice about it.
+ * phone. Nothing resumes from that and retries the spent token, so the whole
+ * of the answer has to be in what the phone shows, and it is tested for the
+ * key itself rather than for advice about it.
  */
 describe("a vault that was started and never joined (P16)", () => {
   it("stops with the recovery key on screen rather than retrying for ever", async () => {

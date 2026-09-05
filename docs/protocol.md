@@ -81,19 +81,14 @@ added and the reason the recovery key stays offline.
 
 `cursor` is the last uid the client applied, or 0. The server speaks every
 version from `minProto` to `proto` and answers in the one the client asked for,
-so the upgrade order is the server first, then each client. Today that range is
-one version wide, and anything outside it, or a `crypto` the server does not
-implement, is refused with `{res:"err", code:"proto"}` naming both numbers.
-That refusal does not name the server's version: nothing has authenticated when
-it is sent, and `serverVersion` travels in `ready` and `registrar`, after a
-hello has succeeded.
-
-**Protocol 4 is not compatible with 3, and there is no shim.** A protocol 3
-hello carries no `deviceId`, and its `token` was the vault's credential used as
-a sync credential, exactly what 4 took away. A server that guessed would hand a
-connection the sync rights per-device credentials exist to make revocable. So a
-protocol 3 client is refused at hello, naming its number and the server's
-range, and upgrades. Protocol 3 was in use by one person for one day.
+so the upgrade order is the server first, then each client. That range is one
+version wide: 4 is the only protocol, and anything outside it, or a `crypto`
+the server does not implement, is refused with `{res:"err", code:"proto"}`
+naming both numbers rather than negotiated. Interoperating with a version we
+have not seen is how a silent incompatibility ships. That refusal does not name
+the server's version: nothing has authenticated when it is sent, and
+`serverVersion` travels in `ready` and `registrar`, after a hello has
+succeeded.
 
 `claim` and `wrapped` travel together, and a hello carrying a claim without a
 valid `wrapped` is refused with `badentry` and ends, whatever state the vault
@@ -303,11 +298,10 @@ random 256-bit key, where there is nothing to guess and nothing for a slow hash
 to slow down, and it must never be reused for anything a person chose. A stolen
 disk yields ciphertext without the ability to add to it.
 
-**The vault's credential may not sync.** Through protocol 3 it was the sync
-credential: every device held the root, derived the same key, and matching the
-stored hash was what a hello proved. Revocation would have meant nothing then,
-which is why the narrowing had to come before the device list: a device list
-with no revocation is worse than no list, because it looks like it works.
+**The vault's credential may not sync.** It registers a device and nothing
+else. A credential every device holds cannot be revoked from any one of them,
+and a device list with no revocation is worse than no list, because it looks
+like it works.
 
 One code path builds a syncing session, and the only way into it is a
 `deviceId` whose stored hash matched the offered key. A registrar session is
@@ -451,11 +445,10 @@ from then on only the new root opens the vault. History is untouched, because
 nothing sealed under the data key changed.
 
 **A rotation touches no device row, and every device keeps syncing across
-one**, mid-session, without pairing again. That is the expensive half of what
-per-device credentials removed: under protocol 3 the vault's hash *was* the
-credential every device held, so a rotation evicted the lot and each had to be
-paired again from the new string, which for a laptop, a phone, a desktop and a
-NAS is a weekend, and is why a leaked string went unrotated.
+one**, mid-session, without pairing again. Device credentials are independent
+of the root, so replacing the root rewraps the data key and evicts nobody. A
+rotation that evicted every device would be a weekend of pairing, which is how
+a leaked string goes unrotated.
 
 What a rotation does close is every *other* registrar session on the vault,
 with an unsolicited `{res:"err", code:"auth"}`. Those are holding the root that

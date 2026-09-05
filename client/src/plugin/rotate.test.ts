@@ -178,8 +178,8 @@ describe("replacing the vault's secret from the panel", () => {
     expect(row, "the panel offers no way to retire a leaked secret").toBeDefined();
     // The copy has to say the two things a person would otherwise get wrong:
     // that this needs the key they wrote down, and that every device keeps
-    // syncing, which is the opposite of what protocol 3 did. The first is
-    // short enough for the row's one line. The other two followed the cut on
+    // syncing, which is the opposite of what people expect a key change to do.
+    // The first is short enough for the row's one line. The other two followed the cut on
     // to the `?` beside the disclosure this row sits in, which is where the
     // panel keeps the detail a line cannot carry.
     expect(row.desc).toMatch(/Paste the vault's current recovery key/);

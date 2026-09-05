@@ -960,11 +960,10 @@ async function cmdRevoke(args: Args, io: Console): Promise<number> {
  * this is one of the two moments in a vault's life the root is used.
  *
  * **No device row is touched and every device keeps syncing across this**,
- * which is the expensive half of what per-device credentials removed. Under
- * protocol 3 the vault's hash was the credential every device held, so a
- * rotation evicted the lot and each one had to be paired again from the new
- * string, which for a laptop, a phone, a desktop and a NAS is a weekend and is
- * the reason a leaked string went unrotated.
+ * which is the expensive half of what per-device credentials removed. A
+ * rotation that evicted every device would be a weekend of re-pairing across a
+ * laptop, a phone, a desktop and a NAS, and that is how a leaked string goes
+ * unrotated.
  *
  * The data key is this device's own, which is the vault's: rotation replaces
  * the wrapping and never the key, so the copy a paired device holds is always
@@ -1547,11 +1546,10 @@ interface ConnectHow {
  * Assembles the four objects and connects, which is the whole of what a shell
  * does.
  *
- * There is one credential now and no candidates to try. Protocol 3 kept a list
- * here, because a device might have been holding a spent bootstrap, a rotation
- * whose reply was lost, or the root, and the connection was where it found out
- * which. A paired device has exactly one credential and either it opens the
- * vault or it does not, and no other credential on this disk would.
+ * There is one credential and no candidates to try. A paired device has
+ * exactly one, and either it opens the vault or it does not; no other
+ * credential on this disk would. A second way in is one that revoking the
+ * first cannot close.
  *
  * Nothing is written back either. What a connection used to prove, and this
  * file used to record, is settled by the registration that made the device,
