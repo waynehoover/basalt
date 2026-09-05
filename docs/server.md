@@ -484,9 +484,9 @@ while a server holds it. Run it as its own container against the same volume.
 
 ```bash
 docker compose stop basalt
-docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.2 \
+docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.4.0 \
   backup -data /data -to /data/backup
-docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.3.2 \
+docker run --rm -v basalt_basalt-data:/data ghcr.io/waynehoover/basalt-sync:0.4.0 \
   purge -data /data -confirm default -backup /data/backup -grace 0
 docker compose start basalt
 ```
