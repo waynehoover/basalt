@@ -69,9 +69,14 @@ and there is nothing the plugin can do about it that a person cannot see: the
 panel shows the vault's recovery key, which may be the only copy of it, and
 says to write it down, unlink and pair again with it.
 
-The device name is optional. Left blank it becomes `obsidian-` and four random
-characters, so two devices left at the default do not share a name. It appears
-in version history and in conflict copy filenames.
+The device name comes filled in, with what kind of machine this is and four
+random characters: `mac-3f2a`, `android-91c7`, `ipad-0b55`. Type over it with
+whatever you call this device: that replaces the whole suggestion, tail and
+all, the way `--device` does on the command line. The tail is why two Macs left
+at the suggestion do not share a name, and a name is worth having because it is
+what a row in *Devices* says, what version history shows against a version, and
+what a conflict copy is named after. `basalt` does the same thing with the
+machine's hostname.
 
 The pairing is stored in the plugin's own `data.json`: this device's id, the
 secret it connects with, and the vault's data key, all in the clear. The root
@@ -94,6 +99,13 @@ the server suggested. Only a refusal that would repeat word for word stops it.
 The panel shows the local cursor and the server cursor. A device that is behind
 and stays behind while nothing arrives is the one thing the protocol cannot
 detect on its own, and these two numbers are how you see it.
+
+Under them is what this device is talking to: the address it holds, whether
+something in front of the server terminated TLS, and the protocol and server
+build from `ready`. That is the first thing wanted when sync is not working,
+and none of it costs a request. A device that is not connected shows the
+address and says the protocol and the build are not known yet, because a build
+missing for want of a connection looks exactly like a server that did not say.
 
 The status bar icon shows the state. Obsidian mobile has no status bar, so the
 same sentence is the ribbon icon's tooltip.

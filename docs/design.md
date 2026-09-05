@@ -113,6 +113,21 @@ judgement except where it trades away a note; fail loudly and never report
 success you have not verified; the server is an opaque blob store and stays one;
 verify against the artifact, never infer; everything is reversible.
 
+One honest note against all of that, raised in review and worth keeping. There
+is no settings screen, and there is a settings surface: `-max-file`,
+`-max-batch-bytes`, `-max-fetch-bytes`, `-allow-origin`, `-grace`, `-ttl`,
+`--ignore`, `--timeout`, the device cap, the retry hints, the debounce, the
+full-pass interval. Some are flags, some are options, some are constants
+answered once in the source, and the ones a phone most needs are the ones it
+can least reach. Two of those refusals have already been re-litigated by
+reality: `-allow-origin` exists because phones exist, `--ignore` because vaults
+hold things people do not want synced. The counter is real too, since every
+option multiplies untested combinations and the suite is this project's best
+asset. So the position is not that the surface does not exist, but that it
+stays documented in one place per component rather than gathered into a screen,
+and that a refusal which keeps losing the same argument should be amended
+rather than restated.
+
 ## Refusals
 
 No second backend. No peer-to-peer. No teams or shared vaults. No settings
@@ -259,6 +274,34 @@ the version property above is. The same probe goes to a vault this server
 serves, furnished with devices, entries and an outstanding invite, and to a
 vault it has never heard of, and the two frames must match byte for byte,
 whatever code either of them chooses.
+
+### Why a loopback bind is not the token
+
+The first-run token is the one step of setup that is pure ceremony: start the
+server, find the line, copy it, paste it. The obvious way to remove it is to let
+a server bound to `127.0.0.1` accept an unauthenticated claim, on the grounds
+that anything reaching loopback is already on the machine. That was considered
+and refused, because here loopback is where the proxy lives.
+[server.md](server.md#tls) says to bind to `127.0.0.1:3003` and put `tailscale
+serve` or Caddy in front, and the systemd unit does exactly that. Both proxies
+run on the machine and dial loopback, so the bind address is loopback and the
+peer address is 127.0.0.1 in the arrangement where the tailnet can reach the
+port, and in the Caddy one, where the whole internet can. A rule keyed on
+either would read both as "same machine" and hand an unclaimed vault to whoever
+asked first. A container only muddies it further: `compose.yaml` publishes the
+port on the host's loopback while the server inside binds a wildcard, so the
+same words mean different things depending on which namespace is asked. The
+condition is not too broad and in need of narrowing: it is measuring the wrong
+thing.
+
+What the token is, then, is evidence that whoever is claiming can read a file in
+the data directory, which is the only same-machine proof a plain TCP listener
+has. It is required on every bind, `-localhost` included. What makes it safe to
+print in a log is that spending it is final: the claim binds the vault to that
+device's key, and the next claim is refused with `auth` and changes nothing.
+That is checked against the running binary and not only against the
+authenticator, because the property is about the door and not about the
+function behind it.
 
 ## The keys
 
@@ -421,3 +464,14 @@ published from CI over OIDC with no stored token.
   `basaltd backup`.
 - TLS. The server speaks plain HTTP and expects `tailscale serve` or a proxy in
   front. No key material lives in this repository.
+- A canvas edge whose node the other device deleted. The merge keeps the edge,
+  the file is valid JSON, and Obsidian drops the edge silently on the next
+  save. There is no third answer when one person removes the node another drew
+  an arrow to, and telling that edge from one the ancestor already had needs
+  the validity check to see the ancestor and both sides rather than just the
+  result. Pinned as a test so it is met as a decision.
+- The whole-file fallback on mobile. The 64 MiB default was sized from a
+  desktop memory curve, and the fallback reads a whole file. An older phone
+  syncing a large attachment may be killed mid-pass. Staging means no note is
+  lost, but the file never syncs and the symptom is a dead app rather than an
+  error. It wants measuring on a real device, and has not been.

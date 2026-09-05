@@ -14,11 +14,12 @@ The tree moved during this review and is still moving: a pairing-flow
 refactor is in flight in the dirty tree (`convertToDevice` and
 `needsConversion` gone from core, `registerAsDevice` in their place, the
 plugin's runLoop/pair/pairFirst reworked around register-then-save, plus
-the continuing protocol-4 comment/docs pass). It is uncommitted, it is not
-this review's scope, and its suite is red while it moves, a later client
-run failed 190 with edits landing mid-run, and a rerun still fails 5 in
-`main.test.ts` with files changing underneath it. Nothing below judges it;
-re-review it once it commits and its own suite is green.
+the continuing protocol-4 comment/docs pass). That work has since
+committed (`dfa0d2b` and friends) and is reviewed in `todo-new.md`, which
+carries this file's open items forward with the new findings. The
+mid-review red suite was edits landing mid-run, not real breakage: the
+committed tree is green except the `format`/`typecheck` gate (B1 in
+`todo-new.md`).
 
 **Rule 9 applies to every item:** a fix without a test that failed first
 is not finished. Items marked `[needs-repro]` are suspected from reading
@@ -55,7 +56,12 @@ refused-but-confusing > operational footguns > leaks/hardening.
 
 ## In progress, uncommitted
 
-- [ ] **The protocol 4 docs pass.** `README.md`, the security SVGs and
+- [x] **The protocol 4 docs pass.** Done, `bc18bb6`. Found four more claims of
+  the same shape as the two already fixed, including a third instance of "a
+  device cannot add a device of its own", plus nine code comments saying a
+  device holds the root, which is presumably why the docs kept saying it. The
+  security graphic was redrawn: it drew the old derivation as a picture.
+  Original entry: `README.md`, the security SVGs and
   `docs/protocol.md` are dirty in the tree: the README's security copy now
   describes device credentials and revocation, the picture draws the new
   derivation, and the protocol doc states the honest boundary ("it cannot do
@@ -68,8 +74,46 @@ refused-but-confusing > operational footguns > leaks/hardening.
   the Sep-04 devices work. Retake with the capturePage recipe (Electron,
   background throttling off), which does not steal focus.
 
-## Test-coverage debts (not bugs, tracked here so they don't drift)
+## From collie's pairing screen, 2026-09-04
 
+Collie shows "Nothing is paired, so writes are ungated. Pair a device to
+require a credential." That model does not transfer: in Basalt the credential
+is the encryption key, not an access gate, so there is no readable state to
+leave ungated and nothing to retrofit encryption onto later. There should
+never be a Basalt screen that says writes are ungated. Three things next to it
+are worth taking.
+
+- [x] **Claim without a token when the server is bound to loopback.**
+  **Refused, and the reasoning is in `docs/design.md` so it is not proposed
+  again.** Loopback is not a reliable signal of "same machine" here, and this
+  project's own deployment docs are why: `server.md` says to bind 127.0.0.1
+  and put `tailscale serve` or Caddy in front, and the systemd unit does
+  exactly that. Both proxies run on the machine and dial loopback, so in the
+  arrangement where the whole tailnet can reach the port, and the Caddy one
+  where the whole internet can, the bind is loopback and the peer address is
+  127.0.0.1. A rule keyed on either hands an unclaimed vault to whoever asks
+  first. Containers are worse: compose publishes on the host's loopback while
+  the server inside binds a wildcard. The only genuine same-machine proofs are
+  a unix socket with peer credentials, or being able to read a file in the
+  data directory, and the second one is the token. So the token is not
+  ceremony, it is the proof. Shipped instead: a test that a claimed vault
+  refuses the next claim against the running binary, since the existing
+  coverage was at the authenticator, which is a function call and not a door.
+- [x] **Ask for the device's name when pairing, in the panel.** **Done, and
+  this entry was wrong.** The panel has always asked; the field existed from
+  the first commit. The real gap was that it was empty behind a placeholder,
+  and a placeholder is not a value, so blank became `obsidian-3f2a` on every
+  device and a list read from inside Obsidian where every row says Obsidian
+  identifies nothing. The field is prefilled now (`mac-3f2a`, `android-91c7`,
+  `ipad-0b55`), mirroring the CLI's own naming. The platform check asks the
+  mobile flags first, because Obsidian's types document `isMacOS` as true on
+  iPhones and iPads, so the other order calls every iPad a Mac.
+- [x] **A connection block in the panel.** Done, one line under the cursors,
+  built only from what the client already holds: address, whether TLS
+  terminates in front, protocol, server build. A `ws://` connection names what
+  that costs exactly rather than vaguely, and disconnected says so rather than
+  leaving a gap, because a build missing for want of a connection reads like a
+  server that did not say.
 - [ ] iOS: first-sync of the real-vault corpus, memory ceiling on an
   old phone, kill-and-resume: numbers, not "should work."
 

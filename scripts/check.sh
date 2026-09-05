@@ -76,6 +76,20 @@ run "test" client bun run test
 run "compression golden, under bun" client bun run src/core/compression-golden.run.ts
 run "build" client bun run build
 
+# ---- the panel states ------------------------------------------------------
+#
+# The walk that writes client/panel-shots/, which CI uploads as an artifact.
+# Run here as well, and not only because the guard below insists: the artifact
+# is the thing somebody looks at when a layout bug is suspected, and a walk
+# that has stopped working is worth finding on the machine where the panel is
+# being changed rather than after the push.
+#
+# Already inside `bun run test` above. Run again by name for the same reason
+# `compression golden, under bun` is: the CI job it mirrors runs exactly this
+# and nothing else, and a step this script covered only incidentally is a step
+# it would stop covering the day the other command changed.
+run "capture every panel state" client bunx vitest run src/plugin/panel-shots.test.ts
+
 # The one that was missed. Its own command, its own job, and not part of
 # `bun run test`.
 run "stress" client bun run stress

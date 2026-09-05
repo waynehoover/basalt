@@ -210,6 +210,45 @@ does to concurrent writers, not for its arithmetic.
   second code path through the most durability-critical part of the client.
 - **node-diff3** for the merge. It conflicted on five of eight cases that merge
   cleanly here, including two devices appending to a daily note.
+- **A CRDT for the text**, Automerge or Yjs, to replace the three-way merge
+  outright. Considered seriously after fuzzing found four ways the merge could
+  produce text neither device wrote, and declined, because it solves a problem
+  this product does not have and does not solve the one it does. A CRDT
+  guarantees that every device converges on the same text. It says nothing
+  about that text being what either person meant: two devices editing one line
+  apart still interleave, deterministically, and the result is the same
+  garbled sentence with nothing to flag it. What Basalt does instead is detect
+  that the two edits cannot be reconciled and keep both versions, which is the
+  safety net the first rule rests on, and a CRDT has no conflict to fall back
+  to. It would also cost per-document operation history the server must hold
+  and compact, do nothing for attachments or canvases, and require a protocol
+  change plus a migration of every existing vault. The defects fuzzing found
+  were merges that merged where they should have conflicted, so the fix was to
+  conflict more accurately, at a measured 0.18% of clean merges.
+- **Resolving renames at scan time**, by matching a disappeared path to an
+  appeared one with the same content hash, instead of the stateful `prev`
+  chain. The chain has produced several real bugs, which is what prompted it,
+  but the replacement is a guess with worse ambiguity: identical files are
+  ordinary in a vault (empty notes, templates), a rename plus an edit changes
+  the hash and stops looking like a rename, and a delete then create of the
+  same content becomes a false one. The current code also deliberately matches
+  Obsidian's own `previouspath` behaviour. Its bugs were found, fixed and
+  pinned; trading tested state for an untested heuristic in the path that
+  produced them is the wrong direction. Revisit if renames start producing new
+  bugs.
+- **A server-side streaming import for a first sync**, one long-lived upload
+  instead of many capped batches. The numbers do not justify it: 54 seconds up
+  and 22 down for the real 3,751 file vault, and a first sync happens once per
+  device. A second path through the most durability-critical code is a poor
+  trade for that. Worth re-measuring over real tailscale latency before
+  reopening, not before building.
+- **Merging the four "not acted on" maps** (`blocked`, `skipped`, `ignored`,
+  `refusedInbound`) into one. Rule 7 is right that four categories is three
+  distinctions a person must learn, and wrong about where to fix it: each map
+  came from its own incident and they carry different exit-code semantics.
+  The output was merged into one "needs attention" list with reasons; the
+  model was left alone. Merging the maps would trade four incidents' worth of
+  learning for one fewer noun.
 - **Naming a chunk by its plaintext rather than its ciphertext**, so that the
   chunk size, the deflate level and the sealing construction stop being baked
   into the name. Spiked in September 2026 against the real corpus, and not
@@ -245,7 +284,7 @@ does to concurrent writers, not for its arithmetic.
   stays on file for one case: a construction change that is forced rather than
   chosen, where re-sealing under today's naming would rename every chunk,
   rewrite every entry and re-MAC the whole of history. The prototype and its
-  benchmark are on the branch `worktree-agent-afcd112f19a23495e`, unmerged
+  benchmark are on the branch `spike/hmac-chunk-names`, pushed and unmerged
   because nothing imports them, so the numbers above can be re-run rather than
   re-derived.
 - **A local map from plaintext to the name a chunk was uploaded under**, which

@@ -37,20 +37,17 @@ Basalt is the narrow version. One backend, one transport, one person's devices. 
     </td>
   </tr>
   <tr>
+    <th align="center">Every device, and revoking one</th>
     <th align="center">Deleted notes, kept until you purge</th>
-    <th align="center">Adding a device</th>
   </tr>
   <tr>
+    <td align="center">
+      <img src="docs/assets/screenshots/devices.png" alt="The device list: each device with its name, when it was added and when it was last seen, a button to revoke one, and a note saying revoking stops a device connecting but does not un-read what it already read.">
+    </td>
     <td align="center">
       <picture>
         <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/recover-dark.png">
         <img src="docs/assets/screenshots/recover.png" alt="The deleted notes list, with a restore button.">
-      </picture>
-    </td>
-    <td align="center">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/pairing-dark.png">
-        <img src="docs/assets/screenshots/pairing.png" alt="The pairing panel, taking an invite or a recovery key.">
       </picture>
     </td>
   </tr>
@@ -136,6 +133,7 @@ Notes are cut into content-defined chunks, so an edit sends the chunk that moved
 - [x] Headless client for a machine with no Obsidian
 - [x] One static binary, verified atomic backups, and a restore runbook
 - [ ] Tested on iOS, which should work and has never been run
+- [ ] Measured on an older phone: the memory ceiling for a large attachment, and a first sync of a real vault over real latency
 - [ ] Listed in the Obsidian community directory
 - [ ] Syncing themes and snippets, the one open question in [the design](docs/design.md)
 

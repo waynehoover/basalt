@@ -161,6 +161,61 @@ jobs:
         working-directory: client
         run: bun run build
 
+  # The panel, in every state it has, walked and written down so that somebody
+  # can look at it. Two layout bugs here have been found by taking a screenshot
+  # and none by a test, and taking a screenshot only happens when somebody
+  # remembers to, on a machine with Obsidian on it.
+  #
+  # It is not a screenshot and it cannot be one. Obsidian is proprietary and is
+  # not on a runner, and every pixel of the panel's appearance comes from
+  # Obsidian's own theme rather than from this repository, so a headless render
+  # would be a picture of a panel that does not exist. What this uploads is the
+  # honest half: which elements the panel builds, in what order, nested how,
+  # carrying what words, which is the half both of those bugs lived in.
+  # panel-shots.ts says all of this at the top of the artifact too, because an
+  # artifact that overstates what it is is worse than none.
+  #
+  # Uploaded rather than diffed. Its point is to be looked at, and a golden copy
+  # of it would be one more thing to keep in step for no gain. The test that
+  # writes it is the gate, and it checks what a gate can: that the walk reached
+  # every state and captured something real in each.
+  #
+  # Its own job so that "the panel states were not captured" is a sentence CI
+  # can say, and so the artifact is uploaded even when the walk fails, because a
+  # half-written capture is the first thing to look at when it does.
+  panel:
+    name: the panel states
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The walk starts a vault and pairs a second device into it against a
+      # real basaltd, so this needs both toolchains for the same reason the
+      # client job does.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Unnamed on purpose: it is the same install the client job already does
+      # under that name, and scripts/check.sh's guard matches step names.
+      - working-directory: client
+        run: bun install --frozen-lockfile
+
+      - name: capture every panel state
+        working-directory: client
+        run: bunx vitest run src/plugin/panel-shots.test.ts
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: panel-states
+          path: client/panel-shots/
+          if-no-files-found: error
+
   # Its own job so that "the stress suite failed" is a sentence CI can say.
   #
   # Unit tests are necessary here and never sufficient: every real defect in the
