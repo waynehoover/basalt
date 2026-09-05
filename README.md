@@ -11,7 +11,7 @@ Basalt Sync is self-hosted sync for Obsidian. It keeps a vault the same on every
 
 ## About
 
-Obsidian Sync works well and costs a subscription. The self-hosted alternatives are good and general, which means they carry backends, options and settings screens that a person syncing their own notes between their own devices does not need.
+Obsidian Sync works well and costs a subscription. The self-hosted alternatives are good and general, so they carry backends, options and settings screens that a person syncing their own notes between their own devices does not need.
 
 Basalt is the narrow version. One backend, one transport, one person's devices. Every question with a right answer is answered once in the source instead of becoming a setting, which is why there is no settings screen and why the whole interface is one panel. The rule it will not break is that a note is never lost: when simplicity and correctness disagree, the feature gets cut.
 
@@ -66,7 +66,7 @@ docker run -d --name basalt -p 127.0.0.1:3003:3003 \
 docker logs basalt
 ```
 
-The log prints one line for your first device, `host:3003#TOKEN`. The server speaks plain HTTP on purpose, so that no key material lives in it. Put TLS in front before anything else can reach it: `tailscale serve --bg 3003` is one line, and [docs/server.md](docs/server.md) covers Compose, systemd, Caddy and every flag.
+The log prints one line for your first device, `host:3003#TOKEN`. The server speaks plain HTTP on purpose, so no key material lives in it. Put TLS in front before anything else can reach it: `tailscale serve --bg 3003` is one line, and [docs/server.md](docs/server.md) covers Compose, systemd, Caddy and every flag.
 
 `latest` is for trying it. For the box you keep, pin the tag and its digest, as [`compose.yaml`](compose.yaml) does, so a pull cannot move you to an image nobody tested against your devices.
 
@@ -106,11 +106,11 @@ basalt sync --watch
   <img src="docs/assets/security.svg" alt="The recovery key stays offline and does two things: register a device and rewrap the data key. Each paired device holds a device secret of its own, whose auth key proves it may connect, and the vault's data key, which derives the keys for names, bodies, nonces and version signatures. Only ciphertext crosses to the server, which holds sealed bodies and names, one row per device with a hash of its key, and a wrapped data key it cannot open.">
 </picture>
 
-- **The server never holds a key.** Note contents and file names are sealed on the device. What it stores is ciphertext, and what it can tell about that ciphertext is its length and that two chunks are identical, which is what deduplication is made of.
+- **The server never holds a key.** Note contents and file names are sealed on the device. It stores ciphertext, and all it can tell about that ciphertext is its length and that two chunks are identical, which is what deduplication is made of.
 - **It cannot write either.** Every version carries a signature under a key the server has never seen, so it cannot forge a version, alter one, or move one file's contents onto another.
 - **Each device has its own credential, so one can be revoked.** No device holds the recovery key: it is written down and offline, and a device is added with a single-use invite instead. `basalt revoke ID` stops one device connecting and disturbs no other.
-- **A leaked recovery key can be retired.** Content is sealed under a data key that the recovery key only wraps, so `basalt rotate` gives the vault a new secret, keeps every version of the history, and leaves every device syncing.
-- **What it can still do is withhold.** A server can go quiet and show a device nothing. No note is altered, and two devices disagreeing is how a person notices. That is stated rather than solved, and [the design doc](docs/design.md) says why the alternative was rejected.
+- **A leaked recovery key can be retired.** Content is sealed under a data key the recovery key only wraps, so `basalt rotate` gives the vault a new secret, keeps every version of the history, and leaves every device syncing.
+- **What it can still do is withhold.** A server can go quiet and show a device nothing. No note is altered, and two devices disagreeing is how a person notices. Stated rather than solved; [the design doc](docs/design.md) says why the alternative was rejected.
 
 ## What makes it fast
 
@@ -119,7 +119,7 @@ basalt sync --watch
   <img src="docs/assets/wire.svg" alt="Editing one line of a 2 MiB note: whole-file sync sends 2.0 MiB, Basalt sends 21.7 KiB, of which 12.7 KiB is the chunk that changed and 9.0 KiB is the entry naming every chunk of the new version.">
 </picture>
 
-Notes are cut into content-defined chunks, so an edit sends the chunk that moved rather than the file. Chunks are compressed before they are encrypted, and two thousand files reach a second device in tens of round trips rather than thousands. Every number here was measured, including a run against a real 3,751-file vault, and [docs/compared.md](docs/compared.md) shows them with the corpus each came from.
+Notes are cut into content-defined chunks, so an edit sends the chunk that moved rather than the file. Chunks are compressed before encryption, and two thousand files reach a second device in tens of round trips rather than thousands. Every number here was measured, including a run against a real 3,751-file vault, and [docs/compared.md](docs/compared.md) shows them with the corpus each came from.
 
 ## Features and roadmap
 

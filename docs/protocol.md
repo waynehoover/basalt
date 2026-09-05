@@ -40,8 +40,8 @@ inverts one.
 
 ## Handshake
 
-A hello offers one of three credentials, and which one it offers decides what
-the session may do.
+A hello offers one of three credentials, and which one decides what the session
+may do.
 
 **A device connecting.** `deviceId` names its row in the vault's device list
 and `token` is that device's own auth key.
@@ -57,22 +57,22 @@ and `token` is that device's own auth key.
 from the root secret, which is the recovery key. What comes back is a
 registrar session: it may `register` a device, `rotate` the vault's secret, and
 administer the device list with `devices`, `revoke` and `uninvite`. It may not
-read or write a note, and there is nothing else for it to send.
+read or write a note, and has nothing else to send.
 
 ```
 -> {op:"hello", id, proto:4, vault, token, device, crypto, claim?, wrapped?}
 <- {res:"registrar", id, proto:4, minProto:4, serverVersion, maxDevices}
 ```
 
-A registrar gets no `ready`, no catch-up and no place in the vault's fan-out,
-because there is nothing it may be sent. `ready` promises the ceilings for a
-`put` and a backlog behind it, and a reply that promised a catch-up nobody
-would send is how a client comes to wait for a frame that is not coming.
+A registrar gets no `ready`, no catch-up and no place in the fan-out, because
+there is nothing it may be sent. `ready` promises the ceilings for a `put` and
+a backlog behind it, and promising a catch-up nobody would send is how a client
+comes to wait for a frame that never arrives.
 
 **An invite being redeemed.** `invite` in place of a token, beside the device
 row the redemption is to register. It is answered `redeemed` and closed; see
-**Adding a device with a single-use invite**, which is the ordinary way a
-device is added and the reason the recovery key stays offline.
+**Adding a device with a single-use invite**, the ordinary way a device is
+added and the reason the recovery key stays offline.
 
 ```
 -> {op:"hello", id, proto:4, vault, device, crypto, invite, deviceId, auth, name?}
@@ -80,21 +80,20 @@ device is added and the reason the recovery key stays offline.
 ```
 
 `cursor` is the last uid the client applied, or 0. The server speaks every
-version from `minProto` to `proto` and answers in the version the client asked
-for, so the upgrade order is the server first, then each client. Today that
-range is one version wide, and anything outside it, or a `crypto` the server
-does not implement, is refused with `{res:"err", code:"proto"}` naming both
-numbers. That refusal does not name the server's version: nothing has
-authenticated when it is sent, and `serverVersion` travels in `ready` and in
-`registrar`, after a hello has succeeded.
+version from `minProto` to `proto` and answers in the one the client asked for,
+so the upgrade order is the server first, then each client. Today that range is
+one version wide, and anything outside it, or a `crypto` the server does not
+implement, is refused with `{res:"err", code:"proto"}` naming both numbers.
+That refusal does not name the server's version: nothing has authenticated when
+it is sent, and `serverVersion` travels in `ready` and `registrar`, after a
+hello has succeeded.
 
 **Protocol 4 is not compatible with 3, and there is no shim.** A protocol 3
 hello carries no `deviceId`, and its `token` was the vault's credential used as
-a sync credential, which is exactly what 4 took away. A server that guessed
-would be handing a connection the sync rights per-device credentials exist to
-make revocable. So a protocol 3 client is refused at hello, naming its number
-and the server's range, and upgrades. Protocol 3 was in use by one person for
-one day.
+a sync credential, exactly what 4 took away. A server that guessed would hand a
+connection the sync rights per-device credentials exist to make revocable. So a
+protocol 3 client is refused at hello, naming its number and the server's
+range, and upgrades. Protocol 3 was in use by one person for one day.
 
 `claim` and `wrapped` travel together, and a hello carrying a claim without a
 valid `wrapped` is refused with `badentry` and ends, whatever state the vault
@@ -105,31 +104,27 @@ A client sends the pair only while it is still claiming, which is while it
 holds the server's first-run token, and sends the same `wrapped` every time: a
 claim retried after a lost reply must offer the key it offered before, or the
 vault can be bound to one candidate while the device goes on proposing another.
-It stops once the token is spent. A claim on a claimed vault changes nothing on
-the server, but it hands a wrapping of a data key to a server that has no
-honest use for it, and a dishonest one can return that wrapping as the vault's
-own; see **The data key** for the other half of that.
+A claim on a claimed vault changes nothing on the server, but hands a wrapping
+of a data key to a server with no honest use for it, and a dishonest one can
+return that wrapping as the vault's own; see **The data key**.
 
 `vault` and `device` are at most 64 characters and contain no control
 characters; either fault is `badname` and ends the session, because both land
 in logs and file paths. `deviceId` is at most 64 characters of base64url, with
 no minimum: the server cannot check that sixteen random bytes were random, and
 a minimum would admit a string of A's anyway. A malformed one is `badname` too,
-rather than `auth`, because it is a fact about the request and answering it
-with `auth` would make the shape of an id look like the answer to whether that
-device is registered. A hello carrying a `deviceId` and also a `claim` is
-`badentry`: one is a registered device connecting and the other is how a vault
-is bound, and a server that picked one would be choosing which the client
-meant. A `deviceId` beside an `invite` is not that case and is required: see
-**Adding a device with a single-use invite**.
+not `auth`, because it is a fact about the request, and answering with `auth`
+would make the shape of an id look like the answer to whether that device is
+registered. A hello carrying a `deviceId` and also a `claim` is `badentry`: one
+is a registered device connecting, the other is how a vault is bound. A
+`deviceId` beside an `invite` is not that case and is required: see below.
 
 `ready` carries every ceiling the server enforces, before any catch-up, so a
-client knows all of them before its first `put`: the largest file, chunk and
-chunk list, the largest encoded `putmany` frame (`maxBatchBytes`) and the most
-body bytes one `fetch` may ask for (`maxFetchBytes`). A request over a ceiling
-is refused with `toolarge`, never with a bare disconnect, and every legal
-message fits under the server's read limit. `ready.cursor` is what the server
-holds. `wrapped` is the vault's wrapped data key when it has one; see
+client knows them all before its first `put`: the largest file, chunk and chunk
+list, the largest encoded `putmany` frame (`maxBatchBytes`) and the most body
+bytes one `fetch` may ask for (`maxFetchBytes`). A request over a ceiling is
+refused with `toolarge`, never a bare disconnect, and every legal message fits
+under the server's read limit. `ready.cursor` is what the server holds. `wrapped` is the vault's wrapped data key when it has one; see
 **Authentication**.
 
 ## Request ids
@@ -137,9 +132,9 @@ holds. `wrapped` is the vault's wrapped data key when it has one; see
 Every request that expects a reply carries `id`, a client-chosen integer from 1
 to 2^32-1, unique among the requests in flight: `hello`, `put`, `putmany`,
 `get`, `fetch`, `history`, `deleted`, `invite`, `uninvite`, `rotate`,
-`register`, `devices`, `revoke`. The reply echoes it,
-and so does an `err` refusing that request. A request with no `id`, or one
-outside that range, is `protostate` and ends the session. `batch`, `caught-up` and pings are
+`register`, `devices`, `revoke`. The reply echoes it, and so does an `err`
+refusing that request. A request with no `id`, or one outside that range, is
+`protostate` and ends the session. `batch`, `caught-up` and pings are
 unsolicited and carry no `id`. The server never sends an `id` it was not given.
 A client ends the session on a reply whose `id` it does not recognise, and
 treats an `err` with no `id` as the reason the connection is about to close.
@@ -205,9 +200,9 @@ changes that arrive mid-catch-up are held and released in order afterwards.
   and checks neither, but refuses an entry with no `mac` of the right shape.
 - A rejected `put` returns `{res:"err", code, msg}` and the session continues.
 - A quiet connection is kept. The server pings an idle session and expects a
-  pong; it does not ping while frames are queued or a request is in flight,
-  because a client busy reading a large fetch cannot answer. A client that
-  stops answering is closed within a ping interval.
+  pong, but not while frames are queued or a request is in flight, because a
+  client busy reading a large fetch cannot answer. A client that stops
+  answering is closed within a ping interval.
 - On shutdown the server sends every idle session `{res:"err", code:"busy"}`
   with a reason and closes it; a request in flight is allowed to finish first.
   A client treats an error it did not ask for as the close reason.
@@ -226,10 +221,10 @@ changes that arrive mid-catch-up are held and released in order afterwards.
 Up to 256 entries, at most `maxBatchBytes` of encoded request, and at most
 `maxBatchBytes` of summed ciphertext budget (`size + 256 * len(chunks)` over
 every entry); a client splits a batch that would exceed any of the three, and
-sends a file whose own budget exceeds it with `put`. `results` has one slot per entry, in the order sent. A
-refused entry appears as `{code, msg}` in its slot and does not refuse the
-batch, so a client never has to bisect two hundred notes to find the one the
-server would not take. An empty batch is `badentry`; over 256 is `toolarge`.
+sends a file whose own budget exceeds it with `put`. `results` has one slot per
+entry, in the order sent. A refused entry appears as `{code, msg}` in its slot
+and does not refuse the batch, so a client never has to bisect two hundred
+notes to find the one the server would not take. An empty batch is `badentry`; over 256 is `toolarge`.
 Every rule of `put` applies.
 
 ## Authenticating an entry
@@ -296,7 +291,7 @@ one way to change a vault.
 
 ## Authentication
 
-Two credentials, deliberately separated, and the separation is the point.
+Two credentials, deliberately separated. The separation is the point.
 
 | credential | held by | may |
 |---|---|---|
@@ -310,44 +305,40 @@ disk yields ciphertext without the ability to add to it.
 
 **The vault's credential may not sync.** Through protocol 3 it was the sync
 credential: every device held the root, derived the same key, and matching the
-stored hash was what a hello proved. That is why revocation would have meant
-nothing then, and why the narrowing had to come before the device list. A vault
-whose devices can all be bypassed by the one credential they were meant to
-replace has a device list and no revocation, which is worse than having no
-list, because it looks like it works.
+stored hash was what a hello proved. Revocation would have meant nothing then,
+which is why the narrowing had to come before the device list: a device list
+with no revocation is worse than no list, because it looks like it works.
 
-It is enforced by there being one code path that builds a syncing session, and
-the only way into it is a `deviceId` whose stored hash matched the offered key.
-A registrar session is refused every op that reads or writes a note, is in no
-fan-out, and is not counted against the vault's connected-device limit, because
-it is not a device.
+One code path builds a syncing session, and the only way into it is a
+`deviceId` whose stored hash matched the offered key. A registrar session is
+refused every op that reads or writes a note, is in no fan-out, and is not
+counted against the vault's connected-device limit, because it is not a device.
 
-What a registrar may also do is read the device list and take a row off it. The
-list is who may connect rather than what the vault holds, it carries no key
-material, and two things need the recovery key to reach it: emptying the vault
-is the recovery key's alone, below, and a vault whose every row is a pairing
-that crashed refuses each new registration with `full`, leaving no device to
-prune the list from. The cost is stated rather than hidden: a leaked root can
-stop devices connecting, where before it could only read and add. Rotation is
-what answers a leaked root, and every write a registrar makes, `revoke`
-included, is conditional on the credential it authenticated under still being
-the vault's.
+A registrar may also read the device list and take a row off it. The list is
+who may connect rather than what the vault holds and carries no key material,
+and two things need the recovery key to reach it: emptying the vault is the
+recovery key's alone, below, and a vault whose every row is a crashed pairing
+refuses each new registration with `full`, leaving no device to prune the list
+from. The cost: a leaked root can stop devices connecting, where before it
+could only read and add. Rotation answers that, and every write a registrar
+makes, `revoke` included, is conditional on the credential it authenticated
+under still being the vault's.
 
 **Claiming.** A vault with no auth hash is opened only by the server's
 first-run token, in exchange for `claim`, the key it is to be bound to, and
 `wrapped`. Claiming is one-time and cannot be undone over the wire, or a second
 device could lock the first out. A device sends `claim` while it still holds
 the bootstrap token and not after, so it never has to work out whether it is
-first. A hello that claims is a registrar session like any other, so creating
-a vault is: claim, `register` the first device, then connect as that device.
-A session that authenticated with the bootstrap token may not `rotate`, because
-it proved nothing about holding the old root.
+first. A hello that claims is a registrar session like any other, so creating a
+vault is: claim, `register` the first device, then connect as that device. A
+session that authenticated with the bootstrap token may not `rotate`: it proved
+nothing about holding the old root.
 
 ### The device list
 
 A device is a row: an id it chose, a name a person reads, the hash of its own
 auth key, when it was created and when it was last seen. The id is the
-identity; the name is never one, and two laptops may both be called laptop.
+identity; the name never is, and two laptops may both be called laptop.
 
 ```
 -> {op:"register", id, deviceId, auth, name?}     registrar sessions only
@@ -362,81 +353,76 @@ identity; the name is never one, and two laptops may both be called laptop.
 
 `auth` is the new device's auth key, not its hash, for the same reason `claim`
 is the key: the server keeps only the digest either way, so the key reveals
-nothing the digest would have hidden, and what it buys is that a credential
-short enough to guess can be refused. `name` defaults to the session's own
+nothing the digest would have hidden, and it buys the ability to refuse a
+credential short enough to guess. `name` defaults to the session's own
 `device`. `wrapped` comes back because the registering session holds the root
 and can unwrap it, which is how a device ends up holding the data key without
 ever holding the root.
 
 Registering the same `deviceId` with the same key again succeeds and is the
-registration having happened. That is the half-finished registration: the row
-committed and the reply was lost. Answering `badentry` there would leave a
-device retrying for ever, which is the same defect a duplicate invite
-identifier had. A *different* key under an id the vault already holds is
+registration having happened: the half-finished case where the row committed
+and the reply was lost. Answering `badentry` there would leave a device
+retrying for ever, the same defect a duplicate invite identifier had. A *different* key under an id the vault already holds is
 somebody else's device and is `badentry`, and nothing is overwritten.
 
 **A device may not `register`.** It holds no vault credential, so a stolen
 laptop cannot mint a row directly, cannot `rotate`, and cannot produce the
-recovery key. It **can** still add a device, by issuing an invite, and that is
+recovery key. It **can** still add a device by issuing an invite, and that is
 the design rather than a hole: the recovery key stays offline, so something a
-device holds has to be able to admit the next one. The honest boundary is that
-it cannot do so unseen, because both the row and the outstanding invite are in
-the same `devices` listing. What a device may send is `devices`, `invite`,
-`uninvite`, and `revoke` for any device but the vault's last, itself included,
-which is what unlinking is.
+device holds has to admit the next one. The honest boundary is that it cannot
+do so unseen, because both the row and the outstanding invite are in the same
+`devices` listing. A device may send `devices`, `invite`, `uninvite`, and
+`revoke` for any device but the vault's last, itself included, which is what
+unlinking is.
 
 **Revoking closes the device's live sessions**, and the reply means both. The
-row alone would be a revocation the revoked device never notices: it holds an
-authenticated connection, nothing on a live session is re-checked, and it
-would go on receiving every note pushed to the vault while the panel said it
-was gone. The order is the guarantee. A revoke deletes the row and only then
+row alone would be a revocation the revoked device never notices: nothing on a
+live session is re-checked, so it would go on receiving every note pushed to
+the vault while the panel said it was gone. The order is the guarantee. A
+revoke deletes the row and only then
 collects the sessions to close; a connecting device joins the fan-out and only
-then stamps its `lastSeen`. So either the delete is first and the stamp finds
-no row, and the connect is refused, or the join is first and the revoke finds
-the session. There is no interleaving that leaves a revoked device connected.
+then stamps its `lastSeen`. So either the delete is first, the stamp finds no
+row and the connect is refused, or the join is first and the revoke finds the
+session. No interleaving leaves a revoked device connected.
 
 **Emptying the vault takes the recovery key.** Ordinary revocation is any
 device's: a phone cutting off a stolen laptop without anybody digging out the
 recovery key is why there is revocation here rather than only rotation. The
 last row is the exception, and the only one. `allowLast` is honoured on a
-registrar session and refused with `auth` on a device's, because it is the one
-revocation nothing on a device can undo: what it leaves is a vault only the
-recovery key opens, so a compromised device could otherwise delete every row
-and the last one with it and leave its owner holding devices that cannot reach
-their own notes. It costs nothing in the case it is for, since a device stolen
-when it was the only one wants a rotation as well, and rotating already needs
-the key. A registrar still has to send `allowLast`, and without it gets
-`badentry`: the confirmation is still asked, now of the credential that can
-undo the answer. Revoking an id the vault does not have is `nodevice`, which
-says the list you were reading is stale.
+registrar session and refused with `auth` on a device's, because what it leaves
+is a vault only the recovery key opens, and a compromised device could
+otherwise delete every row and leave its owner holding devices that cannot
+reach their own notes. It costs nothing in the case it is for, since a device
+stolen when it was the only one wants a rotation as well, and rotating already
+needs the key. A registrar still has to send `allowLast`, and without it gets
+`badentry`. Revoking an id the vault does not have is `nodevice`: the list you
+were reading is stale.
 
 Revoking stops a device connecting. It does not un-read what that device
 already read: it still holds the data key and can decrypt every note it had
 synced. A device that was stolen rather than merely lost wants a rotation too.
 
 **Eight devices.** `maxDevices` is in `registrar` and in the device list, so a
-client knows the cap before it registers rather than discovering it by being
-refused. The ninth registration is `full`, which is not `busy`: `busy` means
-come back later and this never becomes true by waiting, because somebody has to
-revoke a device.
+client knows the cap before it registers rather than by being refused. The
+ninth registration is `full`, not `busy`: `busy` means come back later, and
+this never becomes true by waiting, because somebody has to revoke a device.
 
 `full` names how many of the vault's rows have never connected, and both
-clients flag those rows in the list. They are the reclaimable ones, and they
-are what the redemption ordering costs: the row is written before the device
-redeeming it saves anything, so a pairing that reaches the server and then
-crashes strands a row rather than a device that believes it is paired. That is
-the right way round and does not change, but eight of them, or eight an
-attacker minted invites for, fill the cap. Nothing reclaims one on its own; a
-server deleting a device row because it looks unused is the failure the cap
-decision already refused. What the refusal can do is point at the rows worth
-looking at, so that "the vault is full" is an instruction rather than a choice
-between somebody's working devices. It is the same eight as the connected-device limit, and a test
-pins the two together, because a vault that could register more devices than it
-can connect would have one that registers and is then refused with `busy` for
-ever with nothing saying why. A vault that somehow already holds more keeps
-every row and every one of those devices goes on syncing: the cap bounds
-growth, and enforcing it backwards would mean the server choosing which of
-somebody's devices stops working, silently.
+clients flag those rows. They are the reclaimable ones, and what the redemption
+ordering costs: the row is written before the device redeeming it saves
+anything, so a pairing that reaches the server and then crashes strands a row
+rather than a device that believes it is paired. Eight of them, or eight an
+attacker minted invites for, fill the cap. Nothing reclaims one on its own,
+because a server deleting a row that looks unused is the failure the cap
+decision already refused; naming them is what makes "the vault is full" an
+instruction.
+
+It is the same eight as the connected-device limit, pinned by a test, since a
+vault that could register more devices than it can connect would have one that
+registers and is then refused with `busy` for ever with nothing saying why. A
+vault that somehow holds more keeps every row and all of those devices go on
+syncing: the cap bounds growth, and enforcing it backwards would mean the
+server silently choosing which of somebody's devices stops working.
 
 ### The data key, and rotating a leaked secret
 
@@ -444,13 +430,13 @@ Every claimed vault has a **data key**: 32 random bytes generated by the first
 device, wrapped under a key derived from the root secret, and stored on the
 server as an opaque blob. Every key that touches content derives from the data
 key; only the vault's auth key and the wrapping key derive from the root. The
-server returns the blob in `ready` and hands it to a registrar in `registered`.
-The server cannot open it: it holds neither key.
+server returns the blob in `ready` and hands it to a registrar in `registered`,
+and cannot open it: it holds neither key.
 
-That indirection is what separates the two credentials. A device is given the
-data key when it is registered, by the registrar that could unwrap it, so a
-device never needs the root and never holds it. It is also what makes a leaked
-recovery key survivable, below.
+That indirection separates the two credentials. A device is given the data key
+when it is registered, by the registrar that could unwrap it, so a device never
+needs the root and never holds it. It is also what makes a leaked recovery key
+survivable, below.
 
 Rotating is a registrar's op, because it is the root that is being replaced:
 
@@ -467,9 +453,9 @@ nothing sealed under the data key changed.
 **A rotation touches no device row, and every device keeps syncing across
 one**, mid-session, without pairing again. That is the expensive half of what
 per-device credentials removed: under protocol 3 the vault's hash *was* the
-credential every device held, so a rotation evicted the lot and each one had to
-be paired again from the new string, which for a laptop, a phone, a desktop and
-a NAS is a weekend, and is the reason a leaked string went unrotated.
+credential every device held, so a rotation evicted the lot and each had to be
+paired again from the new string, which for a laptop, a phone, a desktop and a
+NAS is a weekend, and is why a leaked string went unrotated.
 
 What a rotation does close is every *other* registrar session on the vault,
 with an unsolicited `{res:"err", code:"auth"}`. Those are holding the root that
@@ -483,11 +469,11 @@ unconditional swap let the loser overwrite the winner and the device the winner
 was revoking ended up owning the vault.
 
 The two device-list ops are the same race with worse prizes, and both turn on
-the one fact that a rotation deliberately leaves every device row alone. A
-device registered a millisecond too late by the leaked key would still be there
-afterwards, which is permanent access outliving the rotation meant to end it. A
-row deleted a millisecond too late is the other direction: the retired root
-answers the rotation by locking every real device out of the vault.
+the fact that a rotation deliberately leaves every device row alone. A device
+registered a millisecond too late by the leaked key would still be there
+afterwards: permanent access outliving the rotation meant to end it. A row
+deleted a millisecond too late is the other direction, the retired root
+answering the rotation by locking every real device out of the vault.
 
 A client that has a rotation outstanding, sent with no reply, keeps both
 secrets and tries the new one first on its next connect, falling back to the
@@ -501,7 +487,7 @@ the history.
 
 The root secret is shown once, to the person who starts the vault, as a
 recovery key to write down. It is never shown again, and adding a device does
-not need it. A device that already has the vault issues an invite instead:
+not need it: a device that already has the vault issues an invite instead.
 
 ```
 -> {op:"invite", id, invite, sealed, ttlMs?}      device sessions only
@@ -531,19 +517,16 @@ An invite that has not been redeemed is visible, and can be cancelled:
 ```
 
 Outstanding invites ride on the device list, in `invites`, as an identifier and
-an expiry each and never the sealed blob. They are the same question the rows
-answer: a row is a device that was added, an outstanding invite is one about to
-be. Before they were listed, an invite was the one authority on a vault that
-nothing could see, so a string issued on a stolen laptop stayed invisible until
-somebody redeemed it, for up to an hour. Seeing the identifier redeems nothing:
-that also takes the invite key, which never reaches the server and exists only
-in the string somebody is holding. What the identifier is for is `uninvite`,
-which deletes the row so the string stops working before it expires. Without
-it, the only ways to retire an invite were to wait out the hour or to rotate,
-which retires the recovery key with it. An identifier that is unknown, expired
-or already redeemed is one `badentry`, saying which of the three to nobody, for
-the reason every other invite refusal is one answer, and the message says to
-look at the device list, because a redeemed invite is a row there now.
+an expiry each and never the sealed blob. Before that, an invite was the one
+authority on a vault nothing could see: a string issued on a stolen laptop
+stayed invisible until somebody redeemed it, for up to an hour. Seeing the
+identifier redeems nothing, since that also takes the invite key, which only
+the person holding the string has. The identifier is for `uninvite`, which
+deletes the row so the string stops working before it expires; the only
+alternatives were to wait out the hour or to rotate, which retires the recovery
+key with it. An identifier that is unknown, expired or already redeemed is one
+`badentry`, saying which of the three to nobody, and the message says to look
+at the device list, because a redeemed invite is a row there now.
 
 The new device redeems it at hello, in place of a token, and names the device
 row it is asking for:
@@ -554,12 +537,12 @@ row it is asking for:
 ```
 
 **Redeeming registers the device.** The invite is unguessable, single use,
-server tracked and expiring, which is exactly the authority to register exactly
-one device, and it has to be: the issuing device holds no root and so cannot
-register a row on the newcomer's behalf, and the newcomer holds nothing else
-the server would accept a registration under. `deviceId` and `auth` are the
-row's id and the key its hash is taken from, the same fields `register` takes
-and bounded the same way; `name` defaults to `device`.
+server tracked and expiring, which is exactly the authority to register one
+device, and it has to be: the issuing device holds no root and cannot register
+a row on the newcomer's behalf, and the newcomer holds nothing else the server
+would accept a registration under. `deviceId` and `auth` are the row's id and
+the key its hash is taken from, the same fields `register` takes and bounded
+the same way; `name` defaults to `device`.
 
 The spend and the insert are one transaction. An invite is never spent without
 a row, and no row is ever written under an invite that is still live, so every
@@ -567,28 +550,24 @@ refusal below leaves the string in somebody's hand still working.
 
 The session closes after `redeemed`. It is not a device session: nothing on it
 has proved that anybody holds the key just registered, and the redeemer has to
-write that key and the data key down before it can use either. Its next hello,
-as an ordinary device, is the proof. There is no `wrapped` in the reply and
-there must not be: the wrapping opens under the root and a redeemer holds none.
+write that key and the data key down before using either. Its next hello, as an
+ordinary device, is the proof. There is no `wrapped` in the reply and there
+must not be: the wrapping opens under the root and a redeemer holds none.
 
 Refusals. An unknown, expired, already used or malformed invite is `auth`,
-never saying which, and an unclaimed vault is the same answer. A hello carrying
-an invite without a `deviceId`, or with an `auth` key shorter than 32
-characters, or with a name the server will not store, is `badname` or
-`badentry`: those are facts about the frame rather than about the vault, and
-naming them cannot leak whether the invite exists. An id the vault already
-holds is `badentry`, and the invite stays unspent so the redeemer can pick
-another. A vault already at its device cap is `full`, not `busy`, because
-waiting never makes room; revoke a device and the same string works, and the
-refusal says how many rows have never connected, because those are the ones
-that cost nothing to revoke. A hello
-carrying both a token and an invite, or both a claim and an invite, is
-`badentry`, because an invite stands in for the one and excludes the other, and
-sending both leaves the server choosing which credential was meant. Issuing an
-invite under an identifier the vault already holds is `badentry` too, rather
-than a retryable `internal` a client would repeat for ever.
+never saying which, and so is an unclaimed vault. A hello carrying an invite
+without a `deviceId`, with an `auth` key shorter than 32 characters, or with a
+name the server will not store, is `badname` or `badentry`: facts about the
+frame, not the vault, so naming them cannot leak whether the invite exists. An
+id the vault already holds is `badentry`, and the invite stays unspent so the
+redeemer can pick another. A vault at its device cap is `full`, not `busy`,
+since waiting never makes room, and the refusal names the rows that have never
+connected. Both a token and an invite, or a claim and an invite, is `badentry`:
+an invite stands in for the one and excludes the other. Issuing an invite under
+an identifier the vault already holds is `badentry` too, rather than a
+retryable `internal` a client would repeat for ever.
 
-`rotate` deletes every outstanding invite on the vault. That is the same guard
+`rotate` deletes every outstanding invite on the vault, the same guard
 registration has: a rotation exists to end access somebody should not have, and
 an invite issued before one is a device somebody could still add after it.
 `invite` is refused with `auth` on a registrar session, which is what a session
@@ -631,12 +610,11 @@ nonce(p)  = HMAC-SHA-256(K_nonce, p)[:12]
 seal(K,p) = nonce(p) || AES-GCM-256(K, nonce(p), p)
 ```
 
-There is one schedule and every content key hangs off `D`. That is not a
-simplification, it is the reason a leaked `S` can be retired: nothing sealed
-depends on it. It also removes a state a server could otherwise choose. When a
-vault might or might not have had a data key, a server could pick the schedule
-a device used by leaving `wrapped` out of `ready`, and the device had no way to
-know it had been moved onto keys no other device could read.
+There is one schedule and every content key hangs off `D`. That is the reason a
+leaked `S` can be retired: nothing sealed depends on it. It also removes a
+state a server could otherwise choose: when a vault might or might not have had
+a data key, a server could pick the schedule a device used by leaving `wrapped`
+out of `ready`, and the device had no way to know.
 
 Paths and chunks use the same construction under different keys. The nonce is
 derived from the plaintext, so sealing is deterministic. Equal paths must seal
@@ -681,11 +659,11 @@ expected straight back.
 
 Every error carries `retryable`, including the ones sent before a hello has
 been read. A client still keeps a default by code for a frame that arrives
-without the field, which is a defence against a malformed answer rather than a
-second shape to support: a refusal at admission during shutdown or at the pre-auth cap, a
-first frame that is not a hello, or an unsupported `proto`. What such an error
-lacks is an `id`, because it answers no request, and so do the shutdown and
-rotation notices.
+without the field, a defence against a malformed answer rather than a second
+shape to support: a refusal at admission during shutdown or at the pre-auth
+cap, a first frame that is not a hello, or an unsupported `proto`. What such an
+error lacks is an `id`, because it answers no request, and so do the shutdown
+and rotation notices.
 
 The session **continues** after a code that rejects one request, and **ends**
 after one that means the connection should not have been opened or the two ends
@@ -714,26 +692,20 @@ no longer agree how many frames are outstanding.
 ### Why `busy` is still not two codes
 
 `busy` covers the vault's connected-device limit and a server shutting down,
-which are unrelated conditions, and splitting them has been proposed more than
-once. Protocol 4 did add a `full`, and it is deliberately not this: `full` is
-the *registration* cap, which no amount of waiting clears, and the two limits
-are answered differently for exactly that reason. A connection refused at the
-device limit succeeds when somebody closes a laptop; a ninth registration
-succeeds when somebody revokes a device.
+and splitting them has been proposed more than once. Protocol 4 did add a
+`full`, deliberately not this: `full` is the *registration* cap, which no
+waiting clears. A connection refused at the device limit succeeds when somebody
+closes a laptop; a ninth registration succeeds when somebody revokes a device.
 
 The reason the connection limit keeps sharing `busy` is in the client: a client
 decides whether to retry from an allowlist of codes it knows, so a code it has
 never seen is not retryable. Send a device at the connection limit a code it
-does not know and it stops for good, where `busy` has it come back. That is the
-failure the allowlist exists to prevent, aimed at the one case that most needs
-a retry.
+does not know and it stops for good, where `busy` has it come back.
 
 Nothing is lost by the sharing. Both conditions want the same thing from a
-client, come back later, and they already differ in the only two ways that
-carry: `retryAfterMs`, which says how much later, and the message, which says
-`this server is shutting down, reconnect in a moment` or
-`vault has 8 devices connected, limit is 8`. No client branches on the
-distinction and a person reading a log has the sentence, not just the number.
+client, come back later, and they already differ in `retryAfterMs` and in the
+message: `this server is shutting down, reconnect in a moment` or
+`vault has 8 devices connected, limit is 8`.
 
 If it is ever split, both ends move together: the client learns the new code
 first and only then may a server send it.

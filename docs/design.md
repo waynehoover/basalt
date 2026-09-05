@@ -5,15 +5,14 @@
 Why Basalt is built the way it is: the rules it will not break, what it refuses
 to do, and what it does and does not protect against.
 
-**Minimal, opinionated, fast, self-hosted.** In that order when they conflict,
-except that nothing outranks not losing a note. Every question with a right
-answer is answered once, in the source, which is why there is no settings
-screen. Fast follows, because the cheapest thing a sync client can do with a
-byte is not send it. Self-hosted is what makes the rest possible: one backend,
-one transport, one person's devices.
+**Minimal, opinionated, fast, self-hosted.** In that order when they conflict.
+Every question with a right answer is answered once, in the source, which is
+why there is no settings screen. Fast follows, because the cheapest thing a
+sync client can do with a byte is not send it. Self-hosted is what makes the
+rest possible: one backend, one transport, one person's devices.
 
-When simplicity and correctness conflict, correctness wins and the feature gets
-cut.
+Nothing outranks not losing a note. When simplicity and correctness conflict,
+correctness wins and the feature gets cut.
 
 ## The durability rules
 
@@ -61,21 +60,20 @@ them by number.
 
 11. **A recovery path tested only in docs is a rumour.** The restore runbook
     read correctly the whole time nothing had run it. It runs on every push
-    now, against the built binary: back up, lose the original, copy, verify
-    deeply, serve, and read every version and every body back. The last step
-    is the one that earns the rule, because a restore that verifies, starts
-    and serves a vault with a hole in it passes every check before it.
+    now, against the built binary, ending in a read-back of every version and
+    every body: a restore with a hole in it verifies, starts and serves before
+    that step.
 
 ## Conflicts: keep both
 
 Obsidian Sync and LiveSync both merge with diff-match-patch. Obsidian discards
 the array saying which hunks landed, so a hunk that does not apply is silently
-dropped. Basalt uses the same library and abandons the merge if any hunk fails.
-It also adds the check the library lacks: it compares which spans each side
-changed and refuses before applying anything if they overlap. Two devices
-rewriting one sentence differently would otherwise "apply" cleanly and produce
-a sentence neither wrote. Two additions at the same point on a line boundary are
-allowed, because that is two devices adding to one daily note.
+dropped. Basalt uses the same library, abandons the merge if any hunk fails,
+and adds the check the library lacks: it compares which spans each side changed
+and refuses before applying anything if they overlap. Two devices rewriting one
+sentence differently would otherwise "apply" cleanly and produce a sentence
+neither wrote. Two additions at the same point on a line boundary are allowed,
+because that is two devices adding to one daily note.
 
 When both versions are kept, the incoming one takes the conflict name. Obsidian
 puts the local one there and overwrites the file you have open. A sync you did
@@ -90,10 +88,9 @@ before encryption, which takes a vault's text to well under what the plaintext
 would have cost. That order is forced: compressing first would move every
 boundary on any edit, and ciphertext does not compress.
 
-Every size and threshold came from a measurement on a real vault, and the
-figures live in [compared.md](compared.md) with the corpus each was taken on,
-rather than being restated here, so there is one place to correct when they are
-measured again.
+Every size and threshold came from a measurement on a real vault. The figures
+live in [compared.md](compared.md) with the corpus each was taken on, so there
+is one place to correct when they are measured again.
 
 ## Simplicity
 
@@ -113,20 +110,18 @@ judgement except where it trades away a note; fail loudly and never report
 success you have not verified; the server is an opaque blob store and stays one;
 verify against the artifact, never infer; everything is reversible.
 
-One honest note against all of that, raised in review and worth keeping. There
-is no settings screen, and there is a settings surface: `-max-file`,
+One honest note against all of that, raised in review. There is no settings
+screen, and there is a settings surface: `-max-file`,
 `-max-batch-bytes`, `-max-fetch-bytes`, `-allow-origin`, `-grace`, `-ttl`,
 `--ignore`, `--timeout`, the device cap, the retry hints, the debounce, the
-full-pass interval. Some are flags, some are options, some are constants
-answered once in the source, and the ones a phone most needs are the ones it
-can least reach. Two of those refusals have already been re-litigated by
-reality: `-allow-origin` exists because phones exist, `--ignore` because vaults
-hold things people do not want synced. The counter is real too, since every
-option multiplies untested combinations and the suite is this project's best
-asset. So the position is not that the surface does not exist, but that it
-stays documented in one place per component rather than gathered into a screen,
-and that a refusal which keeps losing the same argument should be amended
-rather than restated.
+full-pass interval. Some are flags, some options, some constants answered once
+in the source, and the ones a phone most needs are the ones it can least reach.
+Two of those refusals have already been re-litigated by reality: `-allow-origin`
+exists because phones exist, `--ignore` because vaults hold things people do
+not want synced. The counter is real too: every option multiplies untested
+combinations. So the surface stays documented in one place per component rather
+than gathered into a screen, and a refusal that keeps losing the same argument
+gets amended rather than restated.
 
 ## Refusals
 
@@ -141,27 +136,26 @@ refusals above this is not settled.
 
 The reason is mechanical. Obsidian holds the config folder in memory and writes
 it back, so a file changed underneath the running app is overwritten rather
-than read. A config change from another device would land and be undone.
+than read, and a config change from another device would land and be undone.
 Beyond that: rule 2 came from exactly this bug; a broken config reaches every
 device including the one that still worked, where a note conflict is two
 visible files; the pairing secret lives in that folder; and `workspace.json` is
 rewritten whenever a pane moves.
 
 Snippets and themes are inert, so a slice limited to those is the one worth
-building first. Until then the rule is simple and the same on every device:
-the config folder, and any file or folder whose name starts with a dot, never
-syncs in either direction. Obsidian's own index does not list dot-prefixed
-paths, so a client that accepted one from a peer would write it, fail to see
-it, and report it deleted. One rule in one place is what keeps the two
-clients from disagreeing about what a vault contains.
+building first. Until then the rule is the same on every device: the config
+folder, and any file or folder whose name starts with a dot, never syncs in
+either direction. Obsidian's own index does not list dot-prefixed paths, so a
+client that accepted one from a peer would write it, fail to see it, and report
+it deleted.
 
 ## Notes first, and what that costs attachments
 
 Somebody writing prose is the case every decision is made for. Attachments are
 supported and not optimised for: chunk sizes were tuned against Markdown,
 deduplication does nothing for two photographs, and a large file costs the
-sender memory a note never does. So the default file limit is 64 MiB rather
-than the 256 MiB the format allows, and `basaltd serve -max-file` raises it. A
+sender memory a note never does. Hence a default file limit of 64 MiB rather
+than the 256 MiB the format allows, raised by `basaltd serve -max-file`. A
 vault that is mostly video wants a file sync.
 
 ## Who this is wrong for
@@ -175,8 +169,8 @@ does all of that and is a better answer.
 
 ## What the server can and cannot do
 
-The server is the interesting adversary. It is the one part of the system not
-on a device you are holding.
+The server is the interesting adversary: the one part of the system not on a
+device you are holding.
 
 **It cannot read anything.** Note contents and filenames are sealed on the
 device. The server holds no key and nothing in it needs one. What it can tell
@@ -184,15 +178,14 @@ about the ciphertext is its length, and that two chunks are byte-identical,
 which is what deduplication is made of.
 
 **It cannot write anything either.** An early draft sealed the bytes of a file
-and left the fields deciding what a client did with them in the clear. The
-server holds every sealed path, so it could have set `deleted` on one and every
-device would have deleted that note, or emptied a note by declaring a size with
-no chunks, or handed one file another's chunk list. Every entry carries an HMAC
-under a key the server never sees, and a device refuses an entry it cannot
-verify. Clients also check what the server used to be trusted with: an
-assembled file must match its declared size, the merge ancestor must match the
-local `synchash`, a cursor never moves backwards, and a missing limit means this
-device's own ceiling rather than no ceiling.
+and left the fields deciding what a client did with them in the clear, so the
+server could have set `deleted` on a path, emptied a note by declaring a size
+with no chunks, or handed one file another's chunk list. Every entry now
+carries an HMAC under a key the server never sees, and a device refuses an
+entry it cannot verify. Clients also check what the server used to be trusted
+with: an assembled file must match its declared size, the merge ancestor must
+match the local `synchash`, a cursor never moves backwards, and a missing limit
+means this device's own ceiling rather than no ceiling.
 
 Recovery is held to the same standard. Every entry that history, the deleted
 list or a `get` returns is checked against its authenticator before anything is
@@ -201,18 +194,14 @@ server cannot point a restore at another file's content.
 
 That rule is why the server does not stamp its own arrival time on an entry.
 `ctime` and `mtime` come from the writing device, are covered by the entry's
-authenticator, and are never checked against anything, so a device with a wrong
-clock writes times that read oddly in a history list. The fix that suggests
-itself is a timestamp the server writes and the panel prefers, and it was
-declined: nothing would cover it, the server would choose what it said, and a
-person deciding which version to restore would be reading it. What it would buy
-is nothing, because the ordering is already right. History comes back in `uid`
-order, which is arrival order by construction and involves no clock, so the
-worst a skewed device does is put a wrong label beside a correctly placed
-version. What the server does instead is say so: a device declaring times more
+authenticator, and are never checked, so a wrong clock writes times that read
+oddly in a history list. A timestamp the server writes and the panel prefers
+was declined: nothing would cover it, and the person choosing which version to
+restore would be reading a field the server chose. It buys nothing anyway,
+because history comes back in `uid` order, arrival order by construction,
+involving no clock. The server says so instead: a device declaring times more
 than a day ahead of the server's own clock is named once per session in the
-log, with the offset and with the note that the ordering is unaffected. Neither
-device changes its behaviour, because neither should.
+log, with the offset and the note that ordering is unaffected.
 
 **What it can still do is withhold.** A server can advance a client past
 versions it never shows it, because an empty batch over a covered range is also
@@ -228,13 +217,12 @@ Behind `tailscale serve` the port is private. Behind Caddy it is on the
 internet, and an unauthenticated request can reach exactly three things: `GET
 /health`, one hello frame before the server decides whether to keep talking,
 and the `426` that every other path and method gets, which says `basalt speaks
-websocket only`. None of them says which release is running. `/health` answers
-`ok` and nothing else, the `426` names no version and sends no `Server` header,
-and a hello refused for its protocol or crypto names the range the server
-speaks and not its version. The version is in `ready`, which only a device
-holding the vault's auth key receives, and in `basaltd version` on the machine
-itself. A version string is where targeted probing starts, and the operator has
-better ways to learn it than the network does.
+websocket only`. None of them names the release: `/health` answers `ok`, the
+`426` sends no `Server` header, and a hello refused for its protocol or crypto
+names the range the server speaks and not its version. The version is in
+`ready`, which only a device holding the vault's auth key receives, and in
+`basaltd version` on the machine itself. A version string is where targeted
+probing starts.
 
 That is a property rather than three careful strings, and it is tested as one:
 a sentinel version is stamped on the server and every pre-auth response,
@@ -250,17 +238,16 @@ healthcheck has to say so.
 `auth` deliberately never says which of the token, the vault, the device row or
 the invite was wrong, so the codes beside it look like the same disclosure
 wearing a different name: `badname` says the vault id parses, `proto` says how
-old this client is, `full` says the server is out of room. Each was checked,
-and none of them is.
+old this client is, `full` says the server is out of room. Each was checked;
+none of them is.
 
 `proto`, `badname`, `protostate` and `badentry` are decided by comparing the
-frame against constants that are in this repository and in
-[protocol.md](protocol.md), before any credential is looked at and without
-reading the vault. A prober learns the length of a name it may send, which it
-could have read here. Collapsing them into `auth` would cost the thing they
-exist for: a client that cannot tell `proto` from `auth` cannot tell somebody
-which end to upgrade, and one that cannot tell `badname` from `auth` sends
-somebody hunting a credential bug over a 65-character device name.
+frame against constants published in [protocol.md](protocol.md), before any
+credential is looked at and without reading the vault. Collapsing them into
+`auth` would cost the thing they exist for: a client that cannot tell `proto`
+from `auth` cannot tell somebody which end to upgrade, and one that cannot tell
+`badname` from `auth` sends somebody hunting a credential bug over a
+65-character device name.
 
 `full` is not reachable without a credential at all. It comes from the device
 limit, which is counted inside the transaction that writes the row, after the
@@ -268,40 +255,32 @@ invite has been spent, so a redeem carrying an invite nobody issued is refused
 by the spend and never reaches the count. A vault at its limit answers a bogus
 invite exactly as an empty one does.
 
-The property behind all of that is one sentence: a pre-auth refusal is a
-function of the request, and never of the vault. It is tested as one, the way
-the version property above is. The same probe goes to a vault this server
-serves, furnished with devices, entries and an outstanding invite, and to a
-vault it has never heard of, and the two frames must match byte for byte,
-whatever code either of them chooses.
+The property behind all of that: a pre-auth refusal is a function of the
+request, never of the vault. It is tested as one, the way the version property
+above is. The same probe goes to a vault this server serves, furnished with
+devices, entries and an outstanding invite, and to one it has never heard of,
+and the two frames must match byte for byte.
 
 ### Why a loopback bind is not the token
 
-The first-run token is the one step of setup that is pure ceremony: start the
-server, find the line, copy it, paste it. The obvious way to remove it is to let
-a server bound to `127.0.0.1` accept an unauthenticated claim, on the grounds
-that anything reaching loopback is already on the machine. That was considered
-and refused, because here loopback is where the proxy lives.
-[server.md](server.md#tls) says to bind to `127.0.0.1:3003` and put `tailscale
-serve` or Caddy in front, and the systemd unit does exactly that. Both proxies
-run on the machine and dial loopback, so the bind address is loopback and the
-peer address is 127.0.0.1 in the arrangement where the tailnet can reach the
-port, and in the Caddy one, where the whole internet can. A rule keyed on
-either would read both as "same machine" and hand an unclaimed vault to whoever
-asked first. A container only muddies it further: `compose.yaml` publishes the
-port on the host's loopback while the server inside binds a wildcard, so the
-same words mean different things depending on which namespace is asked. The
+The obvious way to remove the first-run token is to let a server bound to
+`127.0.0.1` accept an unauthenticated claim, since anything reaching loopback
+is already on the machine. Refused, because here loopback is where the proxy
+lives. [server.md](server.md#tls) says to bind to `127.0.0.1:3003` behind
+`tailscale serve` or Caddy, and the systemd unit does exactly that, so bind
+address and peer address are both loopback whether only the tailnet can reach
+the port or the whole internet can. A rule keyed on either would hand an
+unclaimed vault to whoever asked first. `compose.yaml` muddies it further,
+publishing on the host's loopback while the server inside binds a wildcard. The
 condition is not too broad and in need of narrowing: it is measuring the wrong
 thing.
 
-What the token is, then, is evidence that whoever is claiming can read a file in
-the data directory, which is the only same-machine proof a plain TCP listener
-has. It is required on every bind, `-localhost` included. What makes it safe to
-print in a log is that spending it is final: the claim binds the vault to that
-device's key, and the next claim is refused with `auth` and changes nothing.
-That is checked against the running binary and not only against the
-authenticator, because the property is about the door and not about the
-function behind it.
+The token is instead evidence that whoever is claiming can read a file in the
+data directory, the only same-machine proof a plain TCP listener has. It is
+required on every bind, `-localhost` included. What makes it safe to print in a
+log is that spending it is final: the claim binds the vault to that device's
+key, and the next claim is refused with `auth` and changes nothing. That is
+checked against the running binary, not only against the authenticator.
 
 ## The keys
 
@@ -332,7 +311,7 @@ and is a bound rather than an impossibility.
 ## What a device can do to another device
 
 A paired device holds the vault's data key and a credential of its own, so it
-can read and write every note. A buggy or hostile one is inside the trust
+can read and write every note; a buggy or hostile one is inside the trust
 boundary for content. What is enforced regardless: a path a client would never
 upload is one it will never accept, so a peer cannot write
 `.obsidian/plugins/<any>/main.js`; containment is checked against the resolved
@@ -340,54 +319,40 @@ filesystem, so a symlink inside the vault cannot lead a write out; and a path
 from the wire cannot climb out with `..` or an absolute path.
 
 What a device cannot do is `register` or `rotate`, or show you the recovery
-key, because it does not hold the root. The boundary stops there, and an
-earlier draft of this paragraph drew it in the wrong place.
+key, because it does not hold the root. The boundary stops there.
 
-It cannot **empty the vault** either. Any device may revoke any other device,
-which is the whole reason revocation exists here rather than only rotation: a
-phone cuts off a stolen laptop without anybody finding the recovery key. The
-last row is the exception and the only one, because it is the one revocation
-nothing on a device can undo. What it leaves is a vault only the recovery key
-opens, so a compromised laptop could otherwise delete every row and the last
-one with it, and its owner would be left holding devices that can no longer
-reach their own notes. It costs nothing in the case it is aimed at: a device
-stolen when it was the only one wants a rotation as well, and rotating already
-needs the key.
+It cannot **empty the vault** either. Any device may revoke any other, which is
+why revocation exists here rather than only rotation: a phone cuts off a stolen
+laptop without anybody finding the recovery key. The last row is the exception,
+and the only one: revoking it takes the recovery key, for the reason below.
 
 A device **can** add another device, because it can issue an invite and an
-invite registers exactly one row. That is not a leak, it is the design: the
+invite registers exactly one row. That is the design rather than a leak: the
 recovery key stays offline, so something a device holds has to be able to admit
-the next one. A compromised laptop can therefore issue a string and redeem it
-elsewhere, and the honest boundary is not that it cannot, but that it cannot do
-so unseen. Every row is in `basalt devices` with when it was added and when it
-was last seen, every outstanding invite is in that list too, any device can
-revoke any row but the last or cancel any invite, and an unredeemed invite dies
-on the next rotation or within the hour regardless.
+the next one. The honest boundary is not that a compromised laptop cannot issue
+a string and redeem it elsewhere, but that it cannot do so unseen.
+
+An invite used to be the one authority on a vault that nothing could see,
+invisible until somebody redeemed it, for up to an hour. Both surfaces now list
+every row and every outstanding invite, by identifier and expiry and never the
+sealed blob, with when a row was added and last seen. Any device can revoke any
+row but the last or cancel any invite, and an unredeemed invite dies on the
+next rotation or within the hour regardless. Seeing an identifier redeems
+nothing: redeeming also takes the invite key, which never reaches the server.
 
 The other side of that boundary: the recovery key can now read the device list
-and take rows off it, where it used to be able only to register and rotate.
-Two things forced it. Emptying the vault has to be the recovery key's, and a
+and take rows off it, where before it could only register and rotate. Two
+things forced it. Emptying the vault has to be the recovery key's, and a
 refusal naming a credential the server would then also refuse is a dead end
 rather than an instruction. And a vault whose eight rows are all pairings that
-crashed refuses every registration until somebody prunes it, with no device
-left to prune it from. What it costs is that a leaked root can stop devices
-connecting, where before it could only read and add: worth saying, and smaller
-than it sounds, because a leaked root can already register itself and read
-everything, the answer to one is a rotation, and a rotation retires the leaked
-key's power to touch the list at all.
-
-That an invite is in the list at all is new, and it closes the gap this
-paragraph used to end on. An invite was the one authority on a vault that
-nothing could see, so a string issued on a stolen laptop stayed invisible until
-somebody redeemed it, for up to an hour. Both surfaces show every outstanding
-one now, by identifier and expiry and never the sealed blob, and offer to
-cancel it. Seeing an identifier redeems nothing, because redeeming also takes
-the invite key, which never reaches the server and exists only in the string
-somebody is holding.
+crashed refuses every registration with no device left to prune it from. The
+cost is that a leaked root can stop devices connecting, smaller than it sounds
+because a leaked root can already register itself and read everything, and a
+rotation retires its power to touch the list at all.
 
 ## Three credentials, and who holds which
 
-The separation is the point, so it is worth stating as three lines.
+The separation is the point:
 
 | credential | held by | may |
 |---|---|---|
@@ -397,40 +362,39 @@ The separation is the point, so it is worth stating as three lines.
 
 The root is used twice in a vault's life: when it is created, and when every
 device is gone. **Adding a device is not one of those.** A device that already
-has the vault issues a single-use invite, which carries the data key sealed
-under a key that travels in the string and never to the server, and redeeming
-it registers the new device's own credential. So the recovery key stays written
+has the vault issues a single-use invite, carrying the data key sealed under a
+key that travels in the string and never to the server, and redeeming it
+registers the new device's own credential. So the recovery key stays written
 down, and a stolen laptop cannot register itself again, cannot mint a
 credential for anything else, and cannot show anybody the recovery key.
 
 ## A lost or stolen device
 
 Revoke it. `basalt devices` lists every device that may reach the vault and
-`basalt revoke ID` deletes one's row and closes whatever it has open, and no
-other device is disturbed: each holds a credential of its own, so there is
-nothing shared to retire. That is the cheap, common case, and it is the one
-that used to cost a weekend of re-pairing everything. Any device can do it to
-any other, which is the point: the recovery key stays in its drawer.
+`basalt revoke ID` deletes one's row and closes whatever it has open. No other
+device is disturbed: each holds a credential of its own, so there is nothing
+shared to retire. That is the cheap, common case, and the one that used to cost
+a weekend of re-pairing everything. Any device can do it to any other, which is
+the point: the recovery key stays in its drawer.
 
 The exception is the vault's **last** device, which takes the recovery key:
 `basalt revoke ID --allow-last --recovery-key basalt3_...`. That one revocation
 cannot be undone without the key, since what it leaves is a vault only the key
-opens, so it is the one that asks for it. If the last device was stolen you
-want the rotation below as well, and that needs the key anyway.
+opens, so it is the one that asks for it. It costs nothing in the case it is
+aimed at: if the last device was stolen you want the rotation below as well,
+and that needs the key anyway.
 
 **Revoking does not un-read what that device already read.** It still holds the
 data key and can decrypt every note it had synced. Revocation stops future
-connection, not past knowledge, and any surface that offers it has to say so:
-somebody who reads "revoked" as "the vault is safe again" skips the step below,
-which is the one that actually helps.
+connection, not past knowledge, and any surface that offers it has to say so.
 
-For a device that was stolen rather than merely lost, and for a recovery key
-that has been somewhere it should not have been, rotate as well. The vault's
-content is sealed under a data key that the root only wraps, so `basalt rotate`
-gives the vault a new root, re-wraps the same data key, and swaps the server's
-auth hash. The old key stops working, every outstanding invite is deleted,
-history stays, and every device goes on syncing, because a rotation replaces
-the vault's credential and touches no device row. The steps are in
+For a device stolen rather than merely lost, and for a recovery key that has
+been somewhere it should not have been, rotate as well. The vault's content is
+sealed under a data key that the root only wraps, so `basalt rotate` gives the
+vault a new root, re-wraps the same data key, and swaps the server's auth hash.
+The old key stops working, every outstanding invite is deleted, history stays,
+and every device goes on syncing, because a rotation replaces the vault's
+credential and touches no device row. The steps are in
 [server.md](server.md#rotating-the-vault-secret).
 
 Rotation does not unread what was already read either. Whoever held the old key
@@ -464,14 +428,11 @@ published from CI over OIDC with no stored token.
   `basaltd backup`.
 - TLS. The server speaks plain HTTP and expects `tailscale serve` or a proxy in
   front. No key material lives in this repository.
-- A canvas edge whose node the other device deleted. The merge keeps the edge,
-  the file is valid JSON, and Obsidian drops the edge silently on the next
-  save. There is no third answer when one person removes the node another drew
-  an arrow to, and telling that edge from one the ancestor already had needs
-  the validity check to see the ancestor and both sides rather than just the
-  result. Pinned as a test so it is met as a decision.
-- The whole-file fallback on mobile. The 64 MiB default was sized from a
-  desktop memory curve, and the fallback reads a whole file. An older phone
-  syncing a large attachment may be killed mid-pass. Staging means no note is
-  lost, but the file never syncs and the symptom is a dead app rather than an
-  error. It wants measuring on a real device, and has not been.
+- A canvas edge whose node the other device deleted. The merge keeps it, the
+  file is valid JSON, and Obsidian drops the edge silently on the next save.
+  Telling it from one the ancestor already had would need the validity check to
+  see both sides and the ancestor. Pinned as a test.
+- The whole-file fallback on mobile. The 64 MiB default came off a desktop
+  memory curve, so an older phone syncing a large attachment may be killed
+  mid-pass: no note is lost, the file never syncs, and the symptom is a dead
+  app rather than an error. Never measured on a real device.
