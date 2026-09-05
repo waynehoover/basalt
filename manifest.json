@@ -1,7 +1,7 @@
 {
 	"id": "basalt-sync",
 	"name": "Basalt Sync",
-	"version": "0.4.0",
+	"version": "0.4.1",
 	"minAppVersion": "1.7.2",
 	"description": "Self-hosted sync. End-to-end encrypted, fast, and nothing to configure.",
 	"author": "Wayne Hoover",
